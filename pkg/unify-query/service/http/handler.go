@@ -17,7 +17,6 @@ import (
 
 	influxdbRouter "github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/json"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/structured"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/redis"
@@ -53,8 +52,10 @@ func HandlerPromQLToStruct(c *gin.Context) {
 	promQL := &structured.QueryPromQL{}
 	err = json.NewDecoder(c.Request.Body).Decode(promQL)
 	if err != nil {
-		log.Errorf(ctx, err.Error())
-		resp.failed(ctx, err)
+		resp.failed(ctx, metadata.Sprintf(
+			metadata.MsgTransformPromQL,
+			"json 格式解析异常",
+		).Error(ctx, err))
 		return
 	}
 
@@ -63,7 +64,10 @@ func HandlerPromQLToStruct(c *gin.Context) {
 
 	query, err := promQLToStruct(ctx, promQL)
 	if err != nil {
-		resp.failed(ctx, err)
+		resp.failed(ctx, metadata.Sprintf(
+			metadata.MsgTransformPromQL,
+			"转换查询结构异常",
+		).Error(ctx, err))
 		return
 	}
 
@@ -102,8 +106,10 @@ func HandlerStructToPromQL(c *gin.Context) {
 	query := &structured.QueryTs{}
 	err = json.NewDecoder(c.Request.Body).Decode(query)
 	if err != nil {
-		log.Errorf(ctx, err.Error())
-		resp.failed(ctx, err)
+		resp.failed(ctx, metadata.Sprintf(
+			metadata.MsgTransformTs,
+			"json 格式解析异常",
+		).Error(ctx, err))
 		return
 	}
 	queryStr, _ := json.Marshal(query)
@@ -111,8 +117,10 @@ func HandlerStructToPromQL(c *gin.Context) {
 
 	promQL, err := structToPromQL(ctx, query)
 	if err != nil {
-		log.Errorf(ctx, err.Error())
-		resp.failed(ctx, err)
+		resp.failed(ctx, metadata.Sprintf(
+			metadata.MsgTransformTs,
+			"转换查询结构异常",
+		).Error(ctx, err))
 		return
 	}
 
@@ -160,8 +168,10 @@ func HandlerQueryExemplar(c *gin.Context) {
 	query := &structured.QueryTs{}
 	err = json.NewDecoder(c.Request.Body).Decode(query)
 	if err != nil {
-		log.Errorf(ctx, err.Error())
-		resp.failed(ctx, err)
+		resp.failed(ctx, metadata.Sprintf(
+			metadata.MsgQueryExemplar,
+			"json 格式解析异常",
+		).Error(ctx, err))
 		return
 	}
 
@@ -172,11 +182,18 @@ func HandlerQueryExemplar(c *gin.Context) {
 	queryStr, _ := json.Marshal(query)
 	span.Set("query-body", string(queryStr))
 
-	log.Infof(ctx, fmt.Sprintf("header: %+v, body: %s", c.Request.Header, queryStr))
+	metadata.Sprintf(
+		metadata.MsgQueryExemplar,
+		"%s, header: %+v, data: %+v",
+		c.Request.URL.String(), c.Request.Header, string(queryStr),
+	).Info(ctx)
 
 	res, err := queryExemplar(ctx, query)
 	if err != nil {
-		resp.failed(ctx, err)
+		resp.failed(ctx, metadata.Sprintf(
+			metadata.MsgHandlerAPI,
+			"查询异常",
+		).Error(ctx, err))
 		return
 	}
 
@@ -209,8 +226,10 @@ func HandlerQueryRaw(c *gin.Context) {
 	ctx, span = trace.NewSpan(ctx, "handler-query-raw")
 	defer func() {
 		if err != nil {
-			log.Errorf(ctx, err.Error())
-			resp.failed(ctx, err)
+			resp.failed(ctx, metadata.Sprintf(
+				metadata.MsgQueryRaw,
+				"原始数据查询异常",
+			).Error(ctx, err))
 		}
 
 		span.End(&err)
@@ -262,7 +281,7 @@ func HandlerQueryRaw(c *gin.Context) {
 
 // HandlerQueryRawWithScroll
 // @Summary query monitor by raw data with scroll
-// @ID query_raw
+// @ID query_raw_with_scroll
 // @Produce json
 // @Param    traceparent            header    string                        false  "TraceID" default(00-3967ac0f1648bf0216b27631730d7eb9-8e3c31d5109e78dd-01)
 // @Param    Bk-Query-Source   		header    string                        false  "来源" default(username:goodman)
@@ -285,8 +304,10 @@ func HandlerQueryRawWithScroll(c *gin.Context) {
 	ctx, span = trace.NewSpan(ctx, "handler-query-raw-with-scroll")
 	defer func() {
 		if err != nil {
-			log.Errorf(ctx, err.Error())
-			resp.failed(ctx, err)
+			resp.failed(ctx, metadata.Sprintf(
+				metadata.MsgQueryRawScroll,
+				"下载接口异常",
+			).Error(ctx, err))
 		}
 
 		span.End(&err)
@@ -373,7 +394,6 @@ func HandlerQueryRawWithScroll(c *gin.Context) {
 	listData.TraceID = span.TraceID()
 	listData.Total, listData.List, listData.ResultTableOptions, err = queryRawWithScroll(ctx, queryTs, session)
 	listData.Done = session.Done()
-	listData.Cache = session.Cache
 	if err != nil {
 		listData.Status = &metadata.Status{
 			Code:    metadata.QueryRawError,
@@ -428,8 +448,10 @@ func HandlerQueryTs(c *gin.Context) {
 	query := &structured.QueryTs{}
 	err = json.NewDecoder(c.Request.Body).Decode(query)
 	if err != nil {
-		log.Errorf(ctx, err.Error())
-		resp.failed(ctx, err)
+		resp.failed(ctx, metadata.Sprintf(
+			metadata.MsgQueryTs,
+			"json 格式解析异常",
+		).Error(ctx, err))
 		return
 	}
 
@@ -441,7 +463,11 @@ func HandlerQueryTs(c *gin.Context) {
 	span.Set("query-body", string(queryStr))
 	span.Set("query-body-size", len(queryStr))
 
-	log.Infof(ctx, fmt.Sprintf("header: %+v, body: %s", c.Request.Header, queryStr))
+	metadata.Sprintf(
+		metadata.MsgQueryTs,
+		"%s, header: %+v, data: %+v",
+		c.Request.URL.String(), c.Request.Header, string(queryStr),
+	).Info(ctx)
 
 	res, err := queryTsWithPromEngine(ctx, query)
 	if err != nil {
@@ -490,7 +516,10 @@ func HandlerQueryPromQL(c *gin.Context) {
 	queryPromQL := &structured.QueryPromQL{}
 	err = json.NewDecoder(c.Request.Body).Decode(queryPromQL)
 	if err != nil {
-		resp.failed(ctx, err)
+		resp.failed(ctx, metadata.Sprintf(
+			metadata.MsgParserPromQL,
+			"json 格式解析异常",
+		).Error(ctx, err))
 		return
 	}
 
@@ -498,24 +527,32 @@ func HandlerQueryPromQL(c *gin.Context) {
 	span.Set("query-body", string(queryStr))
 	span.Set("query-promql", queryPromQL.PromQL)
 
-	log.Infof(ctx, fmt.Sprintf("header: %+v, body: %s", c.Request.Header, queryStr))
+	metadata.Sprintf(
+		metadata.MsgParserPromQL,
+		"%s, header: %+v, data: %+v",
+		c.Request.URL.String(), c.Request.Header, string(queryStr),
+	).Info(ctx)
 
 	if queryPromQL.PromQL == "" {
-		resp.failed(ctx, fmt.Errorf("promql is empty"))
+		resp.failed(ctx, metadata.Sprintf(
+			metadata.MsgQueryPromQL,
+			"查询语句不能为空",
+		).Error(ctx, err))
 		return
 	}
 
 	// promql to struct
 	query, err := promQLToStruct(ctx, queryPromQL)
 	if err != nil {
-		log.Errorf(ctx, err.Error())
-		resp.failed(ctx, err)
+		resp.failed(ctx, metadata.Sprintf(
+			metadata.MsgParserPromQL,
+			"PromQL 语法解析异常",
+		).Error(ctx, err))
 		return
 	}
 
 	res, err := queryTsWithPromEngine(ctx, query)
 	if err != nil {
-		log.Errorf(ctx, err.Error())
 		resp.failed(ctx, err)
 		return
 	}
@@ -524,7 +561,7 @@ func HandlerQueryPromQL(c *gin.Context) {
 
 // HandlerQueryReference
 // @Summary  query monitor by reference
-// @ID       query_ts
+// @ID       query_reference
 // @Produce  json
 // @Param    traceparent            header    string                        false  "TraceID" default(00-3967ac0f1648bf0216b27631730d7eb9-8e3c31d5109e78dd-01)
 // @Param    Bk-Query-Source   		header    string                        false  "来源" default(username:goodman)
@@ -559,8 +596,10 @@ func HandlerQueryReference(c *gin.Context) {
 	query := &structured.QueryTs{}
 	err = json.NewDecoder(c.Request.Body).Decode(query)
 	if err != nil {
-		log.Errorf(ctx, err.Error())
-		resp.failed(ctx, err)
+		resp.failed(ctx, metadata.Sprintf(
+			metadata.MsgQueryReference,
+			"json 格式解析异常",
+		).Error(ctx, err))
 		return
 	}
 
@@ -573,10 +612,18 @@ func HandlerQueryReference(c *gin.Context) {
 	span.Set("query-body", string(queryStr))
 	span.Set("query-body-size", len(queryStr))
 
-	log.Infof(ctx, fmt.Sprintf("header: %+v, body: %s", c.Request.Header, queryStr))
+	metadata.Sprintf(
+		metadata.MsgQueryReference,
+		"%s, header: %+v, data: %+v",
+		c.Request.URL.String(), c.Request.Header, string(queryStr),
+	).Info(ctx)
+
 	res, err := queryReferenceWithPromEngine(ctx, query)
 	if err != nil {
-		resp.failed(ctx, err)
+		resp.failed(ctx, metadata.Sprintf(
+			metadata.MsgQueryReference,
+			"查询异常",
+		).Error(ctx, err))
 		return
 	}
 	if res != nil {
@@ -612,17 +659,27 @@ func HandlerQueryTsClusterMetrics(c *gin.Context) {
 	query := &structured.QueryTs{}
 	err = json.NewDecoder(c.Request.Body).Decode(query)
 	if err != nil {
-		resp.failed(ctx, err)
+		resp.failed(ctx, metadata.Sprintf(
+			metadata.MsgQueryClusterMetrics,
+			"json 格式解析异常",
+		).Error(ctx, err))
 		return
 	}
 	queryStr, _ := json.Marshal(query)
 
-	log.Infof(ctx, fmt.Sprintf("header: %+v, body: %s", c.Request.Header, queryStr))
+	metadata.Sprintf(
+		metadata.MsgQueryClusterMetrics,
+		"%s, header: %+v, data: %+v",
+		c.Request.URL.String(), c.Request.Header, string(queryStr),
+	).Info(ctx)
 
 	span.Set("query-body", string(queryStr))
 	res, err := QueryTsClusterMetrics(ctx, query)
 	if err != nil {
-		resp.failed(ctx, err)
+		resp.failed(ctx, metadata.Sprintf(
+			metadata.MsgQueryClusterMetrics,
+			"查询异常",
+		).Error(ctx, err))
 		return
 	}
 	resp.success(ctx, res)

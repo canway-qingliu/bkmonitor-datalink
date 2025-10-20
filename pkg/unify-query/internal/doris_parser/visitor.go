@@ -31,7 +31,7 @@ const (
 	AsItem = "AS"
 )
 
-type Encode func(string) (string, bool)
+type Encode func(string) (string, string)
 
 type Node interface {
 	antlr.ParseTreeVisitor
@@ -72,8 +72,8 @@ type Statement struct {
 
 	nodeMap map[string]Node
 
-	Table string
-	Where string
+	Tables []string
+	Where  string
 
 	errNode []string
 }
@@ -95,10 +95,28 @@ func (v *Statement) String() string {
 
 		switch name {
 		case TableItem:
-			if v.Table != "" {
-				res = v.Table
+			if len(v.Tables) > 0 {
+				if len(v.Tables) == 1 {
+					res = v.Tables[0]
+				} else {
+					stmts := make([]string, 0, len(v.Tables))
+					for _, t := range v.Tables {
+						s := fmt.Sprintf("SELECT * FROM %s", t)
+						if v.Where != "" {
+							s = fmt.Sprintf("%s WHERE %s", s, v.Where)
+						}
+						stmts = append(stmts, s)
+					}
+					res = fmt.Sprintf("(%s) AS combined_data", strings.Join(stmts, " UNION ALL "))
+					v.Where = ""
+				}
 			}
 		case WhereItem:
+			// 清空 where 条件
+			if len(v.Tables) > 1 {
+				res = ""
+			}
+
 			if v.Where != "" {
 				if res == "" {
 					res = v.Where
@@ -594,7 +612,12 @@ func (v *SelectNode) String() string {
 		ss := nodeToString(fn)
 		if ss != "" {
 			if v.Distinct && idx == v.DistinctIndex {
-				ss = fmt.Sprintf("DISTINCT(%s)", ss)
+				// 如果字段包含AS别名，则不添加外层括号
+				if strings.Contains(ss, " AS ") {
+					ss = fmt.Sprintf("DISTINCT %s", ss)
+				} else {
+					ss = fmt.Sprintf("DISTINCT(%s)", ss)
+				}
 			}
 			ns = append(ns, ss)
 		}
@@ -635,9 +658,9 @@ func (v *FieldNode) String() string {
 	result = nodeToString(v.node)
 
 	if v.isField && v.Encode != nil {
-		originField, ok := v.Encode(result)
-		if v.SetAs && ok && v.as == nil {
-			v.as = &StringNode{Name: result}
+		originField, as := v.Encode(result)
+		if v.SetAs && as != "" && v.as == nil {
+			v.as = &StringNode{Name: as}
 		}
 		result = originField
 	}
@@ -1100,6 +1123,6 @@ func visitChildren(encode Encode, setAs bool, next Node, node antlr.RuleNode) an
 type Option struct {
 	DimensionTransform Encode
 
-	Table string
-	Where string
+	Tables []string
+	Where  string
 }

@@ -24,8 +24,8 @@ import (
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/function"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/json"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/lucene_parser"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/set"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/structured"
 )
@@ -41,10 +41,6 @@ const (
 
 	DefaultReverseAggName = "reverse_nested"
 
-	Type = "type"
-
-	Properties = "properties"
-
 	Min         = "min"
 	Max         = "max"
 	Sum         = "sum"
@@ -57,6 +53,7 @@ const (
 
 	Nested = "nested"
 	Terms  = "terms"
+	Object = "object"
 
 	ESStep = "."
 
@@ -91,6 +88,9 @@ const (
 	ShouldNot = "should_not"
 )
 
+// text、object、nested 类型不支持聚合，其他类型默认支持
+var nonAggTypes = []string{Text, Object, Nested}
+
 type TimeSeriesResult struct {
 	TimeSeriesMap map[string]*prompb.TimeSeries
 	Error         error
@@ -106,29 +106,6 @@ func mapData(prefix string, data map[string]any, res map[string]any) {
 			mapData(k, nv, res)
 		default:
 			res[k] = nv
-		}
-	}
-}
-
-func mapProperties(prefix string, data map[string]any, res map[string]string) {
-	if prefix != "" {
-		if t, ok := data[Type]; ok {
-			switch ts := t.(type) {
-			case string:
-				res[prefix] = ts
-			}
-		}
-	}
-
-	if properties, ok := data[Properties]; ok {
-		for k, v := range properties.(map[string]any) {
-			if prefix != "" {
-				k = prefix + ESStep + k
-			}
-			switch v.(type) {
-			case map[string]any:
-				mapProperties(k, v.(map[string]any), res)
-			}
 		}
 	}
 }
@@ -173,7 +150,7 @@ type FormatFactory struct {
 	decode func(k string) string
 	encode func(k string) string
 
-	mapping map[string]string
+	fieldsMap metadata.FieldsMap
 
 	data map[string]any
 
@@ -195,7 +172,6 @@ type FormatFactory struct {
 func NewFormatFactory(ctx context.Context) *FormatFactory {
 	f := &FormatFactory{
 		ctx:         ctx,
-		mapping:     make(map[string]string),
 		aggInfoList: make(aggInfoList, 0),
 
 		// default encode / decode
@@ -207,6 +183,11 @@ func NewFormatFactory(ctx context.Context) *FormatFactory {
 		},
 	}
 
+	return f
+}
+
+func (f *FormatFactory) WithFieldMap(fieldsMap metadata.FieldsMap) *FormatFactory {
+	f.fieldsMap = fieldsMap
 	return f
 }
 
@@ -342,26 +323,53 @@ func (f *FormatFactory) WithOrders(orders metadata.Orders) *FormatFactory {
 	return f
 }
 
-// WithMappings 合并 mapping，后面的合并前面的
-func (f *FormatFactory) WithMappings(mappings ...map[string]any) *FormatFactory {
-	for _, mapping := range mappings {
-		if _, ok := mapping[Properties]; ok {
-			mapProperties("", mapping, f.mapping)
-		} else {
-			// 有的 es 因为版本不同，properties 不在第一层，所以需要往下一层找
-			for _, m := range mapping {
-				switch nm := m.(type) {
-				case map[string]any:
-					f.WithMappings(nm)
-				}
-			}
-		}
+func (f *FormatFactory) GetFieldType(k string) string {
+	if v, ok := f.fieldsMap[k]; ok {
+		return v.FieldType
 	}
-	return f
+
+	return ""
+}
+
+func (s *FormatFactory) queryString(str string, isPrefix bool) elastic.Query {
+	q := elastic.NewQueryStringQuery(str).AnalyzeWildcard(true).Field("*").Field("__*").Lenient(true)
+	if isPrefix {
+		q.Type("phrase_prefix")
+	}
+	return q
+}
+
+func (f *FormatFactory) ParserQueryString(ctx context.Context, q string, isPrefix bool) elastic.Query {
+	node := lucene_parser.ParseLuceneWithVisitor(ctx, q, lucene_parser.Option{
+		FieldsMap: f.fieldsMap,
+	})
+
+	if node != nil && node.Error() == nil {
+		return lucene_parser.MergeQuery(node.DSL())
+	}
+
+	var reason string
+	if node != nil && node.Error() != nil {
+		reason = fmt.Sprintf(" 失败原因：%s", node.Error())
+	}
+
+	metadata.Sprintf(
+		metadata.MsgParserLucene, "%s 解析失败%s",
+		q, reason,
+	).Warn(ctx)
+
+	return f.queryString(q, isPrefix)
 }
 
 func (f *FormatFactory) FieldType() map[string]string {
-	return f.mapping
+	ft := make(map[string]string)
+	for k := range f.fieldsMap {
+		nv := f.GetFieldType(k)
+		if nv != "" {
+			ft[k] = nv
+		}
+	}
+	return ft
 }
 
 func (f *FormatFactory) RangeQuery() (elastic.Query, error) {
@@ -431,10 +439,8 @@ func (f *FormatFactory) NestedField(field string) string {
 	lbs := strings.Split(field, ESStep)
 	for i := len(lbs) - 1; i >= 0; i-- {
 		checkKey := strings.Join(lbs[0:i], ESStep)
-		if v, ok := f.mapping[checkKey]; ok {
-			if v == Nested {
-				return checkKey
-			}
+		if f.GetFieldType(checkKey) == Nested {
+			return checkKey
 		}
 	}
 	return ""
@@ -464,7 +470,10 @@ func (f *FormatFactory) AggDataFormat(data elastic.Aggregations, metricLabel *pr
 
 	defer func() {
 		if r := recover(); r != nil {
-			log.Errorf(f.ctx, fmt.Sprintf("agg data format %v", r))
+			_ = metadata.Sprintf(
+				metadata.MsgQueryES,
+				"聚合数据格式化失败",
+			).Error(f.ctx, fmt.Errorf("%+v", r))
 		}
 	}()
 
@@ -595,7 +604,10 @@ func (f *FormatFactory) resetAggInfoListWithNested() {
 func (f *FormatFactory) Agg() (name string, agg elastic.Aggregation, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Errorf(f.ctx, fmt.Sprintf("get mapping error: %s", r))
+			_ = metadata.Sprintf(
+				metadata.MsgQueryES,
+				"聚合数据格式化失败",
+			).Error(f.ctx, fmt.Errorf("%+v", r))
 		}
 	}()
 
@@ -758,8 +770,8 @@ func (f *FormatFactory) Agg() (name string, agg elastic.Aggregation, err error) 
 		case TermAgg:
 			curName := info.Name
 			curAgg := elastic.NewTermsAggregation().Field(info.Name)
-			fieldType, ok := f.mapping[info.Name]
-			if !ok || fieldType == Text || fieldType == KeyWord {
+			fieldType := f.GetFieldType(info.Name)
+			if fieldType == "" || fieldType == Text || fieldType == KeyWord {
 				curAgg = curAgg.Missing(" ")
 			}
 
@@ -874,7 +886,7 @@ func (f *FormatFactory) Orders() metadata.Orders {
 			order.Name = f.timeField.Name
 		}
 
-		if _, ok := f.mapping[order.Name]; ok {
+		if v := f.GetFieldType(order.Name); v != "" {
 			orders = append(orders, order)
 		}
 	}
@@ -965,12 +977,10 @@ func (f *FormatFactory) Query(allConditions metadata.AllConditions) (elastic.Que
 					q = f.getQuery(MustNot, q)
 				default:
 					// 根据字段类型，判断是否使用 isExistsQuery 方法判断非空
-					fieldType, ok := f.mapping[key]
+					fieldType := f.GetFieldType(key)
 					isExistsQuery := true
-					if ok {
-						if fieldType == Text || fieldType == KeyWord {
-							isExistsQuery = false
-						}
+					if fieldType == Text || fieldType == KeyWord {
+						isExistsQuery = false
 					}
 
 					queries := make([]elastic.Query, 0)
