@@ -10,8 +10,9 @@
 package tokenreplacer
 
 import (
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 	"go.opentelemetry.io/collector/pdata/pcommon"
+
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 )
 
 func NewReplacer() Replacer {

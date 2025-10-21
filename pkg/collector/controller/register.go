@@ -27,6 +27,7 @@ import (
 	_ "github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/processor/servicediscover"
 	_ "github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/processor/textspliter"
 	_ "github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/processor/tokenchecker"
+	_ "github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/processor/tokenreplacer"
 	_ "github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/processor/tracesderiver"
 	_ "github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/receiver/beat"
 	_ "github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/receiver/fta"
@@ -39,7 +40,4 @@ import (
 	_ "github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/receiver/skywalking"
 	_ "github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/receiver/tars"
 	_ "github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/receiver/zipkin"
-
-	// 嘉为定开内容
-	_ "github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/processor/tokenreplacer"
 )

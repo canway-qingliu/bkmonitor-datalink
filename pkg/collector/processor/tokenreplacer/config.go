@@ -10,10 +10,11 @@
 package tokenreplacer
 
 import (
+	"strings"
+
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/metacache"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
-	"strings"
 )
 
 const (

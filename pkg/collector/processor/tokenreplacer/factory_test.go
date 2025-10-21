@@ -10,17 +10,18 @@
 package tokenreplacer
 
 import (
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/metacache"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
-	"testing"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/generator"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/mapstructure"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/metacache"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/processor"
-	"github.com/stretchr/testify/assert"
 )
 
 func TestFactory(t *testing.T) {
