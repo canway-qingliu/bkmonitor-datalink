@@ -41,6 +41,10 @@ func validatePreCheckProcessors(r *define.Record, getter Getter) (define.StatusC
 	for _, name := range pl.PreCheckProcessors() {
 		inst := getter.GetProcessor(name)
 		switch inst.Name() {
+		case define.ProcessorTokenReplacer:
+			if _, err := inst.Process(r); err != nil {
+				return define.StatusCodeUnauthorized, define.ProcessorTokenReplacer, err
+			}
 		case define.ProcessorTokenChecker:
 			if _, err := inst.Process(r); err != nil {
 				return define.StatusCodeUnauthorized, define.ProcessorTokenChecker, err

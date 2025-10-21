@@ -41,6 +41,17 @@ func (c *Cache) Get(k string) (define.Token, bool) {
 	return v, ok
 }
 
+func (c *Cache) Range(f func(key string, value define.Token) bool) {
+	c.mut.RLock()
+	defer c.mut.RUnlock()
+
+	for key, value := range c.cache {
+		if !f(key, value) {
+			break
+		}
+	}
+}
+
 var Default = New()
 
 // Set 调用全局 cache 实例 Set 方法
@@ -51,4 +62,9 @@ func Set(k string, v define.Token) {
 // Get 调用全局 cache 实例 Get 方法
 func Get(k string) (define.Token, bool) {
 	return Default.Get(k)
+}
+
+// Range 调用全局 cache 实例 Range 方法
+func Range(f func(key string, value define.Token) bool) {
+	Default.Range(f)
 }

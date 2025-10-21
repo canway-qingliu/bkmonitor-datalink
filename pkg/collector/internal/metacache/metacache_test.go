@@ -33,4 +33,28 @@ func TestCache(t *testing.T) {
 		assert.True(t, ok)
 		assert.Equal(t, v, got)
 	}
+
+	t.Run("full range", func(t *testing.T) {
+		visited := make(map[string]define.Token)
+		c.Range(func(key string, value define.Token) bool {
+			visited[key] = value
+			return true
+		})
+
+		assert.Equal(t, len(items), len(visited))
+		for k, v := range items {
+			assert.Equal(t, v, visited[k])
+		}
+	})
+
+	t.Run("empty cache", func(t *testing.T) {
+		emptyCache := New()
+		count := 0
+		emptyCache.Range(func(key string, value define.Token) bool {
+			count++
+			return true
+		})
+
+		assert.Equal(t, 0, count)
+	})
 }

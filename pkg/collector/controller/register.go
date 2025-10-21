@@ -39,4 +39,7 @@ import (
 	_ "github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/receiver/skywalking"
 	_ "github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/receiver/tars"
 	_ "github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/receiver/zipkin"
+
+	// 嘉为定开内容
+	_ "github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/processor/tokenreplacer"
 )
