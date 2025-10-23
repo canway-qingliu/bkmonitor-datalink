@@ -253,6 +253,12 @@ bk-collector:
           keys:
             - "app_name"
 
+    # ResourceFilter: 资源过滤处理器（嘉为）
+    - name: "resource_filter/keep_origin_traceid"
+      config:
+        keep_origin_traceid:
+          enabled: true
+
     # MetricsFilter: 指标过滤处理器
     - name: "metrics_filter/relabel"
 
@@ -1872,6 +1878,7 @@ bk-collector:
         - "field_normalizer/otel_mapping"
         - "resource_filter/fill_dimensions"
         - "resource_filter/instance_id"
+        - "resource_filter/keep_origin_traceid"
         - "db_filter/common"
         - "attribute_filter/common"
         - "attribute_filter/app"
