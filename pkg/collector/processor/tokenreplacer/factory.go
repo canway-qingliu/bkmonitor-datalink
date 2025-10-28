@@ -10,7 +10,6 @@
 package tokenreplacer
 
 import (
-	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -101,16 +100,6 @@ func (p *tokenReplacer) Process(record *define.Record) (*define.Record, error) {
 		err = p.processCommon(config, record)
 	}
 	return nil, err
-}
-
-func tokenFromAttrs(attrs pcommon.Map, keys []string) string {
-	for _, key := range keys {
-		v, ok := attrs.Get(key)
-		if ok {
-			return v.AsString()
-		}
-	}
-	return ""
 }
 
 func (p *tokenReplacer) processTraces(config Config, record *define.Record) error {

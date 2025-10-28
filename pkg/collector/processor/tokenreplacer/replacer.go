@@ -15,6 +15,16 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 )
 
+func tokenFromAttrs(attrs pcommon.Map, keys []string) (string, string, bool) {
+	for _, key := range keys {
+		v, ok := attrs.Get(key)
+		if ok {
+			return key, v.AsString(), true
+		}
+	}
+	return "", "", false
+}
+
 func NewReplacer() Replacer {
 	return Replacer{}
 }
@@ -22,22 +32,26 @@ func NewReplacer() Replacer {
 type Replacer struct{}
 
 func (p *Replacer) replaceToken(config Config, record *define.Record, attrs pcommon.Map) {
-	src := []string{
-		record.Token.Original,
-		tokenFromAttrs(attrs, config.resourceKeys),
-	}
-	for _, token := range src {
-		switch config.Type {
-		case typeAppName:
-			if replace, ok := config.appTokenMapping[token]; ok {
+	attrKey, attrValue, found := tokenFromAttrs(attrs, config.resourceKeys)
+
+	switch config.Type {
+	case typeAppName:
+		if found && attrValue != "" {
+			if replace, ok := config.appTokenMapping[attrValue]; ok {
+				attrs.UpdateString(attrKey, replace.Original)
 				record.Token.Original = replace.Original
-				break
 			}
-		default:
-			if replace, ok := config.replaceMapping[token]; ok {
+		} else if replace, ok := config.appTokenMapping[record.Token.Original]; ok {
+			record.Token.Original = replace.Original
+		}
+	default:
+		if found && attrValue != "" {
+			if replace, ok := config.replaceMapping[attrValue]; ok {
+				attrs.UpdateString(attrKey, replace)
 				record.Token.Original = replace
-				break
 			}
+		} else if replace, ok := config.replaceMapping[record.Token.Original]; ok {
+			record.Token.Original = replace
 		}
 	}
 }
