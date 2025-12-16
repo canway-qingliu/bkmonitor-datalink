@@ -12,6 +12,7 @@ package curl
 import (
 	"bytes"
 	"context"
+	encodingJson "encoding/json"
 	"io"
 	"net/http"
 	"sync"
@@ -19,7 +20,6 @@ import (
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/json"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/trace"
 )
@@ -71,16 +71,18 @@ func (c *HttpCurl) Request(ctx context.Context, method string, opt Options, res 
 	}
 
 	if opt.UrlPath == "" {
-		return size, metadata.Sprintf(
+		return size, metadata.NewMessage(
 			metadata.MsgHttpCurl,
+			"%s",
 			"url path is empty",
 		).Error(ctx, err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, opt.UrlPath, bytes.NewBuffer(opt.Body))
 	if err != nil {
-		return size, metadata.Sprintf(
+		return size, metadata.NewMessage(
 			metadata.MsgHttpCurl,
+			"%s",
 			"client new request error",
 		).Error(ctx, err)
 	}
@@ -92,7 +94,7 @@ func (c *HttpCurl) Request(ctx context.Context, method string, opt Options, res 
 	span.Set("req-http-method", method)
 	span.Set("req-http-path", opt.UrlPath)
 
-	metadata.Sprintf(
+	metadata.NewMessage(
 		metadata.MsgHttpCurl,
 		"%s [%s] body: %s",
 		method, opt.UrlPath, opt.Body,
@@ -117,7 +119,7 @@ func (c *HttpCurl) Request(ctx context.Context, method string, opt Options, res 
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return size, metadata.Sprintf(
+		return size, metadata.NewMessage(
 			metadata.MsgHttpCurl,
 			"http code error: %s in %s",
 			resp.Status, opt.UrlPath,
@@ -134,7 +136,10 @@ func (c *HttpCurl) Request(ctx context.Context, method string, opt Options, res 
 		}
 		size = buf.Len()
 
-		decoder := json.NewDecoder(buf)
+		// 使用标准库的 json.Decoder，因为需要 UseNumber() 功能
+		// sonic 的 Decoder 不支持 UseNumber()，会导致大整数精度丢失
+		decoder := encodingJson.NewDecoder(buf)
+		decoder.UseNumber()
 		err = decoder.Decode(&res)
 		return size, err
 	}

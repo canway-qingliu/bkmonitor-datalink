@@ -11,10 +11,12 @@ package victoriaMetrics
 
 import (
 	"fmt"
-	"strconv"
+
+	"github.com/spf13/cast"
 )
 
 type ParamsQueryRange struct {
+	BkBizID          string `json:"bk_biz_id,omitempty"`
 	InfluxCompatible bool   `json:"influx_compatible"`
 	UseNativeOr      bool   `json:"use_native_or"`
 	APIType          string `json:"api_type"`
@@ -31,6 +33,7 @@ type ParamsQueryRange struct {
 }
 
 type ParamsQuery struct {
+	BkBizID          string `json:"bk_biz_id,omitempty"`
 	InfluxCompatible bool   `json:"influx_compatible"`
 	UseNativeOr      bool   `json:"use_native_or"`
 	APIType          string `json:"api_type"`
@@ -45,6 +48,7 @@ type ParamsQuery struct {
 }
 
 type ParamsSeries struct {
+	BkBizID          string `json:"bk_biz_id,omitempty"`
 	InfluxCompatible bool   `json:"influx_compatible"`
 	UseNativeOr      bool   `json:"use_native_or"`
 	APIType          string `json:"api_type"`
@@ -74,6 +78,7 @@ type ParamsLabelName struct {
 }
 
 type ParamsLabelValues struct {
+	BkBizID          string `json:"bk_biz_id,omitempty"`
 	InfluxCompatible bool   `json:"influx_compatible"`
 	UseNativeOr      bool   `json:"use_native_or"`
 	APIType          string `json:"api_type"`
@@ -98,29 +103,16 @@ func (f Value) Point() (t int64, v float64, err error) {
 		return t, v, err
 	}
 
-	switch pt := f[0].(type) {
-	case float64:
-		// 从秒转换为毫秒
-		t = int64(pt) * 1e3
-	default:
-		err = fmt.Errorf("%+v type is not float64", f[0])
+	t, err = cast.ToInt64E(f[0])
+	if err != nil {
 		return t, v, err
 	}
 
+	// 从秒转换为毫秒
+	t = t * 1e3
+
 	// 值从 string 转换为 float64
-	switch pv := f[1].(type) {
-	case string:
-		v, err = strconv.ParseFloat(pv, 64)
-		if err != nil {
-			err = fmt.Errorf("%+v %s", f[1], err)
-			return t, v, err
-		}
-	case int, int64, int32:
-		v = float64(v)
-	default:
-		err = fmt.Errorf("%+v type is not string", f[0])
-		return t, v, err
-	}
+	v, err = cast.ToFloat64E(f[1])
 
 	return t, v, err
 }

@@ -23,7 +23,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt"
+	jwt "github.com/golang-jwt/jwt/v4"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb"
@@ -148,7 +148,7 @@ func TestJwtAuthMiddleware(t *testing.T) {
 		"没有传 token": {
 			spaceUID: "other_space_uid",
 			status:   http.StatusUnauthorized,
-			expected: `{"error":"jwt auth unauthorized (app_code: , space_uid: other_space_uid): token is empty"}`,
+			expected: `{"error":"jwt auth unauthorized (app_code: , space_uid: other_space_uid): token is malformed"}`,
 		},
 	}
 

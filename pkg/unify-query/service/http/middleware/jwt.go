@@ -14,7 +14,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt"
+	jwt "github.com/golang-jwt/jwt/v4"
 	"github.com/pkg/errors"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb"
@@ -127,25 +127,28 @@ func JwtAuthMiddleware(enabled bool, publicKey string, defaultAppCodeSpaces map[
 
 			appCode  string
 			spaceUID = user.SpaceUID
+
+			tokenString = c.Request.Header.Get(JwtHeaderKey)
 		)
 
 		ctx, span := trace.NewSpan(ctx, "jwt-auth")
-
 		span.Set("enabled", enabled)
-
-		// 通过配置判断是否开启验证，如果未开启验证则不进行 504 校验
-		if !enabled {
-			c.Next()
-			return
-		}
 
 		defer func() {
 			span.End(&err)
 
 			if err != nil {
 				metric.JWTRequestInc(ctx, c.Request.URL.Path, appCode, payLoad.UserName(), user.SpaceUID, metric.StatusFailed)
+
+				// 通过配置判断是否开启验证，如果未开启验证则不进行 504 校验
+				if !enabled {
+					err = nil
+					c.Next()
+					return
+				}
+
 				res := gin.H{
-					"error": metadata.Sprintf(
+					"error": metadata.NewMessage(
 						metadata.MsgHandlerAPI,
 						"jwt auth unauthorized (app_code: %s, space_uid: %s)",
 						appCode, spaceUID,
@@ -160,14 +163,13 @@ func JwtAuthMiddleware(enabled bool, publicKey string, defaultAppCodeSpaces map[
 			} else {
 				metric.JWTRequestInc(ctx, c.Request.URL.Path, appCode, payLoad.UserName(), user.SpaceUID, metric.StatusSuccess)
 				c.Next()
+				return
 			}
 		}()
 
-		tokenString := c.Request.Header.Get(JwtHeaderKey)
-
-		// 如果未传 jwtToken（兼容非 apigw 调用逻辑），则不启用 jwt 校验
+		// 如果未传 jwtToken，则进行报错
 		if tokenString == "" {
-			err = errTokenEmpty
+			err = jwt.ErrTokenMalformed
 			return
 		}
 

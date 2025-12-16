@@ -69,8 +69,10 @@ type DorisSQLExpr struct {
 	valueField string
 
 	keepColumns []string
-	fieldsMap   metadata.FieldsMap
-	fieldAlias  metadata.FieldAlias
+
+	ignoreFieldSet *set.Set[string]
+	fieldsMap      metadata.FieldsMap
+	fieldAlias     metadata.FieldAlias
 
 	isSetLabels bool
 	lock        sync.Mutex
@@ -136,10 +138,13 @@ func (d *DorisSQLExpr) ParserSQLWithVisitor(ctx context.Context, q, table, where
 func (d *DorisSQLExpr) ParserSQL(ctx context.Context, q string, tables []string, where string, offset, limit int) (sql string, err error) {
 	opt := &doris_parser.Option{
 		DimensionTransform: d.dimTransform,
-		Tables:             tables,
-		Where:              where,
-		Offset:             offset,
-		Limit:              limit,
+		AddIgnoreField: func(s string) {
+			d.ignoreFieldSet.Add(strings.ToUpper(s))
+		},
+		Tables: tables,
+		Where:  where,
+		Offset: offset,
+		Limit:  limit,
 	}
 
 	return doris_parser.ParseDorisSQLWithVisitor(ctx, q, opt)
@@ -147,6 +152,13 @@ func (d *DorisSQLExpr) ParserSQL(ctx context.Context, q string, tables []string,
 
 // ParserAggregatesAndOrders 解析聚合函数，生成 select 和 group by 字段
 func (d *DorisSQLExpr) ParserAggregatesAndOrders(aggregates metadata.Aggregates, orders metadata.Orders) (selectFields []string, groupByFields []string, orderByFields []string, dimensionSet *set.Set[string], timeAggregate TimeAggregate, err error) {
+	// 默认需要支持
+	d.ignoreFieldSet.Add([]string{
+		strings.ToUpper(Value),
+		strings.ToUpper(TimeStamp),
+		strings.ToUpper(d.timeField),
+	}...)
+
 	valueField, _ := d.dimTransform(d.valueField)
 
 	var (
@@ -197,12 +209,18 @@ func (d *DorisSQLExpr) ParserAggregatesAndOrders(aggregates metadata.Aggregates,
 		}
 	}
 
+	// 回传时间聚合信息
+	timeAggregate = TimeAggregate{
+		Window:       window,
+		OffsetMillis: timeZoneOffset,
+	}
+
 	if window > 0 {
-		fh_1 := "+"
-		fh_2 := "-"
+		fh1 := "+"
+		fh2 := "-"
 		if timeZoneOffset > 0 {
-			fh_1 = "-"
-			fh_2 = "+"
+			fh1 = "-"
+			fh2 = "+"
 		} else {
 			timeZoneOffset *= -1
 		}
@@ -211,9 +229,9 @@ func (d *DorisSQLExpr) ParserAggregatesAndOrders(aggregates metadata.Aggregates,
 		var timeField string
 		if int64(window.Seconds())%60 == 0 {
 			windowMinutes := int(window.Minutes())
-			timeField = fmt.Sprintf(`((CAST((FLOOR(%s / 1000) %s %d) / %d AS INT) * %d %s %d) * 60 * 1000)`, ShardKey, fh_1, timeZoneOffset/6e4, windowMinutes, windowMinutes, fh_2, timeZoneOffset/6e4)
+			timeField = fmt.Sprintf(`((CAST((FLOOR(%s / 1000) %s %d) / %d AS INT) * %d %s %d) * 60 * 1000)`, ShardKey, fh1, timeZoneOffset/6e4, windowMinutes, windowMinutes, fh2, timeZoneOffset/6e4)
 		} else {
-			timeField = fmt.Sprintf(`(CAST((FLOOR(%s %s %d) / %d) AS INT) * %d %s %d)`, d.timeField, fh_1, timeZoneOffset, window.Milliseconds(), window.Milliseconds(), fh_2, timeZoneOffset)
+			timeField = fmt.Sprintf(`(CAST((FLOOR(%s %s %d) / %d) AS INT) * %d %s %d)`, d.timeField, fh1, timeZoneOffset, window.Milliseconds(), window.Milliseconds(), fh2, timeZoneOffset)
 		}
 
 		selectFields = append(selectFields, fmt.Sprintf("%s AS `%s`", timeField, TimeStamp))
@@ -242,6 +260,7 @@ func (d *DorisSQLExpr) ParserAggregatesAndOrders(aggregates metadata.Aggregates,
 		if d.timeField != "" {
 			selectFields = append(selectFields, fmt.Sprintf("`%s` AS `%s`", d.timeField, TimeStamp))
 		}
+
 	}
 
 	orderNameSet := set.New[string]()
@@ -276,12 +295,6 @@ func (d *DorisSQLExpr) ParserAggregatesAndOrders(aggregates metadata.Aggregates,
 			ascName = "DESC"
 		}
 		orderByFields = append(orderByFields, fmt.Sprintf("%s %s", orderField, ascName))
-	}
-
-	// 回传时间聚合信息
-	timeAggregate = TimeAggregate{
-		Window:       window,
-		OffsetMillis: timeZoneOffset,
 	}
 
 	return selectFields, groupByFields, orderByFields, dimensionSet, timeAggregate, err
@@ -361,7 +374,7 @@ func (d *DorisSQLExpr) buildCondition(c metadata.ConditionField) (string, error)
 			break
 		}
 
-		if len(c.Value) > 1 && !c.IsWildcard && !d.isText(c.DimensionName) && !d.isArray(c.DimensionName) {
+		if len(c.Value) > 1 && !c.IsWildcard && !d.isAnalyzed(c.DimensionName) && !d.isArray(c.DimensionName) && c.Operator != metadata.ConditionContains {
 			op = "IN"
 			val = fmt.Sprintf("('%s')", strings.Join(c.Value, "', '"))
 			break
@@ -419,7 +432,7 @@ func (d *DorisSQLExpr) buildCondition(c metadata.ConditionField) (string, error)
 			break
 		}
 
-		if len(c.Value) > 1 && !c.IsWildcard && !d.isText(c.DimensionName) {
+		if len(c.Value) > 1 && !c.IsWildcard && !d.isAnalyzed(c.DimensionName) && !d.isArray(c.DimensionName) && c.Operator != metadata.ConditionNotContains {
 			op = "NOT IN"
 			val = fmt.Sprintf("('%s')", strings.Join(c.Value, "', '"))
 			break
@@ -564,15 +577,7 @@ func (d *DorisSQLExpr) likeValue(s string) string {
 }
 
 func (d *DorisSQLExpr) getFieldType(s string) (opt metadata.FieldOption) {
-	if d.fieldsMap == nil {
-		return opt
-	}
-
-	var ok bool
-	if opt, ok = d.fieldsMap[s]; ok {
-		opt.FieldType = strings.ToUpper(opt.FieldType)
-	}
-	return opt
+	return d.fieldsMap.Field(s)
 }
 
 func (d *DorisSQLExpr) caseAs(s string) (string, bool) {
@@ -597,6 +602,28 @@ func (d *DorisSQLExpr) arrayTypeTransform(s string) string {
 	return fmt.Sprintf(DorisTypeArrayTransform, s)
 }
 
+func (d *DorisSQLExpr) getField(s string) (metadata.FieldOption, bool) {
+	fo := d.fieldsMap.Field(s)
+	if fo.Existed() {
+		return fo, true
+	}
+
+	s = strings.ToUpper(s)
+
+	// 检查是否是内置的 MINUTE 字段
+	re := regexp.MustCompile(`MINUTE\d+`)
+	if re.MatchString(s) {
+		return fo, true
+	}
+
+	// 检查是否是可以跳过的字段
+	if d.ignoreFieldSet.Existed(s) {
+		return fo, true
+	}
+
+	return fo, false
+}
+
 func (d *DorisSQLExpr) dimTransform(s string) (ns string, as string) {
 	if s == "" || s == "*" {
 		return ns, as
@@ -606,14 +633,23 @@ func (d *DorisSQLExpr) dimTransform(s string) (ns string, as string) {
 	if alias, ok := d.fieldAlias[ns]; ok {
 		as = ns
 		ns = alias
+		d.ignoreFieldSet.Add(strings.ToUpper(as))
 	}
 
-	fieldType := d.getFieldType(ns)
-	castType, _ := d.caseAs(fieldType.FieldType)
+	fieldOption, existed := d.getField(ns)
+	if !existed {
+		if d.encodeFunc != nil {
+			ns = d.encodeFunc(ns)
+		}
+		return metadata.Null, ns
+	}
+
+	castType, _ := d.caseAs(strings.ToUpper(fieldOption.FieldType))
 
 	fs := strings.Split(ns, ".")
 	if len(fs) == 1 {
 		ns = fmt.Sprintf("`%s`", ns)
+
 		return ns, as
 	}
 
