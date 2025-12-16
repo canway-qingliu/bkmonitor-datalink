@@ -29,6 +29,7 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/trace"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/tsdb"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/tsdb/bksql/sql_expr"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/precision"
 )
 
 const (
@@ -36,7 +37,7 @@ const (
 	TableFieldType     = "Type"
 	TableFieldAnalyzed = "Analyzed"
 
-	TableTypeVariant = "variant"
+	TableTypeVariant = "VARIANT"
 )
 
 type Instance struct {
@@ -125,7 +126,7 @@ func (i *Instance) sqlQuery(ctx context.Context, sql string) (*QuerySyncResultDa
 	}
 
 	if !res.Result || res.Code != StatusOK || res.Data == nil {
-		return data, metadata.Sprintf(
+		return data, metadata.NewMessage(
 			metadata.MsgQueryBKSQL,
 			"查询异常 %s",
 			res.Message,
@@ -441,7 +442,7 @@ func (i *Instance) QuerySeriesSet(ctx context.Context, query *metadata.Query, st
 
 	data, err := i.sqlQuery(ctx, sql)
 	if err != nil {
-		err = metadata.Sprintf(
+		err = metadata.NewMessage(
 			metadata.MsgQueryBKSQL,
 			"%s 查询失败",
 			sql,
@@ -461,7 +462,7 @@ func (i *Instance) QuerySeriesSet(ctx context.Context, query *metadata.Query, st
 
 	qr, err := queryFactory.FormatDataToQueryResult(ctx, data.List)
 	if err != nil {
-		err = metadata.Sprintf(
+		err = metadata.NewMessage(
 			metadata.MsgQueryBKSQL,
 			"数据解析失败",
 		).Error(ctx, err)
@@ -593,13 +594,16 @@ func getValue(k string, d map[string]any) (string, error) {
 			return value, nil
 		}
 
-		switch v.(type) {
+		switch t := v.(type) {
 		case string:
 			value = fmt.Sprintf("%s", v)
 		case float64, float32:
 			value = fmt.Sprintf("%.f", v)
 		case int64, int32, int:
 			value = fmt.Sprintf("%d", v)
+		case json.Number:
+			processed := precision.ProcessNumber(t)
+			value = fmt.Sprintf("%v", processed)
 		default:
 			return value, fmt.Errorf("get_value_error: type %T, %v in %s with %+v", v, v, k, d)
 		}

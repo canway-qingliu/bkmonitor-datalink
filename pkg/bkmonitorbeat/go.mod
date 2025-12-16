@@ -20,7 +20,6 @@ require (
 	github.com/goccy/go-json v0.10.4
 	github.com/golang/mock v1.6.0
 	github.com/gosnmp/gosnmp v1.32.0
-	github.com/hpcloud/tail v1.0.0
 	github.com/json-iterator/go v1.1.12
 	github.com/magiconair/properties v1.8.1
 	github.com/mattn/go-shellwords v1.0.12
@@ -50,6 +49,7 @@ require (
 
 require (
 	github.com/TencentBlueKing/bk-gse-sdk/go v0.0.3
+	github.com/nxadm/tail v1.4.11
 	github.com/prometheus/client_golang v1.18.0
 	golang.org/x/exp v0.0.0-20241108190413-2d47ceb2692f
 )
@@ -81,7 +81,6 @@ require (
 	github.com/facebookgo/structtag v0.0.0-20150214074306-217e25fb9691 // indirect
 	github.com/facebookgo/subset v0.0.0-20200203212716-c811ad88dec4 // indirect
 	github.com/fatih/color v1.15.0 // indirect
-	github.com/frankban/quicktest v1.14.3 // indirect
 	github.com/garyburd/redigo v1.6.2 // indirect
 	github.com/go-logr/logr v1.2.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -117,7 +116,7 @@ require (
 	github.com/rcrowley/go-metrics v0.0.0-20200313005456-10cdbea86bc0 // indirect
 	github.com/shoenig/go-m1cpu v0.1.6 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
-	github.com/spf13/cast v1.3.0 // indirect
+	github.com/spf13/cast v1.10.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect
@@ -141,7 +140,6 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20231009173412-8bfb1ae86b6c // indirect
 	google.golang.org/grpc v1.58.3 // indirect
 	google.golang.org/protobuf v1.35.2 // indirect
-	gopkg.in/fsnotify.v1 v1.4.7 // indirect
 	gopkg.in/jcmturner/aescts.v1 v1.0.1 // indirect
 	gopkg.in/jcmturner/dnsutils.v1 v1.0.1 // indirect
 	gopkg.in/jcmturner/gokrb5.v7 v7.5.0 // indirect

@@ -10,7 +10,9 @@
 package elasticsearch
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,7 +28,6 @@ import (
 	"github.com/samber/lo"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/function"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/json"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metric"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/structured"
@@ -172,7 +173,7 @@ func (i *Instance) fieldMap(ctx context.Context, fieldAlias metadata.FieldAlias,
 	indices, indicesErr := cli.IndexGet(aliases...).Do(ctx)
 	if indicesErr != nil {
 		// 兼容没有索引接口的情况，例如 bkbase
-		metadata.Sprintf(
+		metadata.NewMessage(
 			metadata.MsgQueryES,
 			"索引查询 index 接口异常: %+v",
 			aliases,
@@ -181,7 +182,7 @@ func (i *Instance) fieldMap(ctx context.Context, fieldAlias metadata.FieldAlias,
 		span.Set("get-mapping", aliases)
 		res, err := cli.GetMapping().Index(aliases...).Type("").Do(ctx)
 		if err != nil {
-			return nil, metadata.Sprintf(
+			return nil, metadata.NewMessage(
 				metadata.MsgQueryES,
 				"索引查询异常: %+v",
 				aliases,
@@ -316,7 +317,7 @@ func (i *Instance) esQuery(ctx context.Context, qo *queryOption, fact *FormatFac
 	bodyString := string(bodyJson)
 	span.Set("query-body", bodyString)
 
-	metadata.Sprintf(
+	metadata.NewMessage(
 		metadata.MsgQueryES,
 		"es 查询 index: %+v, body: %s",
 		qo.indexes, bodyString,
@@ -331,6 +332,16 @@ func (i *Instance) esQuery(ctx context.Context, qo *queryOption, fact *FormatFac
 	opt := qb.ResultTableOption
 	var res *elastic.SearchResult
 	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err = metadata.NewMessage(
+					metadata.MsgQueryES,
+					"es 查询发生 panic index: %+v, panic: %v",
+					qo.indexes, r,
+				).Error(ctx, nil)
+			}
+		}()
+
 		if opt != nil {
 			if opt.ScrollID != "" {
 				span.Set("query-scroll-id", opt.ScrollID)
@@ -368,7 +379,7 @@ func (i *Instance) esQuery(ctx context.Context, qo *queryOption, fact *FormatFac
 		return nil, processOnESErr(ctx, qo.conn.Address, err)
 	}
 	if res.Error != nil {
-		err = metadata.Sprintf(
+		err = metadata.NewMessage(
 			metadata.MsgQueryES,
 			"es 查询失败 index: %+v",
 			qo.indexes,
@@ -417,7 +428,7 @@ func (i *Instance) queryWithAgg(ctx context.Context, qo *queryOption, fact *Form
 
 	span.Set("time-series-length", len(qr.Timeseries))
 
-	return remote.FromQueryResult(false, qr)
+	return remote.FromQueryResult(true, qr)
 }
 
 func (i *Instance) getAlias(ctx context.Context, query *metadata.Query, start, end time.Time) ([]string, error) {
@@ -445,7 +456,7 @@ func (i *Instance) getAlias(ctx context.Context, query *metadata.Query, start, e
 	span.Set("alias", allAlias)
 
 	if len(allAlias) == 0 {
-		return nil, metadata.Sprintf(
+		return nil, metadata.NewMessage(
 			metadata.MsgQueryES,
 			"%s 构建索引异常",
 			query.TableID,
@@ -595,7 +606,7 @@ func (i *Instance) QueryRawData(ctx context.Context, query *metadata.Query, star
 
 	fieldMap, err := i.fieldMap(ctx, query.FieldAlias, aliases...)
 	if err != nil {
-		return size, total, option, metadata.Sprintf(
+		return size, total, option, metadata.NewMessage(
 			metadata.MsgQueryES,
 			"字段查询异常: %+v",
 			aliases,
@@ -653,7 +664,7 @@ func (i *Instance) QueryRawData(ctx context.Context, query *metadata.Query, star
 
 	sr, err := i.esQuery(ctx, qo, fact)
 	if err != nil {
-		return size, total, option, metadata.Sprintf(
+		return size, total, option, metadata.NewMessage(
 			metadata.MsgQueryES,
 			"原始数据查询异常",
 		).Error(ctx, err)
@@ -671,10 +682,11 @@ func (i *Instance) QueryRawData(ctx context.Context, query *metadata.Query, star
 
 			for idx, d := range sr.Hits.Hits {
 				data := make(map[string]any)
-				if err = json.Unmarshal(d.Source, &data); err != nil {
+				decoder := json.NewDecoder(bytes.NewReader(d.Source))
+				decoder.UseNumber()
+				if err = decoder.Decode(&data); err != nil {
 					return size, total, option, err
 				}
-
 				fact.SetData(data)
 
 				// 注入别名
@@ -789,7 +801,7 @@ func (i *Instance) QuerySeriesSet(
 	}
 	fieldMap, err := i.fieldMap(ctx, query.FieldAlias, aliases...)
 	if err != nil {
-		metadata.Sprintf(
+		metadata.NewMessage(
 			metadata.MsgQueryES,
 			"字段查询异常: %v",
 			err,

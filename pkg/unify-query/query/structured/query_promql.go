@@ -25,8 +25,8 @@ type QueryPromQL struct {
 	PromQL              string   `json:"promql"`
 	Start               string   `json:"start"`
 	End                 string   `json:"end"`
-	Step                string   `json:"step"`
-	BKBizIDs            []string `json:"bk_biz_ids"`
+	Step                string   `json:"step,omitempty"`
+	BKBizIDs            []string `json:"bk_biz_ids,omitempty"`
 	MaxSourceResolution string   `json:"max_source_resolution,omitempty"`
 	NotAlignInfluxdb    bool     `json:"not_align_influxdb,omitempty"` // 不与influxdb对齐
 	Limit               int      `json:"limit,omitempty"`
@@ -45,6 +45,9 @@ type QueryPromQL struct {
 	LookBackDelta string `json:"look_back_delta"`
 	// 瞬时数据
 	Instant bool `json:"instant"`
+
+	// AddDimensions 额外添加的聚合维度，会与每个 function.dimensions 合并
+	AddDimensions []string `json:"add_dimensions,omitempty"`
 }
 
 // refMgr

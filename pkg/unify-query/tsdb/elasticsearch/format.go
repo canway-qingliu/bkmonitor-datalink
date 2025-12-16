@@ -28,6 +28,7 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/set"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/structured"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/precision"
 )
 
 const (
@@ -105,7 +106,7 @@ func mapData(prefix string, data map[string]any, res map[string]any) {
 		case map[string]any:
 			mapData(k, nv, res)
 		default:
-			res[k] = nv
+			res[k] = precision.ProcessValue(nv)
 		}
 	}
 }
@@ -353,7 +354,7 @@ func (f *FormatFactory) ParserQueryString(ctx context.Context, q string, isPrefi
 		reason = fmt.Sprintf(" 失败原因：%s", node.Error())
 	}
 
-	metadata.Sprintf(
+	metadata.NewMessage(
 		metadata.MsgParserLucene, "%s 解析失败%s",
 		q, reason,
 	).Warn(ctx)
@@ -470,7 +471,7 @@ func (f *FormatFactory) AggDataFormat(data elastic.Aggregations, metricLabel *pr
 
 	defer func() {
 		if r := recover(); r != nil {
-			_ = metadata.Sprintf(
+			_ = metadata.NewMessage(
 				metadata.MsgQueryES,
 				"聚合数据格式化失败",
 			).Error(f.ctx, fmt.Errorf("%+v", r))
@@ -604,7 +605,7 @@ func (f *FormatFactory) resetAggInfoListWithNested() {
 func (f *FormatFactory) Agg() (name string, agg elastic.Aggregation, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			_ = metadata.Sprintf(
+			_ = metadata.NewMessage(
 				metadata.MsgQueryES,
 				"聚合数据格式化失败",
 			).Error(f.ctx, fmt.Errorf("%+v", r))

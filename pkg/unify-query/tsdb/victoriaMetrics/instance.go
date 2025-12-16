@@ -135,7 +135,7 @@ func (i *Instance) QuerySeriesSet(ctx context.Context, query *metadata.Query, st
 
 func (i *Instance) vectorFormat(ctx context.Context, resp *VmResponse, span *trace.Span) (promql.Vector, error) {
 	if !resp.Result || resp.Code != OK {
-		return nil, metadata.Sprintf(
+		return nil, metadata.NewMessage(
 			metadata.MsgQueryVictoriaMetrics,
 			"查询异常 %s",
 			resp.Message,
@@ -175,7 +175,7 @@ func (i *Instance) vectorFormat(ctx context.Context, resp *VmResponse, span *tra
 
 			nt, nv, err := series.Value.Point()
 			if err != nil {
-				_ = metadata.Sprintf(
+				_ = metadata.NewMessage(
 					metadata.MsgQueryVictoriaMetrics,
 					"查询异常",
 				).Error(ctx, err)
@@ -200,7 +200,7 @@ func (i *Instance) vectorFormat(ctx context.Context, resp *VmResponse, span *tra
 
 func (i *Instance) matrixFormat(ctx context.Context, resp *VmResponse, span *trace.Span) (promql.Matrix, bool, error) {
 	if !resp.Result || resp.Code != OK {
-		return nil, false, metadata.Sprintf(
+		return nil, false, metadata.NewMessage(
 			metadata.MsgQueryVictoriaMetrics,
 			"查询异常 %s",
 			resp.Message,
@@ -239,7 +239,7 @@ func (i *Instance) matrixFormat(ctx context.Context, resp *VmResponse, span *tra
 			if data.ResultType == VectorType {
 				nt, nv, err := series.Value.Point()
 				if err != nil {
-					_ = metadata.Sprintf(
+					_ = metadata.NewMessage(
 						metadata.MsgQueryVictoriaMetrics,
 						"值格式解析异常",
 					).Error(ctx, err)
@@ -253,7 +253,7 @@ func (i *Instance) matrixFormat(ctx context.Context, resp *VmResponse, span *tra
 				for _, value := range series.Values {
 					nt, nv, err := value.Point()
 					if err != nil {
-						_ = metadata.Sprintf(
+						_ = metadata.NewMessage(
 							metadata.MsgQueryVictoriaMetrics,
 							"值格式解析异常",
 						).Error(ctx, err)
@@ -289,7 +289,7 @@ func (i *Instance) labelFormat(ctx context.Context, resp *VmLableValuesResponse,
 		)
 	}
 	if resp.Code != OK {
-		return nil, metadata.Sprintf(
+		return nil, metadata.NewMessage(
 			metadata.MsgQueryVictoriaMetrics,
 			"查询异常 %s, %s, %s",
 			resp.Message, resp.Errors.Error, resp.Errors.QueryId,
@@ -409,7 +409,7 @@ func (i *Instance) vmQuery(
 		data,
 	)
 	if err != nil {
-		return metadata.Sprintf(
+		return metadata.NewMessage(
 			metadata.MsgQueryVictoriaMetrics,
 			"查询异常",
 		).Error(ctx, err)
@@ -465,6 +465,7 @@ func (i *Instance) DirectQueryRange(
 	metric.TsDBRequestRangeMinute(ctx, rangeLeftTime, i.InstanceType())
 
 	paramsQueryRange := &ParamsQueryRange{
+		BkBizID:          metadata.GetBkBizID(ctx),
 		InfluxCompatible: i.influxCompatible,
 		APIType:          APIQueryRange,
 		APIParams: struct {
@@ -529,6 +530,7 @@ func (i *Instance) DirectQuery(
 	span.Set("vm-expand-cluster-name", vmExpand.ClusterName)
 
 	paramsQuery := &ParamsQuery{
+		BkBizID:          metadata.GetBkBizID(ctx),
 		InfluxCompatible: i.influxCompatible,
 		APIType:          APIQuery,
 		APIParams: struct {
@@ -578,6 +580,7 @@ func (i *Instance) QuerySeries(ctx context.Context, query *metadata.Query, start
 	}
 
 	paramsQuery := &ParamsSeries{
+		BkBizID:          metadata.GetBkBizID(ctx),
 		InfluxCompatible: i.influxCompatible,
 		APIType:          APISeries,
 		APIParams: struct {
@@ -632,6 +635,7 @@ func (i *Instance) QueryLabelNames(ctx context.Context, query *metadata.Query, s
 	}
 
 	paramsQuery := &ParamsSeries{
+		BkBizID:          metadata.GetBkBizID(ctx),
 		InfluxCompatible: i.influxCompatible,
 		APIType:          APILabelNames,
 		APIParams: struct {
@@ -700,6 +704,7 @@ func (i *Instance) QueryLabelValues(ctx context.Context, query *metadata.Query, 
 		span.Set("query-storage-name", query.StorageName)
 
 		paramsQueryRange := &ParamsQueryRange{
+			BkBizID:          metadata.GetBkBizID(ctx),
 			InfluxCompatible: i.influxCompatible,
 			APIType:          APIQueryRange,
 			APIParams: struct {
@@ -745,6 +750,9 @@ func (i *Instance) QueryLabelValues(ctx context.Context, query *metadata.Query, 
 
 	// 如果 tag values 超过 24h 或者报错的话，则跳转到 DirectLabelValues 查询
 	matcher, _ := labels.NewMatcher(labels.MatchEqual, labels.MetricName, metadata.DefaultReferenceName)
+
+	// 构建新的 ctx 进行缓存写入，避免影响原查询，因为会有多个查询并发
+	ctx = metadata.InitHashID(ctx)
 	metadata.SetExpand(ctx, query.VMExpand())
 
 	return i.DirectLabelValues(ctx, name, start, end, query.Size, matcher)
@@ -786,6 +794,7 @@ func (i *Instance) DirectLabelValues(ctx context.Context, name string, start, en
 	}
 
 	paramsQuery := &ParamsLabelValues{
+		BkBizID:          metadata.GetBkBizID(ctx),
 		InfluxCompatible: i.influxCompatible,
 		APIType:          APILabelValues,
 		APIParams: struct {
