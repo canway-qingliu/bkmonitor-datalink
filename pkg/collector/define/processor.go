@@ -29,5 +29,6 @@ const (
 	ProcessorMethodFilter    = "method_filter"
 
 	// 嘉为定开内容
-	ProcessorTokenReplacer = "token_replacer"
+	ProcessorTokenReplacer  = "token_replacer"
+	ProcessorMetricsDeriver = "metrics_deriver"
 )

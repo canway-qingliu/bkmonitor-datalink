@@ -86,6 +86,7 @@ default:
 {% if metrics_filter_config is defined %}
       - name: "{{ metrics_filter_config.name }}"
         config:
+          {%- if metrics_filter_config.code_relabel is defined %}
           code_relabel:
             {%- for item in metrics_filter_config.code_relabel %}
             - metrics: {{ item.metrics | tojson }}
@@ -103,6 +104,21 @@ default:
                 {%- endfor %}
               {%- endfor %}
             {%- endfor %}
+          {%- endif %}
+          {%- if metrics_filter_config.drop is defined %}
+          drop:
+            metrics: {{ metrics_filter_config.drop.metrics | tojson }}
+            op: {{metrics_filter_config.drop.get("op", "in")}}
+            {%- if metrics_filter_config.drop.extra_rules is defined %}
+            extra_rules:
+              {%- for item in metrics_filter_config.drop.get("extra_rules", []) %}
+              - predicate_key: '{{ item.predicate_key }}'
+                match:
+                  op: '{{ item.match.op }}'
+                  value: '{{ item.match.value }}'
+              {%- endfor %}
+            {%- endif %}
+          {%- endif %}
 {%- endif %}
 
 {% if db_slow_command_config is defined %}
@@ -384,6 +400,16 @@ default:
                   op: '{{ item.match.op }}'
                   value: '{{ item.match.value }}'
               {%- endfor %}
+{%- endif %}
+
+{% if metrics_deriver_config is defined %}
+      - name: '{{ metrics_deriver_config.name }}'
+        config:
+          {%- if metrics_deriver_config.ot_java_agent is defined %}
+          ot_java_agent:
+            enabled: '{{ metrics_deriver_config.ot_java_agent.enabled }}'
+            keep_origin_metric: '{{ metrics_deriver_config.ot_java_agent.keep_origin_metric }}'
+          {%- endif %}
 {%- endif %}
 
 {% if service_configs is defined %}
