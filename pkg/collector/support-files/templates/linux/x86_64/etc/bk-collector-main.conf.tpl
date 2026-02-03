@@ -415,6 +415,7 @@ bk-collector:
         - "token_replacer/token_mapping"
         - "token_checker/aes256"
         - "rate_limiter/token_bucket"
+        - "metrics_filter/relabel"
 
     - name: "remotewrite_pipeline/common"
       type: "remotewrite"
