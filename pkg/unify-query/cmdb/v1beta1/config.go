@@ -77,11 +77,11 @@ var configData = &Config{
 			},
 		},
 		{
-			Name: "deamonset",
+			Name: "daemonset",
 			Index: cmdb.Index{
 				"bcs_cluster_id",
 				"namespace",
-				"deamonset",
+				"daemonset",
 			},
 		},
 		{
@@ -177,6 +177,20 @@ var configData = &Config{
 			},
 		},
 		{
+			Name: "p4_changelist",
+			Index: cmdb.Index{
+				"p4_port",
+				"changelist_id",
+			},
+		},
+		{
+			Name: "svn_revision",
+			Index: cmdb.Index{
+				"svn_repo",
+				"revision",
+			},
+		},
+		{
 			Name: "host",
 			Index: cmdb.Index{
 				"bk_host_id",
@@ -223,7 +237,7 @@ var configData = &Config{
 		},
 		{
 			Resources: []cmdb.Resource{
-				"deamonset", "pod",
+				"daemonset", "pod",
 			},
 		},
 		{
@@ -314,6 +328,16 @@ var configData = &Config{
 		{
 			Resources: []cmdb.Resource{
 				"app_version", "git_commit",
+			},
+		},
+		{
+			Resources: []cmdb.Resource{
+				"app_version", "p4_changelist",
+			},
+		},
+		{
+			Resources: []cmdb.Resource{
+				"app_version", "svn_revision",
 			},
 		},
 	},
