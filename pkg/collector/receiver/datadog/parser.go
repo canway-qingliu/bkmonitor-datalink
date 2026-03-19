@@ -62,14 +62,13 @@ type RUMEventV2 struct {
 	Context map[string]interface{} `json:"context,omitempty"`
 }
 
-// 常量配置（可根据业务调整）
+// 常量配置
 const (
 	maxScanLineSize = 1024 * 1024 // 单行最大 1MB
 	maxParseLines   = 10000       // 最大解析行数，防攻击
 )
 
 // parseDatadogRUM 优化版：支持 NDJSON / 单对象 / 数组 自动识别
-// 使用流式处理替代全量分割，性能更优，内存占用更低
 func parseDatadogRUM(buf []byte) ([]interface{}, error) {
 	// panic 保护
 	defer func() {
@@ -164,15 +163,6 @@ func tryParseNDJSON(buf []byte) ([]interface{}, bool, parseStats) {
 
 	// 解析到有效记录才算成功
 	return records, len(records) > 0, stats
-}
-
-// getMapKeys 获取 map 的所有 key
-func getMapKeys(m map[string]interface{}) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
 }
 
 // parseDatadogRUMV2 解析 Datadog Browser SDK RUM 数据 (V2 格式 - 推荐)

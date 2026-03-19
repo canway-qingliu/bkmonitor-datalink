@@ -67,17 +67,9 @@ type convertedRecord struct {
 
 var httpSvc HttpService
 
-// min 返回两个整数中的最小值
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// convertDataToRUMEventV2 将原始数据转换为 RUMEventV2 格式
+// convertDataToDatadogEventV2 将原始数据转换为 RUMEventV2 格式
 // 保留所有顶层字段和嵌套对象，避免属性丢失
-func convertDataToRUMEventV2(data interface{}) (RUMEventV2, error) {
+func convertDataToDatadogEventV2(data interface{}) (RUMEventV2, error) {
 	m, ok := data.(map[string]interface{})
 	if !ok {
 		return RUMEventV2{}, errors.New("data must be a map")
@@ -151,10 +143,10 @@ func getMapValue(m map[string]interface{}, key string) map[string]interface{} {
 	return nil
 }
 
-// transformRecord 将原始数据通过 OtelConverter 转换为 OTEL 格式
+// transformRecord 将原始数据转换为 OTEL 格式。
 func transformRecord(data interface{}) (ConversionResult, error) {
 	// 先转换为 RUMEventV2
-	event, err := convertDataToRUMEventV2(data)
+	event, err := convertDataToDatadogEventV2(data)
 	if err != nil {
 		return ConversionResult{}, err
 	}
@@ -163,34 +155,42 @@ func transformRecord(data interface{}) (ConversionResult, error) {
 	logger.Warnf("convertedRUMEventV2: type=%s, event_type=%s, has_data=%v", event.Type, event.EventType, event.Data != nil)
 
 	// 使用转换器进行转换
-	conversionResult := otelConverter.ToOTEL(event)
+	conversionResult := otelConverter.ToOTEL(&event)
 
 	return conversionResult, nil
 }
 
-// splitConversionResult 按信号类型拆分转换结果
+// splitConversionResult 按信号类型拆分转换结果。
 func splitConversionResult(result ConversionResult) []convertedRecord {
 	records := make([]convertedRecord, 0, 3)
 
-	if len(result.Logs.ResourceLogs) > 0 {
+	if result.Logs.LogRecordCount() > 0 {
 		records = append(records, convertedRecord{rtype: define.RecordLogs, data: result.Logs})
 	}
-	if len(result.Traces.ResourceSpans) > 0 {
+	if result.Traces.SpanCount() > 0 {
 		records = append(records, convertedRecord{rtype: define.RecordTraces, data: result.Traces})
 	}
-	if len(result.Metrics.ResourceMetrics) > 0 {
+	if result.Metrics.MetricCount() > 0 {
 		records = append(records, convertedRecord{rtype: define.RecordMetrics, data: result.Metrics})
 	}
 
 	return records
 }
 
-// publishConvertedRecords 按 conversionResult 分流发布 logs/traces/metrics
+// publishConvertedRecords 按 conversionResult 分流发布 logs、traces 和 metrics。
 func (s HttpService) publishConvertedRecords(conversionResult ConversionResult, ip string, token string, bodySize int, start time.Time) {
-	// 打印转换后的 JSON 字符串
-	jsonBytes, _ := json.MarshalIndent(conversionResult, "", "  ")
-	logger.Infof("Converted JSON result:\n%s", string(jsonBytes))
-
+	logger.Infof(
+		"Converted pdata result: logs=%d spans=%d metrics=%d",
+		conversionResult.Logs.LogRecordCount(),
+		conversionResult.Traces.SpanCount(),
+		conversionResult.Metrics.MetricCount(),
+	)
+	jsonBytes, err := json.Marshal(conversionResult.Traces)
+	if err != nil {
+		logger.Debugf("conversionResult序列化失败: %v, 原始值: %v", err, conversionResult)
+	} else {
+		logger.Debugf("conversionResult %s", string(jsonBytes))
+	}
 	for _, item := range splitConversionResult(conversionResult) {
 		r := &define.Record{
 			RequestType:   define.RequestHttp,
