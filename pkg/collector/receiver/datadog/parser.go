@@ -10,11 +10,14 @@
 package datadog
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"runtime/debug"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
-	"github.com/pkg/errors"
 )
 
 // RUMEvent 已弃用 - 保留用于向后兼容
@@ -59,76 +62,108 @@ type RUMEventV2 struct {
 	Context map[string]interface{} `json:"context,omitempty"`
 }
 
-// RUMEventV2 表示 Datadog RUM V2 格式的事件结构
-// V1 格式通常是单个 JSON 对象或数组
+// 常量配置（可根据业务调整）
+const (
+	maxScanLineSize = 1024 * 1024 // 单行最大 1MB
+	maxParseLines   = 10000       // 最大解析行数，防攻击
+)
+
+// parseDatadogRUM 优化版：支持 NDJSON / 单对象 / 数组 自动识别
+// 使用流式处理替代全量分割，性能更优，内存占用更低
 func parseDatadogRUM(buf []byte) ([]interface{}, error) {
-	var records []interface{}
-
-	// 日志记录原始数据
-	logger.Warnf("parseDatadogRUM: data length=%d, first 300 chars: %s", len(buf), string(buf[:min(len(buf), 300)]))
-
-	// 首先尝试按行解析 NDJSON 格式 (最可能)
-	// 支持 \n 和 \r\n 两种行分隔符
-	lines := bytes.Split(buf, []byte("\n"))
-	jsonLineCount := 0
-	for i, line := range lines {
-		// 移除 \r（如果存在）
-		line = bytes.TrimSuffix(line, []byte("\r"))
-
-		// 跳过空行
-		if len(bytes.TrimSpace(line)) == 0 {
-			continue
+	// panic 保护
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Errorf("parseDatadogRUM panic: %v\nstack: %s", r, debug.Stack())
 		}
+	}()
 
-		// 直接解析为通用对象
-		var data interface{}
-		if err := json.Unmarshal(line, &data); err != nil {
-			logger.Debugf("line %d parse failed: %v", i, err)
-			continue
-		}
+	// 安全打印前 N 字符
+	preview := string(buf[:min(len(buf), 300)])
+	logger.Infof("parseDatadogRUM: data length=%d, preview: %s", len(buf), preview)
 
-		// 转换为 map，便于后续处理
-		if m, ok := data.(map[string]interface{}); ok {
-			logger.Warnf("line %d parsed successfully, type: %T, keys: %v", i, data, getMapKeys(m))
-			records = append(records, m)
-			jsonLineCount++
-		} else {
-			logger.Warnf("line %d parsed but not a map, type: %T, value: %v", i, data, data)
-			records = append(records, data)
-			jsonLineCount++
-		}
-	}
-
-	if len(records) > 0 {
-		logger.Warnf("✓ parsed %d objects from NDJSON format", jsonLineCount)
+	// ==========================================
+	// 第一步：流式解析 NDJSON（最优性能）
+	// ==========================================
+	records, ndjsonSuccess, stats := tryParseNDJSON(buf)
+	if ndjsonSuccess {
+		logger.Infof("parse success: format=NDJSON, total=%d, success=%d, failed=%d, skipped=%d",
+			stats.totalLines, stats.successLines, stats.failedLines, stats.skippedLines)
 		return records, nil
 	}
 
-	// 如果不是 NDJSON，尝试作为单个对象或数组
+	// ==========================================
+	// 第二步：尝试解析为单个对象 / 数组
+	// ==========================================
 	var data interface{}
 	if err := json.Unmarshal(buf, &data); err != nil {
-		logger.Errorf("json.Unmarshal failed: %v", err)
-		return nil, errors.New("invalid datadog rum format")
+		logger.Errorf("json unmarshal failed: %v", err)
+		return nil, fmt.Errorf("invalid json format: %w", err)
 	}
 
-	// 根据类型处理
 	switch v := data.(type) {
 	case map[string]interface{}:
-		// 单个对象
-		logger.Warnf("✓ parsed as single map with %d keys", len(v))
-		records = append(records, v)
-		return records, nil
+		logger.Infof("parse success: format=single object, keys=%d", len(v))
+		return []interface{}{v}, nil
+
 	case []interface{}:
-		// 数组
-		logger.Warnf("✓ parsed as array with %d items", len(v))
-		for _, item := range v {
-			records = append(records, item)
-		}
-		return records, nil
+		logger.Infof("parse success: format=array, items=%d", len(v))
+		return v, nil
+
 	default:
-		logger.Errorf("✗ unsupported type: %T", data)
-		return nil, errors.New("invalid datadog rum format")
+		return nil, errors.New("unsupported data type: not map/array/ndjson")
 	}
+}
+
+// parseStats 解析统计信息
+type parseStats struct {
+	totalLines   int
+	successLines int
+	failedLines  int
+	skippedLines int
+}
+
+// tryParseNDJSON 流式解析 NDJSON（高性能核心）
+func tryParseNDJSON(buf []byte) ([]interface{}, bool, parseStats) {
+	var records []interface{}
+	var stats parseStats
+
+	scanner := bufio.NewScanner(bytes.NewReader(buf))
+	scanner.Buffer(make([]byte, maxScanLineSize), maxScanLineSize) // 支持超长行
+
+	for scanner.Scan() {
+		stats.totalLines++
+		// 防过载
+		if stats.totalLines > maxParseLines {
+			logger.Warnf("parse stop: exceed max line limit %d", maxParseLines)
+			break
+		}
+
+		line := bytes.TrimSpace(scanner.Bytes()) // 零拷贝！不生成 string
+		if len(line) == 0 {
+			stats.skippedLines++
+			continue
+		}
+
+		var item interface{}
+		if err := json.Unmarshal(line, &item); err != nil {
+			stats.failedLines++
+			logger.Debugf("line %d parse failed: %v", stats.totalLines, err)
+			continue
+		}
+
+		records = append(records, item)
+		stats.successLines++
+	}
+
+	// 扫描器错误
+	if err := scanner.Err(); err != nil {
+		logger.Debugf("ndjson scan error: %v", err)
+		return nil, false, stats
+	}
+
+	// 解析到有效记录才算成功
+	return records, len(records) > 0, stats
 }
 
 // getMapKeys 获取 map 的所有 key
@@ -141,59 +176,39 @@ func getMapKeys(m map[string]interface{}) []string {
 }
 
 // parseDatadogRUMV2 解析 Datadog Browser SDK RUM 数据 (V2 格式 - 推荐)
-// V2 格式是 JSON Lines 格式 (每行一个 JSON 对象)
+// 使用流式处理，高效处理大数据量
 func parseDatadogRUMV2(buf []byte) ([]interface{}, error) {
-	var records []interface{}
-
-	// 日志记录原始数据
-	logger.Warnf("parseDatadogRUMV2: data length=%d, first 300 chars: %s", len(buf), string(buf[:min(len(buf), 300)]))
-
-	// 首先尝试按行解析 (JSON Lines 格式)
-	// 支持 \n 和 \r\n 两种行分隔符
-	lines := bytes.Split(buf, []byte("\n"))
-	for i, line := range lines {
-		// 移除 \r（如果存在）
-		line = bytes.TrimSuffix(line, []byte("\r"))
-
-		// 跳过空行
-		if len(bytes.TrimSpace(line)) == 0 {
-			continue
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Errorf("parseDatadogRUMV2 panic: %v\nstack: %s", r, debug.Stack())
 		}
+	}()
 
-		// 直接解析为通用对象
-		var data interface{}
-		if err := json.Unmarshal(line, &data); err != nil {
-			logger.Debugf("failed to parse line %d: %v", i, err)
-			continue
-		}
-		records = append(records, data)
-	}
+	logger.Infof("parseDatadogRUMV2: data length=%d", len(buf))
 
-	if len(records) > 0 {
-		logger.Warnf("✓ parsed %d events from NDJSON format", len(records))
+	// 首先尝试流式解析 JSON Lines 格式
+	records, success, stats := tryParseNDJSON(buf)
+	if success {
+		logger.Infof("parse v2 success: format=NDJSON, total=%d, success=%d, failed=%d, skipped=%d",
+			stats.totalLines, stats.successLines, stats.failedLines, stats.skippedLines)
 		return records, nil
 	}
 
-	// 如果不是 JSON Lines，尝试作为单个 map 或数组
+	// 失败则尝试作为单个 map 或数组
 	var data interface{}
 	if err := json.Unmarshal(buf, &data); err != nil {
-		logger.Errorf("json.Unmarshal failed: %v", err)
-		return nil, errors.New("invalid datadog rum v2 format")
+		logger.Errorf("json unmarshal failed: %v", err)
+		return nil, fmt.Errorf("invalid datadog rum v2 format: %w", err)
 	}
 
 	switch v := data.(type) {
 	case map[string]interface{}:
-		logger.Warnf("✓ parsed as single map with %d keys", len(v))
-		records = append(records, v)
-		return records, nil
+		logger.Infof("parse v2 success: format=single object, keys=%d", len(v))
+		return []interface{}{v}, nil
 	case []interface{}:
-		logger.Warnf("✓ parsed as array with %d items", len(v))
-		for _, item := range v {
-			records = append(records, item)
-		}
-		return records, nil
+		logger.Infof("parse v2 success: format=array, items=%d", len(v))
+		return v, nil
 	default:
-		logger.Errorf("unsupported type: %T", data)
-		return nil, errors.New("invalid datadog rum v2 format")
+		return nil, errors.New("unsupported data type in rum v2: not map/array/ndjson")
 	}
 }

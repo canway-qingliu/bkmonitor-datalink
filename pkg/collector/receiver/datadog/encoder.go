@@ -10,13 +10,112 @@
 package datadog
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+// ======== OTLP 兼容的属性定义 ========
+
+// AnyValue 代表 OTLP 中的多态值对象
+// 根据 OTLP 规范，同一时刻只有一个字段有值
+type AnyValue struct {
+	StringValue string        `json:"stringValue,omitempty"`
+	IntValue    int64         `json:"intValue,omitempty"`
+	DoubleValue float64       `json:"doubleValue,omitempty"`
+	BoolValue   bool          `json:"boolValue,omitempty"`
+	ArrayValue  *ArrayValue   `json:"arrayValue,omitempty"`
+	KvlistValue *KeyValueList `json:"kvlistValue,omitempty"`
+}
+
+// ArrayValue 代表数组值
+type ArrayValue struct {
+	Values []AnyValue `json:"values"`
+}
+
+// KeyValueList 代表键值对列表
+type KeyValueList struct {
+	Values []KeyValue `json:"values"`
+}
+
+// KeyValue 代表 OTLP 中的键值对
+type KeyValue struct {
+	Key   string   `json:"key"`
+	Value AnyValue `json:"value"`
+}
+
+// toAnyValue 将 Go 值转换为 AnyValue
+func toAnyValue(value interface{}) AnyValue {
+	if value == nil {
+		return AnyValue{}
+	}
+
+	switch v := value.(type) {
+	case string:
+		return AnyValue{StringValue: v}
+	case int:
+		return AnyValue{IntValue: int64(v)}
+	case int32:
+		return AnyValue{IntValue: int64(v)}
+	case int64:
+		return AnyValue{IntValue: v}
+	case uint:
+		return AnyValue{IntValue: int64(v)}
+	case uint32:
+		return AnyValue{IntValue: int64(v)}
+	case uint64:
+		return AnyValue{StringValue: strconv.FormatUint(v, 10)}
+	case float32:
+		return AnyValue{DoubleValue: float64(v)}
+	case float64:
+		return AnyValue{DoubleValue: v}
+	case bool:
+		return AnyValue{BoolValue: v}
+	case json.Number:
+		if f, err := v.Float64(); err == nil {
+			return AnyValue{DoubleValue: f}
+		}
+		return AnyValue{StringValue: v.String()}
+	case []interface{}:
+		arr := &ArrayValue{Values: make([]AnyValue, len(v))}
+		for i, item := range v {
+			arr.Values[i] = toAnyValue(item)
+		}
+		return AnyValue{ArrayValue: arr}
+	case map[string]interface{}:
+		kvlist := &KeyValueList{Values: make([]KeyValue, 0, len(v))}
+		for k, val := range v {
+			kvlist.Values = append(kvlist.Values, KeyValue{
+				Key:   k,
+				Value: toAnyValue(val),
+			})
+		}
+		return AnyValue{KvlistValue: kvlist}
+	default:
+		// 默认转换为字符串
+		return AnyValue{StringValue: fmt.Sprintf("%v", value)}
+	}
+}
+
+// toKeyValueSlice 将 map[string]interface{} 转换为 KeyValue 数组
+func toKeyValueSlice(attrs map[string]interface{}) []KeyValue {
+	if attrs == nil {
+		return []KeyValue{}
+	}
+	kvs := make([]KeyValue, 0, len(attrs))
+	for key, value := range attrs {
+		kvs = append(kvs, KeyValue{
+			Key:   key,
+			Value: toAnyValue(value),
+		})
+	}
+	return kvs
+}
 
 // ======== Conversion Strategy Pattern ========
 
@@ -74,6 +173,18 @@ func (s *simpleEventStrategy) Convert(event RUMEventV2, converter *OtelConverter
 	}
 }
 
+// actionEventStrategy action 时间转换器
+
+type actionEventStrategy struct {
+	baseStrategy
+}
+
+func (s *actionEventStrategy) Convert(event RUMEventV2, converter *OtelConverter) ConversionResult {
+	return ConversionResult{
+		Traces: converter.convertSimpleEventToTraces(event),
+	}
+}
+
 // resourceEventStrategy 资源事件转换策略
 type resourceEventStrategy struct {
 	baseStrategy
@@ -81,9 +192,7 @@ type resourceEventStrategy struct {
 
 func (s *resourceEventStrategy) Convert(event RUMEventV2, converter *OtelConverter) ConversionResult {
 	return ConversionResult{
-		Logs:    converter.convertToLogsInternal(event, false),
-		Traces:  converter.convertResourceToTraces(event),
-		Metrics: converter.convertToMetricsInternal(event),
+		Traces: converter.convertResourceToTraces(event),
 	}
 }
 
@@ -115,7 +224,7 @@ func NewLogRecordBuilder(timestamp int64) *LogRecordBuilder {
 	return &LogRecordBuilder{
 		record: OtelLogRecord{
 			Timestamp:  timestamp * 1_000_000,
-			Attributes: make(map[string]interface{}, 32),
+			Attributes: make([]KeyValue, 0, 32),
 		},
 		attrs: make(map[string]interface{}, 32),
 	}
@@ -139,7 +248,10 @@ func (b *LogRecordBuilder) SetTraceInfo(traceID, spanID string) *LogRecordBuilde
 }
 
 func (b *LogRecordBuilder) AddAttribute(key string, value interface{}) *LogRecordBuilder {
-	b.record.Attributes[key] = value
+	b.record.Attributes = append(b.record.Attributes, KeyValue{
+		Key:   key,
+		Value: toAnyValue(value),
+	})
 	return b
 }
 
@@ -151,7 +263,11 @@ func (b *LogRecordBuilder) AddAttributes(prefix string, data map[string]interfac
 		if _, isList := value.([]interface{}); isList {
 			continue
 		}
-		b.record.Attributes[fmt.Sprintf("%s.%s", prefix, key)] = value
+		fullKey := fmt.Sprintf("%s.%s", prefix, key)
+		b.record.Attributes = append(b.record.Attributes, KeyValue{
+			Key:   fullKey,
+			Value: toAnyValue(value),
+		})
 	}
 	return b
 }
@@ -184,7 +300,7 @@ func NewSpanBuilder(timestamp int64) *SpanBuilder {
 		span: OtelSpan{
 			StartTimeUnixNano: timestamp * 1_000_000,
 			EndTimeUnixNano:   (timestamp + 1) * 1_000_000,
-			Attributes:        make(map[string]interface{}, 32),
+			Attributes:        make([]KeyValue, 0, 32),
 			Status:            make(map[string]interface{}, 2),
 			Kind:              SpanKindInternal,
 		},
@@ -221,7 +337,10 @@ func (b *SpanBuilder) SetStatus(code string, description string) *SpanBuilder {
 }
 
 func (b *SpanBuilder) AddAttribute(key string, value interface{}) *SpanBuilder {
-	b.span.Attributes[key] = value
+	b.span.Attributes = append(b.span.Attributes, KeyValue{
+		Key:   key,
+		Value: toAnyValue(value),
+	})
 	return b
 }
 
@@ -233,7 +352,11 @@ func (b *SpanBuilder) AddAttributes(prefix string, data map[string]interface{}) 
 		if _, isList := value.([]interface{}); isList {
 			continue
 		}
-		b.span.Attributes[fmt.Sprintf("%s.%s", prefix, key)] = value
+		fullKey := fmt.Sprintf("%s.%s", prefix, key)
+		b.span.Attributes = append(b.span.Attributes, KeyValue{
+			Key:   fullKey,
+			Value: toAnyValue(value),
+		})
 	}
 	return b
 }
@@ -245,7 +368,7 @@ func (b *SpanBuilder) AddEvent(name string, timeUnixNano int64) *SpanBuilder {
 	b.span.Events = append(b.span.Events, OtelSpanEvent{
 		Name:         name,
 		TimeUnixNano: timeUnixNano,
-		Attributes:   make(map[string]interface{}),
+		Attributes:   make([]KeyValue, 0),
 	})
 	return b
 }
@@ -298,7 +421,7 @@ func NewOtelConverter() *OtelConverter {
 		"error":       &errorEventStrategy{baseStrategy: baseStrategy{"error"}},
 		"performance": &performanceEventStrategy{baseStrategy: baseStrategy{"performance"}},
 		"view":        &simpleEventStrategy{baseStrategy: baseStrategy{"view"}},
-		"action":      &simpleEventStrategy{baseStrategy: baseStrategy{"action"}},
+		"action":      &actionEventStrategy{baseStrategy: baseStrategy{"action"}},
 		"log":         &simpleEventStrategy{baseStrategy: baseStrategy{"log"}},
 		"resource":    &resourceEventStrategy{baseStrategy: baseStrategy{"resource"}},
 		"long_task":   &longTaskEventStrategy{baseStrategy: baseStrategy{"long_task"}},
@@ -320,8 +443,6 @@ func (c *OtelConverter) ToOTEL(event RUMEventV2) ConversionResult {
 	if strategy != nil {
 		return strategy.Convert(event, c)
 	}
-
-	// 默认转换为日志
 	return ConversionResult{
 		Logs:    c.convertToLogsInternal(event, false),
 		Traces:  OtelTracesData{},
@@ -921,7 +1042,7 @@ func (c *OtelConverter) convertToMetricsInternal(event RUMEventV2) OtelMetricsDa
 							Sum:        duration,
 							Min:        duration,
 							Max:        duration,
-							Attributes: map[string]interface{}{"event.type": "performance"},
+							Attributes: toKeyValueSlice(map[string]interface{}{"event.type": "performance"}),
 						},
 					},
 				})
@@ -938,7 +1059,7 @@ func (c *OtelConverter) convertToMetricsInternal(event RUMEventV2) OtelMetricsDa
 						{
 							Timestamp:  timestampNano,
 							Value:      size,
-							Attributes: map[string]interface{}{"event.type": "performance"},
+							Attributes: toKeyValueSlice(map[string]interface{}{"event.type": "performance"}),
 						},
 					},
 				})
@@ -974,7 +1095,7 @@ func (c *OtelConverter) convertToMetricsInternal(event RUMEventV2) OtelMetricsDa
 							Sum:        duration,
 							Min:        duration,
 							Max:        duration,
-							Attributes: map[string]interface{}{"event.type": "resource"},
+							Attributes: toKeyValueSlice(map[string]interface{}{"event.type": "resource"}),
 						},
 					},
 				})
@@ -990,7 +1111,7 @@ func (c *OtelConverter) convertToMetricsInternal(event RUMEventV2) OtelMetricsDa
 						{
 							Timestamp:  timestampNano,
 							Value:      size,
-							Attributes: map[string]interface{}{"event.type": "resource"},
+							Attributes: toKeyValueSlice(map[string]interface{}{"event.type": "resource"}),
 						},
 					},
 				})
@@ -1260,7 +1381,7 @@ func (c *OtelConverter) convertLongTaskToMetrics(event RUMEventV2) OtelMetricsDa
 					Sum:        duration,
 					Min:        duration,
 					Max:        duration,
-					Attributes: map[string]interface{}{"event.type": "long_task"},
+					Attributes: toKeyValueSlice(map[string]interface{}{"event.type": "long_task"}),
 				},
 			},
 		})
@@ -1354,12 +1475,12 @@ func mapSeverityLevel(level string) int {
 // createOtelResource 创建 OTEL 资源
 func createOtelResource() OtelResource {
 	return OtelResource{
-		Attributes: map[string]interface{}{
+		Attributes: toKeyValueSlice(map[string]interface{}{
 			"service.name":           "datadog-rum",
 			"service.source":         "datadog",
 			"telemetry.sdk.name":     "datadog-browser",
 			"telemetry.sdk.language": "javascript",
-		},
+		}),
 	}
 }
 
@@ -1441,25 +1562,25 @@ func createEnrichedOtelResource(event RUMEventV2) OtelResource {
 		}
 	}
 
-	return OtelResource{Attributes: attrs}
+	return OtelResource{Attributes: toKeyValueSlice(attrs)}
 }
 
 // ======== OTEL Data Structures ========
 
 // OtelResource 表示资源
 type OtelResource struct {
-	Attributes map[string]interface{} `json:"attributes"`
+	Attributes []KeyValue `json:"attributes"`
 }
 
 // OtelLogRecord 日志记录
 type OtelLogRecord struct {
-	Timestamp      int64                  `json:"timestamp_nanos"`
-	SeverityNumber int                    `json:"severity_number"`
-	SeverityText   string                 `json:"severity_text"`
-	Body           string                 `json:"body"`
-	Attributes     map[string]interface{} `json:"attributes"`
-	TraceID        string                 `json:"trace_id,omitempty"`
-	SpanID         string                 `json:"span_id,omitempty"`
+	Timestamp      int64      `json:"timestamp_nanos"`
+	SeverityNumber int        `json:"severity_number"`
+	SeverityText   string     `json:"severity_text"`
+	Body           string     `json:"body"`
+	Attributes     []KeyValue `json:"attributes"`
+	TraceID        string     `json:"trace_id,omitempty"`
+	SpanID         string     `json:"span_id,omitempty"`
 }
 
 // OtelScopeLogs 作用域日志
@@ -1488,16 +1609,16 @@ type OtelSpan struct {
 	Kind              int                    `json:"kind"`
 	StartTimeUnixNano int64                  `json:"start_time_unix_nano"`
 	EndTimeUnixNano   int64                  `json:"end_time_unix_nano"`
-	Attributes        map[string]interface{} `json:"attributes"`
+	Attributes        []KeyValue             `json:"attributes"`
 	Events            []OtelSpanEvent        `json:"events,omitempty"`
 	Status            map[string]interface{} `json:"status"`
 }
 
 // OtelSpanEvent Span 事件
 type OtelSpanEvent struct {
-	Name         string                 `json:"name"`
-	TimeUnixNano int64                  `json:"time_unix_nano"`
-	Attributes   map[string]interface{} `json:"attributes,omitempty"`
+	Name         string     `json:"name"`
+	TimeUnixNano int64      `json:"time_unix_nano"`
+	Attributes   []KeyValue `json:"attributes,omitempty"`
 }
 
 // OtelScopeSpans 作用域跨度
@@ -1519,13 +1640,13 @@ type OtelTracesData struct {
 
 // OtelMetricDataPoint 数据点
 type OtelMetricDataPoint struct {
-	Timestamp  int64                  `json:"timestamp_unix_nano"`
-	Value      float64                `json:"value,omitempty"`
-	Count      int64                  `json:"count,omitempty"`
-	Sum        float64                `json:"sum,omitempty"`
-	Min        float64                `json:"min,omitempty"`
-	Max        float64                `json:"max,omitempty"`
-	Attributes map[string]interface{} `json:"attributes,omitempty"`
+	Timestamp  int64      `json:"timestamp_unix_nano"`
+	Value      float64    `json:"value,omitempty"`
+	Count      int64      `json:"count,omitempty"`
+	Sum        float64    `json:"sum,omitempty"`
+	Min        float64    `json:"min,omitempty"`
+	Max        float64    `json:"max,omitempty"`
+	Attributes []KeyValue `json:"attributes,omitempty"`
 }
 
 // OtelMetric 指标

@@ -14,7 +14,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/pkg/errors"
@@ -36,8 +35,10 @@ func init() {
 	receiver.RegisterReadyFunc(define.SourceDatadog, Ready)
 }
 
-var metricMonitor = receiver.DefaultMetricMonitor.Source(define.SourceDatadog)
-var otelConverter = NewOtelConverter()
+var (
+	metricMonitor = receiver.DefaultMetricMonitor.Source(define.SourceDatadog)
+	otelConverter = NewOtelConverter()
+)
 
 func Ready() {
 	receiver.RegisterRecvHttpRoute(define.SourceDatadog, []receiver.RouteWithFunc{
@@ -93,11 +94,6 @@ func convertDataToRUMEventV2(data interface{}) (RUMEventV2, error) {
 	}
 	if v, ok := m["date"].(float64); ok {
 		event.Date = int64(v)
-	}
-
-	// 如果 date 为 0，设置为当前时间
-	if event.Date == 0 {
-		event.Date = time.Now().UnixMilli()
 	}
 
 	// 提取顶层属性
@@ -191,19 +187,9 @@ func splitConversionResult(result ConversionResult) []convertedRecord {
 
 // publishConvertedRecords 按 conversionResult 分流发布 logs/traces/metrics
 func (s HttpService) publishConvertedRecords(conversionResult ConversionResult, ip string, token string, bodySize int, start time.Time) {
-	// 打印转换后的 JSON 字符串并写入文件
+	// 打印转换后的 JSON 字符串
 	jsonBytes, _ := json.MarshalIndent(conversionResult, "", "  ")
 	logger.Infof("Converted JSON result:\n%s", string(jsonBytes))
-
-	// 将 JSON 写入文件
-	fileName := "converted_result_" + time.Now().Format("20060102_150405.999999") + ".json"
-	filePath := fileName
-	err := os.WriteFile(filePath, jsonBytes, 0644)
-	if err != nil {
-		logger.Warnf("failed to write json to file: %v", err)
-	} else {
-		logger.Infof("JSON written to file: %s", filePath)
-	}
 
 	for _, item := range splitConversionResult(conversionResult) {
 		r := &define.Record{
@@ -222,7 +208,7 @@ func (s HttpService) publishConvertedRecords(conversionResult ConversionResult, 
 			continue
 		}
 
-		s.Publish(r)
+		// s.Publish(r)
 		receiver.RecordHandleMetrics(metricMonitor, r.Token, define.RequestHttp, item.rtype, bodySize, start)
 	}
 }
