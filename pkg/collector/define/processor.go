@@ -27,6 +27,7 @@ const (
 	ProcessorTextSpliter     = "text_spliter"
 	ProcessorFieldNormalizer = "field_normalizer"
 	ProcessorMethodFilter    = "method_filter"
+	ProcessorSpanProcessor   = "span_processor"
 
 	// 嘉为定开内容
 	ProcessorTokenReplacer  = "token_replacer"
