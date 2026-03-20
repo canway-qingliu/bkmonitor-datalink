@@ -558,6 +558,9 @@ func (c *Converter) convertResourceToTraces(event *RUMEventV2) ptrace.Traces {
 	c.enrichResource(resourceSpans.Resource(), event)
 
 	scopeSpans := resourceSpans.ScopeSpans().AppendEmpty()
+	scop := scopeSpans.Scope()
+	scop.SetName("datadog rum")
+	scop.SetVersion("1.0.0")
 	span := scopeSpans.Spans().AppendEmpty()
 
 	// 确定 Span Name
@@ -572,6 +575,8 @@ func (c *Converter) convertResourceToTraces(event *RUMEventV2) ptrace.Traces {
 	// 时间戳
 	ts := pcommon.NewTimestampFromTime(time.UnixMilli(event.Date))
 	span.SetStartTimestamp(ts)
+	durationNs := event.Resource["duration"].(float64)
+	durationTs := pcommon.Timestamp(uint64(durationNs))
 
 	// 计算结束时间
 	endTs := ts + (pcommon.Timestamp(time.Millisecond))
@@ -580,6 +585,7 @@ func (c *Converter) convertResourceToTraces(event *RUMEventV2) ptrace.Traces {
 			endTs = ts + (pcommon.Timestamp(time.Duration(duration) * time.Millisecond))
 		}
 	}
+
 	span.SetEndTimestamp(endTs)
 
 	// Trace & Span ID
@@ -614,7 +620,7 @@ func (c *Converter) convertResourceToTraces(event *RUMEventV2) ptrace.Traces {
 			attrs.UpsertString("connectivity.effective_type", effectiveType)
 		}
 	}
-
+	spanStatus := span.Status()
 	// 添加资源属性
 	if event.Resource != nil {
 		if resourceURL != "" {
@@ -622,6 +628,18 @@ func (c *Converter) convertResourceToTraces(event *RUMEventV2) ptrace.Traces {
 		}
 		if statusCode, ok := event.Resource["status_code"].(float64); ok {
 			attrs.UpsertInt("http.status_code", int64(statusCode))
+			if statusCode >= 200 && statusCode < 300 {
+				// 方案 A: 显式设置为 OK (推荐，语义清晰)
+				spanStatus.SetCode(ptrace.StatusCodeOk)
+				spanStatus.SetMessage(fmt.Sprintf("HTTP status: %s", statusCode))
+			} else {
+				// === 失败情况 (非 2xx) ===
+				// 必须设置为 Error (2)
+				spanStatus.SetCode(ptrace.StatusCodeError)
+
+				// 建议带上具体的 HTTP 状态码作为错误消息，方便排查
+				spanStatus.SetMessage(fmt.Sprintf("HTTP Error: %s", statusCode))
+			}
 		}
 		if resType, ok := event.Resource["type"].(string); ok {
 			attrs.UpsertString("resource.type", resType)
@@ -631,6 +649,55 @@ func (c *Converter) convertResourceToTraces(event *RUMEventV2) ptrace.Traces {
 		}
 	}
 
+	// 添加事件 fetchStart
+	otEvent1 := span.Events().AppendEmpty()
+	otEvent1.SetName("fetchStart")
+	otEvent1.SetTimestamp(pcommon.Timestamp(ts))
+	otEvent1.SetDroppedAttributesCount(0)
+
+	// domainLookupStart
+	otEvent2 := span.Events().AppendEmpty()
+	otEvent2.SetName("domainLookupStart")
+	otEvent2.SetTimestamp(pcommon.Timestamp(ts))
+	otEvent2.SetDroppedAttributesCount(0)
+
+	// domainLookupEnd
+	otEvent3 := span.Events().AppendEmpty()
+	otEvent3.SetName("domainLookupEnd")
+	otEvent3.SetTimestamp(pcommon.Timestamp(ts))
+	otEvent3.SetDroppedAttributesCount(0)
+
+	// connectStart
+	otEvent4 := span.Events().AppendEmpty()
+	otEvent4.SetName("connectStart")
+	otEvent4.SetTimestamp(pcommon.Timestamp(ts))
+	otEvent4.SetDroppedAttributesCount(0)
+	// connectEnd
+	otEvent5 := span.Events().AppendEmpty()
+	otEvent5.SetName("connectEnd")
+	otEvent5.SetTimestamp(pcommon.Timestamp(ts))
+	otEvent5.SetDroppedAttributesCount(0)
+
+	// requestStart
+	requestStartTs := ts + durationTs
+	otEvent6 := span.Events().AppendEmpty()
+	otEvent6.SetName("requestStart")
+	otEvent6.SetTimestamp(pcommon.Timestamp(requestStartTs))
+	otEvent6.SetDroppedAttributesCount(0)
+
+	// responseStart
+	responseStartTs := ts + durationTs
+	otEvent7 := span.Events().AppendEmpty()
+	otEvent7.SetName("responseStart")
+	otEvent7.SetTimestamp(pcommon.Timestamp(responseStartTs))
+	otEvent7.SetDroppedAttributesCount(0)
+
+	// responseEnd
+	responseEndTs := ts + durationTs
+	otEvent8 := span.Events().AppendEmpty()
+	otEvent8.SetName("responseEnd")
+	otEvent8.SetTimestamp(pcommon.Timestamp(responseEndTs))
+	otEvent8.SetDroppedAttributesCount(0)
 	return traces
 }
 
