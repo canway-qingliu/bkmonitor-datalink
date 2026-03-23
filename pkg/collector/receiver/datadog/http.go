@@ -30,8 +30,9 @@ import (
 )
 
 const (
-	routeRumV1 = "/api/v2/rum"
-	routeRumV2 = "/api/v2/rum/events"
+	routeRumV1  = "/api/v2/rum"
+	routeRumV2  = "/api/v2/rum/events"
+	routeReplay = "/api/v2/replay"
 )
 
 func init() {
@@ -53,6 +54,11 @@ func Ready() {
 		{
 			Method:       http.MethodPost,
 			RelativePath: routeRumV2,
+			HandlerFunc:  httpSvc.RumV2,
+		},
+		{
+			Method:       http.MethodPost,
+			RelativePath: routeReplay,
 			HandlerFunc:  httpSvc.RumV2,
 		},
 	})
@@ -86,7 +92,9 @@ func convertDataToDatadogEventV2(data interface{}) (RUMEventV2, error) {
 	if v, ok := m["event_type"].(string); ok {
 		event.EventType = v
 	}
-	if v, ok := m["date"].(float64); ok {
+	if v, ok := getNumberValue(m, "date"); ok {
+		event.Date = int64(v)
+	} else if v, ok := getNumberValue(m, "timestamp"); ok {
 		event.Date = int64(v)
 	}
 
@@ -107,7 +115,7 @@ func convertDataToDatadogEventV2(data interface{}) (RUMEventV2, error) {
 	// 提取嵌套对象（保持完整的 map 结构）
 	event.DD = getMapValue(m, "_dd")
 	event.Application = getMapValue(m, "application")
-	event.View = getMapValue(m, "view")
+	event.View = getViewData(m, "view")
 	event.Session = getMapValue(m, "session")
 	event.Connectivity = getMapValue(m, "connectivity")
 	event.User = getMapValue(m, "usr")
@@ -116,7 +124,7 @@ func convertDataToDatadogEventV2(data interface{}) (RUMEventV2, error) {
 	// 根据事件类型提取相应的详细信息对象
 	switch event.Type {
 	case "resource":
-		event.Resource = getMapValue(m, "resource")
+		event.Resource = getResourceData(m, "resource")
 	case "error":
 		event.Error = getMapValue(m, "error")
 	case "action":
@@ -137,12 +145,245 @@ func convertDataToDatadogEventV2(data interface{}) (RUMEventV2, error) {
 	return event, nil
 }
 
-// getMapValue 从map中获取map类型的值
+// getMapValue 从 map 中获取 map 类型的值。
 func getMapValue(m map[string]interface{}, key string) map[string]interface{} {
 	if v, ok := m[key].(map[string]interface{}); ok {
 		return v
 	}
 	return nil
+}
+
+// getNumberValue 从 map 中获取数值类型的值。
+func getNumberValue(m map[string]interface{}, key string) (float64, bool) {
+	value, ok := m[key].(float64)
+	if !ok {
+		return 0, false
+	}
+
+	return value, true
+}
+
+// getResourceData 从 map 中提取并转换为 ResourceData 结构
+func getResourceData(m map[string]interface{}, key string) *ResourceData {
+	resourceMap := getMapValue(m, key)
+	if resourceMap == nil {
+		return nil
+	}
+
+	resource := &ResourceData{}
+
+	// 基本字段
+	if v, ok := resourceMap["id"].(string); ok {
+		resource.ID = v
+	}
+	if v, ok := resourceMap["type"].(string); ok {
+		resource.Type = v
+	}
+	if v, ok := resourceMap["url"].(string); ok {
+		resource.URL = v
+	}
+	if v, ok := resourceMap["duration"].(float64); ok {
+		resource.Duration = int64(v)
+	}
+
+	// HTTP 状态码
+	if v, ok := resourceMap["status_code"].(float64); ok {
+		resource.StatusCode = int(v)
+	}
+
+	// 传输信息
+	if v, ok := resourceMap["delivery_type"].(string); ok {
+		resource.DeliveryType = v
+	}
+	if v, ok := resourceMap["render_blocking_status"].(string); ok {
+		resource.RenderBlockingStatus = v
+	}
+
+	// 大小信息
+	if v, ok := resourceMap["size"].(float64); ok {
+		resource.Size = int64(v)
+	}
+	if v, ok := resourceMap["encoded_body_size"].(float64); ok {
+		resource.EncodedBodySize = int64(v)
+	}
+	if v, ok := resourceMap["decoded_body_size"].(float64); ok {
+		resource.DecodedBodySize = int64(v)
+	}
+	if v, ok := resourceMap["transfer_size"].(float64); ok {
+		resource.TransferSize = int64(v)
+	}
+
+	// 协议信息
+	if v, ok := resourceMap["protocol"].(string); ok {
+		resource.Protocol = v
+	}
+
+	// 时间详情
+	resource.DNS = getResourceTiming(resourceMap, "dns")
+	resource.Connect = getResourceTiming(resourceMap, "connect")
+	resource.FirstByte = getResourceTiming(resourceMap, "first_byte")
+	resource.Download = getResourceTiming(resourceMap, "download")
+
+	return resource
+}
+
+// getResourceTiming 从 map 中提取并转换为 ResourceTiming 结构
+func getResourceTiming(m map[string]interface{}, key string) *ResourceTiming {
+	timingMap := getMapValue(m, key)
+	if timingMap == nil {
+		return nil
+	}
+
+	timing := &ResourceTiming{}
+
+	if v, ok := timingMap["start"].(float64); ok {
+		timing.Start = int64(v)
+	}
+	if v, ok := timingMap["duration"].(float64); ok {
+		timing.Duration = int64(v)
+	}
+
+	// 若 start 和 duration 都为零，则返回 nil
+	if timing.Start == 0 && timing.Duration == 0 {
+		return nil
+	}
+
+	return timing
+}
+
+// getCounter 从 map 中提取计数信息
+func getCounter(m map[string]interface{}, key string) *Counter {
+	counterMap := getMapValue(m, key)
+	if counterMap == nil {
+		return nil
+	}
+
+	counter := &Counter{}
+	if v, ok := counterMap["count"].(float64); ok {
+		counter.Count = int(v)
+	}
+
+	return counter
+}
+
+// getViewData 从 map 中提取并转换为 ViewData 结构
+func getViewData(m map[string]interface{}, key string) *ViewData {
+	viewMap := getMapValue(m, key)
+	if viewMap == nil {
+		return nil
+	}
+
+	view := &ViewData{}
+
+	// 基本信息
+	if v, ok := viewMap["url"].(string); ok {
+		view.URL = v
+	}
+	if v, ok := viewMap["referrer"].(string); ok {
+		view.Referrer = v
+	}
+	if v, ok := viewMap["id"].(string); ok {
+		view.ID = v
+	}
+	if v, ok := viewMap["is_active"].(bool); ok {
+		view.IsActive = v
+	}
+
+	// 用户交互计数
+	view.Action = getCounter(viewMap, "action")
+	view.Error = getCounter(viewMap, "error")
+	view.LongTask = getCounter(viewMap, "long_task")
+	view.Resource = getCounter(viewMap, "resource")
+	view.Frustration = getCounter(viewMap, "frustration")
+
+	// 布局移位信息
+	if v, ok := viewMap["cumulative_layout_shift"].(float64); ok {
+		view.CumulativeLayoutShift = v
+	}
+	if v, ok := viewMap["cumulative_layout_shift_time"].(float64); ok {
+		view.CumulativeLayoutShiftTime = int64(v)
+	}
+	if v, ok := viewMap["cumulative_layout_shift_target_selector"].(string); ok {
+		view.CumulativeLayoutShiftTarget = v
+	}
+
+	// 加载性能指标（纳秒）
+	if v, ok := viewMap["first_byte"].(float64); ok {
+		view.FirstByte = int64(v)
+	}
+	if v, ok := viewMap["dom_interactive"].(float64); ok {
+		view.DOMInteractive = int64(v)
+	}
+	if v, ok := viewMap["dom_content_loaded"].(float64); ok {
+		view.DOMContentLoaded = int64(v)
+	}
+	if v, ok := viewMap["dom_complete"].(float64); ok {
+		view.DOMComplete = int64(v)
+	}
+	if v, ok := viewMap["load_event"].(float64); ok {
+		view.LoadEvent = int64(v)
+	}
+	if v, ok := viewMap["first_contentful_paint"].(float64); ok {
+		view.FirstContentfulPaint = int64(v)
+	}
+	if v, ok := viewMap["largest_contentful_paint"].(float64); ok {
+		view.LargestContentfulPaint = int64(v)
+	}
+
+	// 交互性能指标（纳秒）
+	if v, ok := viewMap["interaction_to_next_paint"].(float64); ok {
+		view.InteractionToNextPaint = int64(v)
+	}
+	if v, ok := viewMap["interaction_to_next_paint_time"].(float64); ok {
+		view.InteractionToNextPaintTime = int64(v)
+	}
+	if v, ok := viewMap["interaction_to_next_paint_target_selector"].(string); ok {
+		view.InteractionToNextPaintTarget = v
+	}
+
+	// 加载类型和时间
+	if v, ok := viewMap["loading_type"].(string); ok {
+		view.LoadingType = v
+	}
+	if v, ok := viewMap["loading_time"].(float64); ok {
+		view.LoadingTime = int64(v)
+	}
+	if v, ok := viewMap["time_spent"].(float64); ok {
+		view.TimeSpent = int64(v)
+	}
+
+	// 最大内容绘制目标选择器
+	if v, ok := viewMap["largest_contentful_paint_target_selector"].(string); ok {
+		view.LargestContentfulPaintTarget = v
+	}
+
+	// 性能指标详情
+	view.Performance = getViewPerformanceMetrics(viewMap)
+
+	return view
+}
+
+// getViewPerformanceMetrics 从 map 中提取性能指标详情
+func getViewPerformanceMetrics(viewMap map[string]interface{}) *ViewPerformanceMetrics {
+	perfMap := getMapValue(viewMap, "performance")
+	if perfMap == nil {
+		return nil
+	}
+
+	// 通过 JSON 序列化和反序列化来处理内联结构体类型匹配问题
+	perfBytes, err := json.Marshal(perfMap)
+	if err != nil {
+		logger.Debugf("marshal performance failed: %v", err)
+		return nil
+	}
+
+	metrics := &ViewPerformanceMetrics{}
+	if err := json.Unmarshal(perfBytes, metrics); err != nil {
+		logger.Debugf("unmarshal performance failed: %v", err)
+		return nil
+	}
+
+	return metrics
 }
 
 // transformRecord 将原始数据转换为 OTEL 格式。
@@ -239,6 +480,7 @@ func (s HttpService) publishConvertedRecords(conversionResult ConversionResult, 
 		conversionResult.Traces.SpanCount(),
 		conversionResult.Metrics.MetricCount(),
 	)
+
 	debugLogConversionResult(conversionResult)
 
 	for _, item := range splitConversionResult(conversionResult) {

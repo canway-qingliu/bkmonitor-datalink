@@ -44,6 +44,13 @@ type ConversionOutput struct {
 	Metrics pmetric.Metrics
 }
 
+const (
+	rumScopeName         = "datadog rum"
+	rumScopeVersion      = "1.0.0"
+	spanNameResourceLoad = "resource.load"
+	spanNameResourceFetch = "resourceFetch"
+)
+
 // ConversionResult 兼容旧调用方。
 type ConversionResult = ConversionOutput
 
@@ -57,7 +64,7 @@ func NewConverter() *Converter {
 	strategies := map[string]ConversionStrategy{
 		"error":       &errorEventStrategy{},
 		"performance": &performanceEventStrategy{},
-		"view":        &simpleEventStrategy{eventType: "view"},
+		"view":        &viewEventStrategy{},
 		"action":      &actionEventStrategy{},
 		"log":         &simpleEventStrategy{eventType: "log"},
 		"resource":    &resourceEventStrategy{},
@@ -203,6 +210,22 @@ func (s *resourceEventStrategy) Convert(event *RUMEventV2, converter *Converter)
 	return output
 }
 
+// viewEventStrategy view 视图事件转换策略
+type viewEventStrategy struct{}
+
+func (s *viewEventStrategy) CanHandle(event *RUMEventV2) bool {
+	return event.Type == "view"
+}
+
+func (s *viewEventStrategy) Convert(event *RUMEventV2, converter *Converter) ConversionOutput {
+	output := ConversionOutput{
+		Logs:    plog.NewLogs(),
+		Traces:  converter.convertViewToTraces(event),
+		Metrics: pmetric.NewMetrics(),
+	}
+	return output
+}
+
 // longTaskEventStrategy 长任务事件转换策略
 type longTaskEventStrategy struct{}
 
@@ -278,20 +301,11 @@ func (c *Converter) extractMessageAndLevel(event *RUMEventV2, isError bool) (str
 			}
 		}
 	case "view":
-		if event.View != nil {
-			if msg, ok := event.View["message"].(string); ok {
-				message = msg
-			}
-		}
+		// view 事件在 ViewData 中没有 message 字段
+		// 如果需要从其他地方提取，可在此扩展
 	case "long_task":
 		if event.LongTask != nil {
 			if msg, ok := event.LongTask["message"].(string); ok {
-				message = msg
-			}
-		}
-	case "resource":
-		if event.Resource != nil {
-			if msg, ok := event.Resource["message"].(string); ok {
 				message = msg
 			}
 		}
@@ -317,11 +331,11 @@ func (c *Converter) addEventAttributes(attrs pcommon.Map, event *RUMEventV2) {
 	switch event.Type {
 	case "view":
 		if event.View != nil {
-			if id, ok := event.View["id"].(string); ok {
-				attrs.UpsertString("view.id", id)
+			if event.View.ID != "" {
+				attrs.UpsertString("view.id", event.View.ID)
 			}
-			if url, ok := event.View["url"].(string); ok {
-				attrs.UpsertString("view.url", url)
+			if event.View.URL != "" {
+				attrs.UpsertString("view.url", event.View.URL)
 			}
 		}
 	case "action":
@@ -436,14 +450,14 @@ func (c *Converter) convertSimpleEventToTraces(event *RUMEventV2) ptrace.Traces 
 	switch event.Type {
 	case "view":
 		if event.View != nil {
-			if id, ok := event.View["id"].(string); ok {
-				attrs.UpsertString("view.id", id)
+			if event.View.ID != "" {
+				attrs.UpsertString("view.id", event.View.ID)
 			}
-			if viewURL, ok := event.View["url"].(string); ok {
-				attrs.UpsertString("view.url", viewURL)
+			if event.View.URL != "" {
+				attrs.UpsertString("view.url", event.View.URL)
 			}
-			if loadingTime, ok := event.View["loading_time"].(float64); ok {
-				attrs.UpsertInt("view.loading_time", int64(loadingTime))
+			if event.View.LoadingTime > 0 {
+				attrs.UpsertInt("view.loading_time", event.View.LoadingTime)
 			}
 		}
 	case "action":
@@ -519,7 +533,7 @@ func (c *Converter) convertPerformanceToTraces(event *RUMEventV2) ptrace.Traces 
 	scopeSpans := resourceSpans.ScopeSpans().AppendEmpty()
 	span := scopeSpans.Spans().AppendEmpty()
 
-	span.SetName("resource.load")
+	span.SetName(spanNameResourceLoad)
 	span.SetKind(ptrace.SpanKindInternal)
 
 	// 时间戳
@@ -551,153 +565,229 @@ func (c *Converter) convertPerformanceToTraces(event *RUMEventV2) ptrace.Traces 
 	return traces
 }
 
-// convertResourceToTraces resource 事件转换为 Trace
-func (c *Converter) convertResourceToTraces(event *RUMEventV2) ptrace.Traces {
+func (c *Converter) newClientEventTrace(
+	event *RUMEventV2,
+	spanName string,
+) (ptrace.Traces, ptrace.Span, pcommon.Timestamp) {
 	traces := ptrace.NewTraces()
 	resourceSpans := traces.ResourceSpans().AppendEmpty()
 	c.enrichResource(resourceSpans.Resource(), event)
 
 	scopeSpans := resourceSpans.ScopeSpans().AppendEmpty()
-	scop := scopeSpans.Scope()
-	scop.SetName("datadog rum")
-	scop.SetVersion("1.0.0")
-	span := scopeSpans.Spans().AppendEmpty()
+	scope := scopeSpans.Scope()
+	scope.SetName(rumScopeName)
+	scope.SetVersion(rumScopeVersion)
 
-	// 确定 Span Name
-	resourceURL := c.extractResourceURL(event)
-	if c.isStaticResourceURL(resourceURL) {
-		span.SetName("resourceFetch")
-	} else {
-		span.SetName("resource.load")
-	}
+	span := scopeSpans.Spans().AppendEmpty()
+	span.SetName(spanName)
 	span.SetKind(ptrace.SpanKindClient)
 
-	// 时间戳
-	ts := pcommon.NewTimestampFromTime(time.UnixMilli(event.Date))
-	span.SetStartTimestamp(ts)
-	durationNs := event.Resource["duration"].(float64)
-	durationTs := pcommon.Timestamp(uint64(durationNs))
+	startTs := pcommon.NewTimestampFromTime(time.UnixMilli(event.Date))
+	span.SetStartTimestamp(startTs)
+	span.SetEndTimestamp(c.getClientSpanEndTimestamp(event, startTs))
+	c.populateSpanIdentity(span, event)
+	span.Attributes().UpsertString("event.type", event.Type)
 
-	// 计算结束时间
-	endTs := ts + (pcommon.Timestamp(time.Millisecond))
-	if event.Resource != nil {
-		if duration, ok := event.Resource["duration"].(float64); ok {
-			endTs = ts + (pcommon.Timestamp(time.Duration(duration) * time.Millisecond))
-		}
+	return traces, span, startTs
+}
+
+func (c *Converter) getClientSpanEndTimestamp(event *RUMEventV2, startTs pcommon.Timestamp) pcommon.Timestamp {
+	endTs := startTs + pcommon.Timestamp(time.Millisecond)
+	if event == nil || event.Resource == nil || event.Resource.Duration <= 0 {
+		return endTs
 	}
 
-	span.SetEndTimestamp(endTs)
+	return startTs + pcommon.Timestamp(event.Resource.Duration)
+}
 
-	// Trace & Span ID
+func resourceDurationToMilliseconds(duration int64) float64 {
+	if duration <= 0 {
+		return 0
+	}
+
+	return float64(duration) / float64(time.Millisecond)
+}
+
+func (c *Converter) populateSpanIdentity(span ptrace.Span, event *RUMEventV2) {
 	traceID := c.generateTraceID(event)
 	spanID := c.generateSpanID(event)
 	span.SetTraceID(c.stringToTraceID(traceID))
 	span.SetSpanID(c.stringToSpanID(spanID))
+}
 
-	// 属性
+func (c *Converter) addSharedClientTraceAttributes(
+	span ptrace.Span,
+	event *RUMEventV2,
+	resourceURL string,
+) {
 	attrs := span.Attributes()
-	attrs.UpsertString("event.type", event.Type)
+	c.addViewTraceAttributes(attrs, event.View)
+	c.addConnectivityAttributes(attrs, event.Connectivity)
+	c.addResourceTraceAttributes(span, attrs, event.Resource, resourceURL)
+}
 
-	// 添加视图信息
-	if event.View != nil {
-		if viewID, ok := event.View["id"].(string); ok {
-			attrs.UpsertString("view.id", viewID)
-		}
-		if viewURL, ok := event.View["url"].(string); ok {
-			attrs.UpsertString("view.url", viewURL)
-		}
-		if referrer, ok := event.View["referrer"].(string); ok {
-			attrs.UpsertString("view.referrer", referrer)
-		}
+func (c *Converter) addViewTraceAttributes(attrs pcommon.Map, view *ViewData) {
+	if view == nil {
+		return
 	}
 
-	// 添加网络连接信息
-	if event.Connectivity != nil {
-		if status, ok := event.Connectivity["status"].(string); ok {
-			attrs.UpsertString("connectivity.status", status)
-		}
-		if effectiveType, ok := event.Connectivity["effective_type"].(string); ok {
-			attrs.UpsertString("connectivity.effective_type", effectiveType)
-		}
+	if view.ID != "" {
+		attrs.UpsertString("view.id", view.ID)
 	}
-	spanStatus := span.Status()
-	// 添加资源属性
+	if view.URL != "" {
+		attrs.UpsertString("view.url", view.URL)
+	}
+	if view.Referrer != "" {
+		attrs.UpsertString("view.referrer", view.Referrer)
+	}
+	if view.FirstContentfulPaint > 0 {
+		attrs.UpsertInt("view.first_contentful_paint", view.FirstContentfulPaint)
+	}
+	if view.LargestContentfulPaint > 0 {
+		attrs.UpsertInt("view.largest_contentful_paint", view.LargestContentfulPaint)
+	}
+	if view.InteractionToNextPaint > 0 {
+		attrs.UpsertInt("view.interaction_to_next_paint", view.InteractionToNextPaint)
+	}
+	if view.CumulativeLayoutShift > 0 {
+		attrs.UpsertDouble("view.cumulative_layout_shift", view.CumulativeLayoutShift)
+	}
+	if view.LoadingTime > 0 {
+		attrs.UpsertInt("view.loading_time", view.LoadingTime)
+	}
+	if view.TimeSpent > 0 {
+		attrs.UpsertInt("view.time_spent", view.TimeSpent)
+	}
+
+	addCounterAttribute(attrs, "view.action.count", view.Action)
+	addCounterAttribute(attrs, "view.error.count", view.Error)
+	addCounterAttribute(attrs, "view.long_task.count", view.LongTask)
+	addCounterAttribute(attrs, "view.resource.count", view.Resource)
+	addCounterAttribute(attrs, "view.frustration.count", view.Frustration)
+}
+
+func addCounterAttribute(attrs pcommon.Map, key string, counter *Counter) {
+	if counter == nil || counter.Count <= 0 {
+		return
+	}
+
+	attrs.UpsertInt(key, int64(counter.Count))
+}
+
+func (c *Converter) addConnectivityAttributes(attrs pcommon.Map, connectivity map[string]interface{}) {
+	if connectivity == nil {
+		return
+	}
+
+	if status, ok := c.lookupStringValueWithOk(connectivity, "status"); ok {
+		attrs.UpsertString("connectivity.status", status)
+	}
+	if effectiveType, ok := c.lookupStringValueWithOk(connectivity, "effective_type"); ok {
+		attrs.UpsertString("connectivity.effective_type", effectiveType)
+	}
+}
+
+func (c *Converter) addResourceTraceAttributes(
+	span ptrace.Span,
+	attrs pcommon.Map,
+	resource *ResourceData,
+	resourceURL string,
+) {
+	if resource == nil {
+		return
+	}
+
+	if resourceURL != "" {
+		attrs.UpsertString("http.url", resourceURL)
+	}
+	attrs.UpsertInt("http.status_code", int64(resource.StatusCode))
+	c.setHTTPSpanStatus(span.Status(), resource.StatusCode)
+
+	if resource.Type != "" {
+		attrs.UpsertString("resource.type", resource.Type)
+	}
+	if resource.Protocol != "" {
+		attrs.UpsertString("http.protocol", resource.Protocol)
+	}
+}
+
+func (c *Converter) setHTTPSpanStatus(status ptrace.SpanStatus, statusCode int) {
+	if statusCode >= 200 && statusCode < 300 {
+		status.SetCode(ptrace.StatusCodeOk)
+		status.SetMessage(fmt.Sprintf("HTTP status: %d", statusCode))
+		return
+	}
+
+	status.SetCode(ptrace.StatusCodeError)
+	status.SetMessage(fmt.Sprintf("HTTP Error: %d", statusCode))
+}
+
+func (c *Converter) getViewSpanName(event *RUMEventV2) string {
+	if event != nil && event.View != nil && !event.View.IsActive {
+		return spanNameResourceFetch
+	}
+
+	return spanNameResourceLoad
+}
+
+func (c *Converter) addViewTimingEvents(span ptrace.Span, view *ViewData, baseTime pcommon.Timestamp) {
+	if view == nil {
+		return
+	}
+
+	if view.FirstContentfulPaint > 0 {
+		addTimingEvent(span, "firstContentfulPaint", baseTime+pcommon.Timestamp(view.FirstContentfulPaint))
+	}
+	if view.LargestContentfulPaint > 0 {
+		addTimingEvent(span, "largestContentfulPaint", baseTime+pcommon.Timestamp(view.LargestContentfulPaint))
+	}
+	if view.InteractionToNextPaintTime > 0 {
+		addTimingEvent(span, "interactionToNextPaint", baseTime+pcommon.Timestamp(view.InteractionToNextPaintTime))
+	}
+	if view.CumulativeLayoutShiftTime > 0 {
+		addTimingEvent(span, "cumulativeLayoutShift", baseTime+pcommon.Timestamp(view.CumulativeLayoutShiftTime))
+	}
+	if view.FirstByte > 0 {
+		addTimingEvent(span, "responseStart", baseTime+pcommon.Timestamp(view.FirstByte))
+	}
+	if view.DOMInteractive > 0 {
+		addTimingEvent(span, "domInteractive", baseTime+pcommon.Timestamp(view.DOMInteractive))
+	}
+	if view.DOMContentLoaded > 0 {
+		addTimingEvent(span, "domContentLoadedEventEnd", baseTime+pcommon.Timestamp(view.DOMContentLoaded))
+	}
+	if view.DOMComplete > 0 {
+		addTimingEvent(span, "domComplete", baseTime+pcommon.Timestamp(view.DOMComplete))
+	}
+	if view.LoadEvent > 0 {
+		addTimingEvent(span, "loadEventEnd", baseTime+pcommon.Timestamp(view.LoadEvent))
+	}
+}
+
+// convertResourceToTraces resource 事件转换为 Trace
+func (c *Converter) convertResourceToTraces(event *RUMEventV2) ptrace.Traces {
+	resourceURL := c.extractResourceURL(event)
+	traces, span, ts := c.newClientEventTrace(event, c.getResourceSpanNameForURL(resourceURL))
+	c.addSharedClientTraceAttributes(span, event, resourceURL)
+
+	// 添加完整的 resource timing events 链
+	// 包括 fetchStart, DNS lookup, TCP connect, first byte, download 等
 	if event.Resource != nil {
-		if resourceURL != "" {
-			attrs.UpsertString("http.url", resourceURL)
-		}
-		if statusCode, ok := event.Resource["status_code"].(float64); ok {
-			attrs.UpsertInt("http.status_code", int64(statusCode))
-			if statusCode >= 200 && statusCode < 300 {
-				// 方案 A: 显式设置为 OK (推荐，语义清晰)
-				spanStatus.SetCode(ptrace.StatusCodeOk)
-				spanStatus.SetMessage(fmt.Sprintf("HTTP status: %s", statusCode))
-			} else {
-				// === 失败情况 (非 2xx) ===
-				// 必须设置为 Error (2)
-				spanStatus.SetCode(ptrace.StatusCodeError)
-
-				// 建议带上具体的 HTTP 状态码作为错误消息，方便排查
-				spanStatus.SetMessage(fmt.Sprintf("HTTP Error: %s", statusCode))
-			}
-		}
-		if resType, ok := event.Resource["type"].(string); ok {
-			attrs.UpsertString("resource.type", resType)
-		}
-		if protocol, ok := event.Resource["protocol"].(string); ok {
-			attrs.UpsertString("http.protocol", protocol)
-		}
+		c.addResourceTimingEvents(span, event.Resource, ts)
 	}
+	return traces
+}
 
-	// 添加事件 fetchStart
-	otEvent1 := span.Events().AppendEmpty()
-	otEvent1.SetName("fetchStart")
-	otEvent1.SetTimestamp(pcommon.Timestamp(ts))
-	otEvent1.SetDroppedAttributesCount(0)
+// convertViewToTraces view 事件转换为 Trace
+func (c *Converter) convertViewToTraces(event *RUMEventV2) ptrace.Traces {
+	resourceURL := c.extractResourceURL(event)
+	traces, span, ts := c.newClientEventTrace(event, c.getViewSpanName(event))
+	c.addSharedClientTraceAttributes(span, event, resourceURL)
 
-	// domainLookupStart
-	otEvent2 := span.Events().AppendEmpty()
-	otEvent2.SetName("domainLookupStart")
-	otEvent2.SetTimestamp(pcommon.Timestamp(ts))
-	otEvent2.SetDroppedAttributesCount(0)
+	// 添加完整的 view 性能指标事件
+	// 包括 FCP, LCP, INP, CLS 等
+	c.addViewTimingEvents(span, event.View, ts)
 
-	// domainLookupEnd
-	otEvent3 := span.Events().AppendEmpty()
-	otEvent3.SetName("domainLookupEnd")
-	otEvent3.SetTimestamp(pcommon.Timestamp(ts))
-	otEvent3.SetDroppedAttributesCount(0)
-
-	// connectStart
-	otEvent4 := span.Events().AppendEmpty()
-	otEvent4.SetName("connectStart")
-	otEvent4.SetTimestamp(pcommon.Timestamp(ts))
-	otEvent4.SetDroppedAttributesCount(0)
-	// connectEnd
-	otEvent5 := span.Events().AppendEmpty()
-	otEvent5.SetName("connectEnd")
-	otEvent5.SetTimestamp(pcommon.Timestamp(ts))
-	otEvent5.SetDroppedAttributesCount(0)
-
-	// requestStart
-	requestStartTs := ts + durationTs
-	otEvent6 := span.Events().AppendEmpty()
-	otEvent6.SetName("requestStart")
-	otEvent6.SetTimestamp(pcommon.Timestamp(requestStartTs))
-	otEvent6.SetDroppedAttributesCount(0)
-
-	// responseStart
-	responseStartTs := ts + durationTs
-	otEvent7 := span.Events().AppendEmpty()
-	otEvent7.SetName("responseStart")
-	otEvent7.SetTimestamp(pcommon.Timestamp(responseStartTs))
-	otEvent7.SetDroppedAttributesCount(0)
-
-	// responseEnd
-	responseEndTs := ts + durationTs
-	otEvent8 := span.Events().AppendEmpty()
-	otEvent8.SetName("responseEnd")
-	otEvent8.SetTimestamp(pcommon.Timestamp(responseEndTs))
-	otEvent8.SetDroppedAttributesCount(0)
 	return traces
 }
 
@@ -824,9 +914,13 @@ func (c *Converter) addPerformanceMetrics(scopeMetrics pmetric.ScopeMetrics, res
 }
 
 // addResourceMetrics 添加资源指标
-func (c *Converter) addResourceMetrics(scopeMetrics pmetric.ScopeMetrics, resourceData map[string]interface{}, ts pcommon.Timestamp) {
+func (c *Converter) addResourceMetrics(scopeMetrics pmetric.ScopeMetrics, resource *ResourceData, ts pcommon.Timestamp) {
+	if resource == nil {
+		return
+	}
+
 	// Duration 指标
-	if duration, ok := resourceData["duration"].(float64); ok {
+	if resource.Duration > 0 {
 		metric := scopeMetrics.Metrics().AppendEmpty()
 		metric.SetName("http.client.duration_ms")
 		metric.SetDescription("HTTP client request duration")
@@ -838,7 +932,7 @@ func (c *Converter) addResourceMetrics(scopeMetrics pmetric.ScopeMetrics, resour
 		dataPoint := histogram.DataPoints().AppendEmpty()
 		dataPoint.SetTimestamp(ts)
 		dataPoint.SetCount(1)
-		dataPoint.SetSum(duration)
+		dataPoint.SetSum(resourceDurationToMilliseconds(resource.Duration))
 		dataPoint.SetMExplicitBounds([]float64{10, 50, 100, 500, 1000})
 		bucketCounts := []uint64{0, 0, 0, 0, 0, 1}
 		dataPoint.SetMBucketCounts(bucketCounts)
@@ -846,7 +940,7 @@ func (c *Converter) addResourceMetrics(scopeMetrics pmetric.ScopeMetrics, resour
 	}
 
 	// Size 指标
-	if size, ok := resourceData["size"].(float64); ok {
+	if resource.Size > 0 {
 		metric := scopeMetrics.Metrics().AppendEmpty()
 		metric.SetName("http.client.response_size_bytes")
 		metric.SetDescription("HTTP client response size")
@@ -856,7 +950,7 @@ func (c *Converter) addResourceMetrics(scopeMetrics pmetric.ScopeMetrics, resour
 		gauge := metric.Gauge()
 		dataPoint := gauge.DataPoints().AppendEmpty()
 		dataPoint.SetTimestamp(ts)
-		dataPoint.SetDoubleVal(size)
+		dataPoint.SetDoubleVal(float64(resource.Size))
 		dataPoint.Attributes().UpsertString("event.type", "resource")
 	}
 }
@@ -977,7 +1071,7 @@ func (c *Converter) getSpanNameForEvent(event *RUMEventV2) string {
 	case "error":
 		return "exception"
 	case "performance":
-		return "resource.load"
+		return spanNameResourceLoad
 	default:
 		return fmt.Sprintf("%s.%s", event.Type, event.EventType)
 	}
@@ -986,21 +1080,21 @@ func (c *Converter) getSpanNameForEvent(event *RUMEventV2) string {
 // getResourceSpanName 根据 resource URL 识别 Span Name
 func (c *Converter) getResourceSpanName(event *RUMEventV2) string {
 	resourceURL := c.extractResourceURL(event)
+	return c.getResourceSpanNameForURL(resourceURL)
+}
+
+// getResourceSpanNameForURL 根据 resource URL 识别 Span Name。
+func (c *Converter) getResourceSpanNameForURL(resourceURL string) string {
 	if c.isStaticResourceURL(resourceURL) {
-		return "resourceFetch"
+		return spanNameResourceFetch
 	}
-	return "resource.load"
+	return spanNameResourceLoad
 }
 
 // extractResourceURL 提取 resource URL
 func (c *Converter) extractResourceURL(event *RUMEventV2) string {
-	if event.Resource != nil {
-		if resourceURL, ok := event.Resource["url"].(string); ok && resourceURL != "" {
-			return resourceURL
-		}
-		if name, ok := event.Resource["name"].(string); ok && name != "" {
-			return name
-		}
+	if event.Resource != nil && event.Resource.URL != "" {
+		return event.Resource.URL
 	}
 
 	if event.Data != nil {
@@ -1023,12 +1117,8 @@ func (c *Converter) shouldGenerateLogForResource(event *RUMEventV2) bool {
 		return false
 	}
 
-	statusCode, ok := event.Resource["status_code"].(float64)
-	if !ok {
-		return false
-	}
-
-	return statusCode < 200 || statusCode >= 300
+	// 仅当 HTTP 状态码非 2xx 时生成额外日志
+	return event.Resource.StatusCode < 200 || event.Resource.StatusCode >= 300
 }
 
 // isStaticResourceURL 判断 URL 是否为静态资源
@@ -1097,53 +1187,48 @@ func (c *Converter) generateSpanID(event *RUMEventV2) string {
 
 // lookupEventSpecificSpanID 提取不同事件类型自身的唯一 id。
 func (c *Converter) lookupEventSpecificSpanID(event *RUMEventV2) (string, bool) {
-	fields, ok := c.lookupEventSpecificSpanFields(event)
-	if !ok {
-		return "", false
-	}
-
-	return c.lookupStringValueWithOk(fields, "id")
-}
-
-// lookupEventSpecificSpanFields 返回不同事件类型对应的字段 map。
-func (c *Converter) lookupEventSpecificSpanFields(event *RUMEventV2) (map[string]interface{}, bool) {
 	if event == nil {
-		return nil, false
+		return "", false
 	}
 
 	switch event.Type {
 	case "resource":
-		return event.Resource, event.Resource != nil
+		if event.Resource != nil && event.Resource.ID != "" {
+			return event.Resource.ID, true
+		}
 	case "view":
-		return event.View, event.View != nil
+		if event.View != nil && event.View.ID != "" {
+			return event.View.ID, true
+		}
 	case "action":
-		return event.Action, event.Action != nil
+		if event.Action != nil {
+			if id, ok := event.Action["id"].(string); ok && id != "" {
+				return id, true
+			}
+		}
 	case "long_task":
-		return event.LongTask, event.LongTask != nil
+		if event.LongTask != nil {
+			if id, ok := event.LongTask["id"].(string); ok && id != "" {
+				return id, true
+			}
+		}
 	case "error":
-		return event.Error, event.Error != nil
+		if event.Error != nil {
+			if id, ok := event.Error["id"].(string); ok && id != "" {
+				return id, true
+			}
+		}
 	case "performance":
-		return c.lookupMapValueWithOk(event.Data, "resource")
-	default:
-		return nil, false
-	}
-}
-
-// lookupMapValueWithOk 从 map 中提取嵌套 map 值并返回是否存在。
-func (c *Converter) lookupMapValueWithOk(
-	fields map[string]interface{},
-	key string,
-) (map[string]interface{}, bool) {
-	if fields == nil {
-		return nil, false
+		if event.Data != nil {
+			if resourceData, ok := event.Data["resource"].(map[string]interface{}); ok {
+				if id, ok := resourceData["id"].(string); ok && id != "" {
+					return id, true
+				}
+			}
+		}
 	}
 
-	value, ok := fields[key].(map[string]interface{})
-	if !ok || value == nil {
-		return nil, false
-	}
-
-	return value, true
+	return "", false
 }
 
 // lookupStringValueWithOk 从 map 中提取字符串值并返回是否存在。
@@ -1188,4 +1273,70 @@ func (c *Converter) hashToFixedHex(source string, length int) string {
 		return result[:length]
 	}
 	return result
+}
+
+// getTimingValues 从 ResourceData 中提取 start 和 duration 时间值。
+// 返回相对于基准时间（baseTime）的计算时间戳。
+func (c *Converter) getTimingValues(
+	timing *ResourceTiming,
+	baseTime pcommon.Timestamp,
+) (pcommon.Timestamp, pcommon.Timestamp) {
+	if timing == nil {
+		return baseTime, baseTime
+	}
+
+	startTs := baseTime + pcommon.Timestamp(uint64(timing.Start))
+	endTs := startTs + pcommon.Timestamp(uint64(timing.Duration))
+
+	return startTs, endTs
+}
+
+// addTimingEvent 向 span 中添加单个 timing event。
+func addTimingEvent(span ptrace.Span, name string, timestamp pcommon.Timestamp) {
+	event := span.Events().AppendEmpty()
+	event.SetName(name)
+	event.SetTimestamp(timestamp)
+	event.SetDroppedAttributesCount(0)
+}
+
+// addResourceTimingEvents 为资源请求添加完整的 timing events 链。
+// 包括 DNS、Connect、FirstByte 和 Download 事件。
+func (c *Converter) addResourceTimingEvents(span ptrace.Span, resource *ResourceData, baseTime pcommon.Timestamp) {
+	if resource == nil {
+		return
+	}
+
+	// fetchStart
+	addTimingEvent(span, "fetchStart", baseTime)
+
+	// DNS timing: domainLookupStart 和 domainLookupEnd
+	if resource.DNS != nil {
+		dnsStart, dnsEnd := c.getTimingValues(resource.DNS, baseTime)
+		addTimingEvent(span, "domainLookupStart", dnsStart)
+		addTimingEvent(span, "domainLookupEnd", dnsEnd)
+	}
+
+	// TCP Connect timing: connectStart 和 connectEnd
+	if resource.Connect != nil {
+		connectStart, connectEnd := c.getTimingValues(resource.Connect, baseTime)
+		addTimingEvent(span, "connectStart", connectStart)
+		addTimingEvent(span, "connectEnd", connectEnd)
+	} else {
+		// 无连接数据时使用基准时间
+		addTimingEvent(span, "connectStart", baseTime)
+		addTimingEvent(span, "connectEnd", baseTime)
+	}
+
+	// First Byte timing: requestStart 和 responseStart
+	if resource.FirstByte != nil {
+		fbStart, fbEnd := c.getTimingValues(resource.FirstByte, baseTime)
+		addTimingEvent(span, "requestStart", fbStart)
+		addTimingEvent(span, "responseStart", fbEnd)
+	}
+
+	// Download timing: responseEnd
+	if resource.Download != nil {
+		_, dlEnd := c.getTimingValues(resource.Download, baseTime)
+		addTimingEvent(span, "responseEnd", dlEnd)
+	}
 }
