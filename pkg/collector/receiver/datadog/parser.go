@@ -41,7 +41,7 @@ type RUMEventV2 struct {
 	DDTags  string `json:"ddtags,omitempty"`  // 标签字符串
 
 	// 嵌套对象（保持为 map 以支持动态结构）
-	DD           map[string]interface{} `json:"_dd,omitempty"`          // Datadog 元数据
+	DD           *DDData                `json:"_dd,omitempty"`          // Datadog 元数据（强类型结构）
 	Application  map[string]interface{} `json:"application,omitempty"`  // 应用信息
 	View         *ViewData              `json:"view,omitempty"`         // 视图信息（强类型结构）
 	Session      map[string]interface{} `json:"session,omitempty"`      // 会话信息
@@ -71,6 +71,7 @@ type ResourceData struct {
 	ID         string `json:"id,omitempty"`          // 资源唯一 ID
 	Type       string `json:"type,omitempty"`        // 资源类型 (document, xhr, fetch, image, css, js, etc.)
 	URL        string `json:"url,omitempty"`         // 资源 URL
+	Method     string `json:"method,omitempty"`      // HTTP 方法 (GET, POST, PUT, DELETE, etc.)
 	StatusCode int    `json:"status_code,omitempty"` // HTTP 状态码
 	Duration   int64  `json:"duration,omitempty"`    // 总耗时（纳秒）
 
@@ -136,6 +137,47 @@ type Rect struct {
 	Y      float64 `json:"y,omitempty"`      // Y 坐标
 	Width  float64 `json:"width,omitempty"`  // 宽度
 	Height float64 `json:"height,omitempty"` // 高度
+}
+
+// DDConfiguration 表示 Datadog SDK 配置信息
+type DDConfiguration struct {
+	SessionSampleRate       int  `json:"session_sample_rate,omitempty"`        // 会话采样率
+	SessionReplaySampleRate int  `json:"session_replay_sample_rate,omitempty"` // 会话回放采样率
+	ProfilingSampleRate     int  `json:"profiling_sample_rate,omitempty"`      // 性能分析采样率
+	TraceSampleRate         int  `json:"trace_sample_rate,omitempty"`          // 链路追踪采样率
+	BetaEncodeCookieOptions bool `json:"beta_encode_cookie_options,omitempty"` // Cookie 编码选项
+}
+
+// DDActionTarget 表示用户交互目标信息（按钮、链接等）
+type DDActionTarget struct {
+	Width    int    `json:"width,omitempty"`    // 目标宽度（像素）
+	Height   int    `json:"height,omitempty"`   // 目标高度（像素）
+	Selector string `json:"selector,omitempty"` // CSS 选择器
+}
+
+// DDActionPosition 表示用户交互位置信息
+type DDActionPosition struct {
+	X int `json:"x,omitempty"` // X 坐标（相对于视口）
+	Y int `json:"y,omitempty"` // Y 坐标（相对于视口）
+}
+
+// DDAction 表示 SDK 层面的用户动作信息（用于 click 事件追踪）
+type DDAction struct {
+	Target     *DDActionTarget   `json:"target,omitempty"`      // 目标元素信息
+	Position   *DDActionPosition `json:"position,omitempty"`    // 点击位置
+	NameSource string            `json:"name_source,omitempty"` // 动作名称来源（text_content, placeholder 等）
+}
+
+// DDData 表示 Datadog 元数据的完整结构
+type DDData struct {
+	FormatVersion int              `json:"format_version,omitempty"` // 格式版本
+	Drift         int              `json:"drift,omitempty"`          // 时间漂移（毫秒）
+	Configuration *DDConfiguration `json:"configuration,omitempty"`  // SDK 配置信息
+	SDKName       string           `json:"sdk_name,omitempty"`       // SDK 名称（rum, logs 等）
+	Discarded     bool             `json:"discarded,omitempty"`      // 是否丢弃该事件
+	SpanID        string           `json:"span_id,omitempty"`        // 链路追踪 Span ID
+	TraceID       string           `json:"trace_id,omitempty"`       // 链路追踪 Trace ID
+	Action        *DDAction        `json:"action,omitempty"`         // SDK 层面追踪的用户动作
 }
 
 // ViewData 表示 Datadog RUM 视图信息的强类型结构

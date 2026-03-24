@@ -113,7 +113,7 @@ func convertDataToDatadogEventV2(data interface{}) (RUMEventV2, error) {
 	}
 
 	// 提取嵌套对象（保持完整的 map 结构）
-	event.DD = getMapValue(m, "_dd")
+	event.DD = getDDData(m, "_dd")
 	event.Application = getMapValue(m, "application")
 	event.View = getViewData(m, "view")
 	event.Session = getMapValue(m, "session")
@@ -189,6 +189,10 @@ func getResourceData(m map[string]interface{}, key string) *ResourceData {
 	// HTTP 状态码
 	if v, ok := resourceMap["status_code"].(float64); ok {
 		resource.StatusCode = int(v)
+	}
+
+	if v, ok := resourceMap["method"].(string); ok {
+		resource.Method = v
 	}
 
 	// 传输信息
@@ -384,6 +388,28 @@ func getViewPerformanceMetrics(viewMap map[string]interface{}) *ViewPerformanceM
 	}
 
 	return metrics
+}
+
+// getDDData 从 map 中提取并转换为 DDData 结构
+func getDDData(m map[string]interface{}, key string) *DDData {
+	ddMap := getMapValue(m, key)
+	if ddMap == nil {
+		return nil
+	}
+
+	ddBytes, err := json.Marshal(ddMap)
+	if err != nil {
+		logger.Debugf("marshal DDData failed: %v", err)
+		return nil
+	}
+
+	ddData := &DDData{}
+	if err := json.Unmarshal(ddBytes, ddData); err != nil {
+		logger.Debugf("unmarshal DDData failed: %v", err)
+		return nil
+	}
+
+	return ddData
 }
 
 // transformRecord 将原始数据转换为 OTEL 格式。

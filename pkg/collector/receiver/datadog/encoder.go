@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -45,9 +46,9 @@ type ConversionOutput struct {
 }
 
 const (
-	rumScopeName         = "datadog rum"
-	rumScopeVersion      = "1.0.0"
-	spanNameResourceLoad = "resource.load"
+	rumScopeName          = "datadog rum"
+	rumScopeVersion       = "1.0.0"
+	spanNameResourceLoad  = "resource.load"
 	spanNameResourceFetch = "resourceFetch"
 )
 
@@ -182,7 +183,7 @@ func (s *actionEventStrategy) CanHandle(event *RUMEventV2) bool {
 
 func (s *actionEventStrategy) Convert(event *RUMEventV2, converter *Converter) ConversionOutput {
 	output := ConversionOutput{
-		Traces:  converter.convertSimpleEventToTraces(event),
+		Traces:  converter.convertActionEventToTraces(event),
 		Logs:    plog.NewLogs(),
 		Metrics: pmetric.NewMetrics(),
 	}
@@ -414,7 +415,48 @@ func (c *Converter) stringToSpanID(hexStr string) pcommon.SpanID {
 	return pcommon.NewSpanID(spanID)
 }
 
-// ======== Trace 转换 ========
+// convertSimpleEventToTraces 简单事件（view, action, log）转换为 Trace
+func (c *Converter) convertActionEventToTraces(event *RUMEventV2) ptrace.Traces {
+	traces := ptrace.NewTraces()
+	resourceSpans := traces.ResourceSpans().AppendEmpty()
+	c.enrichResource(resourceSpans.Resource(), event)
+
+	scopeSpans := resourceSpans.ScopeSpans().AppendEmpty()
+	span := scopeSpans.Spans().AppendEmpty()
+
+	// 确定 Span Name
+	span.SetName("action")
+	span.SetKind(ptrace.SpanKindInternal)
+
+	// 时间戳
+	ts := pcommon.NewTimestampFromTime(time.UnixMilli(event.Date))
+	span.SetStartTimestamp(ts)
+	span.SetEndTimestamp(ts + (pcommon.Timestamp(time.Millisecond)))
+
+	// Trace & Span ID
+	traceID := c.generateTraceID(event)
+	spanID := c.generateSpanID(event)
+	span.SetTraceID(c.stringToTraceID(traceID))
+	span.SetSpanID(c.stringToSpanID(spanID))
+
+	// 属性
+	attrs := span.Attributes()
+	attrs.UpsertString("event_type", event.Action["type"].(string))
+	attrs.UpsertString("target_xpath", event.DD.Action.Target.Selector)
+	attrs.UpsertString("target_element", event.Action["type"].(string))
+	attrs.UpsertString("http.url", event.View.URL)
+	attrs.UpsertString("event.domain", event.EventType)
+
+	// 根据类型添加特定属性
+	if actionType, ok := event.Action["type"].(string); ok {
+		attrs.UpsertString("action.type", actionType)
+	}
+	if id, ok := event.Action["id"].(string); ok {
+		attrs.UpsertString("action.id", id)
+	}
+
+	return traces
+}
 
 // convertSimpleEventToTraces 简单事件（view, action, log）转换为 Trace
 func (c *Converter) convertSimpleEventToTraces(event *RUMEventV2) ptrace.Traces {
@@ -766,14 +808,48 @@ func (c *Converter) addViewTimingEvents(span ptrace.Span, view *ViewData, baseTi
 
 // convertResourceToTraces resource 事件转换为 Trace
 func (c *Converter) convertResourceToTraces(event *RUMEventV2) ptrace.Traces {
+	traces := ptrace.NewTraces()
+	resourceSpans := traces.ResourceSpans().AppendEmpty()
+	c.enrichResource(resourceSpans.Resource(), event)
+	scopeSpans := resourceSpans.ScopeSpans().AppendEmpty()
+	scope := scopeSpans.Scope()
+	scope.SetName(rumScopeName)
+	scope.SetVersion(rumScopeVersion)
+
+	span := scopeSpans.Spans().AppendEmpty()
+	span.SetKind(ptrace.SpanKindClient)
+	// span开始时间
+	startTs := pcommon.NewTimestampFromTime(time.UnixMilli(event.Date))
+	span.SetStartTimestamp(startTs)
+	span.SetEndTimestamp(c.getClientSpanEndTimestamp(event, startTs))
+	c.populateSpanIdentity(span, event)
+	span.Attributes().UpsertString("event.type", event.Type)
+	// 判断是否为发送 API 请求类型
+	if event.Resource.Type == "xhr" || event.Resource.Type == "fetch" {
+		span.SetName(event.Resource.Method)
+
+		span.Attributes().UpsertString("http.method", event.Resource.Method)
+		span.Attributes().UpsertString("http.url", event.Resource.URL)
+		// 从 url 中获取 host
+		parsedURL, err := url.Parse(event.Resource.URL)
+		if err != nil {
+			logger.Debugf("解析 URL %s 失败: %v", event.Resource.URL, err)
+		}
+		host := parsedURL.Host
+		span.Attributes().UpsertString("http.host", host)
+		span.Attributes().UpsertString("http.scheme", parsedURL.Scheme)
+		span.Attributes().UpsertString("http.status_code", parsedURL.Scheme)
+		span.Attributes().UpsertString("datadog.trace_id", event.DD.TraceID)
+		span.Attributes().UpsertString("datadog.span_id", event.DD.SpanID)
+		return traces
+	}
 	resourceURL := c.extractResourceURL(event)
-	traces, span, ts := c.newClientEventTrace(event, c.getResourceSpanNameForURL(resourceURL))
 	c.addSharedClientTraceAttributes(span, event, resourceURL)
 
 	// 添加完整的 resource timing events 链
 	// 包括 fetchStart, DNS lookup, TCP connect, first byte, download 等
 	if event.Resource != nil {
-		c.addResourceTimingEvents(span, event.Resource, ts)
+		c.addResourceTimingEvents(span, event.Resource, startTs)
 	}
 	return traces
 }
