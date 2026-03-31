@@ -448,11 +448,11 @@ default:
                     {%- endfor %}
                   replace_from:
                     source:
-                      {%- for key in rule.source %}
+                      {%- for key in rule.replace_from.source %}
                       - '{{ key }}'
                       {%- endfor %}
-                    separator: '{{ rule.separator }}'
-                    const_val: '{{ rule.const_val }}'
+                    separator: '{{ rule.replace_from.separator }}'
+                    const_val: '{{ rule.replace_from.const_val }}'
                 {%- endfor %}
             {%- endfor %}
           {%- endif %}
