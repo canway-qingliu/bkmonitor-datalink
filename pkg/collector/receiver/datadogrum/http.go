@@ -526,7 +526,7 @@ func (s HttpService) publishConvertedRecords(conversionResult ConversionResult, 
 			continue
 		}
 
-		// s.Publish(r)
+		s.Publish(r)
 		receiver.RecordHandleMetrics(metricMonitor, r.Token, define.RequestHttp, item.rtype, bodySize, start)
 	}
 }
