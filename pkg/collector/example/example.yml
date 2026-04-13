@@ -162,6 +162,9 @@ bk-collector:
       # 服务监听端点
       # default: ""
       endpoint: ":4319"
+    recvServer:
+      enabled: true
+
 
   # =============================== Processor ================================
   # name: 名称规则为 ${processor}[/${id}]，id 字段为可选项
@@ -179,6 +182,11 @@ bk-collector:
   # - traces_deriver: [duration]
 
   processor:
+    - name: "resource_filter/client_ip"
+      config:
+        from_record:
+          - source: "request.client.ip"
+            destination: "client.ip"
     # ApdexCalculator: 健康度状态计算器
     # Fixed
     - name: "apdex_calculator/fixed"
@@ -1030,6 +1038,25 @@ bk-collector:
                   - "attributes.celery.state"
                   - "attributes.celery.action"
                   - "attributes.apdex_type"
+    # 新增：LCP (最大内容绘制) 按分钟统计
+    - name: "traces_deriver/web_vitals"
+      config:
+        operations:
+          # 统计 LCP 耗时直方图（单位：秒，配置中的数值将由累加器乘以 1e9 转为纳秒）
+          - type: "bucket"
+            metric_name: "web_vital_lcp_bucket"
+            publish_interval: "30s"
+            gc_interval: "1h"
+            buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0]
+            max_series: 10
+            rules:
+              - kind: "SPAN_KIND_INTERNAL"
+                predicate_key: "attributes.web_vital.value"
+                dimensions:
+                  - "resource.service.name"
+                  - "resource.browser.user_agent"
+                  - "attributes.page.url"
+                  - "resource.name"
 
 
   # =============================== Pipeline =================================
@@ -1037,6 +1064,13 @@ bk-collector:
   # type: pipeline 处理类型，可选项：traces/metrics/logs 以及派生项: traces.derived/metrics.derived/logs.derived
   # processors: 上述定义的处理器名称
   pipeline:
+    - name: "rum_pipeline/direct"
+      type: "rumTraces"
+      processors: 
+        - "token_checker/aes256"
+        - "rate_limiter/token_bucket"
+        - "traces_deriver/web_vitals"
+
     - name: "traces_pipeline/common"
       type: "traces"
       processors:
@@ -1063,6 +1097,8 @@ bk-collector:
         - "traces_deriver/max"
         - "traces_deriver/sum"
         - "traces_deriver/bucket"
+        - "traces_deriver/web_vitals"
+
 
     - name: "logs_pipeline/common"
       type: "logs"
@@ -1144,6 +1180,10 @@ bk-collector:
 
   # =============================== Exporter =================================
   exporter:
+    debug:
+      verbosity: detailed  # 必须设为 detailed，否则只打印概要
+      sampling_initial: 5  # 初始打印数量
+      sampling_thereafter: 200 # 之后每隔多少条打印一次
     slow_send:
       enabled: true
       # 慢发送检查周期
@@ -1170,3 +1210,21 @@ bk-collector:
             tags: ["caller_ip"]
           - scope_name: "client_metrics"
             tags: ["callee_ip"]
+
+
+
+exporters:
+  debug:
+    verbosity: detailed  # 必须设为 detailed，否则只打印概要
+    sampling_initial: 5  # 初始打印数量
+    sampling_thereafter: 200 # 之后每隔多少条打印一次
+
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      # ✅ 正确：只保留标准的 Processor（如 batch）
+      processors: [batch] 
+      # 转发逻辑应该在 Exporters 中定义
+      exporters: [otlp] 
