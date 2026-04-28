@@ -22,10 +22,10 @@ output.console:
 
 
 # ================================= Path =====================================
-#path:
-#  logs: /var/log/gse_opbk
-#  data: /var/lib/gse_opbk
-#  pid: /var/run/gse_opbk
+# path:
+#  logs: ./log/gse_opbk
+#  data: ./lib/gse_opbk
+#  pid: ./run/gse_opbk
 
 
 # ============================ Publisher Queue ===============================
@@ -1054,6 +1054,28 @@ bk-collector:
                   - "resource.browser.user_agent"
                   - "attributes.page.url"
                   - "resource.name"
+                  - "attributes.rum_apdex_type"
+    # 页面加载耗时
+    - name: "apdex_calculator/rum_page_load"
+      config:
+        calculator:
+          type: "standard"
+        rules:
+          - kind: "SPAN_KIND_INTERNAL"
+            predicate_key: "attributes.web_vital.value"
+            value_from: "attributes.web_vital.value"
+            destination: "rum_apdex_type"
+            apdex_t: 500 # ms
+    # 页面 API 请求耗时
+    - name: "apdex_calculator/rum_api"
+      config:
+        calculator:
+          type: "standard"
+        rules:
+          - kind: "SPAN_KIND_INTERNAL"
+            predicate_key: "attributes.web_vital.value"
+            destination: "rum_apdex_type"
+            apdex_t: 500 # ms
 
 
   # =============================== Pipeline =================================
@@ -1062,10 +1084,11 @@ bk-collector:
   # processors: 上述定义的处理器名称
   pipeline:
     - name: "rum_pipeline/direct"
-      type: "rumTraces"
+      type: "rum"
       processors:
         - "token_checker/aes256"
         - "rate_limiter/token_bucket"
+        - "apdex_calculator/rum_page_load"
         - "traces_deriver/web_vitals"
 
     - name: "traces_pipeline/common"

@@ -58,7 +58,7 @@ func (r RecordType) S() string { return string(r) }
 const (
 	RecordUndefined      RecordType = "undefined"
 	RecordTraces         RecordType = "traces"
-	RecordRumTraces      RecordType = "rumTraces"
+	RecordRum            RecordType = "rum"
 	RecordProfiles       RecordType = "profiles"
 	RecordMetrics        RecordType = "metrics"
 	RecordLogs           RecordType = "logs"
@@ -79,8 +79,8 @@ const (
 func IntoRecordType(s string) (RecordType, bool) {
 	var t RecordType
 	switch s {
-	case RecordRumTraces.S():
-		t = RecordRumTraces
+	case RecordRum.S():
+		t = RecordRum
 	case RecordTraces.S():
 		t = RecordTraces
 	case RecordMetrics.S():

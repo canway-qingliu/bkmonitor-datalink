@@ -88,7 +88,7 @@ func (c commonConverter) Convert(record *define.Record, f define.GatherFunc) {
 	switch record.RecordType {
 	case define.RecordTraces:
 		c.traces.Convert(record, f)
-	case define.RecordRumTraces:
+	case define.RecordRum:
 		c.traces.Convert(record, f)
 	case define.RecordMetrics:
 		c.metrics.Convert(record, f)

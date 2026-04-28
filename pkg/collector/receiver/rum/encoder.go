@@ -30,7 +30,7 @@ type Encoder interface {
 
 func unmarshalRecordData(encoder Encoder, rtype define.RecordType, b []byte) (any, error) {
 	switch rtype {
-	case define.RecordRumTraces:
+	case define.RecordRum:
 		return encoder.UnmarshalTraces(b)
 	case define.RecordMetrics:
 		return encoder.UnmarshalMetrics(b)

@@ -34,7 +34,7 @@ import (
 )
 
 const (
-	routeV1Rum = "/v1/otlprum"
+	routeV1Rum = "/v1/rum"
 )
 
 var metricMonitor = receiver.DefaultMetricMonitor.Source(define.SourceRum)
@@ -143,7 +143,7 @@ func (s HttpService) httpExport(w http.ResponseWriter, req *http.Request, rtype 
 }
 
 func (s HttpService) ExportRum(w http.ResponseWriter, req *http.Request) {
-	s.httpExport(w, req, define.RecordRumTraces)
+	s.httpExport(w, req, define.RecordRum)
 }
 
 func (s HttpService) getResponseHandler(contentType string) receiver.ResponseHandler {
@@ -172,7 +172,7 @@ func (h httpPbResponseHandler) ContentType() string {
 
 func (h httpPbResponseHandler) Response(rtype define.RecordType) ([]byte, error) {
 	switch rtype {
-	case define.RecordRumTraces:
+	case define.RecordRum:
 		return ptraceotlp.NewResponse().MarshalProto()
 	case define.RecordMetrics:
 		return pmetricotlp.NewResponse().MarshalProto()
@@ -215,7 +215,7 @@ func (h httpJsonResponseHandler) ContentType() string {
 
 func (h httpJsonResponseHandler) Response(rtype define.RecordType) ([]byte, error) {
 	switch rtype {
-	case define.RecordRumTraces:
+	case define.RecordRum:
 		return ptraceotlp.NewResponse().MarshalJSON()
 	case define.RecordTraces:
 		return ptraceotlp.NewResponse().MarshalJSON()
