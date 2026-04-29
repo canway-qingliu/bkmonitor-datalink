@@ -22,10 +22,10 @@ output.console:
 
 
 # ================================= Path =====================================
-# path:
-#  logs: ./log/gse_opbk
-#  data: ./lib/gse_opbk
-#  pid: ./run/gse_opbk
+#path:
+#  logs: /var/log/gse_opbk
+#  data: /var/lib/gse_opbk
+#  pid: /var/run/gse_opbk
 
 
 # ============================ Publisher Queue ===============================
@@ -1056,26 +1056,30 @@ bk-collector:
                   - "resource.name"
                   - "attributes.rum_apdex_type"
     # 页面加载耗时
-    - name: "apdex_calculator/rum_page_load"
+    - name: "apdex_calculator/rum_view_load"
       config:
         calculator:
           type: "standard"
         rules:
           - kind: "SPAN_KIND_INTERNAL"
-            predicate_key: "attributes.web_vital.value"
-            value_from: "attributes.web_vital.value"
-            destination: "rum_apdex_type"
+            # documentLoad span: loadEventEnd - fetchStart ~= span end - span start
+            predicate_key: "span_name"
+            predicate_value: "documentLoad"
+            destination: "rum_view_load_apdex_type"
             apdex_t: 500 # ms
     # 页面 API 请求耗时
-    - name: "apdex_calculator/rum_api"
+    - name: "apdex_calculator/rum_api_request"
       config:
         calculator:
           type: "standard"
         rules:
-          - kind: "SPAN_KIND_INTERNAL"
-            predicate_key: "attributes.web_vital.value"
-            destination: "rum_apdex_type"
+          - kind: "SPAN_KIND_CLIENT"
+            predicate_key: "attributes.http.method"
+            destination: "rum_api_request_apdex_type"
             apdex_t: 500 # ms
+            duration:
+              start_event: "fetchStart"
+              end_event: "responseEnd"
 
 
   # =============================== Pipeline =================================
@@ -1088,8 +1092,8 @@ bk-collector:
       processors:
         - "token_checker/aes256"
         - "rate_limiter/token_bucket"
-        - "apdex_calculator/rum_page_load"
-        - "traces_deriver/web_vitals"
+        - "apdex_calculator/rum_view_load"
+        - "apdex_calculator/rum_api_request"
 
     - name: "traces_pipeline/common"
       type: "traces"
