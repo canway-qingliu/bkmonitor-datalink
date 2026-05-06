@@ -53,7 +53,11 @@ func queryExemplar(ctx context.Context, query *structured.QueryTs) (any, error) 
 	)
 
 	ctx, span := trace.NewSpan(ctx, "query-exemplar")
-	defer span.End(&err)
+	defer func() {
+		resp.TraceID = span.TraceID()
+		resp.Status = metadata.GetStatus(ctx)
+		span.End(&err)
+	}()
 
 	qStr, _ := json.Marshal(query)
 	span.Set("query-ts", string(qStr))
@@ -157,8 +161,9 @@ func queryRawWithInstance(ctx context.Context, queryTs *structured.QueryTs) (tot
 		dataCh    = make(chan map[string]any)
 		errCh     = make(chan error)
 
-		message strings.Builder
-		lock    sync.Mutex
+		errorMessage   strings.Builder
+		successedPaths atomic.Uint32
+		lock           sync.Mutex
 
 		allLabelMap  = make(map[string][]function.LabelMapValue)
 		allFieldsMap = make(metadata.FieldsMap)
@@ -175,13 +180,7 @@ func queryRawWithInstance(ctx context.Context, queryTs *structured.QueryTs) (tot
 	go func() {
 		defer receiveWg.Done()
 		for e := range errCh {
-			message.WriteString(fmt.Sprintf("query error: %s ", e.Error()))
-		}
-		if message.Len() > 0 {
-			err = metadata.NewMessage(
-				metadata.MsgQueryRaw,
-				"查询原始数据报错",
-			).Error(ctx, errors.New(message.String()))
+			errorMessage.WriteString(fmt.Sprintf("query error: %s ", e.Error()))
 		}
 	}()
 
@@ -338,7 +337,7 @@ func queryRawWithInstance(ctx context.Context, queryTs *structured.QueryTs) (tot
 
 				instance := prometheus.GetTsDbInstance(ctx, qry)
 				if instance == nil {
-					err = metadata.NewMessage(
+					errCh <- metadata.NewMessage(
 						metadata.MsgQueryRaw,
 						"查询实例为空",
 					).Error(ctx, nil)
@@ -364,6 +363,8 @@ func queryRawWithInstance(ctx context.Context, queryTs *structured.QueryTs) (tot
 					return
 				}
 
+				successedPaths.Add(1)
+
 				// 如果配置了 IsMultiFrom，则无需使用 scroll 和 searchAfter 配置
 				lock.Lock()
 				resultTableOptions.SetOption(qry.TableUUID(), option)
@@ -376,6 +377,26 @@ func queryRawWithInstance(ctx context.Context, queryTs *structured.QueryTs) (tot
 
 	// 等待数据组装完毕
 	receiveWg.Wait()
+
+	if errorMessage.Len() > 0 {
+		partialDetail := strings.TrimSpace(errorMessage.String())
+		if successedPaths.Load() > 0 {
+			err = nil
+			span.Set("partial_errors", partialDetail)
+			const warnPrefix = "查询原始数据部分失败: "
+			fullMsg := warnPrefix + partialDetail
+			if existing := metadata.GetStatus(ctx); existing != nil && existing.Message != "" {
+				fullMsg = existing.Message + "; " + fullMsg
+			}
+			metadata.SetStatus(ctx, metadata.QueryRawPartial, fullMsg)
+		} else {
+			err = metadata.NewMessage(
+				metadata.MsgQueryRaw,
+				"查询原始数据报错",
+			).Error(ctx, errors.New(partialDetail))
+		}
+	}
+
 	return total, list, resultTableOptions, err
 }
 
@@ -581,11 +602,6 @@ func queryReferenceWithPromEngine(ctx context.Context, queryTs *structured.Query
 		}
 		if ql.From == 0 && queryTs.From > 0 {
 			ql.From = queryTs.From
-		}
-
-		if ql.TableID == "" {
-			err = fmt.Errorf("tableID is empty")
-			return nil, err
 		}
 	}
 
@@ -1041,9 +1057,14 @@ func QueryTsClusterMetrics(ctx context.Context, query *structured.QueryTs) (any,
 		err       error
 		res       any
 		isPartial bool
+		resp      = NewPromData(query.ResultColumns)
 	)
 	ctx, span := trace.NewSpan(ctx, "query-ts-cluster-metrics")
-	defer span.End(&err)
+	defer func() {
+		resp.TraceID = span.TraceID()
+		resp.Status = metadata.GetStatus(ctx)
+		span.End(&err)
+	}()
 
 	err = query.ToTime(ctx)
 	if err != nil {
@@ -1103,7 +1124,6 @@ func QueryTsClusterMetrics(ctx context.Context, query *structured.QueryTs) (any,
 	span.Set("resp-series-num", seriesNum)
 	span.Set("resp-points-num", pointsNum)
 
-	resp := NewPromData(query.ResultColumns)
 	resp.IsPartial = isPartial
 	err = resp.Fill(tables)
 	if err != nil {

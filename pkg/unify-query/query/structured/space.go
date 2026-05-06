@@ -126,8 +126,10 @@ func (s *SpaceFilter) NewTsDBs(spaceTable *routerInfluxdb.SpaceResultTable, fiel
 		}
 	}
 
-	// 只有在容器场景下的特殊逻辑
-	if isK8s {
+	// 容器场景下的特殊过滤逻辑：仅在未显式提供 table_id_conditions 时生效。
+	// 若调用方已通过 table_id_conditions 按 Labels 显式路由，则信任该选择，不再叠加"仅 bk_split_measurement / BcsClusterID 匹配"的容器默认规则，
+	// 避免把 bklog/bkapm 等非 split-measurement 的 RT 误过滤掉。
+	if isK8s && len(tableIDConditions) == 0 {
 		// 增加在非单指标单表下，判断如果强行指定了单指标单表则对其进行修改以支持 vm 查询
 		isSplitMeasurement := rtDetail.MeasurementType == redis.BkSplitMeasurement
 
@@ -279,7 +281,9 @@ func (s *SpaceFilter) DataList(opt *TsDBOption) ([]*query.TsDBV2, error) {
 		return nil, fmt.Errorf("%s, %s", ErrEmptyTableID.Error(), ErrMetricMissing.Error())
 	}
 
-	if opt.TableID == "" && opt.FieldName == "" {
+	// 允许调用方仅通过 table_id_conditions 做全空间扫表路由
+	// 仅当 table_id、metric_name、table_id_conditions 三者都缺失时才判为"入参不完整"直接拒绝
+	if opt.TableID == "" && opt.FieldName == "" && len(opt.TableIDConditions) == 0 {
 		return nil, fmt.Errorf("%s, %s", ErrEmptyTableID.Error(), ErrMetricMissing.Error())
 	}
 	tsDBs := make([]*query.TsDBV2, 0)
@@ -336,11 +340,20 @@ func (s *SpaceFilter) DataList(opt *TsDBOption) ([]*query.TsDBV2, error) {
 
 	isK8sFeatureFlag := featureFlag.GetIsK8sFeatureFlag(s.ctx)
 
+	// 仅在启用了 table_id_conditions 时跟踪是否有候选 RT 的 Labels 命中，避免后续失败原因不在 Labels 时追加误导文案
+	anyLabelMatched := len(tableIDCondsForFilter) == 0
 	for _, tID := range tableIDs.ToArray() {
 		spaceRt := s.GetSpaceRtInfo(tID)
 		// 如果不跳过空间，则取 space 和 tableIDs 的交集
 		if !opt.IsSkipSpace && spaceRt == nil {
 			continue
+		}
+		if !anyLabelMatched {
+			if rt := s.router.GetResultTable(s.ctx, tID, false); rt != nil {
+				if tableIDCondsForFilter.MatchesResultTableLabels(rt.Labels) {
+					anyLabelMatched = true
+				}
+			}
 		}
 		// 指标模糊匹配，可能命中多个私有指标 RT
 		newTsDBs, err := s.NewTsDBs(spaceRt, fieldNameExp, opt.AllConditions, opt.FieldName, tID, isK8s, isK8sFeatureFlag, opt.IsSkipField, tableIDCondsForFilter)
@@ -354,8 +367,8 @@ func (s *SpaceFilter) DataList(opt *TsDBOption) ([]*query.TsDBV2, error) {
 
 	if len(tsDBs) == 0 {
 		routerMessage = fmt.Sprintf("tableID with field is empty with tableID: %s, field: %s, isSkipField: %v", opt.TableID, opt.FieldName, opt.IsSkipField)
-		if len(tableIDCondsForFilter) > 0 {
-			routerMessage += "；已启用 table_id_conditions，无命中时请核对 Labels 与条件是否一致"
+		if len(tableIDCondsForFilter) > 0 && !anyLabelMatched {
+			routerMessage += "；已启用 table_id_conditions，无 RT 的 Labels 命中条件"
 		}
 		return nil, nil
 	}

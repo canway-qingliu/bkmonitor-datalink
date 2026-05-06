@@ -103,6 +103,20 @@ func (w *Writer) body() string {
 
 var _ http.ResponseWriter = (*Writer)(nil)
 
+// queryRefContainsResultTable 判断 QueryReference 中是否出现指定结果表 table_id（info 路由单测用）。
+func queryRefContainsResultTable(qr metadata.QueryReference, resultTable string) bool {
+	for _, qm := range qr {
+		for _, q := range qm {
+			for _, sub := range q.QueryList {
+				if sub.TableID == resultTable {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func TestAPIHandler(t *testing.T) {
 	mock.Init()
 	ctx := metadata.InitHashID(context.Background())
@@ -568,6 +582,21 @@ func TestAPIHandler(t *testing.T) {
 			},
 			expected: `{"data":[{"alias_name":"","field_name":"__ext.container_id","field_type":"keyword","origin_field":"__ext","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"__ext.container_image","field_type":"keyword","origin_field":"__ext","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"__ext.container_name","field_type":"keyword","origin_field":"__ext","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"__ext.io_kubernetes_pod","field_type":"keyword","origin_field":"__ext","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"__ext.io_kubernetes_pod_ip","field_type":"keyword","origin_field":"__ext","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"__ext.io_kubernetes_pod_namespace","field_type":"keyword","origin_field":"__ext","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"__ext.io_kubernetes_pod_uid","field_type":"keyword","origin_field":"__ext","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"__ext.io_kubernetes_workload_name","field_type":"keyword","origin_field":"__ext","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"__ext.io_kubernetes_workload_type","field_type":"keyword","origin_field":"__ext","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"cloudId","field_type":"integer","origin_field":"cloudId","is_agg":true,"is_analyzed":false,"is_case_sensitive":false,"tokenize_on_chars":[]},{"alias_name":"","field_name":"dtEventTimeStamp","field_type":"date","origin_field":"dtEventTimeStamp","is_agg":true,"is_analyzed":false,"is_case_sensitive":false,"tokenize_on_chars":[]},{"alias_name":"","field_name":"file","field_type":"keyword","origin_field":"file","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"gseIndex","field_type":"long","origin_field":"gseIndex","is_agg":true,"is_analyzed":false,"is_case_sensitive":false,"tokenize_on_chars":[]},{"alias_name":"","field_name":"iterationIndex","field_type":"integer","origin_field":"iterationIndex","is_agg":true,"is_analyzed":false,"is_case_sensitive":false,"tokenize_on_chars":[]},{"alias_name":"","field_name":"level","field_type":"keyword","origin_field":"level","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"log","field_type":"text","origin_field":"log","is_agg":false,"is_analyzed":true,"is_case_sensitive":false,"tokenize_on_chars":[]},{"alias_name":"","field_name":"message","field_type":"text","origin_field":"message","is_agg":false,"is_analyzed":true,"is_case_sensitive":false,"tokenize_on_chars":[]},{"alias_name":"","field_name":"path","field_type":"keyword","origin_field":"path","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"report_time","field_type":"keyword","origin_field":"report_time","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"serverIp","field_type":"keyword","origin_field":"serverIp","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"time","field_type":"date","origin_field":"time","is_agg":true,"is_analyzed":false,"is_case_sensitive":false,"tokenize_on_chars":[]},{"alias_name":"","field_name":"trace_id","field_type":"keyword","origin_field":"trace_id","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]}]}`,
 		},
+		// 与 RT 标签不一致的 table_id_conditions（scene=log）；因已显式 table_id，条件不参与选表，field_map 仍走 result_table.unify_query
+		"test field map in es with table_id_conditions (ignored when table_id specified)": {
+			handler: HandlerFieldMap,
+			method:  http.MethodPost,
+			infoParams: &Params{
+				DataSource: "bklog",
+				TableID:    "result_table.unify_query",
+				TableIDConditions: structured.AllConditions{
+					{
+						{DimensionName: "scene", Value: []string{"log"}, Operator: structured.ConditionEqual},
+					},
+				},
+			},
+			expected: `{"data":[{"alias_name":"","field_name":"__ext.container_id","field_type":"keyword","origin_field":"__ext","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"__ext.container_image","field_type":"keyword","origin_field":"__ext","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"__ext.container_name","field_type":"keyword","origin_field":"__ext","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"__ext.io_kubernetes_pod","field_type":"keyword","origin_field":"__ext","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"__ext.io_kubernetes_pod_ip","field_type":"keyword","origin_field":"__ext","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"__ext.io_kubernetes_pod_namespace","field_type":"keyword","origin_field":"__ext","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"__ext.io_kubernetes_pod_uid","field_type":"keyword","origin_field":"__ext","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"__ext.io_kubernetes_workload_name","field_type":"keyword","origin_field":"__ext","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"__ext.io_kubernetes_workload_type","field_type":"keyword","origin_field":"__ext","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"cloudId","field_type":"integer","origin_field":"cloudId","is_agg":true,"is_analyzed":false,"is_case_sensitive":false,"tokenize_on_chars":[]},{"alias_name":"","field_name":"dtEventTimeStamp","field_type":"date","origin_field":"dtEventTimeStamp","is_agg":true,"is_analyzed":false,"is_case_sensitive":false,"tokenize_on_chars":[]},{"alias_name":"","field_name":"file","field_type":"keyword","origin_field":"file","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"gseIndex","field_type":"long","origin_field":"gseIndex","is_agg":true,"is_analyzed":false,"is_case_sensitive":false,"tokenize_on_chars":[]},{"alias_name":"","field_name":"iterationIndex","field_type":"integer","origin_field":"iterationIndex","is_agg":true,"is_analyzed":false,"is_case_sensitive":false,"tokenize_on_chars":[]},{"alias_name":"","field_name":"level","field_type":"keyword","origin_field":"level","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"log","field_type":"text","origin_field":"log","is_agg":false,"is_analyzed":true,"is_case_sensitive":false,"tokenize_on_chars":[]},{"alias_name":"","field_name":"message","field_type":"text","origin_field":"message","is_agg":false,"is_analyzed":true,"is_case_sensitive":false,"tokenize_on_chars":[]},{"alias_name":"","field_name":"path","field_type":"keyword","origin_field":"path","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"report_time","field_type":"keyword","origin_field":"report_time","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"serverIp","field_type":"keyword","origin_field":"serverIp","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]},{"alias_name":"","field_name":"time","field_type":"date","origin_field":"time","is_agg":true,"is_analyzed":false,"is_case_sensitive":false,"tokenize_on_chars":[]},{"alias_name":"","field_name":"trace_id","field_type":"keyword","origin_field":"trace_id","is_agg":true,"is_analyzed":false,"is_case_sensitive":true,"tokenize_on_chars":[]}]}`,
+		},
 		"test field map in es direct": {
 			handler: HandlerFieldMap,
 			method:  http.MethodPost,
@@ -611,6 +640,43 @@ func TestAPIHandler(t *testing.T) {
 				c.handler(ginC)
 				assert.Equal(t, c.expected, w.body())
 			}
+		})
+	}
+}
+
+// TestInfoParamsToQueryRef 验证 info 类接口将 Params 转换为 QueryReference 的行为。
+// 覆盖 bk_log_search 场景化查询：仅传 table_id_conditions、不传 table_id / metric_name 时，
+// 应透传到底层 space 路由并选中对应 RT，而不是因早退判断被拒为 "empty table id, metric missing"。
+func TestInfoParamsToQueryRef(t *testing.T) {
+	mock.Init()
+	ctx := metadata.InitHashID(context.Background())
+	influxdb.MockSpaceRouter(ctx)
+	metadata.SetUser(ctx, &metadata.User{SpaceUID: influxdb.SpaceUid})
+
+	testCases := map[string]struct {
+		params     *Params
+		expectedRT string
+	}{
+		"route by table_id_conditions when table_id and metric_name empty": {
+			params: &Params{
+				DataSource: "bklog",
+				TableIDConditions: structured.AllConditions{
+					{
+						{DimensionName: "scene", Value: []string{"k8s"}, Operator: structured.ConditionEqual},
+						{DimensionName: "stream", Value: []string{"file"}, Operator: structured.ConditionEqual},
+					},
+				},
+			},
+			expectedRT: influxdb.ResultTableEs,
+		},
+	}
+
+	for name, c := range testCases {
+		t.Run(name, func(t *testing.T) {
+			queryRef, err := infoParamsToQueryRef(ctx, c.params)
+			assert.NoError(t, err)
+			assert.Truef(t, queryRefContainsResultTable(queryRef, c.expectedRT),
+				"expected RT %q to be matched by TableIDConditions", c.expectedRT)
 		})
 	}
 }
@@ -699,6 +765,157 @@ func TestQueryReferenceWithHandler(t *testing.T) {
 			HandlerQueryReference(ginC)
 			b := w.body()
 			assert.JSONEq(t, c.expected, b)
+		})
+	}
+}
+
+func TestValidateQueryTsDataSource(t *testing.T) {
+	testCases := map[string]struct {
+		queryTs   *structured.QueryTs
+		expectErr bool
+	}{
+		"nil queryTs": {
+			queryTs:   nil,
+			expectErr: false,
+		},
+		"bkmonitor with empty table_id and no conditions": {
+			queryTs: &structured.QueryTs{
+				QueryList: []*structured.Query{
+					{DataSource: structured.BkMonitor, TableID: "", ReferenceName: "a"},
+				},
+			},
+			expectErr: false,
+		},
+		"bkdata with empty table_id and no conditions": {
+			queryTs: &structured.QueryTs{
+				QueryList: []*structured.Query{
+					{DataSource: structured.BkData, TableID: "", ReferenceName: "a"},
+				},
+			},
+			expectErr: false,
+		},
+		"bklog with non-empty table_id": {
+			queryTs: &structured.QueryTs{
+				QueryList: []*structured.Query{
+					{DataSource: structured.BkLog, TableID: "result_table.es", ReferenceName: "a"},
+				},
+			},
+			expectErr: false,
+		},
+		"bklog with valid table_id_conditions": {
+			queryTs: &structured.QueryTs{
+				QueryList: []*structured.Query{
+					{
+						DataSource:    structured.BkLog,
+						TableID:       "",
+						ReferenceName: "a",
+						TableIDConditions: structured.AllConditions{
+							{{DimensionName: "bk_biz_id", Value: []string{"2"}, Operator: "eq"}},
+						},
+					},
+				},
+			},
+			expectErr: false,
+		},
+		"bklog with table_id_conditions nil": {
+			queryTs: &structured.QueryTs{
+				QueryList: []*structured.Query{
+					{DataSource: structured.BkLog, TableID: "", ReferenceName: "a", TableIDConditions: nil},
+				},
+			},
+			expectErr: true,
+		},
+		"bklog with table_id_conditions empty outer []": {
+			queryTs: &structured.QueryTs{
+				QueryList: []*structured.Query{
+					{
+						DataSource:        structured.BkLog,
+						TableID:           "",
+						ReferenceName:     "a",
+						TableIDConditions: structured.AllConditions{},
+					},
+				},
+			},
+			expectErr: true,
+		},
+		"bklog with table_id_conditions [[]]": {
+			queryTs: &structured.QueryTs{
+				QueryList: []*structured.Query{
+					{
+						DataSource:        structured.BkLog,
+						TableID:           "",
+						ReferenceName:     "a",
+						TableIDConditions: structured.AllConditions{{}},
+					},
+				},
+			},
+			expectErr: true,
+		},
+		"bklog with table_id_conditions [[{}]] empty ConditionField": {
+			queryTs: &structured.QueryTs{
+				QueryList: []*structured.Query{
+					{
+						DataSource:    structured.BkLog,
+						TableID:       "",
+						ReferenceName: "a",
+						TableIDConditions: structured.AllConditions{
+							{{}},
+						},
+					},
+				},
+			},
+			expectErr: true,
+		},
+		"bkapm with table_id_conditions [[{}]] empty ConditionField": {
+			queryTs: &structured.QueryTs{
+				QueryList: []*structured.Query{
+					{
+						DataSource:    structured.BkApm,
+						TableID:       "",
+						ReferenceName: "b",
+						TableIDConditions: structured.AllConditions{
+							{{}},
+						},
+					},
+				},
+			},
+			expectErr: true,
+		},
+		"bklog mixed groups: only the second group has effective condition": {
+			queryTs: &structured.QueryTs{
+				QueryList: []*structured.Query{
+					{
+						DataSource:    structured.BkLog,
+						TableID:       "",
+						ReferenceName: "a",
+						TableIDConditions: structured.AllConditions{
+							{{}},
+							{{DimensionName: "bk_biz_id", Value: []string{"2"}, Operator: "eq"}},
+						},
+					},
+				},
+			},
+			expectErr: false,
+		},
+		"multiple queries: second bklog query fails validation": {
+			queryTs: &structured.QueryTs{
+				QueryList: []*structured.Query{
+					{DataSource: structured.BkMonitor, TableID: "", ReferenceName: "a"},
+					{DataSource: structured.BkLog, TableID: "", ReferenceName: "b", TableIDConditions: structured.AllConditions{{{}}}},
+				},
+			},
+			expectErr: true,
+		},
+	}
+
+	for name, c := range testCases {
+		t.Run(name, func(t *testing.T) {
+			err := validateQueryTsDataSource(c.queryTs)
+			if c.expectErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
 		})
 	}
 }
