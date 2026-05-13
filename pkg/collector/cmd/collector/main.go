@@ -33,6 +33,11 @@ var (
 )
 
 func main() {
+	// Disable libbeat strict file permission checks to support local/dev environments.
+	if !hasStrictPermsArg(os.Args[1:]) {
+		os.Args = append(os.Args, "--strict.perms=false")
+	}
+
 	settings := instance.Settings{Processing: processing.MakeDefaultSupport(false)}
 	pubConfig := beat.PublishConfig{PublishMode: libbeat.PublishMode(beat.GuaranteedSend)}
 
@@ -82,4 +87,19 @@ func main() {
 			return
 		}
 	}
+}
+
+func hasStrictPermsArg(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--strict.perms" || arg == "-strict.perms" || arg == "-E" {
+			if i+1 < len(args) && args[i+1] == "strict.perms=false" {
+				return true
+			}
+		}
+		if arg == "--strict.perms=false" || arg == "-strict.perms=false" || arg == "-Estrict.perms=false" {
+			return true
+		}
+	}
+	return false
 }
