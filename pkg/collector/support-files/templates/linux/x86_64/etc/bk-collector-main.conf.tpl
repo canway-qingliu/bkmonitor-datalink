@@ -249,6 +249,23 @@ bk-collector:
           keys:
             - "resource.bk.data.token"
             - "resource.process.pid"
+            - "resource.container.id"
+            - "resource.host.arch"
+            - "resource.host.name"
+            - "resource.os.description"
+            - "resource.os.type"
+            - "resource.process.command_line"
+            - "resource.process.command_args"
+            - "resource.process.executable.path"
+            - "resource.process.runtime.description"
+            - "resource.process.runtime.name"
+            - "resource.process.runtime.version"
+            - "resource.service.version"
+            - "resource.telemetry.distro.name"
+            - "resource.telemetry.distro.version"
+            - "resource.telemetry.sdk.language"
+            - "resource.telemetry.sdk.name"
+            - "resource.telemetry.sdk.version"
         from_token:
           keys:
             - "app_name"
@@ -261,6 +278,9 @@ bk-collector:
 
     # MetricsFilter: 指标过滤处理器
     - name: "metrics_filter/relabel"
+
+    # MetricsFilter: jvm 指标过滤处理器
+    - name: "metrics_filter/jvm"
 
     # MetricsDeriver: 指标派生处理器
     - name: "metrics_deriver/ot_java_agent"
@@ -395,6 +415,7 @@ bk-collector:
         - "token_replacer/token_mapping"
         - "token_checker/aes256"
         - "rate_limiter/token_bucket"
+        - "metrics_filter/jvm"
         - "metrics_deriver/ot_java_agent"
         - "resource_filter/metrics"
         - "metrics_filter/relabel"

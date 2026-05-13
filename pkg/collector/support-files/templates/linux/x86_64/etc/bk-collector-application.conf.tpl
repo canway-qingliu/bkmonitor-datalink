@@ -407,8 +407,8 @@ default:
         config:
           {%- if metrics_deriver_config.ot_java_agent is defined %}
           ot_java_agent:
-            enabled: '{{ metrics_deriver_config.ot_java_agent.enabled }}'
-            keep_origin_metric: '{{ metrics_deriver_config.ot_java_agent.keep_origin_metric }}'
+            enabled: {{ metrics_deriver_config.ot_java_agent.enabled }}
+            keep_origin_metric: {{ metrics_deriver_config.ot_java_agent.keep_origin_metric }}
           {%- endif %}
 {%- endif %}
 

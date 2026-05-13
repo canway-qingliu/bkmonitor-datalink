@@ -128,6 +128,10 @@ func (tc *TierConfig) SetGlobal(val any) {
 	tc.m.Store(tierKey{Type: keyGlobal}, val)
 }
 
+func (tc *TierConfig) GetExact(token, typ, id string) (any, bool) {
+	return tc.m.Load(tierKey{Token: token, Type: typ, ID: id})
+}
+
 func (tc *TierConfig) Del(token, typ, id string) {
 	tc.m.Delete(tierKey{Token: token, Type: typ, ID: id})
 }
