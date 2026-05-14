@@ -405,10 +405,10 @@ default:
 {% if metrics_deriver_config is defined %}
       - name: '{{ metrics_deriver_config.name }}'
         config:
-          {%- if metrics_deriver_config.ot_java_agent is defined %}
+          {%- if metrics_deriver_config.name eq "metrics_filter/jvm" %}
           ot_java_agent:
-            enabled: {{ metrics_deriver_config.ot_java_agent.enabled }}
-            keep_origin_metric: {{ metrics_deriver_config.ot_java_agent.keep_origin_metric }}
+            enabled: true
+            keep_origin_metric: false
           {%- endif %}
 {%- endif %}
 
