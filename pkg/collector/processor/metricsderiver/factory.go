@@ -11,6 +11,7 @@ package metricsderiver
 
 import (
 	"regexp"
+	"sync"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -53,6 +54,7 @@ func newFactory(conf map[string]any, customized []processor.SubConfigProcessor) 
 		CommonProcessor: processor.NewCommonProcessor(conf, customized),
 		configs:         configs,
 		metricBuilder:   NewMetricBuilder(),
+		mu:              sync.Mutex{},
 	}, nil
 }
 
@@ -60,6 +62,7 @@ type metricsDeriver struct {
 	processor.CommonProcessor
 	configs       *confengine.TierConfig // type: Config
 	metricBuilder *MetricBuilder
+	mu            sync.Mutex
 }
 
 func (p *metricsDeriver) Name() string {
@@ -106,6 +109,8 @@ func (p *metricsDeriver) otMetricDerive(record *define.Record, config Config) {
 
 			// 仅对来自 OT Java Agent 的指标数据进行处理
 			resourceMetrics.ScopeMetrics().RemoveIf(func(scopeMetrics pmetric.ScopeMetrics) bool {
+				p.mu.Lock()
+				p.metricBuilder.metricSlice = p.metricBuilder.metricSlice[:0]
 				scopeMetrics.Metrics().RemoveIf(func(metric pmetric.Metric) bool {
 					switch metric.Name() {
 					case jvmGcDuration:
@@ -122,6 +127,7 @@ func (p *metricsDeriver) otMetricDerive(record *define.Record, config Config) {
 					}
 				})
 				p.metricBuilder.build(scopeMetrics)
+				p.mu.Unlock()
 				return scopeMetrics.Metrics().Len() == 0
 			})
 			return resourceMetrics.ScopeMetrics().Len() == 0
@@ -160,7 +166,10 @@ func aggregateGcDataPoints(dps pmetric.HistogramDataPointSlice, youngGcMapping, 
 			continue
 		}
 
-		timestamp := dp.StartTimestamp()
+		timestamp := dp.Timestamp()
+		if timestamp == 0 {
+			timestamp = dp.StartTimestamp()
+		}
 		count := dp.Count()
 		sum := dp.Sum()
 
@@ -212,7 +221,11 @@ func foreachSumDataPoints(metric pmetric.Metric, f func(attrs pcommon.Map, ts pc
 	dps := metric.Sum().DataPoints()
 	for i := 0; i < dps.Len(); i++ {
 		dp := dps.At(i)
-		f(dp.Attributes(), dp.StartTimestamp(), dp.IntVal())
+		ts := dp.Timestamp()
+		if ts == 0 {
+			ts = dp.StartTimestamp()
+		}
+		f(dp.Attributes(), ts, dp.IntVal())
 	}
 }
 
