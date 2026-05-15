@@ -284,6 +284,10 @@ bk-collector:
 
     # MetricsDeriver: 指标派生处理器
     - name: "metrics_deriver/ot_java_agent"
+      config:
+        ot_java_agent:
+          enabled: true
+          keep_origin_metric: false
 
     # MethodFilter: method 过滤处理器（做 span 丢弃处理）
     - name: "method_filter/drop_span"
