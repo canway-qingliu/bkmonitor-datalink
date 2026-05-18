@@ -233,6 +233,22 @@ processor:
 			expectYoung: false,
 			expectOld:   true,
 		},
+		{
+			name:        "Old GC - ZGC Cycles (JDK17+)",
+			gcName:      "ZGC Cycles",
+			count:       2,
+			sum:         1.2,
+			expectYoung: false,
+			expectOld:   true,
+		},
+		{
+			name:        "Old GC - Shenandoah Pauses (JDK17+)",
+			gcName:      "Shenandoah Pauses",
+			count:       4,
+			sum:         1.8,
+			expectYoung: false,
+			expectOld:   true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -479,7 +495,7 @@ processor:
 			hasDaemonType:   true,
 			isDaemon:        true,
 			value:           1,
-			expectedMetrics: []string{jvmThreadWaitingCount, jvmThreadLiveCount, jvmThreadDaemonCount},
+			expectedMetrics: []string{jvmThreadLiveCount},
 		},
 		{
 			name:            "Is daemon - other state thread or without state",
@@ -487,7 +503,15 @@ processor:
 			hasDaemonType:   true,
 			isDaemon:        true,
 			value:           4,
-			expectedMetrics: []string{jvmThreadDaemonCount, jvmThreadLiveCount},
+			expectedMetrics: []string{jvmThreadLiveCount},
+		},
+		{
+			name:            "Is daemon with state - Runnable",
+			state:           "runnable",
+			hasDaemonType:   true,
+			isDaemon:        true,
+			value:           2,
+			expectedMetrics: []string{jvmThreadRunnableCount, jvmThreadDaemonCount, jvmThreadLiveCount},
 		},
 		{
 			name:            "No daemon without state",
@@ -576,6 +600,28 @@ func TestAggregateGcDataPoints(t *testing.T) {
 	assert.NotNil(t, oldGc)
 	assert.Equal(t, uint64(2), oldGc.countVal)
 	assert.Equal(t, 1.5, oldGc.timeVal)
+}
+
+func TestClassifyGcType(t *testing.T) {
+	tests := []struct {
+		name     string
+		gcName   string
+		expected string
+	}{
+		{name: "young explicit", gcName: "G1 Young Generation", expected: "young"},
+		{name: "old explicit", gcName: "G1 Old Gen", expected: "old"},
+		{name: "zgc cycles", gcName: "ZGC Cycles", expected: "old"},
+		{name: "shenandoah pauses", gcName: "Shenandoah Pauses", expected: "old"},
+		{name: "young keyword", gcName: "Custom Young Collector", expected: "young"},
+		{name: "old keyword", gcName: "Custom Old Collector", expected: "old"},
+		{name: "unknown", gcName: "UnknownCollector", expected: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, classifyGcType(tt.gcName))
+		})
+	}
 }
 
 func TestProcessMemoryByType(t *testing.T) {
@@ -811,10 +857,21 @@ func TestProcessDaemonThread(t *testing.T) {
 	t.Run("Daemon thread", func(t *testing.T) {
 		mappings := newThreadMappings()
 		attrs := pcommon.NewMap()
+		attrs.UpsertString(jvmThreadState, "runnable")
 		attrs.UpsertBool(jvmThreadDaemon, true)
 
 		processDaemonThread(attrs, now, 2, mappings)
 		assert.Equal(t, int64(2), mappings.daemon[now])
+	})
+
+	t.Run("Daemon thread but non-runnable state", func(t *testing.T) {
+		mappings := newThreadMappings()
+		attrs := pcommon.NewMap()
+		attrs.UpsertString(jvmThreadState, "waiting")
+		attrs.UpsertBool(jvmThreadDaemon, true)
+
+		processDaemonThread(attrs, now, 2, mappings)
+		assert.Len(t, mappings.daemon, 0)
 	})
 
 	t.Run("Non-daemon thread", func(t *testing.T) {

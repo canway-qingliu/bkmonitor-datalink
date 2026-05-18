@@ -11,6 +11,7 @@ package metricsderiver
 
 import (
 	"regexp"
+	"strings"
 	"sync"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -174,10 +175,10 @@ func aggregateGcDataPoints(dps pmetric.HistogramDataPointSlice, youngGcMapping, 
 		sum := dp.Sum()
 
 		var targetMapping map[pcommon.Timestamp]*JvmGcDataPoint
-		switch gcName.AsString() {
-		case "ParNew", "G1 Young Generation", "PS Scavenge", "Copy":
+		switch classifyGcType(gcName.AsString()) {
+		case "young":
 			targetMapping = youngGcMapping
-		case "ConcurrentMarkSweep", "G1 Old Generation", "PS MarkSweep", "MarkSweepCompact":
+		case "old":
 			targetMapping = oldGcMapping
 		default:
 			continue
@@ -185,6 +186,34 @@ func aggregateGcDataPoints(dps pmetric.HistogramDataPointSlice, youngGcMapping, 
 
 		updateGcMapping(targetMapping, timestamp, count, sum)
 	}
+}
+
+func classifyGcType(gcName string) string {
+	name := strings.TrimSpace(gcName)
+	if name == "" {
+		return ""
+	}
+
+	// 先匹配已知的完整名称，再用关键字兜底。
+	switch name {
+	case "ParNew", "PS Scavenge", "Copy", "G1 Young Generation", "G1 Young Gen":
+		return "young"
+	case "ConcurrentMarkSweep", "PS MarkSweep", "MarkSweepCompact", "G1 Old Generation", "G1 Old Gen":
+		return "old"
+	case "ZGC Cycles", "ZGC Pauses", "Shenandoah Cycles", "Shenandoah Pauses":
+		// ZGC/Shenandoah 为非分代回收，业务侧仅有 young/old 口径时归到 old。
+		return "old"
+	}
+
+	lower := strings.ToLower(name)
+	if strings.Contains(lower, "young") || strings.Contains(lower, "new") || strings.Contains(lower, "scavenge") {
+		return "young"
+	}
+	if strings.Contains(lower, "old") || strings.Contains(lower, "marksweep") || strings.Contains(lower, "zgc") || strings.Contains(lower, "shenandoah") {
+		return "old"
+	}
+
+	return ""
 }
 
 func updateGcMapping(mapping map[pcommon.Timestamp]*JvmGcDataPoint, timestamp pcommon.Timestamp, count uint64, sum float64) {
@@ -397,21 +426,33 @@ func processThreadByState(attrs pcommon.Map, ts pcommon.Timestamp, val int64, ma
 		return
 	}
 
+	isDaemon := false
+	if daemonAttr, ok := attrs.Get(jvmThreadDaemon); ok {
+		isDaemon = daemonAttr.BoolVal()
+	}
+
 	switch state.AsString() {
 	case "runnable":
 		mappings.runnable[ts] += val
 	case "blocked":
-		mappings.blocked[ts] += val
+		if !isDaemon {
+			mappings.blocked[ts] += val
+		}
 	case "waiting":
-		mappings.waiting[ts] += val
+		if !isDaemon {
+			mappings.waiting[ts] += val
+		}
 	case "timed_waiting":
-		mappings.timedWaiting[ts] += val
+		if !isDaemon {
+			mappings.timedWaiting[ts] += val
+		}
 	}
 }
 
 func processDaemonThread(attrs pcommon.Map, ts pcommon.Timestamp, val int64, mappings *threadMappings) {
+	state, hasState := attrs.Get(jvmThreadState)
 	isDaemon, ok := attrs.Get(jvmThreadDaemon)
-	if !ok || !isDaemon.BoolVal() {
+	if !ok || !isDaemon.BoolVal() || !hasState || state.AsString() != "runnable" {
 		return
 	}
 
