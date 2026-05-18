@@ -335,3 +335,11 @@ processor:
         {%- endfor %}
   {%- endif %}
 {%- endif %}
+
+    - name: "metrics_deriver/ot_java_agent"
+      config:
+        ot_java_agent:
+          enabled: TRUE
+          keep_origin_metric: FALSE
+
+
