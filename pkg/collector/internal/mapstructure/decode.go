@@ -10,14 +10,21 @@
 package mapstructure
 
 import (
+	"reflect"
+	"strconv"
+	"strings"
+
 	"github.com/mitchellh/mapstructure"
 )
 
 // Decode 默认支持 time.Duration 类型数据的转换处理
 func Decode(input, output any) error {
 	config := &mapstructure.DecoderConfig{
-		Result:     output,
-		DecodeHook: mapstructure.StringToTimeDurationHookFunc(),
+		Result: output,
+		DecodeHook: mapstructure.ComposeDecodeHookFunc(
+			mapstructure.StringToTimeDurationHookFunc(),
+			stringToBoolHookFunc(),
+		),
 	}
 
 	decoder, err := mapstructure.NewDecoder(config)
@@ -26,4 +33,18 @@ func Decode(input, output any) error {
 	}
 
 	return decoder.Decode(input)
+}
+
+func stringToBoolHookFunc() mapstructure.DecodeHookFuncType {
+	return func(from reflect.Type, to reflect.Type, data any) (any, error) {
+		if from.Kind() != reflect.String || to.Kind() != reflect.Bool {
+			return data, nil
+		}
+
+		parsed, err := strconv.ParseBool(strings.TrimSpace(data.(string)))
+		if err != nil {
+			return data, err
+		}
+		return parsed, nil
+	}
 }

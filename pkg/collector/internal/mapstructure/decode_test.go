@@ -23,6 +23,7 @@ func TestDecode(t *testing.T) {
 			"float64":  1.0,
 			"string":   "foo",
 			"duration": "10s",
+			"enabled":  "True",
 		}
 
 		type Output struct {
@@ -30,6 +31,7 @@ func TestDecode(t *testing.T) {
 			Float    float64       `mapstructure:"float64"`
 			String   string        `mapstructure:"string"`
 			Duration time.Duration `mapstructure:"duration"`
+			Enabled  bool          `mapstructure:"enabled"`
 		}
 
 		var output Output
@@ -39,7 +41,40 @@ func TestDecode(t *testing.T) {
 			Float:    1.0,
 			String:   "foo",
 			Duration: time.Second * 10,
+			Enabled:  true,
 		}, output)
+	})
+
+	t.Run("BoolStringSuccess", func(t *testing.T) {
+		input := map[string]any{
+			"enabled":            "True",
+			"keep_origin_metric": "False",
+		}
+
+		type Output struct {
+			Enabled          bool `mapstructure:"enabled"`
+			KeepOriginMetric bool `mapstructure:"keep_origin_metric"`
+		}
+
+		var output Output
+		assert.NoError(t, Decode(input, &output))
+		assert.Equal(t, Output{
+			Enabled:          true,
+			KeepOriginMetric: false,
+		}, output)
+	})
+
+	t.Run("BoolStringFailed", func(t *testing.T) {
+		input := map[string]any{
+			"enabled": "not-a-bool",
+		}
+
+		type Output struct {
+			Enabled bool `mapstructure:"enabled"`
+		}
+
+		var output Output
+		assert.Error(t, Decode(input, &output))
 	})
 
 	t.Run("Failed", func(t *testing.T) {
