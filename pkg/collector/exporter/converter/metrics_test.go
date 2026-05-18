@@ -65,6 +65,36 @@ func TestConvertGaugeMetrics(t *testing.T) {
 	assert.Equal(t, event.RecordType(), define.RecordMetrics)
 }
 
+func TestConvertGaugeMetricsFillBkInstanceIDFromServiceInstanceID(t *testing.T) {
+	opts := define.MetricsOptions{
+		GaugeCount: 1,
+		MetricName: "jvm.memory.heap.committed",
+		GeneratorOptions: define.GeneratorOptions{
+			Attributes: map[string]string{"service_instance_id": "armsfafdsf"},
+			Resources:  map[string]string{"service.name": "my-java-app"},
+		},
+	}
+
+	events := make([]define.Event, 0)
+	gather := func(evts ...define.Event) {
+		events = append(events, evts...)
+	}
+
+	g := generator.NewMetricsGenerator(opts)
+	metrics := g.Generate()
+	dp := testkits.FirstGaugeDataPoint(metrics)
+	dp.SetTimestamp(0)
+	dp.SetDoubleVal(1024)
+
+	var conv metricsConverter
+	conv.Convert(&define.Record{RecordType: define.RecordMetrics, Data: metrics}, gather)
+
+	event := events[0].Data()
+	dimension := event["dimension"].(map[string]string)
+	assert.Equal(t, "armsfafdsf", dimension["service_instance_id"])
+	assert.Equal(t, "armsfafdsf", dimension["bk_instance_id"])
+}
+
 func TestConvertHistogramMetrics(t *testing.T) {
 	opts := define.MetricsOptions{
 		HistogramCount: 1,

@@ -121,7 +121,7 @@ func (c metricsConverter) convertSumMetrics(pdMetric pmetric.Metric, rs pcommon.
 		m := otMetricMapper{
 			Metrics:    map[string]float64{pdMetric.Name(): val},
 			Time:       dp.Timestamp().AsTime(),
-			Dimensions: utils.MergeReplaceAttributeMaps(dp.Attributes(), rs),
+			Dimensions: normalizeMetricsDimensions(utils.MergeReplaceAttributeMaps(dp.Attributes(), rs)),
 		}
 		items = append(items, m.AsMapStr())
 	}
@@ -134,7 +134,7 @@ func (c metricsConverter) convertHistogramMetrics(pdMetric pmetric.Metric, rs pc
 	for i := 0; i < dps.Len(); i++ {
 		dp := dps.At(i)
 		dpTime := dp.Timestamp().AsTime()
-		dimensions := utils.MergeReplaceAttributeMaps(dp.Attributes(), rs)
+		dimensions := normalizeMetricsDimensions(utils.MergeReplaceAttributeMaps(dp.Attributes(), rs))
 		metrics := make(map[string]float64)
 
 		// 当且仅当 Sum 存在时才追加 _sum 指标
@@ -214,7 +214,7 @@ func (c metricsConverter) convertGaugeMetrics(pdMetric pmetric.Metric, rs pcommo
 
 		m := otMetricMapper{
 			Metrics:    map[string]float64{pdMetric.Name(): val},
-			Dimensions: utils.MergeReplaceAttributeMaps(dp.Attributes(), rs),
+			Dimensions: normalizeMetricsDimensions(utils.MergeReplaceAttributeMaps(dp.Attributes(), rs)),
 			Time:       dp.Timestamp().AsTime(),
 		}
 		items = append(items, m.AsMapStr())
@@ -227,7 +227,7 @@ func (c metricsConverter) convertSummaryMetrics(pdMetric pmetric.Metric, rs pcom
 	dps := pdMetric.Summary().DataPoints()
 	for i := 0; i < dps.Len(); i++ {
 		dp := dps.At(i)
-		dimensions := utils.MergeReplaceAttributeMaps(dp.Attributes(), rs)
+		dimensions := normalizeMetricsDimensions(utils.MergeReplaceAttributeMaps(dp.Attributes(), rs))
 		metrics := make(map[string]float64)
 
 		// 当且仅当有效数值才进行处理
@@ -264,6 +264,18 @@ func (c metricsConverter) convertSummaryMetrics(pdMetric pmetric.Metric, rs pcom
 		}
 	}
 	return items
+}
+
+func normalizeMetricsDimensions(dimensions map[string]string) map[string]string {
+	if _, ok := dimensions["bk_instance_id"]; ok {
+		return dimensions
+	}
+
+	if instanceID, ok := dimensions["service_instance_id"]; ok && instanceID != "" {
+		dimensions["bk_instance_id"] = instanceID
+	}
+
+	return dimensions
 }
 
 func (c metricsConverter) Extract(pdMetric pmetric.Metric, rs pcommon.Map) []common.MapStr {

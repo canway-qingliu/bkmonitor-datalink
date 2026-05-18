@@ -128,7 +128,7 @@ func (p *resourceFilter) assembleAction(record *define.Record, config Config) {
 	handle := func(rs pcommon.Resource, action AssembleAction) {
 		var values []string
 		for _, key := range action.Keys {
-			v, ok := rs.Attributes().Get(key)
+			v, ok := getAssembleValue(rs.Attributes(), key)
 			if !ok {
 				// 空值保留
 				values = append(values, "")
@@ -164,6 +164,20 @@ func (p *resourceFilter) assembleAction(record *define.Record, config Config) {
 			}
 		})
 	}
+}
+
+func getAssembleValue(attrs pcommon.Map, key string) (pcommon.Value, bool) {
+	v, ok := attrs.Get(key)
+	if ok {
+		return v, true
+	}
+
+	legacyKey := strings.ReplaceAll(key, ".", "_")
+	if legacyKey == key {
+		return pcommon.Value{}, false
+	}
+
+	return attrs.Get(legacyKey)
 }
 
 // addAction 新增维度
