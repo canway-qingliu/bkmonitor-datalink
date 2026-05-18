@@ -226,7 +226,7 @@ bk-collector:
       config:
         assemble:
           - destination: "bk.instance.id"
-            separator: ":"
+            separator: ""
             keys:
               - "resource.service.instance.id"
         drop:
@@ -286,8 +286,8 @@ bk-collector:
     - name: "metrics_deriver/ot_java_agent"
       config:
         ot_java_agent:
-          enabled: true
-          keep_origin_metric: false
+          enabled: True
+          keep_origin_metric: False
 
     # MethodFilter: method 过滤处理器（做 span 丢弃处理）
     - name: "method_filter/drop_span"
