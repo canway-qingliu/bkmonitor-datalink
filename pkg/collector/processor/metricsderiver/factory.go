@@ -107,6 +107,7 @@ func (p *metricsDeriver) otMetricDerive(record *define.Record, config Config) {
 			if !IsOtJavaAgentDatasource(rs) {
 				return false
 			}
+			fillBkInstanceID(rs)
 
 			// 仅对来自 OT Java Agent 的指标数据进行处理
 			resourceMetrics.ScopeMetrics().RemoveIf(func(scopeMetrics pmetric.ScopeMetrics) bool {
@@ -133,6 +134,21 @@ func (p *metricsDeriver) otMetricDerive(record *define.Record, config Config) {
 			})
 			return resourceMetrics.ScopeMetrics().Len() == 0
 		})
+	}
+}
+
+// fillBkInstanceID 确保 OTel Java Agent 的 metrics resource 中存在 bk.instance.id
+// 优先取 service.instance.id（OTel 标准点号格式），兜底取 service_instance_id（下划线格式）
+func fillBkInstanceID(rs pcommon.Map) {
+	if _, ok := rs.Get("bk.instance.id"); ok {
+		return
+	}
+	if v, ok := rs.Get("service.instance.id"); ok && v.AsString() != "" {
+		rs.UpsertString("bk.instance.id", v.AsString())
+		return
+	}
+	if v, ok := rs.Get("service_instance_id"); ok && v.AsString() != "" {
+		rs.UpsertString("bk.instance.id", v.AsString())
 	}
 }
 
