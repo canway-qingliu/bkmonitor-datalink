@@ -224,6 +224,9 @@ bk-collector:
     # ResourceFilter: 资源过滤处理器（嘉为）
     - name: "resource_filter/instance_id"
       config:
+        replace:
+          - source: "service_instance_id"
+            destination: "service.instance.id"
         assemble:
           - destination: "bk.instance.id"
             separator: ""
@@ -244,7 +247,14 @@ bk-collector:
     # ResourceFilter: 资源过滤处理器
     - name: "resource_filter/metrics"
       config:
+        replace:
+          - source: "service_instance_id"
+            destination: "service.instance.id"
         assemble:
+          - destination: "bk.instance.id"
+            separator: ""
+            keys:
+              - "resource.service.instance.id"
         drop:
           keys:
             - "resource.bk.data.token"
