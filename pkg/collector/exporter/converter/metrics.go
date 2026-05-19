@@ -61,6 +61,9 @@ func (c metricsConverter) Convert(record *define.Record, f define.GatherFunc) {
 			dimensions := pcommon.NewMap()
 			rs.CopyTo(dimensions)
 			dimensions.InsertString("scope_name", scopeMetric.Scope().Name())
+			// 最终保证：所有 processor 完成后，若 bk.instance.id 缺失或为空，
+			// 则从 service.instance.id 补填（此处操作的是副本，不影响原始 resource）
+			ensureBkInstanceID(dimensions)
 			metrics := scopeMetric.Metrics()
 			for k := 0; k < metrics.Len(); k++ {
 				for _, dp := range c.Extract(metrics.At(k), dimensions) {
@@ -267,7 +270,7 @@ func (c metricsConverter) convertSummaryMetrics(pdMetric pmetric.Metric, rs pcom
 }
 
 func normalizeMetricsDimensions(dimensions map[string]string) map[string]string {
-	if _, ok := dimensions["bk_instance_id"]; ok {
+	if v, ok := dimensions["bk_instance_id"]; ok && v != "" {
 		return dimensions
 	}
 
@@ -276,6 +279,18 @@ func normalizeMetricsDimensions(dimensions map[string]string) map[string]string 
 	}
 
 	return dimensions
+}
+
+// ensureBkInstanceID 在 exporter 构建 dimensions 副本时做最后一道保证：
+// 所有 processor 执行完毕后，若 bk.instance.id 缺失或为空，则从 service.instance.id 补填。
+// 此时操作的是 resource attrs 的副本，不会影响原始 pdata。
+func ensureBkInstanceID(dimensions pcommon.Map) {
+	if v, ok := dimensions.Get("bk.instance.id"); ok && v.AsString() != "" {
+		return
+	}
+	if sii, ok := dimensions.Get("service.instance.id"); ok && sii.AsString() != "" {
+		dimensions.UpsertString("bk.instance.id", sii.AsString())
+	}
 }
 
 func (c metricsConverter) Extract(pdMetric pmetric.Metric, rs pcommon.Map) []common.MapStr {

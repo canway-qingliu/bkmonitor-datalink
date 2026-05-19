@@ -136,7 +136,11 @@ func (p *resourceFilter) assembleAction(record *define.Record, config Config) {
 			}
 			values = append(values, v.AsString())
 		}
-		rs.Attributes().UpsertString(action.Destination, strings.Join(values, action.Separator))
+		// 组装结果为空时不覆盖，避免清空由 fillBkInstanceID 等写入的有效值
+		assembled := strings.Join(values, action.Separator)
+		if assembled != "" {
+			rs.Attributes().UpsertString(action.Destination, assembled)
+		}
 	}
 
 	switch record.RecordType {

@@ -248,6 +248,67 @@ processor:
 	testkits.AssertAttrsStringKeyVal(t, attrs, "bk_instance_id", "armsfafdsf")
 }
 
+func TestReplaceAndAssembleActionMetricsBkInstanceID(t *testing.T) {
+	content := `
+processor:
+    - name: "resource_filter/metrics"
+      config:
+        replace:
+          - source: "service_instance_id"
+            destination: "service.instance.id"
+        assemble:
+          - destination: "bk_instance_id"
+            separator: ""
+            keys:
+              - "resource.service.instance.id"
+`
+
+	factory := processor.MustCreateFactory(content, NewFactory)
+	record := define.Record{
+		RecordType: define.RecordMetrics,
+		Data:       makeMetricsRecord(1, "string"),
+	}
+
+	pdMetrics := record.Data.(pmetric.Metrics)
+	for i := 0; i < pdMetrics.ResourceMetrics().Len(); i++ {
+		attrs := pdMetrics.ResourceMetrics().At(i).Resource().Attributes()
+		attrs.UpsertString("service_instance_id", "armsfafdsf")
+	}
+
+	testkits.MustProcess(t, factory, record)
+	attrs := testkits.FirstMetricAttrs(record.Data)
+	testkits.AssertAttrsStringKeyVal(t, attrs, "bk_instance_id", "armsfafdsf")
+}
+
+func TestAssembleActionMetricsBkInstanceIDLegacyKey(t *testing.T) {
+	content := `
+processor:
+    - name: "resource_filter/metrics"
+      config:
+        assemble:
+          - destination: "bk_instance_id"
+            separator: ""
+            keys:
+              - "resource.service.instance.id"
+`
+
+	factory := processor.MustCreateFactory(content, NewFactory)
+	record := define.Record{
+		RecordType: define.RecordMetrics,
+		Data:       makeMetricsRecord(1, "string"),
+	}
+
+	pdMetrics := record.Data.(pmetric.Metrics)
+	for i := 0; i < pdMetrics.ResourceMetrics().Len(); i++ {
+		attrs := pdMetrics.ResourceMetrics().At(i).Resource().Attributes()
+		attrs.UpsertString("service_instance_id", "armsfafdsf")
+	}
+
+	testkits.MustProcess(t, factory, record)
+	attrs := testkits.FirstMetricAttrs(record.Data)
+	testkits.AssertAttrsStringKeyVal(t, attrs, "bk_instance_id", "armsfafdsf")
+}
+
 func TestDropAction(t *testing.T) {
 	content := `
 processor:

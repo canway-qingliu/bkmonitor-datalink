@@ -140,16 +140,26 @@ func (p *metricsDeriver) otMetricDerive(record *define.Record, config Config) {
 // fillBkInstanceID 确保 OTel Java Agent 的 metrics resource 中存在 bk.instance.id
 // 优先取 service.instance.id（OTel 标准点号格式），兜底取 service_instance_id（下划线格式）
 func fillBkInstanceID(rs pcommon.Map) {
-	if _, ok := rs.Get("bk.instance.id"); ok {
+	if v, ok := rs.Get("bk.instance.id"); ok && v.AsString() != "" {
 		return
 	}
 	if v, ok := rs.Get("service.instance.id"); ok && v.AsString() != "" {
+		logger.Debugf("fillBkInstanceID: set bk.instance.id from service.instance.id=%s", v.AsString())
 		rs.UpsertString("bk.instance.id", v.AsString())
 		return
 	}
 	if v, ok := rs.Get("service_instance_id"); ok && v.AsString() != "" {
+		logger.Debugf("fillBkInstanceID: set bk.instance.id from service_instance_id=%s", v.AsString())
 		rs.UpsertString("bk.instance.id", v.AsString())
+		return
 	}
+	// 两个 key 都没找到，打印 resource 中所有 key 辅助排查
+	var keys []string
+	rs.Range(func(k string, _ pcommon.Value) bool {
+		keys = append(keys, k)
+		return true
+	})
+	logger.Warnf("fillBkInstanceID: neither service.instance.id nor service_instance_id found in resource, keys=%v", keys)
 }
 
 func IsOtJavaAgentDatasource(rs pcommon.Map) bool {
