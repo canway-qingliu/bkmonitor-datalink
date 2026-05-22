@@ -39,7 +39,13 @@ build:
 	-s -w \
 	-X main.version=$(VERSION) \
 	-X main.buildTime=$(shell date -u '+%Y-%m-%d_%I:%M:%S%p') \
-	-X main.gitHash=$(shell git rev-parse HEAD)" \
+	-X main.gitHash=$(shell git rev-parse HEAD) \
+	-X 'main.gitTag=$(GIT_TAG)' \
+	-X 'main.gitCommitter=$(GIT_COMMITTER_NAME)' \
+	-X 'main.gitCommitTime=$(GIT_COMMIT_TIME)' \
+	-X 'main.buildId=$(CI_BUILD_ID)' \
+	-X 'main.buildNo=$(CI_BUILD_NUM)' \
+	-X 'main.release=$(RELEASE_VALUE)'" \
 	-o $(BIN) .
 
 .PHONY: dev

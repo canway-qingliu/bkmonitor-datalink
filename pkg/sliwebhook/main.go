@@ -20,9 +20,15 @@ import (
 )
 
 var (
-	version   = "unknown.version"
-	gitHash   = "unknown.gitHash"
-	buildTime = "unknown.buildTime"
+	version       = "unknown.version"
+	gitHash       = "unknown.gitHash"
+	buildTime     = "unknown.buildTime"
+	gitTag        = "unknown.tag"
+	gitCommitter  = "unknown.committer"
+	gitCommitTime = "unknown.commitTime"
+	buildId       = "unknown.buildId"
+	buildNo       = "unknown.buildNo"
+	release       = "unknown.release"
 )
 
 func main() {
@@ -32,8 +38,14 @@ func main() {
 
 	if *v {
 		fmt.Println("Version:", version)
-		fmt.Println("GitHash:", gitHash)
+		fmt.Println("CommitId:", gitHash)
+		fmt.Println("Tag:", gitTag)
+		fmt.Println("Committer:", gitCommitter)
+		fmt.Println("CommitTime:", gitCommitTime)
 		fmt.Println("BuildTime:", buildTime)
+		fmt.Println("BuildId:", buildId)
+		fmt.Println("BuildNo:", buildNo)
+		fmt.Println("Release:", release)
 		return
 	}
 

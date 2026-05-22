@@ -26,7 +26,14 @@ var versionCmd = &cobra.Command{
 		fmt.Printf("%s\n", define.Version)
 		all, _ := cmd.Flags().GetBool("all")
 		if all {
-			fmt.Printf("%s\n", define.BuildHash)
+			fmt.Printf("CommitId: %s\n", define.BuildHash)
+			fmt.Printf("Tag: %s\n", define.GitTag)
+			fmt.Printf("Committer: %s\n", define.GitCommitter)
+			fmt.Printf("CommitTime: %s\n", define.GitCommitTime)
+			fmt.Printf("BuildTime: %s\n", define.BuildTime)
+			fmt.Printf("BuildId: %s\n", define.BuildId)
+			fmt.Printf("BuildNo: %s\n", define.BuildNo)
+			fmt.Printf("Release: %s\n", define.Release)
 		}
 	},
 }

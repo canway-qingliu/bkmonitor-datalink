@@ -16,8 +16,15 @@ import (
 )
 
 var (
-	BuildHash string
-	Version   string
+	BuildHash     string
+	Version       string
+	GitTag        string
+	GitCommitter  string
+	GitCommitTime string
+	BuildTime     string
+	BuildId       string
+	BuildNo       string
+	Release       string
 )
 
 // versionCmd represents the version command
@@ -28,7 +35,14 @@ var versionCmd = &cobra.Command{
 		fmt.Printf("%s\n", Version)
 		all, _ := cmd.Flags().GetBool("all")
 		if all {
-			fmt.Printf("%s\n", BuildHash)
+			fmt.Printf("CommitId: %s\n", BuildHash)
+			fmt.Printf("Tag: %s\n", GitTag)
+			fmt.Printf("Committer: %s\n", GitCommitter)
+			fmt.Printf("CommitTime: %s\n", GitCommitTime)
+			fmt.Printf("BuildTime: %s\n", BuildTime)
+			fmt.Printf("BuildId: %s\n", BuildId)
+			fmt.Printf("BuildNo: %s\n", BuildNo)
+			fmt.Printf("Release: %s\n", Release)
 		}
 	},
 }

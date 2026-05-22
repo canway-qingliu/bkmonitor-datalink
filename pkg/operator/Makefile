@@ -48,6 +48,12 @@ build:
 	-X $(PKG)/cmd.Version=$(VERSION) \
 	-X $(PKG)/cmd.BuildTime=$(shell date -u '+%Y-%m-%d_%I:%M:%S%p') \
 	-X $(PKG)/cmd.GitHash=$(shell git rev-parse HEAD) \
+	-X '$(PKG)/cmd.GitTag=$(GIT_TAG)' \
+	-X '$(PKG)/cmd.GitCommitter=$(GIT_COMMITTER_NAME)' \
+	-X '$(PKG)/cmd.GitCommitTime=$(GIT_COMMIT_TIME)' \
+	-X '$(PKG)/cmd.BuildId=$(CI_BUILD_ID)' \
+	-X '$(PKG)/cmd.BuildNo=$(CI_BUILD_NUM)' \
+	-X '$(PKG)/cmd.Release=$(RELEASE_VALUE)' \
 	-X google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=ignore" \
 	-o $(BIN) .
 

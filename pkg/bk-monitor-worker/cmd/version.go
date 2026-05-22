@@ -27,8 +27,14 @@ var versionCmd = &cobra.Command{
 		if all {
 			info := []string{
 				"Version:    " + versions.Version,
-				"Commit:     " + versions.GitCommit,
+				"CommitId:   " + versions.GitCommit,
+				"Tag:        " + versions.GitTag,
+				"Committer:  " + versions.GitCommitter,
+				"CommitTime: " + versions.GitCommitTime,
 				"Build Time: " + versions.BuildTime,
+				"BuildId:    " + versions.BuildId,
+				"BuildNo:    " + versions.BuildNo,
+				"Release:    " + versions.Release,
 				"Go Version: " + versions.GoVersion,
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), strings.Join(info, "\n"))

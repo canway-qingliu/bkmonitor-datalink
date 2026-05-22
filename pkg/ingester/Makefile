@@ -5,7 +5,7 @@ NAME = ingester
 VERSION ?= $(shell cat VERSION)
 COMMIT_ID ?= $(shell git rev-parse HEAD)
 
-APPPATH = "github.com/TencentBlueKing/bkmonitor-datalink/pkg/${NAME}"
+APPPATH = github.com/TencentBlueKing/bkmonitor-datalink/pkg/${NAME}
 PACKAGES = $(shell go list -f '{{.ImportPath}}' ./...)
 
 BUILDTAGS ?= go_metrics bbolt BBolt elasticsearch_v5 elasticsearch_v6 elasticsearch_v7 redis_v2
@@ -14,6 +14,13 @@ LDFLAGS=" \
 		-X ${APPPATH}/define.AppName=${NAME} \
 		-X ${APPPATH}/define.Mode=release \
 		-X ${APPPATH}/define.BuildHash=${COMMIT_ID} \
+		-X '${APPPATH}/define.GitTag=${GIT_TAG}' \
+		-X '${APPPATH}/define.GitCommitter=${GIT_COMMITTER_NAME}' \
+		-X '${APPPATH}/define.GitCommitTime=${GIT_COMMIT_TIME}' \
+		-X '${APPPATH}/define.BuildTime=$(shell date -u +%Y-%m-%d_%I:%M:%S%p)' \
+		-X '${APPPATH}/define.BuildId=${CI_BUILD_ID}' \
+		-X '${APPPATH}/define.BuildNo=${CI_BUILD_NUM}' \
+		-X '${APPPATH}/define.Release=${RELEASE_VALUE}' \
 		"
 
 .PHONY: build

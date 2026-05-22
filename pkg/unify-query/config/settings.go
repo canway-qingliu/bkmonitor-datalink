@@ -14,8 +14,15 @@ const (
 )
 
 var (
-	Version    = "?.?.?"
-	CommitHash = "unknown"
+	Version       = "?.?.?"
+	CommitHash    = "unknown"
+	GitTag        = ""
+	GitCommitter  = ""
+	GitCommitTime = ""
+	BuildTime     = ""
+	BuildId       = ""
+	BuildNo       = ""
+	Release       = ""
 
 	// 自定义配置路径
 	CustomConfigFilePath string

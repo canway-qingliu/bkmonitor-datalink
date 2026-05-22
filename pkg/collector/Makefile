@@ -39,9 +39,9 @@ encode:
 .PHONY: build
 build:
 	cd $(RELEASE_PATH) && ls -lh && rm -rf *
-	JSON_LIB=$(JSON_LIB) ./control.sh package linux amd64 x86_64 $(VERSION) $(RELEASE_PATH)
-	cd $(RELEASE_PATH) && ls -lh && tar -zcvf bk-collector-$(VERSION).tgz --remove-files -C . * && cp bk-collector-$(VERSION).tgz bk-collector.tgz
-	JSON_LIB=$(JSON_LIB) ./control.sh sidecar $(VERSION) $(RELEASE_PATH) && ls -lh $(RELEASE_PATH)
+	CI_BUILD_ID='$(CI_BUILD_ID)' CI_BUILD_NUM='$(CI_BUILD_NUM)' CI_PIPELINE='$(CI_PIPELINE)' GIT_TAG='$(GIT_TAG)' GIT_COMMIT_TIME='$(GIT_COMMIT_TIME)' GIT_COMMITTER_NAME='$(GIT_COMMITTER_NAME)' RELEASE_VALUE='$(RELEASE_VALUE)' JSON_LIB=$(JSON_LIB) ./control.sh package linux amd64 x86_64 $(VERSION) $(RELEASE_PATH)
+	cd $(RELEASE_PATH) && ls -lh && tar -zcvf bk-collector-$(VERSION).tgz -C . * && cp bk-collector-$(VERSION).tgz bk-collector.tgz && find . -mindepth 1 -maxdepth 1 ! -name "bk-collector-$(VERSION).tgz" ! -name "bk-collector.tgz" -exec rm -rf {} +
+	CI_BUILD_ID='$(CI_BUILD_ID)' CI_BUILD_NUM='$(CI_BUILD_NUM)' CI_PIPELINE='$(CI_PIPELINE)' GIT_TAG='$(GIT_TAG)' GIT_COMMIT_TIME='$(GIT_COMMIT_TIME)' GIT_COMMITTER_NAME='$(GIT_COMMITTER_NAME)' RELEASE_VALUE='$(RELEASE_VALUE)' JSON_LIB=$(JSON_LIB) ./control.sh sidecar $(VERSION) $(RELEASE_PATH) && ls -lh $(RELEASE_PATH)
 
 .PHONY: mod
 mod:

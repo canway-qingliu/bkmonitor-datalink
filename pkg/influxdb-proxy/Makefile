@@ -5,7 +5,7 @@ NAME = influxdb-proxy
 VERSION ?= $(shell cat VERSION)
 COMMIT_ID ?= $(shell git rev-parse HEAD)
 
-APPPATH = "github.com/TencentBlueKing/bkmonitor-datalink/pkg/${NAME}"
+APPPATH = github.com/TencentBlueKing/bkmonitor-datalink/pkg/${NAME}
 PACKAGES = $(shell go list -f '{{.ImportPath}}' ./...)
 
 APPNAME = tsdbproxy_v2
@@ -15,6 +15,13 @@ LDFLAGS=" \
 		-X ${APPPATH}/cmd.AppName=${APPNAME} \
 		-X ${APPPATH}/cmd.Mode=release \
 		-X ${APPPATH}/cmd.BuildHash=${COMMIT_ID} \
+		-X '${APPPATH}/cmd.GitTag=${GIT_TAG}' \
+		-X '${APPPATH}/cmd.GitCommitter=${GIT_COMMITTER_NAME}' \
+		-X '${APPPATH}/cmd.GitCommitTime=${GIT_COMMIT_TIME}' \
+		-X '${APPPATH}/cmd.BuildTime=$(shell date -u +%Y-%m-%d_%I:%M:%S%p)' \
+		-X '${APPPATH}/cmd.BuildId=${CI_BUILD_ID}' \
+		-X '${APPPATH}/cmd.BuildNo=${CI_BUILD_NUM}' \
+		-X '${APPPATH}/cmd.Release=${RELEASE_VALUE}' \
 		"
 
 .PHONY: build

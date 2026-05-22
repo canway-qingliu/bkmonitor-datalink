@@ -26,13 +26,38 @@ import (
 )
 
 var (
-	appName   = "bk-collector"
-	version   = "unknown.version"
-	gitHash   = "unknown.gitHash"
-	buildTime = "unknown.buildTime"
+	appName    = "bk-collector"
+	version    = "unknown.version"
+	gitHash    = "unknown.gitHash"
+	buildTime  = "unknown.buildTime"
+	tag        = "unknown.tag"
+	committer  = "unknown.committer"
+	commitTime = "unknown.commitTime"
+	buildId    = "unknown.buildId"
+	buildNo    = "unknown.buildNo"
+	release    = "unknown.release"
 )
 
+func printVersionAndExitIfRequested() {
+	for _, arg := range os.Args[1:] {
+		if arg == "-v" || arg == "--version" {
+			fmt.Printf("Version: %s\n", version)
+			fmt.Printf("CommitId: %s\n", gitHash)
+			fmt.Printf("Tag: %s\n", tag)
+			fmt.Printf("Committer: %s\n", committer)
+			fmt.Printf("CommitTime: %s\n", commitTime)
+			fmt.Printf("BuildTime: %s\n", buildTime)
+			fmt.Printf("BuildId: %s\n", buildId)
+			fmt.Printf("BuildNo: %s\n", buildNo)
+			fmt.Printf("Release: %s\n", release)
+			os.Exit(0)
+		}
+	}
+}
+
 func main() {
+	printVersionAndExitIfRequested()
+
 	settings := instance.Settings{Processing: processing.MakeDefaultSupport(false)}
 	pubConfig := beat.PublishConfig{PublishMode: libbeat.PublishMode(beat.GuaranteedSend)}
 

@@ -26,6 +26,12 @@ endif
 LDFLAGS="-X github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/versions.Version=${VERSION} \
 	-X github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/versions.GitCommit=${COMMIT_ID} \
 	-X github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/versions.BuildTime=${shell date +%Y-%m-%dT%I:%M:%S} \
+	-X 'github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/versions.GitTag=${GIT_TAG}' \
+	-X 'github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/versions.GitCommitter=${GIT_COMMITTER_NAME}' \
+	-X 'github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/versions.GitCommitTime=${GIT_COMMIT_TIME}' \
+	-X 'github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/versions.BuildId=${CI_BUILD_ID}' \
+	-X 'github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/versions.BuildNo=${CI_BUILD_NUM}' \
+	-X 'github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/versions.Release=${RELEASE_VALUE}' \
 	-X github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/config.ServiceName=${SERVICENAME}"
 
 

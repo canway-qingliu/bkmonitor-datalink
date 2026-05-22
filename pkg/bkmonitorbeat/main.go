@@ -43,6 +43,14 @@ import (
 var (
 	BeatName         = "bkmonitorbeat"
 	Version          = "unknown"
+	GitHash          = "unknown.gitHash"
+	GitTag           = "unknown.tag"
+	GitCommitter     = "unknown.committer"
+	GitCommitTime    = "unknown.commitTime"
+	BuildTime        = "unknown.buildTime"
+	BuildId          = "unknown.buildId"
+	BuildNo          = "unknown.buildNo"
+	Release          = "unknown.release"
 	reportFlag       = flag.Bool("report", false, "Report event to time series to bkmonitorproxy")
 	fakeproc         = flag.String("fakeproc", "", "Show the real pid of the mapping process info")
 	disableNormalize = flag.Bool("disable-normalize", false, "If present, disable data normalization")
@@ -53,6 +61,23 @@ var (
 	cgroupBlockWriteIOps  = flag.Int("cgroup-block-write-iops", 0, "set root devices block io write iops")
 	cgroupBlockReadIOps   = flag.Int("cgroup-block-read-iops", 0, "set root devices block io read iops")
 )
+
+func printVersionAndExitIfRequested() {
+	for _, arg := range os.Args[1:] {
+		if arg == "-v" || arg == "--version" {
+			fmt.Printf("Version: %s\n", Version)
+			fmt.Printf("CommitId: %s\n", GitHash)
+			fmt.Printf("Tag: %s\n", GitTag)
+			fmt.Printf("Committer: %s\n", GitCommitter)
+			fmt.Printf("CommitTime: %s\n", GitCommitTime)
+			fmt.Printf("BuildTime: %s\n", BuildTime)
+			fmt.Printf("BuildId: %s\n", BuildId)
+			fmt.Printf("BuildNo: %s\n", BuildNo)
+			fmt.Printf("Release: %s\n", Release)
+			os.Exit(0)
+		}
+	}
+}
 
 func registerValidators() {
 	err := ucfg.RegisterValidator("regexp", validator.ValidateRegex)
@@ -67,6 +92,8 @@ func ignoreSignal(c chan os.Signal) {
 }
 
 func main() {
+	printVersionAndExitIfRequested()
+
 	senderhttp.Register()
 
 	flag.Parse()
