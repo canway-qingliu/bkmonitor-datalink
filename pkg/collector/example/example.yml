@@ -1056,7 +1056,7 @@ bk-collector:
                   - "resource.name"
                   - "attributes.rum_apdex_type"
     # 页面加载耗时
-    - name: "apdex_calculator/rum_view_load"
+    - name: "apdex_calculator/rum_apdex_common"
       config:
         calculator:
           type: "standard"
@@ -1067,12 +1067,6 @@ bk-collector:
             predicate_value: "documentLoad"
             destination: "rum_view_load_apdex_type"
             apdex_t: 500 # ms
-    # 页面 API 请求耗时
-    - name: "apdex_calculator/rum_api_request"
-      config:
-        calculator:
-          type: "standard"
-        rules:
           - kind: "SPAN_KIND_CLIENT"
             predicate_key: "attributes.http.method"
             destination: "rum_api_request_apdex_type"
@@ -1080,7 +1074,6 @@ bk-collector:
             duration:
               start_event: "fetchStart"
               end_event: "responseEnd"
-
 
   # =============================== Pipeline =================================
   # name: pipeline 名称作为标识
@@ -1090,8 +1083,9 @@ bk-collector:
     - name: "rum_pipeline/direct"
       type: "rum"
       processors:
-        - "apdex_calculator/rum_view_load"
-        - "apdex_calculator/rum_api_request"
+        # - "token_checker/aes256"
+        # - "rate_limiter/token_bucket"
+        - "apdex_calculator/rum_apdex_common"
 
     - name: "traces_pipeline/common"
       type: "traces"
@@ -1119,6 +1113,7 @@ bk-collector:
         - "traces_deriver/max"
         - "traces_deriver/sum"
         - "traces_deriver/bucket"
+        - "traces_deriver/web_vitals"
 
     - name: "logs_pipeline/common"
       type: "logs"
