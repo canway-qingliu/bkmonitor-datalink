@@ -11,6 +11,7 @@ package metricsderiver
 
 import (
 	"regexp"
+	"sync"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -58,6 +59,7 @@ func newFactory(conf map[string]any, customized []processor.SubConfigProcessor) 
 
 type metricsDeriver struct {
 	processor.CommonProcessor
+	mu            sync.Mutex
 	configs       *confengine.TierConfig // type: Config
 	metricBuilder *MetricBuilder
 }
@@ -81,12 +83,18 @@ func (p *metricsDeriver) Reload(config map[string]any, customized []processor.Su
 		return
 	}
 
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	p.CommonProcessor = f.CommonProcessor
 	p.configs = f.configs
 	p.metricBuilder = f.metricBuilder
 }
 
 func (p *metricsDeriver) Process(record *define.Record) (*define.Record, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	config := p.configs.GetByToken(record.Token.Original).(Config)
 	if config.OTJavaAgent.Enabled {
 		p.otMetricDerive(record, config)
@@ -160,7 +168,10 @@ func aggregateGcDataPoints(dps pmetric.HistogramDataPointSlice, youngGcMapping, 
 			continue
 		}
 
-		timestamp := dp.StartTimestamp()
+		timestamp := dp.Timestamp()
+		if timestamp == 0 {
+			timestamp = dp.StartTimestamp()
+		}
 		count := dp.Count()
 		sum := dp.Sum()
 
@@ -212,7 +223,11 @@ func foreachSumDataPoints(metric pmetric.Metric, f func(attrs pcommon.Map, ts pc
 	dps := metric.Sum().DataPoints()
 	for i := 0; i < dps.Len(); i++ {
 		dp := dps.At(i)
-		f(dp.Attributes(), dp.StartTimestamp(), dp.IntVal())
+		ts := dp.Timestamp()
+		if ts == 0 {
+			ts = dp.StartTimestamp()
+		}
+		f(dp.Attributes(), ts, dp.IntVal())
 	}
 }
 
