@@ -327,6 +327,31 @@ bk-collector:
 
     # ServiceDiscover: 服务发现处理器
     - name: "service_discover/common"
+      config:
+        rules:
+          - service: ""
+            type: "http"
+            match_type: "auto"
+            predicate_key: "attributes.http.method"
+            kind: "SPAN_KIND_CLIENT"
+            match_key: "attributes.http.method"
+            match_groups:
+              - source: "http_method"
+                destination: "span_name"
+            rule:
+              regex: "^(?P<http_method>.+)$"
+
+          - service: ""
+            type: "http"
+            match_type: "auto"
+            predicate_key: "attributes.http.request.method"
+            kind: "SPAN_KIND_CLIENT"
+            match_key: "attributes.http.request.method"
+            match_groups:
+              - source: "http_method"
+                destination: "span_name"
+            rule:
+              regex: "^(?P<http_method>.+)$"
 
     # SpanProcessor: span 处理器
     - name: "span_processor/common"
