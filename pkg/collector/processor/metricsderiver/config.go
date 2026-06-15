@@ -102,6 +102,8 @@ func (mb *MetricBuilder) build(scopeMetrics pmetric.ScopeMetrics) {
 			metric.Attributes().UpsertString(k, v)
 		}
 	}
+	clear(mb.metricSlice)
+	mb.metricSlice = mb.metricSlice[:0]
 }
 
 type JvmGcDataPoint struct {

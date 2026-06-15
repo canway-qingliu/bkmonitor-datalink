@@ -10,6 +10,7 @@
 package metricsderiver
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -139,6 +140,33 @@ func makeSumMetricData(metricName string, attrs map[string]pcommon.Value, val in
 	return metric
 }
 
+func metricNames(metrics pmetric.MetricSlice) map[string]int {
+	names := make(map[string]int)
+	for i := 0; i < metrics.Len(); i++ {
+		names[metrics.At(i).Name()]++
+	}
+	return names
+}
+
+func metricAttr(metrics pmetric.MetricSlice, metricName, attrName string) (string, bool) {
+	for i := 0; i < metrics.Len(); i++ {
+		metric := metrics.At(i)
+		if metric.Name() != metricName || metric.DataType() != pmetric.MetricDataTypeGauge {
+			continue
+		}
+		dps := metric.Gauge().DataPoints()
+		if dps.Len() == 0 {
+			return "", false
+		}
+		attr, ok := dps.At(0).Attributes().Get(attrName)
+		if !ok {
+			return "", false
+		}
+		return attr.AsString(), true
+	}
+	return "", false
+}
+
 func TestMetricDerive(t *testing.T) {
 	content := `
 processor:
@@ -174,6 +202,7 @@ processor:
 		}, 5)
 
 		factory := processor.MustCreateFactory(content, NewFactory)
+		p := factory.(*metricsDeriver)
 
 		record := define.Record{
 			RecordType: define.RecordMetrics,
@@ -184,6 +213,81 @@ processor:
 		testkits.MustProcess(t, factory, record)
 		metrics := record.Data.(pmetric.Metrics).ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics()
 		assert.Equal(t, 5, metrics.Len())
+		assert.Empty(t, p.metricBuilder.metricSlice)
+	})
+
+	t.Run("MetricBuilder Reset Between Records", func(t *testing.T) {
+		factory := processor.MustCreateFactory(content, NewFactory)
+		p := factory.(*metricsDeriver)
+
+		gcRecord := define.Record{
+			RecordType: define.RecordMetrics,
+			Data: makeMetricsRecord(map[string]string{
+				resourceTelemetryDistroName: "opentelemetry-java-instrumentation",
+			}),
+			Token: define.Token{Original: "test-token"},
+		}
+		gcMetrics := gcRecord.Data.(pmetric.Metrics).ResourceMetrics().At(0).ScopeMetrics().AppendEmpty().Metrics()
+		addHistogramMetric(gcMetrics, jvmGcDuration, map[string]string{
+			jvmGcName: "G1 Young Generation",
+		}, 10, 0.5)
+
+		_, err := factory.Process(&gcRecord)
+		assert.NoError(t, err)
+		assert.Empty(t, p.metricBuilder.metricSlice)
+
+		memoryRecord := define.Record{
+			RecordType: define.RecordMetrics,
+			Data: makeMetricsRecord(map[string]string{
+				resourceTelemetryDistroName: "opentelemetry-java-instrumentation",
+			}),
+			Token: define.Token{Original: "test-token"},
+		}
+		memoryMetrics := memoryRecord.Data.(pmetric.Metrics).ResourceMetrics().At(0).ScopeMetrics().AppendEmpty().Metrics()
+		addSumMetric(memoryMetrics, jvmMemoryUsed, map[string]string{
+			jvmMemoryType: "heap",
+		}, 1024000)
+
+		_, err = factory.Process(&memoryRecord)
+		assert.NoError(t, err)
+		assert.Empty(t, p.metricBuilder.metricSlice)
+
+		names := metricNames(memoryRecord.Data.(pmetric.Metrics).ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics())
+		assert.Equal(t, map[string]int{jvmMemoryHeapUsed: 1}, names)
+		assert.NotContains(t, names, jvmGcYoungCount)
+		assert.NotContains(t, names, jvmGcYoungTime)
+	})
+
+	t.Run("MetricBuilder Reset Between ScopeMetrics", func(t *testing.T) {
+		factory := processor.MustCreateFactory(content, NewFactory)
+		p := factory.(*metricsDeriver)
+
+		metricsRecord := makeMetricsRecord(map[string]string{
+			resourceTelemetryDistroName: "opentelemetry-java-instrumentation",
+		})
+		rm := metricsRecord.ResourceMetrics().At(0)
+		gcMetrics := rm.ScopeMetrics().AppendEmpty().Metrics()
+		addHistogramMetric(gcMetrics, jvmGcDuration, map[string]string{
+			jvmGcName: "G1 Young Generation",
+		}, 10, 0.5)
+		memoryMetrics := rm.ScopeMetrics().AppendEmpty().Metrics()
+		addSumMetric(memoryMetrics, jvmMemoryUsed, map[string]string{
+			jvmMemoryType: "heap",
+		}, 1024000)
+
+		record := define.Record{
+			RecordType: define.RecordMetrics,
+			Data:       metricsRecord,
+			Token:      define.Token{Original: "test-token"},
+		}
+
+		_, err := factory.Process(&record)
+		assert.NoError(t, err)
+		assert.Empty(t, p.metricBuilder.metricSlice)
+
+		scopeMetrics := record.Data.(pmetric.Metrics).ResourceMetrics().At(0).ScopeMetrics()
+		assert.Equal(t, map[string]int{jvmGcYoungCount: 1, jvmGcYoungTime: 1}, metricNames(scopeMetrics.At(0).Metrics()))
+		assert.Equal(t, map[string]int{jvmMemoryHeapUsed: 1}, metricNames(scopeMetrics.At(1).Metrics()))
 	})
 
 	t.Run("Process Non-OT Java Agent Metrics", func(t *testing.T) {
@@ -198,6 +302,69 @@ processor:
 		factory := processor.MustCreateFactory(content, NewFactory)
 		testkits.MustProcess(t, factory, record)
 	})
+}
+
+func TestMetricDeriverConcurrentProcessAndReload(t *testing.T) {
+	content := `
+processor:
+  - name: "metrics_deriver/ot_java_agent"
+    config:
+      ot_java_agent:
+        enabled: true
+        keep_origin_metric: false
+`
+	mainConf := processor.MustLoadConfigs(content)[0].Config
+	factory := processor.MustCreateFactory(content, NewFactory)
+	p := factory.(*metricsDeriver)
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 100)
+
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				metricsRecord := makeMetricsRecord(map[string]string{
+					resourceTelemetryDistroName: "opentelemetry-java-instrumentation",
+				})
+				metricSlice := metricsRecord.ResourceMetrics().At(0).ScopeMetrics().AppendEmpty().Metrics()
+				addHistogramMetric(metricSlice, jvmGcDuration, map[string]string{
+					jvmGcName: "G1 Young Generation",
+				}, 10, 0.5)
+				addSumMetric(metricSlice, jvmMemoryUsed, map[string]string{
+					jvmMemoryType: "heap",
+				}, 1024000)
+
+				record := define.Record{
+					RecordType: define.RecordMetrics,
+					Data:       metricsRecord,
+					Token:      define.Token{Original: "test-token"},
+				}
+				_, err := factory.Process(&record)
+				if err != nil {
+					errCh <- err
+				}
+			}
+		}()
+	}
+
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				factory.Reload(mainConf, nil)
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		assert.NoError(t, err)
+	}
+	assert.Empty(t, p.metricBuilder.metricSlice)
 }
 
 func TestProcessGcMetrics(t *testing.T) {
