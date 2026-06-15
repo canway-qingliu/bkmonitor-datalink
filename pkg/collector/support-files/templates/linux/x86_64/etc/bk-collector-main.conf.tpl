@@ -327,34 +327,37 @@ bk-collector:
 
     # ServiceDiscover: 服务发现处理器
     - name: "service_discover/common"
-      config:
-        rules:
-          - service: ""
-            type: "http"
-            match_type: "auto"
-            predicate_key: "attributes.http.method"
-            kind: "SPAN_KIND_CLIENT"
-            match_key: "attributes.http.method"
-            match_groups:
-              - source: "http_method"
-                destination: "span_name"
-            rule:
-              regex: "^(?P<http_method>.+)$"
-
-          - service: ""
-            type: "http"
-            match_type: "auto"
-            predicate_key: "attributes.http.request.method"
-            kind: "SPAN_KIND_CLIENT"
-            match_key: "attributes.http.request.method"
-            match_groups:
-              - source: "http_method"
-                destination: "span_name"
-            rule:
-              regex: "^(?P<http_method>.+)$"
 
     # SpanProcessor: span 处理器
     - name: "span_processor/common"
+      config:
+        replace_value:
+          - predicate_key: "span_name"
+            rules:
+              - filters:
+                  - key: "kind"
+                    op: "eq"
+                    value:
+                      - "3"
+                  - key: "attributes.http.method"
+                    op: "reg"
+                    value:
+                      - "^.+$"
+                replace_from:
+                  source:
+                    - "attributes.http.method"
+              - filters:
+                  - key: "kind"
+                    op: "eq"
+                    value:
+                      - "3"
+                  - key: "attributes.http.request.method"
+                    op: "reg"
+                    value:
+                      - "^.+$"
+                replace_from:
+                  source:
+                    - "attributes.http.request.method"
 
     # TokenChecker: 权限校验处理器
     # Proxy
