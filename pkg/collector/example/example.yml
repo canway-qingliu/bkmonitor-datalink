@@ -1040,8 +1040,8 @@ bk-collector:
     - name: "traces_pipeline/common"
       type: "traces"
       processors:
-        - "token_checker/aes256"
-        - "rate_limiter/token_bucket"
+        # - "token_checker/aes256"
+        # - "rate_limiter/token_bucket"
         #- "license_checker/common"
         #- "forwarder/traces"
         #- "sampler/status_code"
