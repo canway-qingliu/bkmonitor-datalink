@@ -22,7 +22,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"sort"
@@ -30,6 +29,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"math/rand/v2"
 )
 
 const (
