@@ -96,8 +96,14 @@ func (s *SpaceFilter) getTsDBWithResultTableDetail(t query.TsDBV2, d *routerInfl
 
 	for _, record := range d.StorageClusterRecords {
 		t.StorageClusterRecords = append(t.StorageClusterRecords, query.Record{
-			StorageID:  strconv.Itoa(int(record.StorageID)),
-			EnableTime: record.EnableTime,
+			StorageID:   strconv.Itoa(int(record.StorageID)),
+			StorageType: record.StorageType,
+			StorageName: record.StorageName,
+			ClusterName: record.ClusterName,
+			DB:          record.DB,
+			Measurement: record.Measurement,
+			SourceType:  record.SourceType,
+			EnableTime:  record.EnableTime,
 		})
 	}
 
@@ -105,38 +111,54 @@ func (s *SpaceFilter) getTsDBWithResultTableDetail(t query.TsDBV2, d *routerInfl
 }
 
 func (s *SpaceFilter) NewTsDBs(spaceTable *routerInfluxdb.SpaceResultTable, fieldNameExp *regexp.Regexp, allConditions AllConditions,
-	fieldName, tableID string, isK8s, isK8sFeatureFlag, isSkipField bool,
-) []*query.TsDBV2 {
+	fieldName, tableID string, isK8s, isK8sFeatureFlag, isSkipField, isFieldMissingFallback bool, tableIDConditions AllConditions,
+) ([]*query.TsDBV2, error) {
 	rtDetail := s.router.GetResultTable(s.ctx, tableID, false)
 	if rtDetail == nil {
-		return nil
+		return nil, nil
+	}
+	// 仅在全空间候选路径下传入非空 tableIDConditions（见 DataList）；此处按结果表 Labels 过滤。
+	if len(tableIDConditions) > 0 {
+		labels := rtDetail.Labels
+		if labels == nil {
+			labels = make(map[string]string)
+		}
+		ok, err := tableIDConditions.MatchResultTableLabels(labels)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, nil
+		}
 	}
 
-	// 只有在容器场景下的特殊逻辑
-	if isK8s {
+	// 容器场景下的特殊过滤逻辑：仅在未显式提供 table_id_conditions 时生效。
+	// 若调用方已通过 table_id_conditions 按 Labels 显式路由，则信任该选择，不再叠加"仅 bk_split_measurement / BcsClusterID 匹配"的容器默认规则，
+	// 避免把 bklog/bkapm 等非 split-measurement 的 RT 误过滤掉。
+	if isK8s && len(tableIDConditions) == 0 {
 		// 增加在非单指标单表下，判断如果强行指定了单指标单表则对其进行修改以支持 vm 查询
 		isSplitMeasurement := rtDetail.MeasurementType == redis.BkSplitMeasurement
 
 		// 容器下只能查单指标单表
 		if !isSplitMeasurement {
-			return nil
+			return nil, nil
 		}
 
 		// 容器下 bcs_cluster_id 是内置维度，才进行此逻辑判断
 		// 如果 allConditions 中存在 clusterId 的筛选条件并且比对不成功的情况下，直接返回 nil，出现错误的情况也直接返回 nil
 		compareResult, err := allConditions.Compare(ClusterID, rtDetail.BcsClusterID)
 		if err != nil {
-			return nil
+			return nil, nil
 		}
 
 		if !compareResult {
-			return nil
+			return nil, nil
 		}
 
 		if isK8sFeatureFlag {
 			// 如果是只查询 k8s 的 rt，则需要判断 bcsClusterID 字段不为空
 			if rtDetail.BcsClusterID == "" {
-				return nil
+				return nil, nil
 			}
 		}
 	}
@@ -171,7 +193,7 @@ func (s *SpaceFilter) NewTsDBs(spaceTable *routerInfluxdb.SpaceResultTable, fiel
 	if isSkipField {
 		defaultTsDB.ExpandMetricNames = []string{fieldName}
 		tsDBs = append(tsDBs, &defaultTsDB)
-		return tsDBs
+		return tsDBs, nil
 	}
 	// 字段不为空时，需要判断是否有匹配字段，返回解析后的结果
 	metricNames := make([]string, 0)
@@ -182,7 +204,23 @@ func (s *SpaceFilter) NewTsDBs(spaceTable *routerInfluxdb.SpaceResultTable, fiel
 	}
 	// 如果字段都不匹配到目标字段，则非目标结果表
 	if len(metricNames) == 0 {
-		return tsDBs
+		// 显式 table_id/data_label 场景下，Fields 只作为辅助展开索引；未命中时按候选 RT 兜底。
+		// 但正则未命中时不能把正则串当字面 metric/measurement 下推。
+		if isFieldMissingFallback && fieldName != "" && fieldNameExp == nil {
+			defaultTsDB.ExpandMetricNames = []string{fieldName}
+			tsDBs = append(tsDBs, &defaultTsDB)
+
+			// 字段在 RT Fields 中缺失但已按显式路由边界兜底返回：单独上报区分性指标与日志，
+			// 避免 fallback 静默掩盖底层字段元数据同步延迟/缺失，便于监控兜底命中频率与排查。
+			// metric label 固定为空，避免把用户输入的 fieldName 作为标签导致 Prometheus 高基数；具体缺失字段见下方日志。
+			metric.SpaceRouterNotExistInc(s.ctx, s.spaceUid, tableID, "", metadata.SpaceTableIDFieldMissingFallback)
+			metadata.NewMessage(
+				metadata.MsgQueryRouter,
+				"field [%s] missing in result_table [%s] fields, fallback to explicit route rt (metadata maybe stale)",
+				fieldName, tableID,
+			).Info(s.ctx)
+		}
+		return tsDBs, nil
 	}
 
 	if !defaultTsDB.IsSplit() {
@@ -208,7 +246,7 @@ func (s *SpaceFilter) NewTsDBs(spaceTable *routerInfluxdb.SpaceResultTable, fiel
 		tsDBs = append(tsDBs, &defaultTsDB)
 	}
 
-	return tsDBs
+	return tsDBs, nil
 }
 
 // GetMetricSepRT 获取指标独立配置的 RT
@@ -265,7 +303,9 @@ func (s *SpaceFilter) DataList(opt *TsDBOption) ([]*query.TsDBV2, error) {
 		return nil, fmt.Errorf("%s, %s", ErrEmptyTableID.Error(), ErrMetricMissing.Error())
 	}
 
-	if opt.TableID == "" && opt.FieldName == "" {
+	// 允许调用方仅通过 table_id_conditions 做全空间扫表路由
+	// 仅当 table_id、metric_name、table_id_conditions 三者都缺失时才判为"入参不完整"直接拒绝
+	if opt.TableID == "" && opt.FieldName == "" && len(opt.TableIDConditions) == 0 {
 		return nil, fmt.Errorf("%s, %s", ErrEmptyTableID.Error(), ErrMetricMissing.Error())
 	}
 	tsDBs := make([]*query.TsDBV2, 0)
@@ -278,6 +318,12 @@ func (s *SpaceFilter) DataList(opt *TsDBOption) ([]*query.TsDBV2, error) {
 
 	// 判断 tableID 使用几段式
 	db, measurement := opt.TableID.Split()
+	// 已指定 table_id / data_label（db 非空）时，候选 RT 已由 TableID 限定，不再按 table_id_conditions 过滤 Labels；
+	// 未指定（db 为空，全空间扫表）时，才用 table_id_conditions 在候选集上按结果表 Labels 收窄。
+	var tableIDCondsForFilter AllConditions
+	if db == "" {
+		tableIDCondsForFilter = opt.TableIDConditions
+	}
 
 	var fieldNameExp *regexp.Regexp
 	if opt.IsRegexp {
@@ -286,16 +332,29 @@ func (s *SpaceFilter) DataList(opt *TsDBOption) ([]*query.TsDBV2, error) {
 
 	// tableID 去重，防止重复获取
 	tableIDs := set.New[string]()
+	// fallbackEnabled 标记每个候选 RT 是否允许"字段缺失兜底"：
+	// 仅显式 data_label/table_id 边界内的候选可兜底，避免越过 data_label 边界误带同名 RT。
+	fallbackEnabled := make(map[string]bool)
 	isK8s := false
 
 	if db != "" {
 		// 指标二段式，仅传递 data-label， datalabel 支持各种格式
 		tIDs := s.router.GetDataLabelRelatedRts(s.ctx, string(opt.TableID))
 		tableIDs.Add(tIDs...)
+		// data_label 映射内的候选属于显式 data_label 边界，允许字段缺失兜底
+		for _, tID := range tIDs {
+			fallbackEnabled[tID] = true
+		}
 
 		// 只有当 db 和 measurement 都不为空时，才是 tableID，为了兼容，同时也接入到 tableID  list
 		if measurement != "" {
-			tableIDs.Add(fmt.Sprintf("%s.%s", db, measurement))
+			fullTableID := fmt.Sprintf("%s.%s", db, measurement)
+			tableIDs.Add(fullTableID)
+			// 合成的完整 table_id 仅在不存在 data_label 映射（纯 table_id 查询）时才允许兜底；
+			// 若已存在 data_label 映射，则它只是与 data_label 同名的兼容项，不应越过 data_label 边界兜底。
+			if len(tIDs) == 0 {
+				fallbackEnabled[fullTableID] = true
+			}
 		}
 
 		if tableIDs.Size() == 0 {
@@ -316,14 +375,26 @@ func (s *SpaceFilter) DataList(opt *TsDBOption) ([]*query.TsDBV2, error) {
 
 	isK8sFeatureFlag := featureFlag.GetIsK8sFeatureFlag(s.ctx)
 
+	// 仅在启用了 table_id_conditions 时跟踪是否有候选 RT 的 Labels 命中，避免后续失败原因不在 Labels 时追加误导文案
+	anyLabelMatched := len(tableIDCondsForFilter) == 0
 	for _, tID := range tableIDs.ToArray() {
 		spaceRt := s.GetSpaceRtInfo(tID)
 		// 如果不跳过空间，则取 space 和 tableIDs 的交集
 		if !opt.IsSkipSpace && spaceRt == nil {
 			continue
 		}
+		if !anyLabelMatched {
+			if rt := s.router.GetResultTable(s.ctx, tID, false); rt != nil {
+				if tableIDCondsForFilter.MatchesResultTableLabels(rt.Labels) {
+					anyLabelMatched = true
+				}
+			}
+		}
 		// 指标模糊匹配，可能命中多个私有指标 RT
-		newTsDBs := s.NewTsDBs(spaceRt, fieldNameExp, opt.AllConditions, opt.FieldName, tID, isK8s, isK8sFeatureFlag, opt.IsSkipField)
+		newTsDBs, err := s.NewTsDBs(spaceRt, fieldNameExp, opt.AllConditions, opt.FieldName, tID, isK8s, isK8sFeatureFlag, opt.IsSkipField, fallbackEnabled[tID], tableIDCondsForFilter)
+		if err != nil {
+			return nil, err
+		}
 		for _, newTsDB := range newTsDBs {
 			tsDBs = append(tsDBs, newTsDB)
 		}
@@ -331,6 +402,9 @@ func (s *SpaceFilter) DataList(opt *TsDBOption) ([]*query.TsDBV2, error) {
 
 	if len(tsDBs) == 0 {
 		routerMessage = fmt.Sprintf("tableID with field is empty with tableID: %s, field: %s, isSkipField: %v", opt.TableID, opt.FieldName, opt.IsSkipField)
+		if len(tableIDCondsForFilter) > 0 && !anyLabelMatched {
+			routerMessage += "；已启用 table_id_conditions，无 RT 的 Labels 命中条件"
+		}
 		return nil, nil
 	}
 
@@ -348,6 +422,8 @@ type TsDBOption struct {
 	// IsRegexp 指标是否使用正则查询
 	IsRegexp      bool
 	AllConditions AllConditions
+	// TableIDConditions 表标签条件（AllConditions）。仅当未指定 table_id / data_label（TableID.Split() 后 db 为空、走全空间候选）时参与过滤；已指定 db 或完整 table_id 时不生效。
+	TableIDConditions AllConditions
 }
 
 type TsDBs []*query.TsDBV2

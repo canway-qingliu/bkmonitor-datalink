@@ -18,6 +18,11 @@ import (
 
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/curl"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb"
@@ -25,6 +30,7 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/mock"
+	uqtrace "github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/trace"
 )
 
 var (
@@ -221,6 +227,47 @@ func TestInstance_QueryLabelValues(t *testing.T) {
 	}
 }
 
+func TestInstance_QueryLabelValues_FallbackOver24h(t *testing.T) {
+	mock.Init()
+	ctx := metadata.InitHashID(context.Background())
+
+	testUser := &metadata.User{
+		Key:      "bk_monitor:admin",
+		TenantID: "test-tenant-001",
+		SpaceUID: influxdb.SpaceUid,
+	}
+	metadata.SetUser(ctx, testUser)
+	origHashID := testUser.HashID
+
+	start := time.Unix(1730180458, 0)
+	end := time.Unix(1730180458+86401, 0) // >24h
+
+	mock.Vm.Set(map[string]any{
+		`label_values:17301804581730266859pod{__name__="container_cpu_usage_seconds_total_value", result_table_id="2_bcs_prom_computation_result_table_00000", container="unify-query"}`: `{"result":true,"message":"成功","code":"00","data":{"result_table_scan_range":null,"cluster":"monitor-op","totalRecords":2,"resource_use_summary":{"cpu_time_mills":0,"memory_bytes":0,"processed_bytes":0,"processed_rows":0},"source":"","list":[{"status":"success","isPartial":false,"data":["pod-a","pod-b"]}],"select_fields_order":[],"sql":"test","total_record_size":100,"timetaken":0.0,"bksql_call_elapsed_time":0,"device":"vm","result_table_ids":["2_bcs_prom_computation_result_table_00000"]},"errors":null,"trace_id":"00000000000000000000000000000000","span_id":"0000000000000000"}`,
+	})
+
+	query := &metadata.Query{
+		VmRt:        vmRt,
+		VmCondition: vmCondition,
+	}
+
+	res, err := instance.QueryLabelValues(ctx, query, "pod", start, end)
+	assert.NoError(t, err)
+	sort.Strings(res)
+
+	expected := `["pod-a","pod-b"]`
+	actual, _ := json.Marshal(res)
+	assert.Equal(t, expected, string(actual))
+
+	// 验证原始 User 的 HashID 未被 SetUser 污染
+	assert.Equal(t, origHashID, testUser.HashID, "original user's HashID should not be mutated by the fallback path")
+
+	// 验证原始 ctx 中的 User 信息仍然完整
+	origUser := metadata.GetUser(ctx)
+	assert.Equal(t, "test-tenant-001", origUser.TenantID)
+	assert.Equal(t, influxdb.SpaceUid, origUser.SpaceUID)
+}
+
 func TestVmResponse_VmQueryCluster(t *testing.T) {
 	t.Run("with vm_query_cluster", func(t *testing.T) {
 		raw := `{
@@ -246,7 +293,7 @@ func TestVmResponse_VmQueryCluster(t *testing.T) {
 				"device": "vm",
 				"result_table_ids": ["2_test_rt"],
 				"vm_query_cluster": {
-					"query_cluster": "vm-monitor-op-history2.bkop.woa.com",
+"query_cluster": "vm-query-history.example.com",
 					"storage_cluster_list": ["vm-op1", "vm-op2"]
 				}
 			},
@@ -260,7 +307,7 @@ func TestVmResponse_VmQueryCluster(t *testing.T) {
 		assert.True(t, resp.Result)
 		assert.Equal(t, OK, resp.Code)
 		assert.NotNil(t, resp.Data.VmQueryCluster)
-		assert.Equal(t, "vm-monitor-op-history2.bkop.woa.com", resp.Data.VmQueryCluster.QueryCluster)
+		assert.Equal(t, "vm-query-history.example.com", resp.Data.VmQueryCluster.QueryCluster)
 		assert.Equal(t, []string{"vm-op1", "vm-op2"}, resp.Data.VmQueryCluster.StorageClusterList)
 	})
 
@@ -316,7 +363,7 @@ func TestVmResponse_VmQueryCluster(t *testing.T) {
 				"device": "vm",
 				"result_table_ids": ["2_test_rt"],
 				"vm_query_cluster": {
-					"query_cluster": "vm-monitor-op-history2.bkop.woa.com",
+"query_cluster": "vm-query-history.example.com",
 					"storage_cluster_list": ["vm-op1", "vm-op2"]
 				}
 			},
@@ -328,7 +375,7 @@ func TestVmResponse_VmQueryCluster(t *testing.T) {
 		assert.NoError(t, err)
 
 		assert.NotNil(t, resp.Data.VmQueryCluster)
-		assert.Equal(t, "vm-monitor-op-history2.bkop.woa.com", resp.Data.VmQueryCluster.QueryCluster)
+		assert.Equal(t, "vm-query-history.example.com", resp.Data.VmQueryCluster.QueryCluster)
 		assert.Equal(t, []string{"vm-op1", "vm-op2"}, resp.Data.VmQueryCluster.StorageClusterList)
 	})
 
@@ -349,7 +396,7 @@ func TestVmResponse_VmQueryCluster(t *testing.T) {
 				"device": "vm",
 				"result_table_ids": ["2_test_rt"],
 				"vm_query_cluster": {
-					"query_cluster": "vm-monitor-op.woa.com",
+"query_cluster": "vm-query.example.com",
 					"storage_cluster_list": []
 				}
 			},
@@ -361,7 +408,7 @@ func TestVmResponse_VmQueryCluster(t *testing.T) {
 		assert.NoError(t, err)
 
 		assert.NotNil(t, resp.Data.VmQueryCluster)
-		assert.Equal(t, "vm-monitor-op.woa.com", resp.Data.VmQueryCluster.QueryCluster)
+		assert.Equal(t, "vm-query.example.com", resp.Data.VmQueryCluster.QueryCluster)
 		assert.Empty(t, resp.Data.VmQueryCluster.StorageClusterList)
 	})
 }
@@ -446,7 +493,7 @@ func TestInstance_DirectQuery_WithVmQueryCluster(t *testing.T) {
 
 	// mock response 携带 vm_query_cluster
 	mock.Vm.Set(map[string]any{
-		`query:1730184058sum(increase({__name__="container_cpu_usage_seconds_total_value", result_table_id="2_bcs_prom_computation_result_table_00000", container="unify-query"}[1m])) by (pod)`: `{"result":true,"message":"成功","code":"00","data":{"result_table_scan_range":null,"cluster":"monitor-op","totalRecords":1,"list":[{"status":"success","isPartial":false,"data":{"resultType":"vector","result":[{"metric":{"pod":"test-pod"},"value":[1730184058,"1.5"]}]}}],"select_fields_order":[],"sql":"test","timetaken":0.0,"bksql_call_elapsed_time":0,"device":"vm","result_table_ids":["2_bcs_prom_computation_result_table_00000"],"vm_query_cluster":{"query_cluster":"vm-monitor-op-history2.bkop.woa.com","storage_cluster_list":["vm-op1","vm-op2"]}},"errors":null}`,
+		`query:1730184058sum(increase({__name__="container_cpu_usage_seconds_total_value", result_table_id="2_bcs_prom_computation_result_table_00000", container="unify-query"}[1m])) by (pod)`: `{"result":true,"message":"成功","code":"00","data":{"result_table_scan_range":null,"cluster":"monitor-op","totalRecords":1,"list":[{"status":"success","isPartial":false,"data":{"resultType":"vector","result":[{"metric":{"pod":"test-pod"},"value":[1730184058,"1.5"]}]}}],"select_fields_order":[],"sql":"test","timetaken":0.0,"bksql_call_elapsed_time":0,"device":"vm","result_table_ids":["2_bcs_prom_computation_result_table_00000"],"vm_query_cluster":{"query_cluster":"vm-query-history.example.com","storage_cluster_list":["vm-op1","vm-op2"]}},"errors":null}`,
 	})
 
 	end := time.Unix(1730184058, 0)
@@ -471,7 +518,7 @@ func TestInstance_DirectQueryRange_WithVmQueryCluster(t *testing.T) {
 
 	// mock response 携带 vm_query_cluster
 	mock.Vm.Set(map[string]any{
-		`query_range:17301804581730184058300sum(increase({__name__="container_cpu_usage_seconds_total_value", result_table_id="2_bcs_prom_computation_result_table_00000", container="unify-query"}[1m])) by (pod)`: `{"result":true,"message":"成功","code":"00","data":{"result_table_scan_range":null,"cluster":"monitor-op","totalRecords":1,"list":[{"status":"success","isPartial":false,"data":{"resultType":"matrix","result":[{"metric":{"pod":"test-pod"},"values":[[1730181358,"0.5"],[1730181658,"1.0"]]}]}}],"select_fields_order":[],"sql":"test","timetaken":0.0,"bksql_call_elapsed_time":0,"device":"vm","result_table_ids":["2_bcs_prom_computation_result_table_00000"],"vm_query_cluster":{"query_cluster":"vm-monitor-op-history2.bkop.woa.com","storage_cluster_list":["vm-op1","vm-op2"]}},"errors":null}`,
+		`query_range:17301804581730184058300sum(increase({__name__="container_cpu_usage_seconds_total_value", result_table_id="2_bcs_prom_computation_result_table_00000", container="unify-query"}[1m])) by (pod)`: `{"result":true,"message":"成功","code":"00","data":{"result_table_scan_range":null,"cluster":"monitor-op","totalRecords":1,"list":[{"status":"success","isPartial":false,"data":{"resultType":"matrix","result":[{"metric":{"pod":"test-pod"},"values":[[1730181358,"0.5"],[1730181658,"1.0"]]}]}}],"select_fields_order":[],"sql":"test","timetaken":0.0,"bksql_call_elapsed_time":0,"device":"vm","result_table_ids":["2_bcs_prom_computation_result_table_00000"],"vm_query_cluster":{"query_cluster":"vm-query-history.example.com","storage_cluster_list":["vm-op1","vm-op2"]}},"errors":null}`,
 	})
 
 	start := time.Unix(1730180458, 0)
@@ -487,4 +534,202 @@ func TestInstance_DirectQueryRange_WithVmQueryCluster(t *testing.T) {
 	res, _, err := instance.DirectQueryRange(ctx, fmt.Sprintf(`sum(increase(%s[1m])) by (pod)`, vmCondition.ToMatch()), start, end, step)
 	assert.NoError(t, err)
 	assert.Len(t, res, 1)
+}
+
+func spanAttrString(attrs []attribute.KeyValue, key string) (string, bool) {
+	for _, kv := range attrs {
+		if string(kv.Key) == key {
+			return kv.Value.AsString(), true
+		}
+	}
+	return "", false
+}
+
+func spanAttrStringSlice(attrs []attribute.KeyValue, key string) ([]string, bool) {
+	for _, kv := range attrs {
+		if string(kv.Key) == key {
+			return kv.Value.AsStringSlice(), true
+		}
+	}
+	return nil, false
+}
+
+func TestSpanSetVmQueryClusterIfPresent(t *testing.T) {
+	rec := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+	prevTP := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() {
+		_ = tp.Shutdown(context.Background())
+		otel.SetTracerProvider(prevTP)
+	})
+
+	t.Run("writes JSON for vm-data prefix", func(t *testing.T) {
+		rec.Reset()
+		_, span := uqtrace.NewSpan(context.Background(), "test-span")
+		vc := &metadata.VmQueryCluster{
+			QueryCluster:       "vm-query.example.com",
+			StorageClusterList: []string{"s1", "s2"},
+		}
+		spanSetVmQueryClusterIfPresent(span, "vm-data", vc)
+		var err error
+		span.End(&err)
+
+		ended := rec.Ended()
+		require.Len(t, ended, 1)
+		got, ok := spanAttrString(ended[0].Attributes(), "vm-data-vm-query-cluster")
+		require.True(t, ok)
+		want, jerr := json.Marshal(vc)
+		require.NoError(t, jerr)
+		assert.JSONEq(t, string(want), got)
+	})
+
+	t.Run("writes JSON for response- prefix", func(t *testing.T) {
+		rec.Reset()
+		_, span := uqtrace.NewSpan(context.Background(), "test-span")
+		vc := &metadata.VmQueryCluster{
+			QueryCluster:       "vm-instant.example.com",
+			StorageClusterList: []string{"a"},
+		}
+		spanSetVmQueryClusterIfPresent(span, "response-", vc)
+		var err error
+		span.End(&err)
+
+		ended := rec.Ended()
+		require.Len(t, ended, 1)
+		got, ok := spanAttrString(ended[0].Attributes(), "response--vm-query-cluster")
+		require.True(t, ok)
+		want, jerr := json.Marshal(vc)
+		require.NoError(t, jerr)
+		assert.JSONEq(t, string(want), got)
+	})
+
+	t.Run("nil does not set attribute", func(t *testing.T) {
+		rec.Reset()
+		_, span := uqtrace.NewSpan(context.Background(), "test-span")
+		spanSetVmQueryClusterIfPresent(span, "vm-data", nil)
+		var err error
+		span.End(&err)
+
+		ended := rec.Ended()
+		require.Len(t, ended, 1)
+		_, ok := spanAttrString(ended[0].Attributes(), "vm-data-vm-query-cluster")
+		assert.False(t, ok)
+	})
+}
+
+func TestSpanSetStorageListDiff(t *testing.T) {
+	rec := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+	prevTP := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() {
+		_ = tp.Shutdown(context.Background())
+		otel.SetTracerProvider(prevTP)
+	})
+
+	// These test cases mirror the JSON examples from the code review:
+	// request:  {"rt_vm_1": {"table_id": "rt_1", "storage_name": "vm_op_1"}, ...}
+	// response StorageClusterList: ["vm_op_1", "vm_op_2"]
+	cases := map[string]struct {
+		rtDetail              map[string]metadata.RtDetail
+		responseVMClusterList []string
+		wantStatus            string
+		wantReason            string
+		wantMissing           string // JSON string or empty
+	}{
+		"match: request cluster names equal response cluster names": {
+			rtDetail: map[string]metadata.RtDetail{
+				"rt_vm_1": {TableID: "rt_1", StorageName: "vm_op_1"},
+				"rt_vm_2": {TableID: "rt_2", StorageName: "vm_op_2"},
+			},
+			responseVMClusterList: []string{"vm_op_1", "vm_op_2"},
+			wantStatus:            "match",
+			wantMissing:           "",
+		},
+		"mismatch: vm_op_2 missing from response": {
+			rtDetail: map[string]metadata.RtDetail{
+				"rt_vm_1": {TableID: "rt_1", StorageName: "vm_op_1"},
+				"rt_vm_2": {TableID: "rt_2", StorageName: "vm_op_2"},
+			},
+			responseVMClusterList: []string{"vm_op_1"},
+			wantStatus:            "mismatch",
+			wantMissing:           `[{"cluster":"vm_op_2","vm_rt_list":["rt_vm_2"],"table_id_list":["rt_2"]}]`,
+		},
+		"unknown: response storage cluster list is missing": {
+			rtDetail: map[string]metadata.RtDetail{
+				"rt_vm_1": {TableID: "rt_1", StorageName: "vm_op_1"},
+				"rt_vm_2": {TableID: "rt_2", StorageName: "vm_op_2"},
+			},
+			responseVMClusterList: nil,
+			wantStatus:            "unknown",
+			wantReason:            "empty_storage_cluster_list",
+			wantMissing:           "",
+		},
+		"mismatch: response storage cluster list is explicitly empty": {
+			rtDetail: map[string]metadata.RtDetail{
+				"rt_vm_1": {TableID: "rt_1", StorageName: "vm_op_1"},
+				"rt_vm_2": {TableID: "rt_2", StorageName: "vm_op_2"},
+			},
+			responseVMClusterList: []string{},
+			wantStatus:            "mismatch",
+			wantMissing:           `[{"cluster":"vm_op_1","vm_rt_list":["rt_vm_1"],"table_id_list":["rt_1"]},{"cluster":"vm_op_2","vm_rt_list":["rt_vm_2"],"table_id_list":["rt_2"]}]`,
+		},
+		"response has extra cluster not in request: match (extra ignored)": {
+			rtDetail: map[string]metadata.RtDetail{
+				"rt_vm_1": {TableID: "rt_1", StorageName: "vm_op_1"},
+			},
+			responseVMClusterList: []string{"vm_op_1", "vm_op_2"},
+			wantStatus:            "match",
+			wantMissing:           "",
+		},
+		"empty request and response: match": {
+			rtDetail:              nil,
+			responseVMClusterList: nil,
+			wantStatus:            "match",
+			wantMissing:           "",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			rec.Reset()
+			_, span := uqtrace.NewSpan(context.Background(), "test-span")
+			spanSetStorageListDiff(span, tc.rtDetail, tc.responseVMClusterList)
+			var err error
+			span.End(&err)
+
+			attrs := rec.Ended()[0].Attributes()
+
+			status, _ := spanAttrString(attrs, "query-storage-status")
+			assert.Equal(t, tc.wantStatus, status)
+
+			if tc.wantReason != "" {
+				reason, ok := spanAttrString(attrs, "query-storage-reason")
+				assert.True(t, ok)
+				assert.Equal(t, tc.wantReason, reason)
+			} else {
+				_, ok := spanAttrString(attrs, "query-storage-reason")
+				assert.False(t, ok)
+			}
+
+			// Check missing field
+			if tc.wantMissing != "" {
+				missing, ok := spanAttrString(attrs, "query-storage-missing")
+				assert.True(t, ok)
+				// Parse and compare as JSON to handle ordering
+				var gotMissing, wantMissing any
+				assert.NoError(t, json.Unmarshal([]byte(missing), &gotMissing))
+				assert.NoError(t, json.Unmarshal([]byte(tc.wantMissing), &wantMissing))
+				assert.Equal(t, wantMissing, gotMissing)
+			} else {
+				_, ok := spanAttrString(attrs, "query-storage-missing")
+				assert.False(t, ok)
+			}
+
+			// extra field is no longer recorded
+			_, hasExtra := spanAttrStringSlice(attrs, "query-storage-extra")
+			assert.False(t, hasExtra)
+		})
+	}
 }

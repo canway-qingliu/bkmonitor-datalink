@@ -97,6 +97,13 @@ func NewSQLExpr(key string) SQLExpr {
 		return &DorisSQLExpr{
 			ignoreFieldSet: set.New[string](),
 		}
+	case TSpider:
+		return &TSpiderSQLExpr{
+			DorisSQLExpr: DorisSQLExpr{
+				ignoreFieldSet: set.New[string](),
+				forceEq:        true,
+			},
+		}
 	default:
 		return &DefaultSQLExpr{key: key}
 	}
@@ -300,7 +307,7 @@ func (d *DefaultSQLExpr) ParserAllConditions(allConditions metadata.AllCondition
 }
 
 func (d *DefaultSQLExpr) DescribeTableSQL(table string) string {
-	return ""
+	return fmt.Sprintf("SHOW CREATE TABLE %s", table)
 }
 
 // buildCondition 构建单个条件表达式
@@ -320,18 +327,19 @@ func (d *DefaultSQLExpr) buildCondition(c metadata.ConditionField) (string, erro
 		return "", err
 	}
 
-	// 对值进行转义处理
+	// 对值进行转义处理。不要改写 c.Value，它可能与上游 Query 被多个并发路由共享。
+	values := make([]string, len(c.Value))
 	for i, v := range c.Value {
-		c.Value[i] = d.valueTransform(v)
+		values[i] = d.valueTransform(v)
 	}
 
 	// 根据操作符类型生成不同的SQL表达式
 	switch c.Operator {
 	// 处理等于类操作符（=, IN, LIKE）
 	case metadata.ConditionEqual, metadata.ConditionExact, metadata.ConditionContains:
-		if len(c.Value) > 1 && !c.IsWildcard {
+		if len(values) > 1 && !c.IsWildcard {
 			op = "IN"
-			val = fmt.Sprintf("('%s')", strings.Join(c.Value, "', '"))
+			val = fmt.Sprintf("('%s')", strings.Join(values, "', '"))
 		} else {
 			var format string
 			if c.IsWildcard {
@@ -343,7 +351,7 @@ func (d *DefaultSQLExpr) buildCondition(c metadata.ConditionField) (string, erro
 			}
 
 			var filter []string
-			for _, v := range c.Value {
+			for _, v := range values {
 				filter = append(filter, fmt.Sprintf("%s %s %s", key, op, fmt.Sprintf(format, v)))
 			}
 			key = ""
@@ -355,9 +363,9 @@ func (d *DefaultSQLExpr) buildCondition(c metadata.ConditionField) (string, erro
 		}
 	// 处理不等于类操作符（!=, NOT IN, NOT LIKE）
 	case metadata.ConditionNotEqual, metadata.ConditionNotContains:
-		if len(c.Value) > 1 && !c.IsWildcard {
+		if len(values) > 1 && !c.IsWildcard {
 			op = "NOT IN"
-			val = fmt.Sprintf("('%s')", strings.Join(c.Value, "', '"))
+			val = fmt.Sprintf("('%s')", strings.Join(values, "', '"))
 		} else {
 			var format string
 			if c.IsWildcard {
@@ -369,7 +377,7 @@ func (d *DefaultSQLExpr) buildCondition(c metadata.ConditionField) (string, erro
 			}
 
 			var filter []string
-			for _, v := range c.Value {
+			for _, v := range values {
 				filter = append(filter, fmt.Sprintf("%s %s %s", key, op, fmt.Sprintf(format, v)))
 			}
 			key = ""
@@ -385,48 +393,48 @@ func (d *DefaultSQLExpr) buildCondition(c metadata.ConditionField) (string, erro
 	// - 其他数据库使用 REGEXP 操作符
 	case metadata.ConditionRegEqual:
 		if d.key == HDFS {
-			pattern := strings.Join(c.Value, "|")
+			pattern := strings.Join(values, "|")
 			val = fmt.Sprintf("regexp_like(CAST(%s AS VARCHAR), '%s')", key, pattern)
 			key = ""
 		} else {
 			op = "REGEXP"
-			val = fmt.Sprintf("'%s'", strings.Join(c.Value, "|"))
+			val = fmt.Sprintf("'%s'", strings.Join(values, "|"))
 		}
 	case metadata.ConditionNotRegEqual:
 		if d.key == HDFS {
-			pattern := strings.Join(c.Value, "|")
+			pattern := strings.Join(values, "|")
 			val = fmt.Sprintf("NOT regexp_like(CAST(%s AS VARCHAR), '%s')", key, pattern)
 			key = ""
 		} else {
 			op = "NOT REGEXP"
-			val = fmt.Sprintf("'%s'", strings.Join(c.Value, "|"))
+			val = fmt.Sprintf("'%s'", strings.Join(values, "|"))
 		}
 
 	// 处理数值比较操作符（>, >=, <, <=）
 	case metadata.ConditionGt:
 		op = ">"
-		if len(c.Value) != 1 {
+		if len(values) != 1 {
 			return "", fmt.Errorf("operator %s only support 1 value", op)
 		}
-		val = c.Value[0]
+		val = values[0]
 	case metadata.ConditionGte:
 		op = ">="
-		if len(c.Value) != 1 {
+		if len(values) != 1 {
 			return "", fmt.Errorf("operator %s only support 1 value", op)
 		}
-		val = c.Value[0]
+		val = values[0]
 	case metadata.ConditionLt:
 		op = "<"
-		if len(c.Value) != 1 {
+		if len(values) != 1 {
 			return "", fmt.Errorf("operator %s only support 1 value", op)
 		}
-		val = c.Value[0]
+		val = values[0]
 	case metadata.ConditionLte:
 		op = "<="
-		if len(c.Value) != 1 {
+		if len(values) != 1 {
 			return "", fmt.Errorf("operator %s only support 1 value", op)
 		}
-		val = c.Value[0]
+		val = values[0]
 	default:
 		return "", fmt.Errorf("unknown operator %s", c.Operator)
 	}

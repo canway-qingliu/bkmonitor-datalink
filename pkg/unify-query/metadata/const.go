@@ -15,14 +15,15 @@ const (
 	SkipSpaceHeader     = "X-Bk-Scope-Skip-Space"
 	TenantIDHeader      = "X-Bk-Tenant-Id"
 
-	UserKey               = "user"
-	StatusKey             = "message"
-	ExpandKey             = "expand"
-	QueriesKey            = "queries"
-	QueryParamsKey        = "query_params"
-	QueryReferenceKey     = "query_reference"
-	QueryClusterMetricKey = "query_cluster_metric"
-	JwtPayLoadKey         = "jwt_payload"
+	UserKey                 = "user"
+	StatusKey               = "message"
+	ExpandKey               = "expand"
+	CheckPreviewMetricQLKey = "check_preview_metricql"
+	QueriesKey              = "queries"
+	QueryParamsKey          = "query_params"
+	QueryReferenceKey       = "query_reference"
+	QueryClusterMetricKey   = "query_cluster_metric"
+	JwtPayLoadKey           = "jwt_payload"
 
 	FieldFormatKey = "field_format"
 
@@ -31,9 +32,16 @@ const (
 
 	SpaceIsNotExists             = "SPACE_IS_NOT_EXISTS"
 	SpaceTableIDFieldIsNotExists = "SPACE_TABLE_ID_FIELD_IS_NOT_EXISTS"
-	TableIDProxyISNotExists      = "TABLE_ID_PROXY_IS_NOT_EXISTS"
+	// SpaceTableIDFieldMissingFallback 显式 table_id/data_label 路由下，字段在 RT Fields 中缺失（元数据可能过期/延迟）
+	SpaceTableIDFieldMissingFallback = "SPACE_TABLE_ID_FIELD_MISSING_FALLBACK"
+	TableIDProxyISNotExists          = "TABLE_ID_PROXY_IS_NOT_EXISTS"
 
 	QueryRawError = "QUERY_RAW_ERROR"
+
+	// QueryRawPartial 原始查询多路合并时部分子查询失败、但至少一路成功
+	QueryRawPartial = "QUERY_RAW_PARTIAL"
+	// QueryTsPartial 时序查询多路合并时部分子查询失败、但至少一路成功
+	QueryTsPartial = "QUERY_TS_PARTIAL"
 
 	StorageTimeout = "STORAGE_TIMEOUT"
 	StorageError   = "STORAGE_ERROR"

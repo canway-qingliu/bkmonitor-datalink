@@ -81,6 +81,75 @@ processor:
 	assert.Equal(t, mainConf, factory.MainConfig())
 }
 
+func TestFactoryValidateDropRulesAtLoadTime(t *testing.T) {
+	t.Run("invalid main config returns error", func(t *testing.T) {
+		content := `
+processor:
+  - name: "metrics_filter/drop"
+    config:
+      drop:
+        metrics:
+          - "my_metrics"
+        extra_rules:
+          - predicate_key: "attributes.telemetry.sdk.language"
+            match:
+              op: "eq"
+              value: "go"
+`
+
+		mainConf := processor.MustLoadConfigs(content)[0].Config
+		obj, err := NewFactory(mainConf, nil)
+		assert.Nil(t, obj)
+		assert.ErrorContains(t, err, "only resource.* is supported")
+	})
+
+	t.Run("invalid customized config falls back to global", func(t *testing.T) {
+		mainContent := `
+processor:
+  - name: "metrics_filter/drop"
+    config:
+      drop:
+        metrics:
+          - "my_metrics"
+        extra_rules:
+          - predicate_key: "resource.telemetry.sdk.language"
+            match:
+              op: "eq"
+              value: "go"
+`
+		customContent := `
+processor:
+  - name: "metrics_filter/drop"
+    config:
+      drop:
+        metrics:
+          - "my_metrics"
+        extra_rules:
+          - predicate_key: "attributes.telemetry.sdk.language"
+            match:
+              op: "eq"
+              value: "java"
+`
+
+		mainConf := processor.MustLoadConfigs(mainContent)[0].Config
+		customConf := processor.MustLoadConfigs(customContent)[0].Config
+
+		obj, err := NewFactory(mainConf, []processor.SubConfigProcessor{{
+			Token: "token1",
+			Type:  define.SubConfigFieldDefault,
+			Config: processor.Config{
+				Config: customConf,
+			},
+		}})
+		assert.NoError(t, err)
+
+		factory := obj.(*metricsFilter)
+		var want Config
+		assert.NoError(t, mapstructure.Decode(mainConf, &want))
+		assert.Equal(t, want, factory.configs.GetByToken("token1").(Config))
+	})
+}
+
 func makeMetricsRecord(n int) pmetric.Metrics {
 	opts := define.MetricsOptions{
 		MetricName: "my_metrics",
@@ -260,7 +329,7 @@ processor:
              match:
                op: "eq"
                value: "opentelemetry-java-instrumentation"
-           - predicate_key: "attributes.telemetry.sdk.language"
+           - predicate_key: "resource.telemetry.sdk.language"
              match:
                op: "eq"
                value: "java"
@@ -918,4 +987,134 @@ processor:
 			}
 		}
 	}
+}
+
+func TestCodeRelabelGlobalSource(t *testing.T) {
+	const content = `
+processor:
+  - name: "metrics_filter/code_relabel"
+    config:
+      code_relabel:
+        - metrics: ["rpc_client_handled_total"]
+          source: "*"
+          services:
+          - name: "my.server;my.service;my.method"
+            codes:
+            - rule: "err_200~300"
+              target:
+                action: "upsert"
+                label: "code_type"
+                value: "global_success"
+`
+
+	tests := []relabelBasedCase{
+		{
+			name: "global match service A",
+			args: relabelBasedArgs{
+				metric: "rpc_client_handled_total",
+				rs:     map[string]string{"service_name": "service.a"},
+				attrs: map[string]string{
+					"callee_server": "my.server", "callee_service": "my.service",
+					"callee_method": "my.method", "code": "err_200",
+				},
+			},
+			wantValue: "global_success",
+		},
+		{
+			name: "global match service B",
+			args: relabelBasedArgs{
+				metric: "rpc_client_handled_total",
+				rs:     map[string]string{"service_name": "completely.different.service"},
+				attrs: map[string]string{
+					"callee_server": "my.server", "callee_service": "my.service",
+					"callee_method": "my.method", "code": "err_250",
+				},
+			},
+			wantValue: "global_success",
+		},
+		{
+			name: "global match without service_name",
+			args: relabelBasedArgs{
+				metric: "rpc_client_handled_total",
+				rs:     map[string]string{},
+				attrs: map[string]string{
+					"callee_server": "my.server", "callee_service": "my.service",
+					"callee_method": "my.method", "code": "err_200",
+				},
+			},
+			wantValue: "global_success",
+		},
+		{
+			name: "global miss callee mismatch",
+			args: relabelBasedArgs{
+				metric: "rpc_client_handled_total",
+				rs:     map[string]string{"service_name": "service.a"},
+				attrs: map[string]string{
+					"callee_server": "other.server", "callee_service": "my.service",
+					"callee_method": "my.method", "code": "err_200",
+				},
+			},
+		},
+	}
+
+	testRelabelBasedFactory(t, content, tests)
+}
+
+func TestCodeRelabelGlobalWithServicePriority(t *testing.T) {
+	const content = `
+processor:
+  - name: "metrics_filter/code_relabel"
+    config:
+      code_relabel:
+        - metrics: ["rpc_client_handled_total"]
+          source: "*"
+          services:
+          - name: "my.server;my.service;my.method"
+            codes:
+            - rule: "err_200~300"
+              target:
+                action: "upsert"
+                label: "code_type"
+                value: "global_success"
+        - metrics: ["rpc_client_handled_total"]
+          source: "my.service.name"
+          services:
+          - name: "my.server;my.service;my.method"
+            codes:
+            - rule: "err_200~300"
+              target:
+                action: "upsert"
+                label: "code_type"
+                value: "service_override"
+`
+
+	// 优先级验证，当规则同时满足时，规则越靠后，优先级越高。
+	tests := []relabelBasedCase{
+		{
+			name: "service rule overrides global",
+			args: relabelBasedArgs{
+				metric: "rpc_client_handled_total",
+				rs:     map[string]string{"service_name": "my.service.name"},
+				attrs: map[string]string{
+					"callee_server": "my.server", "callee_service": "my.service",
+					"callee_method": "my.method", "code": "err_200",
+				},
+			},
+			wantValue: "service_override",
+		},
+		{
+			name: "unmatched service falls back to global",
+			args: relabelBasedArgs{
+				metric: "rpc_client_handled_total",
+				rs:     map[string]string{"service_name": "other.service"},
+				attrs: map[string]string{
+					"callee_server": "my.server", "callee_service": "my.service",
+					"callee_method": "my.method", "code": "err_200",
+				},
+			},
+			wantValue: "global_success",
+		},
+	}
+
+	testRelabelBasedFactory(t, content, tests)
 }

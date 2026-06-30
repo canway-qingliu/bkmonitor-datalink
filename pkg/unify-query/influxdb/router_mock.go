@@ -309,6 +309,7 @@ func MockSpaceRouter(ctx context.Context) {
 					MeasurementType: redis.BkSplitMeasurement,
 					StorageType:     metadata.VictoriaMetricsStorageType,
 					DataLabel:       "vm",
+					Labels:          map[string]string{"scene": "k8s", "cluster_id": "2"},
 				},
 				ResultTableInfluxDB: &ir.ResultTableDetail{
 					StorageId:       2,
@@ -321,6 +322,7 @@ func MockSpaceRouter(ctx context.Context) {
 					ClusterName:     "default",
 					DataLabel:       "influxdb",
 					StorageType:     metadata.InfluxDBStorageType,
+					Labels:          map[string]string{"scene": "log", "cluster_id": "1"},
 				},
 				"result_table.unify_query": &ir.ResultTableDetail{
 					StorageId:             3,
@@ -356,6 +358,7 @@ func MockSpaceRouter(ctx context.Context) {
 					FieldAlias: map[string]string{
 						"alias_ns": "__ext.host.bk_set_name",
 					},
+					Labels: map[string]string{"scene": "k8s", "stream": "file"},
 				},
 				ResultTableEs1: &ir.ResultTableDetail{
 					StorageId:   3,
