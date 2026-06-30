@@ -18,8 +18,15 @@ import (
 )
 
 var (
-	Version   string
-	BuildHash string
+	Version       string
+	BuildHash     string
+	GitTag        string
+	GitCommitter  string
+	GitCommitTime string
+	BuildTime     string
+	BuildId       string
+	BuildNo       string
+	Release       string
 )
 
 var ProcessID string

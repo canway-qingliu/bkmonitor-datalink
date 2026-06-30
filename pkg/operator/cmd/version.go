@@ -16,9 +16,15 @@ import (
 )
 
 var (
-	Version   = "unknown.version"
-	GitHash   = "unknown.gitHash"
-	BuildTime = "unknown.buildTime"
+	Version       = "unknown.version"
+	GitHash       = "unknown.gitHash"
+	BuildTime     = "unknown.buildTime"
+	GitTag        = "unknown.tag"
+	GitCommitter  = "unknown.committer"
+	GitCommitTime = "unknown.commitTime"
+	BuildNo       = "unknown.buildNo"
+	BuildId       = "unknown.buildId"
+	Release       = "unknown.release"
 )
 
 var versionCmd = &cobra.Command{
@@ -26,8 +32,14 @@ var versionCmd = &cobra.Command{
 	Short: "display version of bkmonitor-operator",
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Println("Version:", Version)
-		fmt.Println("GitHash:", GitHash)
+		fmt.Println("CommitId:", GitHash)
+		fmt.Println("Tag:", GitTag)
+		fmt.Println("Committer:", GitCommitter)
+		fmt.Println("CommitTime:", GitCommitTime)
 		fmt.Println("BuildTime:", BuildTime)
+		fmt.Println("BuildId:", BuildId)
+		fmt.Println("BuildNo:", BuildNo)
+		fmt.Println("Release:", Release)
 	},
 }
 

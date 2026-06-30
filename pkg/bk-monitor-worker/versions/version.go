@@ -19,7 +19,13 @@ var (
 	// GitCommit
 	GitCommit = ""
 	// BuildTime
-	BuildTime = ""
+	BuildTime     = ""
+	GitTag        = ""
+	GitCommitter  = ""
+	GitCommitTime = ""
+	BuildId       = ""
+	BuildNo       = ""
+	Release       = ""
 	// GoVersion
 	GoVersion = runtime.Version()
 )

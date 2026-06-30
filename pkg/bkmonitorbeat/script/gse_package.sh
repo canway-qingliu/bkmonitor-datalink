@@ -60,7 +60,8 @@ make_package () {
         if [ ${operating_system} = "linux" ] || [ ${operating_system} = "windows" ] ; then
             #VERSION=$(cat VERSION).$(git describe --dirty="-dev" --always --match "NOT A TAG")
              #GO111MODULE=off
-            CGO_ENABLED=0 GO111MODULE=on GOOS=${operating_system} GOARCH=${go_arch} go build -tags "basetask basescheduler bkmonitorbeat" -ldflags=" -X main.BeatName=${plugin_name} -X main.Version=${plugin_version}" -o ${bin_dir}/${plugin_name}${suffix} main.go||exit 1
+            build_time=$(date -u '+%Y-%m-%d_%I:%M:%S%p')
+            CGO_ENABLED=0 GO111MODULE=on GOOS=${operating_system} GOARCH=${go_arch} go build -tags "basetask basescheduler bkmonitorbeat" -ldflags=" -X main.BeatName=${plugin_name} -X main.Version=${plugin_version} -X 'main.GitHash=${LAST_COMMIT_ID}' -X 'main.GitTag=${GIT_TAG}' -X 'main.GitCommitter=${GIT_COMMITTER_NAME}' -X 'main.GitCommitTime=${GIT_COMMIT_TIME}' -X 'main.BuildTime=${build_time}' -X 'main.BuildId=${CI_BUILD_ID}' -X 'main.BuildNo=${CI_BUILD_NUM}' -X 'main.Release=${RELEASE_VALUE}'" -o ${bin_dir}/${plugin_name}${suffix} main.go||exit 1
         elif [ ${operating_system} = "freebsd" ]; then
             cp ${plugin_name}_${operating_system} ${bin_dir}/${plugin_name}${suffix}
         else

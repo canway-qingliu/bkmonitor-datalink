@@ -137,6 +137,16 @@ var Version string
 var Mode string
 
 var (
+	GitTag        string
+	GitCommitter  string
+	GitCommitTime string
+	BuildTime     string
+	BuildId       string
+	BuildNo       string
+	Release       string
+)
+
+var (
 	ConfClusterID string
 	ConfRootV1    string
 )

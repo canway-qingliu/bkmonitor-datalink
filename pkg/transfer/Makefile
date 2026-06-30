@@ -33,7 +33,14 @@ build: mod
 	-X $(PKG)/define.Version=$(VERSION) \
 	-X $(PKG)/define.AppName=$(MODULE) \
 	-X $(PKG)/define.Mode=release \
-	-X $(PKG)/define.BuildHash=$(shell git rev-parse HEAD)" \
+	-X $(PKG)/define.BuildHash=$(shell git rev-parse HEAD) \
+	-X '$(PKG)/define.GitTag=$(GIT_TAG)' \
+	-X '$(PKG)/define.GitCommitter=$(GIT_COMMITTER_NAME)' \
+	-X '$(PKG)/define.GitCommitTime=$(GIT_COMMIT_TIME)' \
+	-X '$(PKG)/define.BuildTime=$(shell date -u +%Y-%m-%d_%I:%M:%S%p)' \
+	-X '$(PKG)/define.BuildId=$(CI_BUILD_ID)' \
+	-X '$(PKG)/define.BuildNo=$(CI_BUILD_NUM)' \
+	-X '$(PKG)/define.Release=$(RELEASE_VALUE)'" \
 	-o $(BIN) .
 	upx -9 $(BIN)
 

@@ -330,6 +330,34 @@ bk-collector:
 
     # SpanProcessor: span 处理器
     - name: "span_processor/common"
+      config:
+        replace_value:
+          - predicate_key: "span_name"
+            rules:
+              - filters:
+                  - key: "kind"
+                    op: "eq"
+                    value:
+                      - "3"
+                  - key: "attributes.http.method"
+                    op: "reg"
+                    value:
+                      - "^.+$"
+                replace_from:
+                  source:
+                    - "attributes.http.method"
+              - filters:
+                  - key: "kind"
+                    op: "eq"
+                    value:
+                      - "3"
+                  - key: "attributes.http.request.method"
+                    op: "reg"
+                    value:
+                      - "^.+$"
+                replace_from:
+                  source:
+                    - "attributes.http.request.method"
 
     # TokenChecker: 权限校验处理器
     # Proxy
