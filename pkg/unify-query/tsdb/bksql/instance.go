@@ -33,9 +33,10 @@ import (
 )
 
 const (
-	TableFieldName     = "Field"
-	TableFieldType     = "Type"
-	TableFieldAnalyzed = "Analyzed"
+	TableFieldName       = "Field"
+	TableFieldNameColumn = "Column"
+	TableFieldType       = "Type"
+	TableFieldAnalyzed   = "Analyzed"
 
 	TableTypeVariant = "VARIANT"
 )
@@ -93,7 +94,7 @@ func (i *Instance) Check(ctx context.Context, promql string, start, end time.Tim
 	return ""
 }
 
-func (i *Instance) sqlQuery(ctx context.Context, sql string) (*QuerySyncResultData, error) {
+func (i *Instance) sqlQuery(ctx context.Context, req QuerySyncRequest) (*QuerySyncResultData, error) {
 	var (
 		data *QuerySyncResultData
 
@@ -105,11 +106,14 @@ func (i *Instance) sqlQuery(ctx context.Context, sql string) (*QuerySyncResultDa
 	ctx, span = trace.NewSpan(ctx, "sql-query")
 	defer span.End(&err)
 
-	if sql == "" {
+	if req.SQL == "" {
 		return data, nil
 	}
 
-	span.Set("query-sql", sql)
+	span.Set("query-sql", req.SQL)
+	if req.ClusterName != "" {
+		span.Set("query-cluster-name", req.ClusterName)
+	}
 
 	user := metadata.GetUser(ctx)
 
@@ -120,7 +124,7 @@ func (i *Instance) sqlQuery(ctx context.Context, sql string) (*QuerySyncResultDa
 	defer cancel()
 
 	// 发起异步查询
-	res := i.client.QuerySync(ctx, sql, span)
+	res := i.client.QuerySync(ctx, req, span)
 	if res == nil {
 		return nil, nil
 	}
@@ -142,18 +146,40 @@ func (i *Instance) sqlQuery(ctx context.Context, sql string) (*QuerySyncResultDa
 
 	span.Set("result-size", len(data.List))
 	span.Set("result-sql", data.Sql)
+	// BK Data query_sync 返回 data.device（如 tspider / doris），便于链路区分实际执行引擎
+	if data.Device != "" {
+		span.Set("device", data.Device)
+	}
 
 	return data, nil
 }
 
-func (i *Instance) getFieldsMap(ctx context.Context, sql string) (metadata.FieldsMap, error) {
+func queryClusterName(query *metadata.Query) string {
+	if query == nil {
+		return ""
+	}
+	// 分段路由会把命中的 Doris 集群放在 ClusterName，StorageName 仅作为旧字段兼容。
+	if query.ClusterName != "" {
+		return query.ClusterName
+	}
+	return query.StorageName
+}
+
+func newQuerySyncRequest(sql string, query *metadata.Query) QuerySyncRequest {
+	return QuerySyncRequest{
+		SQL:         sql,
+		ClusterName: queryClusterName(query),
+	}
+}
+
+func (i *Instance) getFieldsMap(ctx context.Context, req QuerySyncRequest) (metadata.FieldsMap, error) {
 	fieldsMap := make(metadata.FieldsMap)
 
-	if sql == "" {
+	if req.SQL == "" {
 		return nil, nil
 	}
 
-	data, err := i.sqlQuery(ctx, sql)
+	data, err := i.sqlQuery(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +194,11 @@ func (i *Instance) getFieldsMap(ctx context.Context, sql string) (metadata.Field
 		)
 		k, ok = list[TableFieldName].(string)
 		if !ok {
-			continue
+			// HDFS 使用 Column 名称标识
+			k, ok = list[TableFieldNameColumn].(string)
+			if !ok {
+				continue
+			}
 		}
 
 		fieldType, ok = list[TableFieldType].(string)
@@ -190,17 +220,28 @@ func (i *Instance) getFieldsMap(ctx context.Context, sql string) (metadata.Field
 	return fieldsMap, nil
 }
 
+// needFieldMap 判断是否需要执行 QueryFieldMap 并注入 FieldsMap。
+func needFieldMap(query *metadata.Query) bool {
+	if query == nil {
+		return false
+	}
+	switch query.Measurement {
+	case sql_expr.Doris, sql_expr.HDFS:
+		return true
+	case "":
+		return query.StorageType == metadata.BkSqlStorageType && query.SQL != ""
+	default:
+		return false
+	}
+}
+
 func (i *Instance) InitQueryFactory(ctx context.Context, query *metadata.Query, start, end time.Time) (*QueryFactory, error) {
-	var err error
-
-	ctx, span := trace.NewSpan(ctx, "instance-init-query-factory")
-	defer span.End(&err)
-
 	f := NewQueryFactory(ctx, query).
 		WithRangeTime(start, end)
 
-	// 只有 Doris 才需要获取字段表结构
-	if query.Measurement == sql_expr.Doris {
+	// Doris / HDFS 均需获取字段表结构；TSpider 单段 table_id（Measurement 为空）+ 用户 SQL 与 NewQueryFactory 中
+	// TSpiderSQLExpr 路径一致，同样需要 FieldsMap，否则 dimTransform 会将未知列变为 NULL。
+	if needFieldMap(query) {
 		fieldsMap, err := i.QueryFieldMap(ctx, query, start, end)
 		if err != nil {
 			return nil, err
@@ -213,10 +254,6 @@ func (i *Instance) InitQueryFactory(ctx context.Context, query *metadata.Query, 
 				keepColumns = append(keepColumns, k)
 			}
 		}
-		out, _ := json.Marshal(fieldsMap)
-		span.Set("table_fields_map", string(out))
-
-		span.Set("keep-columns", keepColumns)
 		f.WithFieldsMap(fieldsMap).WithKeepColumns(keepColumns)
 	}
 
@@ -271,7 +308,7 @@ func (i *Instance) QueryFieldMap(ctx context.Context, query *metadata.Query, sta
 		}
 
 		sql := f.expr.DescribeTableSQL(table)
-		res, err := i.getFieldsMap(ctx, sql)
+		res, err := i.getFieldsMap(ctx, newQuerySyncRequest(sql, query))
 		if err != nil {
 			continue
 		}
@@ -290,36 +327,6 @@ func (i *Instance) QueryFieldMap(ctx context.Context, query *metadata.Query, sta
 			ks := strings.Split(k, ".")
 			v.OriginField = ks[0]
 			v.TokenizeOnChars = make([]string, 0)
-
-			fieldsMap[k] = v
-		}
-	}
-
-	for _, db := range dbs {
-		table := fmt.Sprintf("`%s`", db)
-		if f.query.Measurement != "" {
-			table += "." + f.query.Measurement
-		}
-
-		sql := f.expr.DescribeTableSQL(table)
-		res, err := i.getFieldsMap(ctx, sql)
-		if err != nil {
-			continue
-		}
-
-		for k, v := range res {
-			if k == "" || v.FieldType == "" {
-				continue
-			}
-			// 如果字段相同则忽略
-			if _, ok := fieldsMap[k]; ok {
-				continue
-			}
-
-			v.AliasName = query.FieldAlias.AliasName(k)
-			v.FieldName = k
-			ks := strings.Split(k, ".")
-			v.OriginField = ks[0]
 
 			fieldsMap[k] = v
 		}
@@ -375,7 +382,7 @@ func (i *Instance) QueryRawData(ctx context.Context, query *metadata.Query, star
 		return size, total, option, err
 	}
 
-	data, err := i.sqlQuery(ctx, sql)
+	data, err := i.sqlQuery(ctx, newQuerySyncRequest(sql, query))
 	if err != nil {
 		err = fmt.Errorf("sql [%s] query err: %s", sql, err.Error())
 		return size, total, option, err
@@ -394,6 +401,7 @@ func (i *Instance) QueryRawData(ctx context.Context, query *metadata.Query, star
 
 	for _, list := range data.List {
 		newData := queryFactory.ReloadListData(list, false)
+		query.FieldAlias.AddAliasKeysWhenOriginalFieldPresent(newData)
 		newData[metadata.KeyIndex] = query.DB
 		// 注入原始数据需要的字段
 		query.DataReload(newData)
@@ -422,15 +430,16 @@ func (i *Instance) QuerySeriesSet(ctx context.Context, query *metadata.Query, st
 	rangeLeftTime := end.Sub(start)
 	metric.TsDBRequestRangeMinute(ctx, rangeLeftTime, i.InstanceType())
 
-	// series 计算需要按照时间排序
-	query.Orders = append(metadata.Orders{
+	// series 计算需要按照时间排序。这里不能原地修改入参 query，调用方可能在多路查询中复用同一个 *metadata.Query。
+	seriesQuery := *query
+	seriesQuery.Orders = append(metadata.Orders{
 		{
 			Name: sql_expr.FieldTime,
 			Ast:  true,
 		},
-	}, query.Orders...)
+	}, append(metadata.Orders(nil), query.Orders...)...)
 
-	queryFactory, err := i.InitQueryFactory(ctx, query, start, end)
+	queryFactory, err := i.InitQueryFactory(ctx, &seriesQuery, start, end)
 	if err != nil {
 		return storage.ErrSeriesSet(err)
 	}
@@ -440,7 +449,7 @@ func (i *Instance) QuerySeriesSet(ctx context.Context, query *metadata.Query, st
 		return storage.ErrSeriesSet(err)
 	}
 
-	data, err := i.sqlQuery(ctx, sql)
+	data, err := i.sqlQuery(ctx, newQuerySyncRequest(sql, query))
 	if err != nil {
 		err = metadata.NewMessage(
 			metadata.MsgQueryBKSQL,
@@ -490,10 +499,11 @@ func (i *Instance) QueryLabelNames(ctx context.Context, query *metadata.Query, s
 	ctx, span := trace.NewSpan(ctx, "bk-sql-label-name")
 	defer span.End(&err)
 
-	// 取字段名不需要返回数据，但是 size 不能使用 0，所以还是用 1
-	query.Size = 1
+	// 取字段名不需要返回数据，但是 size 不能使用 0，所以还是用 1。这里不能原地修改入参 query，调用方可能复用同一个 *metadata.Query。
+	labelNamesQuery := *query
+	labelNamesQuery.Size = 1
 
-	queryFactory, err := i.InitQueryFactory(ctx, query, start, end)
+	queryFactory, err := i.InitQueryFactory(ctx, &labelNamesQuery, start, end)
 	if err != nil {
 		return nil, err
 	}
@@ -503,7 +513,7 @@ func (i *Instance) QueryLabelNames(ctx context.Context, query *metadata.Query, s
 		return nil, err
 	}
 
-	data, err := i.sqlQuery(ctx, sql)
+	data, err := i.sqlQuery(ctx, newQuerySyncRequest(sql, query))
 	if err != nil {
 		return nil, err
 	}
@@ -540,19 +550,20 @@ func (i *Instance) QueryLabelValues(ctx context.Context, query *metadata.Query, 
 		return nil, fmt.Errorf("not support metric query with %s", name)
 	}
 
-	queryFactory, err := i.InitQueryFactory(ctx, query, start, end)
+	labelValuesQuery := *query
+	labelValuesQuery.SelectDistinct = []string{name}
+
+	queryFactory, err := i.InitQueryFactory(ctx, &labelValuesQuery, start, end)
 	if err != nil {
 		return nil, err
 	}
-
-	query.SelectDistinct = []string{name}
 
 	sql, err := queryFactory.SQL()
 	if err != nil {
 		return nil, err
 	}
 
-	data, err := i.sqlQuery(ctx, sql)
+	data, err := i.sqlQuery(ctx, newQuerySyncRequest(sql, query))
 	if err != nil {
 		return nil, err
 	}
@@ -587,11 +598,6 @@ func (i *Instance) QuerySeries(ctx context.Context, query *metadata.Query, start
 	ctx, span := trace.NewSpan(ctx, "bk-sql-query-series")
 	defer span.End(&err)
 
-	queryFactory, err := i.InitQueryFactory(ctx, query, start, end)
-	if err != nil {
-		return nil, err
-	}
-
 	if len(query.Source) == 0 {
 		err = fmt.Errorf("no source specified")
 		return nil, err
@@ -620,18 +626,20 @@ func (i *Instance) QuerySeries(ctx context.Context, query *metadata.Query, start
 		return nil, nil
 	}
 
-	// 设置 SelectDistinct 以获取唯一标签组合
-	query.SelectDistinct = labelNames
-	defer func() {
-		query.SelectDistinct = nil
-	}()
+	// 设置 SelectDistinct 以获取唯一标签组合。这里不能原地修改入参 query，调用方可能复用同一个 *metadata.Query。
+	seriesQuery := *query
+	seriesQuery.SelectDistinct = append([]string(nil), labelNames...)
 
+	queryFactory, err := i.InitQueryFactory(ctx, &seriesQuery, start, end)
+	if err != nil {
+		return nil, err
+	}
 	distinctSQL, err := queryFactory.SQL()
 	if err != nil {
 		return nil, err
 	}
 
-	distinctData, err := i.sqlQuery(ctx, distinctSQL)
+	distinctData, err := i.sqlQuery(ctx, newQuerySyncRequest(distinctSQL, query))
 	if err != nil {
 		return nil, err
 	}

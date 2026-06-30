@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -64,6 +65,148 @@ func TestInstance_ShowCreateTable(t *testing.T) {
 
 			actual, _ := json.Marshal(fact.FieldMap())
 			assert.Equal(t, c.expected, string(actual))
+		})
+	}
+}
+
+// TestInstance_ShowCreateTable_HDFS 测试 HDFS 存储的 show create table 字段解析兼容性。
+// HDFS 使用 "Column" 作为字段名标识（而非 "Field"），且不包含 Null/Key/Default 字段。
+func TestInstance_ShowCreateTable_HDFS(t *testing.T) {
+	ctx := metadata.InitHashID(context.Background())
+	ins := createTestInstance(ctx)
+
+	// HDFS 返回格式：Column + Type + Extra + Comment（无 Null/Key/Default）
+	mock.BkSQL.Set(map[string]any{
+		"SHOW CREATE TABLE `bklog_hdfs_demo`.hdfs": `{"result":true,"message":"成功","code":"00","data":{"list":[{"Column":"process","Type":"varchar","Extra":"","Comment":""},{"Column":"level","Type":"varchar","Extra":"","Comment":""},{"Column":"bk_run_mode","Type":"varchar","Extra":"","Comment":""},{"Column":"message","Type":"varchar","Extra":"","Comment":""},{"Column":"____et","Type":"timestamp(6) with time zone","Extra":"","Comment":""},{"Column":"dteventtime","Type":"varchar","Extra":"","Comment":""},{"Column":"dteventtimestamp","Type":"bigint","Extra":"","Comment":""},{"Column":"localtime","Type":"varchar","Extra":"","Comment":""},{"Column":"thedate","Type":"integer","Extra":"","Comment":""}]},"errors":null,"trace_id":"db892000237c5900fc150bc508580573","span_id":"231d47dfa06f0ba2"}`,
+	})
+
+	end := time.UnixMilli(1730118889181)
+	start := time.UnixMilli(1730118589181)
+
+	query := &metadata.Query{
+		DB:          "bklog_hdfs_demo",
+		Measurement: "hdfs",
+	}
+
+	fieldsMap, err := ins.QueryFieldMap(ctx, query, start, end)
+	assert.Nil(t, err)
+	assert.NotNil(t, fieldsMap)
+
+	// 验证 Column 字段被正确解析为字段名
+	assert.Equal(t, "varchar", fieldsMap["process"].FieldType)
+	assert.Equal(t, "varchar", fieldsMap["level"].FieldType)
+	assert.Equal(t, "bigint", fieldsMap["dteventtimestamp"].FieldType)
+	assert.Equal(t, "integer", fieldsMap["thedate"].FieldType)
+	assert.Equal(t, "timestamp(6) with time zone", fieldsMap["____et"].FieldType)
+
+	// 验证 FieldName 和 OriginField 被正确设置
+	assert.Equal(t, "process", fieldsMap["process"].FieldName)
+	assert.Equal(t, "process", fieldsMap["process"].OriginField)
+	assert.Equal(t, "dteventtimestamp", fieldsMap["dteventtimestamp"].FieldName)
+	assert.Equal(t, "dteventtimestamp", fieldsMap["dteventtimestamp"].OriginField)
+	assert.Equal(t, "____et", fieldsMap["____et"].FieldName)
+	assert.Equal(t, "____et", fieldsMap["____et"].OriginField)
+
+	// 验证字段数量与 mock 数据一致
+	assert.Equal(t, 9, len(fieldsMap))
+
+	// 验证 HDFS 不返回 Analyzed 字段时，IsAnalyzed 默认为 false
+	assert.False(t, fieldsMap["process"].IsAnalyzed)
+	assert.False(t, fieldsMap["level"].IsAnalyzed)
+	assert.False(t, fieldsMap["____et"].IsAnalyzed)
+	assert.False(t, fieldsMap["dteventtimestamp"].IsAnalyzed)
+}
+
+// TestInstance_TSpider 覆盖 TSpider 相关路径：SHOW CREATE 字段解析、InitQueryFactory 是否拉表结构、用户 SQL 下的 FieldsMap 与生成 SQL。
+// TSpider 使用 "Field" 作为字段名标识，Measurement 为空；SHOW CREATE 与 pkg/unify-query/mock/handler.go 中 mockBKBaseHandler 内 TSpider 表项保持一致（Set 为合并写入）。
+func TestInstance_TSpider(t *testing.T) {
+	ctx := metadata.InitHashID(context.Background())
+	ins := createTestInstance(ctx)
+
+	mock.BkSQL.Set(map[string]any{
+		// tspider
+		"SHOW CREATE TABLE `132_lol_new_login_queue_login_1min`": `{"result":true,"message":"成功","code":"00","data":{"list":[{"Field":"thedate","Type":"int(11)","Null":"NO","Key":"","Default":null,"Extra":""},{"Field":"dtEventTime","Type":"varchar(32)","Null":"NO","Key":"","Default":null,"Extra":""},{"Field":"dtEventTimeStamp","Type":"bigint(20)","Null":"NO","Key":"MUL","Default":null,"Extra":""},{"Field":"localTime","Type":"varchar(32)","Null":"YES","Key":"","Default":null,"Extra":""},{"Field":"flow_id","Type":"bigint(20)","Null":"YES","Key":"MUL","Default":null,"Extra":""},{"Field":"flow_name","Type":"text","Null":"YES","Key":"","Default":null,"Extra":""},{"Field":"namespace","Type":"varchar(64)","Null":"YES","Key":"","Default":null,"Extra":""},{"Field":"login_rate","Type":"double","Null":"YES","Key":"","Default":null,"Extra":""}]},"errors":null,"trace_id":"00000000000000000000000000000000","span_id":"0000000000000000"}`,
+		"SHOW CREATE TABLE `36_game_bot_num_5min_stat`":          `{"result":true,"message":"成功","code":"00","data":{"list":[{"Field":"thedate","Type":"int(11)","Null":"NO","Key":"","Default":null,"Extra":""},{"Field":"dtEventTime","Type":"varchar(32)","Null":"NO","Key":"","Default":null,"Extra":""},{"Field":"dtEventTimeStamp","Type":"bigint(20)","Null":"NO","Key":"","Default":null,"Extra":""},{"Field":"localTime","Type":"varchar(32)","Null":"YES","Key":"","Default":null,"Extra":""},{"Field":"dsname","Type":"varchar(128)","Null":"YES","Key":"","Default":null,"Extra":""},{"Field":"bot_num","Type":"double","Null":"YES","Key":"","Default":null,"Extra":""},{"Field":"game_id","Type":"bigint(20)","Null":"YES","Key":"","Default":null,"Extra":""}]},"errors":null}`,
+	})
+
+	end := time.UnixMilli(1730118889181)
+	start := time.UnixMilli(1730118589181)
+
+	for name, c := range map[string]struct {
+		query       *metadata.Query
+		start       time.Time
+		end         time.Time
+		fieldMap    bool
+		initNilFM   bool
+		wantUserSQL string
+	}{
+		"ShowCreateTable_QueryFieldMap": {
+			query: &metadata.Query{
+				DB:          "132_lol_new_login_queue_login_1min",
+				Measurement: "",
+			},
+			fieldMap: true,
+		},
+		"InitQueryFactory_NoUserSQL_FieldMapNil": {
+			query: &metadata.Query{
+				StorageType: metadata.BkSqlStorageType,
+				DB:          "132_lol_new_login_queue_login_1min",
+				Measurement: "",
+				Field:       "login_rate",
+				SQL:         "",
+			},
+			initNilFM: true,
+		},
+		"InitQueryFactory_UserSQL_FieldMapAndSQL": {
+			query: &metadata.Query{
+				StorageType: metadata.BkSqlStorageType,
+				DB:          "36_game_bot_num_5min_stat",
+				Measurement: "",
+				Field:       "bot_num",
+				SQL:         "SELECT dsname, SUM(bot_num) AS total FROM tbl WHERE game_id = 1 GROUP BY dsname ORDER BY total DESC LIMIT 50",
+			},
+			start:       time.Unix(1741795260, 0),
+			end:         time.Unix(1741796260, 0),
+			wantUserSQL: "SELECT `dsname`, SUM(`bot_num`) AS total FROM `36_game_bot_num_5min_stat` WHERE `game_id` = 1 AND (`dtEventTimeStamp` >= 1741795260000 AND `dtEventTimeStamp` <= 1741796260000 AND `dtEventTime` >= '2025-03-13 00:01:00' AND `dtEventTime` <= '2025-03-13 00:17:41' AND `thedate` = '20250313') GROUP BY `dsname` ORDER BY `total` DESC LIMIT 50",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx = metadata.InitHashID(ctx)
+			s, e := c.start, c.end
+			if s.IsZero() {
+				s = start
+				e = end
+			}
+			switch {
+			case c.fieldMap:
+				fieldsMap, err := ins.QueryFieldMap(ctx, c.query, s, e)
+				assert.Nil(t, err)
+				assert.NotNil(t, fieldsMap)
+				assert.Equal(t, "int(11)", fieldsMap["thedate"].FieldType)
+				assert.Equal(t, "varchar(32)", fieldsMap["dtEventTime"].FieldType)
+				assert.Equal(t, "bigint(20)", fieldsMap["dtEventTimeStamp"].FieldType)
+				assert.Equal(t, "double", fieldsMap["login_rate"].FieldType)
+				assert.Equal(t, 8, len(fieldsMap))
+			case c.initNilFM:
+				fact, err := ins.InitQueryFactory(ctx, c.query, s, e)
+				assert.Nil(t, err)
+				assert.NotNil(t, fact)
+				assert.Nil(t, fact.FieldMap())
+			case c.wantUserSQL != "":
+				fact, err := ins.InitQueryFactory(ctx, c.query, s, e)
+				assert.Nil(t, err)
+				assert.NotNil(t, fact)
+				fm := fact.FieldMap()
+				assert.NotEmpty(t, fm)
+				assert.Equal(t, "bigint(20)", fm["dtEventTimeStamp"].FieldType)
+				assert.Equal(t, "varchar(128)", fm["dsname"].FieldType)
+				assert.Equal(t, "double", fm["bot_num"].FieldType)
+				gotSQL, err := fact.SQL()
+				assert.Nil(t, err)
+				assert.Equal(t, c.wantUserSQL, gotSQL)
+			default:
+				t.Fatalf("misconfigured TSpider case %q", name)
+			}
 		})
 	}
 }
@@ -2299,6 +2442,42 @@ func TestInstance_QueryLabelValues_Normal(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestQueryLabelValuesConcurrentSharedQueryRace(t *testing.T) {
+	ctx := metadata.InitHashID(context.Background())
+	instance := createTestInstance(ctx)
+
+	end := time.Unix(1740553771, 0)
+	start := time.Unix(1740551971, 0)
+
+	mock.BkSQL.Set(map[string]any{
+		"SHOW CREATE TABLE `race_bklog`.doris": `{"result":true,"message":"成功","code":"00","data":{"list":[{"Field":"thedate","Type":"int"},{"Field":"dteventtimestamp","Type":"bigint"},{"Field":"dteventtime","Type":"varchar(32)"},{"Field":"path","Type":"varchar(128)"},{"Field":"serverip","Type":"varchar(128)"}]}}`,
+		"SELECT DISTINCT `path` FROM `race_bklog`.doris WHERE `dtEventTimeStamp` >= 1740551971000 AND `dtEventTimeStamp` <= 1740553771000 AND `dtEventTime` >= '2025-02-26 14:39:31' AND `dtEventTime` <= '2025-02-26 15:09:32' AND `thedate` = '20250226' LIMIT 2":     `{"result":true,"message":"成功","code":"00","data":{"totalRecords":1,"list":[{"path":"/tmp/app.log"}]}}`,
+		"SELECT DISTINCT `serverip` FROM `race_bklog`.doris WHERE `dtEventTimeStamp` >= 1740551971000 AND `dtEventTimeStamp` <= 1740553771000 AND `dtEventTime` >= '2025-02-26 14:39:31' AND `dtEventTime` <= '2025-02-26 15:09:32' AND `thedate` = '20250226' LIMIT 2": `{"result":true,"message":"成功","code":"00","data":{"totalRecords":1,"list":[{"serverip":"127.0.0.1"}]}}`,
+	})
+
+	query := &metadata.Query{
+		DB:          "race_bklog",
+		Measurement: "doris",
+		Size:        2,
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		for _, key := range []string{"path", "serverip"} {
+			wg.Add(1)
+			go func(key string) {
+				defer wg.Done()
+				values, err := instance.QueryLabelValues(metadata.InitHashID(context.Background()), query, key, start, end)
+				assert.NoError(t, err)
+				assert.NotEmpty(t, values)
+			}(key)
+		}
+	}
+	wg.Wait()
+
+	assert.Empty(t, query.SelectDistinct)
 }
 
 // 创建测试用Instance

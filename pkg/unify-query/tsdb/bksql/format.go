@@ -100,7 +100,13 @@ func NewQueryFactory(ctx context.Context, query *metadata.Query) *QueryFactory {
 		f.timeField = dtEventTimeStamp
 	}
 
-	f.expr = sql_expr.NewSQLExpr(query.Measurement).
+	exprKey := query.Measurement
+	// TSpider 表多为单段 table_id，Measurement 为空；用户自定义 SQL 仍需走 Doris 同源解析，且不能改写 Measurement（否则表名会多出 .tspider）
+	if exprKey == "" && query.SQL != "" && query.StorageType == metadata.BkSqlStorageType {
+		exprKey = sql_expr.TSpider
+	}
+
+	f.expr = sql_expr.NewSQLExpr(exprKey).
 		WithInternalFields(f.timeField, query.Field).
 		WithEncode(metadata.GetFieldFormat(ctx).EncodeFunc()).
 		WithFieldAlias(query.FieldAlias)
@@ -139,6 +145,11 @@ func (f *QueryFactory) ReloadListData(data map[string]any, ignoreInternalDimensi
 
 	for k, d := range data {
 		if d == nil {
+			// SQL 聚合首行常为 NULL。若直接 continue，首行 nd 会缺少 `_value_`/`_timestamp_` 键；
+			// FormatDataToQueryResult 只在首行推断 keys，缺 `_value_` 则后续行永远进不了 Value 分支，整列被当成 0。
+			if k == sql_expr.Value || k == sql_expr.TimeStamp {
+				newData[k] = nil
+			}
 			continue
 		}
 		// 忽略内置字段
@@ -425,6 +436,9 @@ func (f *QueryFactory) parserSQL() (sql string, err error) {
 	_, span = trace.NewSpan(f.ctx, "make-sql-with-parser")
 	defer span.End(&err)
 
+	span.Set("bksql.parser_from_user_sql", true)
+	span.Set("bksql.user_sql.byte_len", len(f.query.SQL))
+
 	tables := f.Tables()
 
 	span.Set("tables", tables)
@@ -438,11 +452,12 @@ func (f *QueryFactory) parserSQL() (sql string, err error) {
 		where = fmt.Sprintf("(%s)", where)
 	}
 	from := f.query.From
-	if f.query.Scroll != "" && f.query.ResultTableOption.From != nil {
+	if f.query.Scroll != "" && f.query.ResultTableOption != nil && f.query.ResultTableOption.From != nil {
 		from = *f.query.ResultTableOption.From
 	}
 
 	sql, err = f.expr.ParserSQL(f.ctx, f.query.SQL, tables, where, from, f.query.Size)
+	span.Set("bksql.sql_expr_type", f.expr.Type())
 	span.Set("query-sql", f.query.SQL)
 
 	span.Set("sql", sql)

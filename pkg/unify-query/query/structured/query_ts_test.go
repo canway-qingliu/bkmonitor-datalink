@@ -16,14 +16,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/query"
 	md "github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/mock"
+	uqQuery "github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/promql"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/redis"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/tsdb/bksql"
+	routerInfluxdb "github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/router/influxdb"
 )
 
 func TestQueryToMetric(t *testing.T) {
@@ -289,6 +294,570 @@ func TestQueryToMetric(t *testing.T) {
 	}
 }
 
+func TestStorageUUIDIncludesRouteRange(t *testing.T) {
+	base := &md.Query{
+		StorageType: md.BkSqlStorageType,
+		StorageID:   "0",
+		Measurement: "doris",
+		DB:          "db_a",
+	}
+	first := *base
+	first.RouteStart = time.Unix(100, 0)
+	first.RouteEnd = time.Unix(200, 0)
+	first.RouteQueryStart = time.Unix(40, 0)
+	first.RouteQueryEnd = time.Unix(260, 0)
+
+	second := *base
+	second.RouteStart = time.Unix(300, 0)
+	second.RouteEnd = time.Unix(400, 0)
+	second.RouteQueryStart = time.Unix(240, 0)
+	second.RouteQueryEnd = time.Unix(460, 0)
+
+	firstWithoutRange := first
+	secondWithoutRange := second
+	firstWithoutRange.RouteStart = time.Time{}
+	firstWithoutRange.RouteEnd = time.Time{}
+	firstWithoutRange.RouteQueryStart = time.Time{}
+	firstWithoutRange.RouteQueryEnd = time.Time{}
+	secondWithoutRange.RouteStart = time.Time{}
+	secondWithoutRange.RouteEnd = time.Time{}
+	secondWithoutRange.RouteQueryStart = time.Time{}
+	secondWithoutRange.RouteQueryEnd = time.Time{}
+
+	assert.Equal(t, firstWithoutRange.StorageUUID(), secondWithoutRange.StorageUUID())
+	assert.NotEqual(t, first.StorageUUID(), second.StorageUUID())
+}
+
+func TestQueryRouteLookbackDuration(t *testing.T) {
+	testCases := map[string]struct {
+		query            *Query
+		lookBackDelta    time.Duration
+		expectedBackward time.Duration
+		expectedForward  time.Duration
+	}{
+		"range selector and backward offset are additive": {
+			query: &Query{
+				TimeAggregation: TimeAggregation{
+					Window: "2h",
+				},
+				VectorOffset: time.Hour,
+			},
+			expectedBackward: 3 * time.Hour,
+		},
+		"explicit lookback participates before backward offset": {
+			query: &Query{
+				VectorOffset: 10 * time.Minute,
+			},
+			lookBackDelta:    5 * time.Minute,
+			expectedBackward: 15 * time.Minute,
+		},
+		"aggregate method window participates": {
+			query: &Query{
+				AggregateMethodList: AggregateMethodList{
+					{Method: "avg_over_time", Window: "2h"},
+					{Method: "max_over_time", Window: "30m"},
+				},
+			},
+			lookBackDelta:    5 * time.Minute,
+			expectedBackward: 2 * time.Hour,
+		},
+		"forward offset expands forward route coverage": {
+			query: &Query{
+				TimeAggregation: TimeAggregation{
+					Window: "2h",
+				},
+				VectorOffset:  time.Hour,
+				OffsetForward: true,
+			},
+			expectedBackward: 2 * time.Hour,
+			expectedForward:  time.Hour,
+		},
+		"signed negative offset expands forward route coverage": {
+			query: &Query{
+				TimeAggregation: TimeAggregation{
+					Window: "2h",
+				},
+				Offset: "-1h",
+			},
+			expectedBackward: 2 * time.Hour,
+			expectedForward:  time.Hour,
+		},
+		"signed negative offset with offset_forward expands backward route coverage": {
+			query: &Query{
+				TimeAggregation: TimeAggregation{
+					Window: "2h",
+				},
+				Offset:        "-1h",
+				OffsetForward: true,
+			},
+			expectedBackward: 3 * time.Hour,
+		},
+		"subquery range and inner matrix range are additive": {
+			query: &Query{
+				TimeAggregation: TimeAggregation{
+					Window: "5m",
+				},
+				AggregateMethodList: AggregateMethodList{
+					{Method: "avg_over_time", Window: "1h", IsSubQuery: true},
+				},
+			},
+			lookBackDelta:    5 * time.Minute,
+			expectedBackward: time.Hour + 5*time.Minute,
+		},
+		"promql ast route offsets keep direction": {
+			query: &Query{
+				RouteSelectorOffset: -2 * time.Hour,
+				RouteSubqueryOffset: 10 * time.Minute,
+				RouteSubqueryRange:  time.Hour,
+			},
+			expectedBackward: time.Hour,
+			expectedForward:  110 * time.Minute,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			backward, forward := tc.query.routeOverlapDuration(tc.lookBackDelta)
+			assert.Equal(t, tc.expectedBackward, backward)
+			assert.Equal(t, tc.expectedBackward, tc.query.routeLookbackDuration(tc.lookBackDelta))
+			assert.Equal(t, tc.expectedForward, forward)
+		})
+	}
+}
+
+func TestQueryRouteTimeRange(t *testing.T) {
+	start := time.Unix(1000, 0)
+	end := time.Unix(2000, 0)
+	qp := (&md.QueryParams{}).SetTime(start, start, end, time.Minute, "s", "Asia/Shanghai")
+
+	at := time.Unix(100, 0).UnixMilli()
+	testCases := map[string]struct {
+		query *Query
+		start time.Time
+		end   time.Time
+	}{
+		"no at modifier uses query range": {
+			query: &Query{},
+			start: start,
+			end:   end,
+		},
+		"fixed at modifier uses fixed timestamp": {
+			query: &Query{Timestamp: &at},
+			start: time.Unix(100, 0),
+			end:   time.Unix(100, 0),
+		},
+		"at start uses query start": {
+			query: &Query{StartOrEnd: parser.START},
+			start: start,
+			end:   start,
+		},
+		"at end uses query end": {
+			query: &Query{StartOrEnd: parser.END},
+			start: end,
+			end:   end,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			gotStart, gotEnd := tc.query.routeTimeRange(qp)
+			assert.Equal(t, tc.start, gotStart)
+			assert.Equal(t, tc.end, gotEnd)
+		})
+	}
+}
+
+func TestQueryTsToTimeLookBackDeltaPrometheusDuration(t *testing.T) {
+	md.InitMetadata()
+	ctx := md.InitHashID(context.Background())
+	q := &QueryTs{
+		Start:         "1741056443",
+		End:           "1741060043",
+		Step:          "1m",
+		LookBackDelta: "1d",
+	}
+
+	require.NoError(t, q.ToTime(ctx))
+	assert.Equal(t, 24*time.Hour, md.GetQueryParams(ctx).LookBackDelta)
+}
+
+func TestQueryTsToTimeLookBackDeltaGoDurationFallback(t *testing.T) {
+	md.InitMetadata()
+	ctx := md.InitHashID(context.Background())
+	q := &QueryTs{
+		Start:         "1741056443",
+		End:           "1741060043",
+		Step:          "1m",
+		LookBackDelta: "1.5h",
+	}
+
+	require.NoError(t, q.ToTime(ctx))
+	assert.Equal(t, 90*time.Minute, md.GetQueryParams(ctx).LookBackDelta)
+}
+
+func TestQueryToMetricStorageClusterRecordStorageType(t *testing.T) {
+	mock.Init()
+	ctx := md.InitHashID(context.Background())
+	start := time.Unix(1500, 0)
+	end := time.Unix(2500, 0)
+	md.GetQueryParams(ctx).SetTime(start, start, end, time.Minute, "s", "UTC")
+
+	queryMetric, err := (&Query{
+		DataSource:    BkLog,
+		TableID:       "result_table.es",
+		FieldName:     "dtEventTimeStamp",
+		ReferenceName: "a",
+	}).ToQueryMetric(ctx, influxdb.SpaceUid, TsDBs{
+		&uqQuery.TsDBV2{
+			TableID:     "result_table.es",
+			DataLabel:   "log_index_set_test",
+			StorageID:   "1",
+			StorageType: md.ElasticsearchStorageType,
+			DB:          "es_index",
+			Measurement: "__default__",
+			StorageClusterRecords: []uqQuery.Record{
+				{
+					StorageID:   "2",
+					StorageType: md.BkSqlStorageType,
+					StorageName: "doris_default",
+					ClusterName: "doris_default",
+					DB:          "bkbase_table",
+					Measurement: "doris",
+					EnableTime:  2000,
+				},
+				{
+					StorageID:  "1",
+					EnableTime: 1000,
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, queryMetric.QueryList, 2)
+
+	storageTypes := make(map[string]string)
+	for _, query := range queryMetric.QueryList {
+		storageTypes[query.StorageID] = query.StorageType
+	}
+	assert.Equal(t, md.BkSqlStorageType, storageTypes["2"])
+	assert.Equal(t, md.ElasticsearchStorageType, storageTypes["1"])
+}
+
+func TestQueryToMetricStorageClusterRecordStorageTypeFromResultTableDetail(t *testing.T) {
+	mock.Init()
+	ctx := md.InitHashID(context.Background())
+	start := time.Unix(1500, 0)
+	end := time.Unix(2500, 0)
+	md.GetQueryParams(ctx).SetTime(start, start, end, time.Minute, "s", "UTC")
+
+	tsDB := (&SpaceFilter{}).getTsDBWithResultTableDetail(uqQuery.TsDBV2{
+		TableID:    "result_table.es",
+		MetricName: "dtEventTimeStamp",
+	}, &routerInfluxdb.ResultTableDetail{
+		StorageId:   1,
+		StorageType: md.ElasticsearchStorageType,
+		DB:          "es_index",
+		TableId:     "result_table.es",
+		Measurement: "__default__",
+		DataLabel:   "log_index_set_test",
+		StorageClusterRecords: []routerInfluxdb.Record{
+			{
+				StorageID:   2,
+				StorageType: md.BkSqlStorageType,
+				StorageName: "doris_default",
+				ClusterName: "doris_default",
+				DB:          "bkbase_table",
+				Measurement: "doris",
+				EnableTime:  2000,
+			},
+			{
+				StorageID:  1,
+				EnableTime: 1000,
+			},
+		},
+	})
+
+	queryMetric, err := (&Query{
+		DataSource:    BkLog,
+		TableID:       "result_table.es",
+		FieldName:     "dtEventTimeStamp",
+		ReferenceName: "a",
+	}).ToQueryMetric(ctx, influxdb.SpaceUid, TsDBs{&tsDB})
+	require.NoError(t, err)
+	require.Len(t, queryMetric.QueryList, 2)
+
+	storageTypes := make(map[string]string)
+	for _, query := range queryMetric.QueryList {
+		storageTypes[query.StorageID] = query.StorageType
+	}
+
+	assert.Equal(t, md.BkSqlStorageType, storageTypes["2"])
+	assert.Equal(t, md.ElasticsearchStorageType, storageTypes["1"])
+}
+
+func TestQueryToMetricStorageClusterRecordSourceType(t *testing.T) {
+	mock.Init()
+	ctx := md.InitHashID(context.Background())
+	start := time.Unix(1500, 0)
+	end := time.Unix(2500, 0)
+	md.GetQueryParams(ctx).SetTime(start, start, end, time.Minute, "s", "UTC")
+
+	queryMetric, err := (&Query{
+		DataSource:    BkLog,
+		TableID:       "result_table.doris",
+		FieldName:     "dtEventTimeStamp",
+		ReferenceName: "a",
+	}).ToQueryMetric(ctx, influxdb.SpaceUid, TsDBs{
+		&uqQuery.TsDBV2{
+			TableID:     "result_table.doris",
+			DataLabel:   "log_index_set_test",
+			StorageID:   "3",
+			StorageType: md.BkSqlStorageType,
+			StorageName: "doris_default",
+			ClusterName: "doris_default",
+			DB:          "bkbase_table",
+			Measurement: "doris",
+			SourceType:  "log",
+			StorageClusterRecords: []uqQuery.Record{
+				{
+					StorageID:   "2",
+					StorageType: md.ElasticsearchStorageType,
+					DB:          "history_es_index",
+					Measurement: "__default__",
+					SourceType:  BkData,
+					EnableTime:  2000,
+				},
+				{
+					StorageID:  "3",
+					EnableTime: 1000,
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, queryMetric.QueryList, 2)
+
+	sourceTypes := make(map[string]string)
+	for _, query := range queryMetric.QueryList {
+		sourceTypes[query.StorageID] = query.SourceType
+	}
+	assert.Equal(t, BkData, sourceTypes["2"])
+	assert.Equal(t, "log", sourceTypes["3"])
+}
+
+func TestBkData_SQL_ToFinalSQL(t *testing.T) {
+	mock.Init()
+	ctx := md.InitHashID(context.Background())
+	influxdb.MockSpaceRouter(ctx)
+
+	start := time.Unix(1741795260, 0)
+	end := time.Unix(1741796260, 0)
+
+	testCases := []struct {
+		name    string
+		query   *Query
+		wantSQL string
+	}{
+		{
+			// doris 表：Measurement="doris"，表名为 `db`.doris
+			// 用户 SQL 的 SELECT/WHERE 被解析后，时间范围条件以 AND (...) 形式追加
+			name: "doris with user sql",
+			query: &Query{
+				DataSource:    BkData,
+				TableID:       "2_bklog_unit_test.doris",
+				FieldName:     "gseIndex",
+				ReferenceName: "a",
+				SQL:           "SELECT dtEventTimeStamp, gseIndex FROM `2_bklog_unit_test`.doris WHERE gseIndex > 0 LIMIT 20",
+			},
+			wantSQL: "SELECT NULL AS dtEventTimeStamp, NULL AS gseIndex FROM `2_bklog_unit_test`.doris WHERE NULL > 0 AND (`dtEventTimeStamp` >= 1741795260000 AND `dtEventTimeStamp` <= 1741796260000 AND `dtEventTime` >= '2025-03-13 00:01:00' AND `dtEventTime` <= '2025-03-13 00:17:41' AND `thedate` = '20250313') LIMIT 20",
+		},
+		{
+			// tspider 表：Measurement="" 单段 table_id，表名无后缀
+			// NewQueryFactory 检测到 SQL 非空 + BkSqlStorageType + Measurement="" 时选用 TSpiderSQLExpr
+			name: "tspider (no measurement) with user sql",
+			query: &Query{
+				DataSource:    BkData,
+				TableID:       "2_bklog_unit_test",
+				FieldName:     "gseIndex",
+				ReferenceName: "a",
+				SQL:           "SELECT dtEventTimeStamp, gseIndex FROM `2_bklog_unit_test` WHERE gseIndex > 0 LIMIT 20",
+			},
+			wantSQL: "SELECT NULL AS dtEventTimeStamp, NULL AS gseIndex FROM `2_bklog_unit_test` WHERE NULL > 0 AND (`dtEventTimeStamp` >= 1741795260000 AND `dtEventTimeStamp` <= 1741796260000 AND `dtEventTime` >= '2025-03-13 00:01:00' AND `dtEventTime` <= '2025-03-13 00:17:41' AND `thedate` = '20250313') LIMIT 20",
+		},
+		{
+			// 无用户 SQL：走 buildSQL 路径，SELECT 中包含内置字段 _value_ / _timestamp_
+			name: "doris without user sql (buildSQL path)",
+			query: &Query{
+				DataSource:    BkData,
+				TableID:       "2_bklog_unit_test.doris",
+				FieldName:     "gseIndex",
+				ReferenceName: "a",
+				Limit:         10,
+			},
+			wantSQL: "SELECT *, NULL AS `_value_`, `dtEventTimeStamp` AS `_timestamp_` FROM `2_bklog_unit_test`.doris WHERE `dtEventTimeStamp` >= 1741795260000 AND `dtEventTimeStamp` <= 1741796260000 AND `dtEventTime` >= '2025-03-13 00:01:00' AND `dtEventTime` <= '2025-03-13 00:17:41' AND `thedate` = '20250313' LIMIT 10",
+		},
+		{
+			// 用户自定义 SQL 仅聚合（count），仍追加时间窗口（与带 SELECT 列表的 user sql 一致）
+			name: "tspider (no measurement) with user sql count(*)",
+			query: &Query{
+				DataSource:    BkData,
+				TableID:       "2_bklog_unit_test",
+				FieldName:     "total",
+				ReferenceName: "a",
+				SQL:           "SELECT count(*) FROM 2_bklog_unit_test LIMIT 1",
+			},
+			wantSQL: "SELECT count(*) FROM `2_bklog_unit_test` WHERE (`dtEventTimeStamp` >= 1741795260000 AND `dtEventTimeStamp` <= 1741796260000 AND `dtEventTime` >= '2025-03-13 00:01:00' AND `dtEventTime` <= '2025-03-13 00:17:41' AND `thedate` = '20250313') LIMIT 1",
+		},
+		{
+			// Doris：反引号库表 + count，时间条件以 AND 追加
+			name: "doris with user sql count(*)",
+			query: &Query{
+				DataSource:    BkData,
+				TableID:       "2_bklog_unit_test.doris",
+				FieldName:     "total",
+				ReferenceName: "a",
+				SQL:           "SELECT count(*) FROM `2_bklog_unit_test`.doris LIMIT 1",
+			},
+			wantSQL: "SELECT count(*) FROM `2_bklog_unit_test`.doris WHERE (`dtEventTimeStamp` >= 1741795260000 AND `dtEventTimeStamp` <= 1741796260000 AND `dtEventTime` >= '2025-03-13 00:01:00' AND `dtEventTime` <= '2025-03-13 00:17:41' AND `thedate` = '20250313') LIMIT 1",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			metric, err := tc.query.ToQueryMetric(ctx, influxdb.SpaceUid, nil)
+			require.NoError(t, err)
+			require.Len(t, metric.QueryList, 1)
+
+			gotSQL, err := bksql.NewQueryFactory(ctx, metric.QueryList[0]).WithRangeTime(start, end).SQL()
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantSQL, gotSQL)
+		})
+	}
+}
+
+// TestE2E_Query_TableIDConditions_ToQueryMetric_GetTsDBList 端到端：Query 带 TableIDConditions → ToQueryMetric(tsDBs=nil) → GetTsDBList 选表，链路打通；mock 下无匹配 Labels 时 QueryList 为空
+func TestE2E_Query_TableIDConditions_ToQueryMetric_GetTsDBList(t *testing.T) {
+	mock.Init()
+	ctx := md.InitHashID(context.Background())
+	influxdb.MockSpaceRouter(ctx)
+
+	query := &Query{
+		TableID:       "",
+		FieldName:     "kube_node_info",
+		ReferenceName: "a",
+		TableIDConditions: AllConditions{
+			{{DimensionName: "scene", Value: []string{"log"}, Operator: ConditionEqual}},
+		},
+	}
+	require.NotEmpty(t, query.TableIDConditions, "TableIDConditions 应有值")
+
+	metric, err := query.ToQueryMetric(ctx, influxdb.SpaceUid, nil)
+	assert.NoError(t, err)
+	assert.NotNil(t, metric)
+	// mock 中 result_table.influxdb 带 Labels scene=log，选表应命中
+	assert.NotEmpty(t, metric.QueryList, "表标签 scene=log 应匹配到带 Labels 的 RT")
+}
+
+// TestE2E_Query_BkLog_TableIDConditions_ToQueryMetric_GetTsDBList 端到端：
+// DataSource=bklog 且 table_id 为空、仅靠 TableIDConditions 选表时，应能命中非 split-measurement 的日志类 RT；
+// 锁住 space.NewTsDBs 中"显式 table_id_conditions 时绕过容器默认过滤"的修复语义。
+func TestE2E_Query_BkLog_TableIDConditions_ToQueryMetric_GetTsDBList(t *testing.T) {
+	mock.Init()
+	ctx := md.InitHashID(context.Background())
+	influxdb.MockSpaceRouter(ctx)
+
+	query := &Query{
+		DataSource:    BkLog,
+		TableID:       "",
+		FieldName:     "dtEventTimeStamp",
+		ReferenceName: "a",
+		TableIDConditions: AllConditions{
+			{{DimensionName: "scene", Value: []string{"k8s"}, Operator: ConditionEqual}},
+		},
+	}
+
+	metric, err := query.ToQueryMetric(ctx, influxdb.SpaceUid, nil)
+	assert.NoError(t, err)
+	assert.NotNil(t, metric)
+	// mock 中 ResultTableEs 为 ES 存储、无 MeasurementType、Labels scene=k8s；
+	// 修复前会被 isK8s 分支误过滤；修复后 space.NewTsDBs 在 table_id_conditions 非空时跳过容器默认过滤，可命中。
+	assert.NotEmpty(t, metric.QueryList, "bklog + table_id_conditions(scene=k8s) 应命中非 split-measurement 的 RT")
+}
+
+// TestQueryTs_StructToPromQL_WithTableIDConditions 独立方向：从 QueryTs 结构体（带 TableIDConditions）转为 PromQL，
+// 单组 AND 输出 __bk_query_label_selector_<维度>；多组 OR 无法写进单条 PromQL，应报错。
+func TestQueryTs_StructToPromQL_WithTableIDConditions(t *testing.T) {
+	t.Run("single_eq", func(t *testing.T) {
+		ts := &QueryTs{
+			QueryList: []*Query{
+				{
+					FieldName:     "metric_name",
+					ReferenceName: "a",
+					TableIDConditions: AllConditions{
+						{{DimensionName: "scene", Value: []string{"log"}, Operator: ConditionEqual}},
+					},
+				},
+			},
+			MetricMerge: "a",
+		}
+		result, err := ts.ToPromQL(context.TODO())
+		require.NoError(t, err)
+		assert.Contains(t, result, `__bk_query_label_selector_scene="log"`)
+	})
+	t.Run("and_or_combined", func(t *testing.T) {
+		ts := &QueryTs{
+			QueryList: []*Query{
+				{
+					FieldName:     "metric_name",
+					ReferenceName: "a",
+					TableIDConditions: AllConditions{
+						{
+							{DimensionName: "scene", Value: []string{"log"}, Operator: ConditionEqual},
+							{DimensionName: "cluster_id", Value: []string{"1"}, Operator: ConditionEqual},
+						},
+						{{DimensionName: "scene", Value: []string{"k8s"}, Operator: ConditionEqual}},
+					},
+				},
+			},
+			MetricMerge: "a",
+		}
+		_, err := ts.ToPromQL(context.TODO())
+		require.Error(t, err, "多组 OR 的 table_id_conditions 不应能转为单条 PromQL")
+	})
+	t.Run("neq_operator", func(t *testing.T) {
+		ts := &QueryTs{
+			QueryList: []*Query{
+				{
+					FieldName:     "metric_name",
+					ReferenceName: "a",
+					TableIDConditions: AllConditions{
+						{{DimensionName: "env", Value: []string{"prod"}, Operator: ConditionNotEqual}},
+					},
+				},
+			},
+			MetricMerge: "a",
+		}
+		result, err := ts.ToPromQL(context.TODO())
+		require.NoError(t, err)
+		assert.Contains(t, result, `__bk_query_label_selector_env!="prod"`)
+	})
+	t.Run("empty_conditions_no_selector", func(t *testing.T) {
+		ts := &QueryTs{
+			QueryList: []*Query{
+				{
+					FieldName:     "metric_name",
+					ReferenceName: "a",
+				},
+			},
+			MetricMerge: "a",
+		}
+		result, err := ts.ToPromQL(context.TODO())
+		require.NoError(t, err)
+		assert.NotContains(t, result, "__query_label_selector")
+		assert.NotContains(t, result, "__bk_query_label_selector_")
+	})
+}
+
 func TestQueryTs_ToQueryReference(t *testing.T) {
 	mock.Init()
 	ctx := md.InitHashID(context.Background())
@@ -328,6 +897,10 @@ func TestQueryTs_ToQueryReference(t *testing.T) {
 				MetricFilterCondition: map[string]string{
 					"a": `bk_biz_id="2", result_table_id="100147_ieod_system_cpu_detail_raw", __name__="usage_value"`,
 					"b": `bk_biz_id="2", result_table_id="100147_ieod_system_disk_raw", __name__="usage_value"`,
+				},
+				RtDetailList: map[string]md.RtDetail{
+					"100147_ieod_system_cpu_detail_raw": {TableID: "system.cpu_detail"},
+					"100147_ieod_system_disk_raw":       {TableID: "system.disk"},
 				},
 			},
 			ref: md.QueryReference{
@@ -421,6 +994,9 @@ func TestQueryTs_ToQueryReference(t *testing.T) {
 				MetricFilterCondition: map[string]string{
 					"a": ``,
 					"b": `bk_biz_id="2", result_table_id="100147_ieod_system_disk_raw", __name__="usage_value"`,
+				},
+				RtDetailList: map[string]md.RtDetail{
+					"100147_ieod_system_disk_raw": {TableID: "system.disk"},
 				},
 			},
 			ref: md.QueryReference{
@@ -569,6 +1145,9 @@ func TestQueryTs_ToQueryReference(t *testing.T) {
 				MetricFilterCondition: map[string]string{
 					"b": `bk_biz_id="2", bk_obj_id!="0", result_table_id="rt_by_cmdb_level", __name__="usage_value"`,
 				},
+				RtDetailList: map[string]md.RtDetail{
+					"rt_by_cmdb_level": {TableID: "system.disk"},
+				},
 			},
 			ref: md.QueryReference{
 				"b": {
@@ -635,6 +1214,9 @@ func TestQueryTs_ToQueryReference(t *testing.T) {
 				ResultTableList: []string{"100147_ieod_system_cpu_detail_cmdb"},
 				MetricFilterCondition: map[string]string{
 					"b": `bk_biz_id="2", bk_obj_id!="0", result_table_id="100147_ieod_system_cpu_detail_cmdb", __name__="usage_value"`,
+				},
+				RtDetailList: map[string]md.RtDetail{
+					"100147_ieod_system_cpu_detail_cmdb": {TableID: "system.cpu_detail"},
 				},
 			},
 			ref: md.QueryReference{
@@ -707,6 +1289,9 @@ func TestQueryTs_ToQueryReference(t *testing.T) {
 				MetricFilterCondition: map[string]string{
 					"b": `bk_biz_id="2", result_table_id="100147_ieod_system_cpu_detail_cmdb", __name__="usage_value"`,
 				},
+				RtDetailList: map[string]md.RtDetail{
+					"100147_ieod_system_cpu_detail_cmdb": {TableID: "system.cpu_detail"},
+				},
 			},
 			ref: md.QueryReference{
 				"b": {
@@ -773,6 +1358,9 @@ func TestQueryTs_ToQueryReference(t *testing.T) {
 				ResultTableList: []string{"100147_ieod_system_cpu_detail_raw"},
 				MetricFilterCondition: map[string]string{
 					"a": `bk_biz_id="2", result_table_id="100147_ieod_system_cpu_detail_raw", __name__="usage_value"`,
+				},
+				RtDetailList: map[string]md.RtDetail{
+					"100147_ieod_system_cpu_detail_raw": {TableID: "system.cpu_detail"},
 				},
 			},
 			ref: md.QueryReference{
@@ -848,6 +1436,9 @@ func TestQueryTs_ToQueryReference(t *testing.T) {
 				MetricFilterCondition: map[string]string{
 					"a": `bk_biz_id="2", result_table_id="100147_ieod_system_cpu_detail_raw", __name__="usage_value"`,
 				},
+				RtDetailList: map[string]md.RtDetail{
+					"100147_ieod_system_cpu_detail_raw": {TableID: "system.cpu_detail"},
+				},
 			},
 			ref: md.QueryReference{
 				"a": {
@@ -921,6 +1512,9 @@ func TestQueryTs_ToQueryReference(t *testing.T) {
 				ResultTableList: []string{"100147_ieod_system_cpu_detail_raw"},
 				MetricFilterCondition: map[string]string{
 					"a": `bk_biz_id="2", result_table_id="100147_ieod_system_cpu_detail_raw", __name__="usage_value"`,
+				},
+				RtDetailList: map[string]md.RtDetail{
+					"100147_ieod_system_cpu_detail_raw": {TableID: "system.cpu_detail"},
 				},
 			},
 			ref: md.QueryReference{
@@ -1514,6 +2108,9 @@ func TestQueryTs_ToQueryReference(t *testing.T) {
 				MetricFilterCondition: map[string]string{
 					"a": `result_table_id="2_bcs_prom_computation_result_table", __name__="kube_pod_info_value"`,
 				},
+				RtDetailList: map[string]md.RtDetail{
+					"2_bcs_prom_computation_result_table": {TableID: "result_table.vm"},
+				},
 			},
 			refString: `{"a":[{"QueryList":[{"storage_type":"influxdb","storage_id":"2","cluster_name":"default","data_source":"bkmonitor","data_label":"influxdb","table_id":"result_table.influxdb","db":"result_table","measurement":"kube_pod_info","measurement_type":"bk_split_measurement","field":"value","time_field":{},"fields":["value"],"measurements":["kube_pod_info"],"metric_names":["kube_pod_info"],"vm_condition":"__name__=\"kube_pod_info_value\"","vm_condition_num":1,"offset_info":{"OffSet":0,"Limit":0,"SOffSet":0,"SLimit":0},"is_merge_db":false},{"storage_type":"victoria_metrics","storage_id":"2","data_source":"bkmonitor","data_label":"vm","table_id":"result_table.vm","vm_rt":"2_bcs_prom_computation_result_table","measurement":"kube_pod_info","measurement_type":"bk_split_measurement","field":"value","time_field":{},"fields":["value"],"measurements":["kube_pod_info"],"metric_names":["kube_pod_info"],"vm_condition":"result_table_id=\"2_bcs_prom_computation_result_table\", __name__=\"kube_pod_info_value\"","vm_condition_num":2,"offset_info":{"OffSet":0,"Limit":0,"SOffSet":0,"SLimit":0},"is_merge_db":false}],"ReferenceName":"a","MetricName":"kube_pod_info","IsCount":false}]}`,
 		},
@@ -1660,6 +2257,86 @@ func TestQueryTs_ToQueryReference(t *testing.T) {
 			assert.Equal(t, tc.promql, pl.String())
 		})
 	}
+}
+
+// TestQueryTs_ToQueryReference_DataSourceAlias 验证 SaaS 命名（bk_data / bk_log_search / bk_apm）
+// 经 ToQueryReference 入口被规范化为内部命名（bkdata / bklog / bkapm），其中 bk_data 别名应正确进入 BkSql 分支。
+func TestQueryTs_ToQueryReference_DataSourceAlias(t *testing.T) {
+	mock.Init()
+	ctx := md.InitHashID(context.Background())
+	influxdb.MockSpaceRouter(ctx)
+
+	t.Run("bk_data alias enters BkSql branch", func(t *testing.T) {
+		ts := &QueryTs{
+			SpaceUid: influxdb.SpaceUid, // bkcc__2，满足 BkData 分支「业务空间下查询」校验
+			QueryList: []*Query{
+				{
+					DataSource:    "bk_data", // SaaS 命名，期望被规范化为 BkData
+					TableID:       "2_table_id",
+					FieldName:     "kube_pod_info",
+					ReferenceName: "a",
+				},
+			},
+			MetricMerge: "a",
+			Start:       "1718865258",
+			End:         "1718868858",
+			Step:        "1m",
+		}
+
+		ref, err := ts.ToQueryReference(ctx)
+		require.NoError(t, err)
+
+		// 规范化后写回 QueryTs.QueryList（指针原地修改）
+		assert.Equal(t, BkData, ts.QueryList[0].DataSource, "bk_data 应被规范化为 bkdata")
+
+		// 走通 BkSql 分支：StorageType == BkSqlStorageType，DB 非空
+		require.Contains(t, ref, "a")
+		require.NotEmpty(t, ref["a"])
+		require.NotEmpty(t, ref["a"][0].QueryList)
+		q := ref["a"][0].QueryList[0]
+		assert.Equal(t, BkData, q.DataSource)
+		assert.Equal(t, md.BkSqlStorageType, q.StorageType, "bkdata 应正确进入 BkSql 分支")
+		assert.NotEmpty(t, q.DB, "BkSql 分支 DB 不应为空")
+	})
+
+	t.Run("bk_log_search and bk_apm aliases normalized", func(t *testing.T) {
+		ts := &QueryTs{
+			SpaceUid: influxdb.SpaceUid,
+			QueryList: []*Query{
+				{
+					DataSource:    "bk_log_search",
+					TableID:       "result_table.es",
+					FieldName:     "kube_pod_info",
+					ReferenceName: "a",
+				},
+				{
+					DataSource:    "bk_apm",
+					TableID:       "",
+					FieldName:     "kube_pod_info",
+					ReferenceName: "b",
+				},
+			},
+			MetricMerge: "a + b",
+			Start:       "1718865258",
+			End:         "1718868858",
+			Step:        "1m",
+		}
+
+		_, err := ts.ToQueryReference(ctx)
+		require.NoError(t, err)
+
+		// 规范化原地写回 QueryTs.QueryList[*].DataSource
+		require.Len(t, ts.QueryList, 2)
+		for i, tc := range []struct {
+			want string
+			msg  string
+		}{
+			{BkLog, "bk_log_search 应被规范化为 bklog"},
+			{BkApm, "bk_apm 应被规范化为 bkapm"},
+		} {
+			assert.Equal(t, tc.want, ts.QueryList[i].DataSource, tc.msg)
+		}
+	})
 }
 
 func TestAggregations(t *testing.T) {

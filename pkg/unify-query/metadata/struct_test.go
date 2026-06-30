@@ -15,6 +15,140 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestFieldAlias_AddAliasKeysWhenOriginalFieldPresent(t *testing.T) {
+	t.Parallel()
+
+	for name, c := range map[string]struct {
+		fa       FieldAlias
+		before   map[string]any
+		expected map[string]any
+	}{
+		"命中原始字段 key 时补全别名字段": {
+			fa:       FieldAlias{"alias": "original"},
+			before:   map[string]any{"original": "v"},
+			expected: map[string]any{"alias": "v", "original": "v"},
+		},
+		"多组映射分别补全别名字段": {
+			fa: FieldAlias{
+				"alias_a": "orig_a",
+				"alias_b": "orig_b",
+			},
+			before: map[string]any{
+				"orig_a": 1,
+				"orig_b": "x",
+				"other":  true,
+			},
+			expected: map[string]any{
+				"alias_a": 1,
+				"alias_b": "x",
+				"orig_a":  1,
+				"orig_b":  "x",
+				"other":   true,
+			},
+		},
+		"原始字段不存在时不新增别名 key": {
+			fa:       FieldAlias{"alias": "original"},
+			before:   map[string]any{"only_other": 1},
+			expected: map[string]any{"only_other": 1},
+		},
+		"别名与原始同时存在时以原始字段值写入别名": {
+			fa:       FieldAlias{"alias": "original"},
+			before:   map[string]any{"alias": "old", "original": "new"},
+			expected: map[string]any{"alias": "new", "original": "new"},
+		},
+		"FieldAlias 为空时不修改 map": {
+			fa:       nil,
+			before:   map[string]any{"k": 2, "original": "v"},
+			expected: map[string]any{"k": 2, "original": "v"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			data := cloneAnyMap(c.before)
+			c.fa.AddAliasKeysWhenOriginalFieldPresent(data)
+			assert.Equal(t, c.expected, data)
+		})
+	}
+
+	t.Run("data 为 nil 时不 panic", func(t *testing.T) {
+		t.Parallel()
+		fa := FieldAlias{"alias": "original"}
+		fa.AddAliasKeysWhenOriginalFieldPresent(nil)
+		var empty FieldAlias
+		empty.AddAliasKeysWhenOriginalFieldPresent(nil)
+	})
+}
+
+func TestResultTableOption_Clone(t *testing.T) {
+	t.Parallel()
+
+	from := 3
+	for name, c := range map[string]struct {
+		option *ResultTableOption
+		check  func(t *testing.T, option, clone *ResultTableOption)
+	}{
+		"nil option": {
+			option: nil,
+			check: func(t *testing.T, option, clone *ResultTableOption) {
+				assert.Nil(t, clone)
+			},
+		},
+		"copy pointer slice and maps": {
+			option: &ResultTableOption{
+				From:        &from,
+				ScrollID:    "scroll-id",
+				SearchAfter: []any{int64(1), "next"},
+				SliceIndex:  1,
+				SliceMax:    4,
+				FieldType: map[string]string{
+					"field": "keyword",
+				},
+				SQL: "select * from t",
+				ResultSchema: []map[string]any{
+					{
+						"name": "field",
+						"type": "keyword",
+					},
+					nil,
+				},
+			},
+			check: func(t *testing.T, option, clone *ResultTableOption) {
+				assert.Equal(t, option, clone)
+				assert.NotSame(t, option, clone)
+				assert.NotSame(t, option.From, clone.From)
+
+				*clone.From = 10
+				clone.SearchAfter[0] = int64(2)
+				clone.FieldType["field"] = "text"
+				clone.ResultSchema[0]["type"] = "text"
+
+				assert.Equal(t, 3, *option.From)
+				assert.Equal(t, []any{int64(1), "next"}, option.SearchAfter)
+				assert.Equal(t, map[string]string{"field": "keyword"}, option.FieldType)
+				assert.Equal(t, "keyword", option.ResultSchema[0]["type"])
+				assert.Nil(t, option.ResultSchema[1])
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			clone := c.option.Clone()
+			c.check(t, c.option, clone)
+		})
+	}
+}
+
+func cloneAnyMap(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
 func TestReplaceVmCondition(t *testing.T) {
 	for name, c := range map[string]struct {
 		condition     VmCondition
@@ -113,4 +247,48 @@ func TestReplaceVmCondition(t *testing.T) {
 			assert.Equal(t, c.expected, actual)
 		})
 	}
+}
+
+func TestQuery_ToRouteInfo(t *testing.T) {
+	q := &Query{
+		TableID:     "rt.es",
+		DB:          "es_index",
+		DataLabel:   "es",
+		DataSource:  "bklog",
+		StorageType: "elasticsearch",
+		StorageID:   "3",
+		Measurement: "__default__",
+	}
+	info := q.ToRouteInfo("ref_a", "metric_b")
+	assert.Equal(t, RouteInfo{
+		ReferenceName: "ref_a",
+		MetricName:    "metric_b",
+		TableID:       "rt.es",
+		DB:            "es_index",
+		DataLabel:     "es",
+		DataSource:    "bklog",
+		StorageType:   "elasticsearch",
+		StorageID:     "3",
+		Measurement:   "__default__",
+	}, info)
+}
+
+func TestQueryReference_CollectRouteInfo_ReferenceOrderStable(t *testing.T) {
+	qr := QueryReference{
+		"z": {{QueryList: []*Query{{TableID: "tz"}}}},
+		"a": {{QueryList: []*Query{{TableID: "tb"}, {TableID: "ta"}}}},
+	}
+	rows := qr.CollectRouteInfo()
+	assert.Equal(t, []RouteInfo{
+		{ReferenceName: "a", TableID: "ta"},
+		{ReferenceName: "a", TableID: "tb"},
+		{ReferenceName: "z", TableID: "tz"},
+	}, rows)
+}
+
+func TestQueryReference_CollectRouteInfo_EmptyReturnsSlice(t *testing.T) {
+	rows := QueryReference{}.CollectRouteInfo()
+
+	assert.NotNil(t, rows)
+	assert.Empty(t, rows)
 }

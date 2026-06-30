@@ -510,6 +510,104 @@ func TestDorisSQLExpr_ParserAllConditions(t *testing.T) {
 			want: "`serverIp` = '127.0.0.1' AND `path` = '/var/host/data/bcs/lib/docker/containers/npc/npc-json.log' AND CAST(__ext['container_id'] AS STRING) = 'npc' AND (`gseIndex` < 101010 OR `gseIndex` = '101010' AND `iterationIndex` < 11 OR `gseIndex` = '101010' AND `iterationIndex` = '11' AND `dtEventTimeStamp` < 1760514288000)",
 		},
 		{
+			name: "unknown field in fieldsMap should use NULL = instead of NULL MATCH_PHRASE",
+			condition: metadata.AllConditions{
+				{
+					{
+						DimensionName: "__ext.labels.k8s_app",
+						Value:         []string{"zonesvr", "scenesvr", "homesvr"},
+						Operator:      metadata.ConditionContains,
+					},
+					{
+						DimensionName: "loglevel",
+						Value:         []string{"INFO", "WARN", "ERROR"},
+						Operator:      metadata.ConditionContains,
+					},
+					{
+						DimensionName: "__ext.io_kubernetes_pod_namespace",
+						Value:         []string{"nrc-prod"},
+						Operator:      metadata.ConditionContains,
+					},
+				},
+			},
+			// __ext.labels.k8s_app 和 __ext.io_kubernetes_pod_namespace 均不在 fieldsMap 中
+			// key == metadata.Null，生成 NULL = 'xxx' 而不是 NULL MATCH_PHRASE 'xxx'
+			want: "(NULL = 'zonesvr' OR NULL = 'scenesvr' OR NULL = 'homesvr') AND (`loglevel` MATCH_PHRASE 'INFO' OR `loglevel` MATCH_PHRASE 'WARN' OR `loglevel` MATCH_PHRASE 'ERROR') AND NULL = 'nrc-prod'",
+		},
+		{
+			name: "none_exist_field_with_contains_operator",
+			condition: metadata.AllConditions{
+				{
+					{
+						DimensionName: "__ext.nonexist_field",
+						Value:         []string{"test"},
+						Operator:      metadata.ConditionContains,
+					},
+				},
+			},
+			// 字段不存在时，key == metadata.Null，应生成 NULL = 'test'
+			want: "NULL = 'test'",
+		},
+		{
+			name: "none_exist_field_with_isPrefix_contains_operator",
+			condition: metadata.AllConditions{
+				{
+					{
+						DimensionName: "__ext.nonexist_field",
+						Value:         []string{"test"},
+						Operator:      metadata.ConditionContains,
+						IsPrefix:      true,
+					},
+				},
+			},
+			// 字段不存在时，key == metadata.Null，应生成 NULL = 'test*'
+			want: "NULL = 'test*'",
+		},
+		{
+			name: "none_exist_field_with_isSuffix_contains_operator",
+			condition: metadata.AllConditions{
+				{
+					{
+						DimensionName: "__ext.nonexist_field",
+						Value:         []string{"test"},
+						Operator:      metadata.ConditionContains,
+						IsSuffix:      true,
+					},
+				},
+			},
+			// 字段不存在时，key == metadata.Null，应生成 NULL = '*test'
+			want: "NULL = '*test'",
+		},
+		{
+			name: "none_exist_field_with_not_contains_operator",
+			condition: metadata.AllConditions{
+				{
+					{
+						DimensionName: "__ext.nonexist_field",
+						Value:         []string{"test"},
+						Operator:      metadata.ConditionNotContains,
+					},
+				},
+			},
+			// 字段不存在时，key == metadata.Null，应生成 NULL != 'test'
+			want: "NULL != 'test'",
+		},
+		{
+			name: "none_exist_field_with_isPrefix_and_isAnalyzed_field",
+			condition: metadata.AllConditions{
+				{
+					{
+						DimensionName: "__ext.nonexist_field",
+						Value:         []string{"test"},
+						Operator:      metadata.ConditionContains,
+						IsPrefix:      true,
+					},
+				},
+			},
+			// 字段不存在时，key == metadata.Null，应生成 NULL = 'test*'
+			want: "NULL = 'test*'",
+		},
+		{
 			name: "doris 条件合并 - 有个全都是公共条件",
 			condition: metadata.AllConditions{
 				{
@@ -659,6 +757,7 @@ func TestDorisSQLExpr_ParserAllConditions(t *testing.T) {
 		"code":                             {FieldType: DorisTypeInt},
 		"cpu_usage":                        {FieldType: DorisTypeInt},
 		"text":                             {FieldType: DorisTypeText, IsAnalyzed: true},
+		"loglevel":                         {FieldType: DorisTypeText, IsAnalyzed: true},
 	})
 
 	for _, tt := range tests {
@@ -668,6 +767,155 @@ func TestDorisSQLExpr_ParserAllConditions(t *testing.T) {
 				assert.Equal(t, tt.wantErr, err)
 				return
 			}
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestTSpiderSQLExpr_ParserAllConditions 验证 TSpider forceEq 模式下 analyzed 字段使用 = / != 而非 MATCH_PHRASE
+func TestTSpiderSQLExpr_ParserAllConditions(t *testing.T) {
+	fieldsMap := metadata.FieldsMap{
+		"message": {FieldType: DorisTypeText, IsAnalyzed: true},
+		"level":   {FieldType: DorisTypeText, IsAnalyzed: true},
+		"host":    {FieldType: DorisTypeString},
+	}
+
+	tests := []struct {
+		name      string
+		condition metadata.AllConditions
+		want      string
+	}{
+		{
+			name: "analyzed field equal uses = instead of MATCH_PHRASE",
+			condition: metadata.AllConditions{
+				{
+					{
+						DimensionName: "message",
+						Value:         []string{"error"},
+						Operator:      metadata.ConditionEqual,
+					},
+				},
+			},
+			want: "`message` = 'error'",
+		},
+		{
+			name: "analyzed field not-equal uses != instead of NOT MATCH_PHRASE",
+			condition: metadata.AllConditions{
+				{
+					{
+						DimensionName: "message",
+						Value:         []string{"debug"},
+						Operator:      metadata.ConditionNotEqual,
+					},
+				},
+			},
+			want: "`message` != 'debug'",
+		},
+		{
+			name: "ConditionContains on analyzed field uses = instead of MATCH_PHRASE",
+			condition: metadata.AllConditions{
+				{
+					{
+						DimensionName: "level",
+						Value:         []string{"error", "warn"},
+						Operator:      metadata.ConditionContains,
+					},
+				},
+			},
+			want: "(`level` = 'error' OR `level` = 'warn')",
+		},
+		{
+			name: "prefix flag on analyzed field uses = instead of MATCH_PHRASE_PREFIX",
+			condition: metadata.AllConditions{
+				{
+					{
+						DimensionName: "message",
+						Value:         []string{"err"},
+						Operator:      metadata.ConditionEqual,
+						IsPrefix:      true,
+					},
+				},
+			},
+			want: "`message` = 'err'",
+		},
+		{
+			name: "non-analyzed field still uses =",
+			condition: metadata.AllConditions{
+				{
+					{
+						DimensionName: "host",
+						Value:         []string{"server1"},
+						Operator:      metadata.ConditionEqual,
+					},
+				},
+			},
+			want: "`host` = 'server1'",
+		},
+		{
+			name: "forceEq with IsWildcard on analyzed field uses LIKE instead of =",
+			condition: metadata.AllConditions{
+				{
+					{
+						DimensionName: "message",
+						Value:         []string{"*err*"},
+						Operator:      metadata.ConditionContains,
+						IsWildcard:    true,
+					},
+				},
+			},
+			want: "`message` LIKE '%err%'",
+		},
+		{
+			name: "forceEq with IsWildcard and NotEqual uses NOT LIKE instead of !=",
+			condition: metadata.AllConditions{
+				{
+					{
+						DimensionName: "message",
+						Value:         []string{"*debug*"},
+						Operator:      metadata.ConditionNotContains,
+						IsWildcard:    true,
+					},
+				},
+			},
+			want: "`message` NOT LIKE '%debug%'",
+		},
+		{
+			name: "forceEq without IsWildcard still uses = on analyzed field",
+			condition: metadata.AllConditions{
+				{
+					{
+						DimensionName: "message",
+						Value:         []string{"error"},
+						Operator:      metadata.ConditionEqual,
+					},
+				},
+			},
+			want: "`message` = 'error'",
+		},
+		{
+			name: "forceEq with IsWildcard on non-analyzed field uses LIKE",
+			condition: metadata.AllConditions{
+				{
+					{
+						DimensionName: "host",
+						Value:         []string{"*srv*"},
+						Operator:      metadata.ConditionContains,
+						IsWildcard:    true,
+					},
+				},
+			},
+			want: "`host` LIKE '%srv%'",
+		},
+	}
+
+	e := NewSQLExpr(TSpider).WithFieldsMap(fieldsMap).WithEncode(func(s string) string {
+		return "`" + s + "`"
+	})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := e.ParserAllConditions(tt.condition)
+			assert.NoError(t, err)
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -725,6 +973,51 @@ func TestDorisSQLExpr_ParserAggregatesAndOrders_ValueFieldIgnore(t *testing.T) {
 		}
 		assert.Equal(t, "COUNT(*) AS `"+Value+"`", valueExpr, "SelectIndex 应被忽略为 *，生成 COUNT(*)")
 		assert.NotContains(t, valueExpr, "COUNT(NULL)", "不得生成 COUNT(NULL)")
+	})
+
+	t.Run("valueField 为 FieldTime(_time) 时使用内置时间字段替换", func(t *testing.T) {
+		expr := NewSQLExpr(Doris).(*DorisSQLExpr).
+			WithInternalFields("dtEventTimeStamp", FieldTime).
+			WithFieldsMap(fieldsMap).
+			WithEncode(encode)
+		selectFields, _, _, _, _, err := expr.ParserAggregatesAndOrders(
+			nil,
+			metadata.Aggregates{{Name: "count", Dimensions: []string{}}},
+			metadata.Orders{},
+		)
+		assert.NoError(t, err)
+		assert.NotEmpty(t, selectFields)
+		valueExpr := ""
+		for _, s := range selectFields {
+			if strings.Contains(s, "AS `"+Value+"`") {
+				valueExpr = s
+				break
+			}
+		}
+		assert.Equal(t, "COUNT(`dtEventTimeStamp`) AS `"+Value+"`", valueExpr, "FieldTime 应替换为内置时间字段")
+		assert.NotContains(t, valueExpr, "COUNT(NULL)", "不得生成 COUNT(NULL)")
+	})
+
+	t.Run("valueField 为 SelectAll(*) 时生成 COUNT(*)", func(t *testing.T) {
+		expr := NewSQLExpr(Doris).(*DorisSQLExpr).
+			WithInternalFields("dtEventTimeStamp", SelectAll).
+			WithFieldsMap(fieldsMap).
+			WithEncode(encode)
+		selectFields, _, _, _, _, err := expr.ParserAggregatesAndOrders(
+			nil,
+			metadata.Aggregates{{Name: "count", Dimensions: []string{}}},
+			metadata.Orders{},
+		)
+		assert.NoError(t, err)
+		assert.NotEmpty(t, selectFields)
+		valueExpr := ""
+		for _, s := range selectFields {
+			if strings.Contains(s, "AS `"+Value+"`") {
+				valueExpr = s
+				break
+			}
+		}
+		assert.Equal(t, "COUNT(*) AS `"+Value+"`", valueExpr, "SelectAll 应生成 COUNT(*)")
 	})
 
 	t.Run("valueField 为真实存在字段时使用该字段聚合", func(t *testing.T) {

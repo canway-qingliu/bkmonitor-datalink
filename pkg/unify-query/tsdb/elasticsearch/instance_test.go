@@ -11,14 +11,22 @@ package elasticsearch
 
 import (
 	"context"
+	stdjson "encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/jarcoal/httpmock"
+	elastic "github.com/olivere/elastic/v7"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/function"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/json"
@@ -26,6 +34,7 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/mock"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/structured"
+	uqtrace "github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/trace"
 )
 
 func TestInstance_getAlias(t *testing.T) {
@@ -166,10 +175,10 @@ func TestInstance_queryReference(t *testing.T) {
 
 	mock.Es.Set(map[string]any{
 		// 统计 __ext.io_kubernetes_pod 不为空的文档数量
-		`{"aggregations":{"_value":{"value_count":{"field":"__ext.io_kubernetes_pod"}}},"query":{"bool":{"filter":[{"exists":{"field":"__ext.io_kubernetes_pod"}},{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}}]}},"size":0,"sort":[{"dtEventTimeStamp":{"order":"desc"}}]}`: `{"took":92,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":10000,"relation":"gte"},"max_score":null,"hits":[]},"aggregations":{"_value":{"value":1523302}}}`,
+		`{"aggregations":{"_value":{"value_count":{"field":"__ext.io_kubernetes_pod"}}},"query":{"bool":{"filter":[{"exists":{"field":"__ext.io_kubernetes_pod"}},{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}}]}},"size":0,"sort":[{"dtEventTimeStamp":{"order":"desc","unmapped_type":"date"}}]}`: `{"took":92,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":10000,"relation":"gte"},"max_score":null,"hits":[]},"aggregations":{"_value":{"value":1523302}}}`,
 
 		// 统计 __ext.io_kubernetes_pod 不为空的去重文档数量
-		`{"aggregations":{"_value":{"cardinality":{"field":"__ext.io_kubernetes_pod"}}},"query":{"bool":{"filter":[{"exists":{"field":"__ext.io_kubernetes_pod"}},{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}}]}},"size":0,"sort":[{"dtEventTimeStamp":{"order":"desc"}}]}`: `{"took":170,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":10000,"relation":"gte"},"max_score":null,"hits":[]},"aggregations":{"_value":{"value":4}}}`,
+		`{"aggregations":{"_value":{"cardinality":{"field":"__ext.io_kubernetes_pod"}}},"query":{"bool":{"filter":[{"exists":{"field":"__ext.io_kubernetes_pod"}},{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}}]}},"size":0,"sort":[{"dtEventTimeStamp":{"order":"desc","unmapped_type":"date"}}]}`: `{"took":170,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":10000,"relation":"gte"},"max_score":null,"hits":[]},"aggregations":{"_value":{"value":4}}}`,
 
 		// 使用 promql 计算平均值 sum(count_over_time(field[12h]))
 		`{"aggregations":{"__ext.container_name":{"aggregations":{"__ext.io_kubernetes_pod":{"aggregations":{"dtEventTimeStamp":{"aggregations":{"_value":{"value_count":{"field":"dtEventTimeStamp"}}},"date_histogram":{"extended_bounds":{"max":1723679962000,"min":1723593608000},"field":"dtEventTimeStamp","interval":"12h","min_doc_count":0}}},"terms":{"field":"__ext.io_kubernetes_pod","missing":" "}}},"terms":{"field":"__ext.container_name","missing":" "}}},"query":{"bool":{"filter":{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}}}},"size":0}`: `{"took":185,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":10000,"relation":"gte"},"max_score":null,"hits":[]},"aggregations":{"__ext.container_name":{"doc_count_error_upper_bound":0,"sum_other_doc_count":0,"buckets":[{"key":"unify-query","doc_count":1523254,"__ext.io_kubernetes_pod":{"doc_count_error_upper_bound":0,"sum_other_doc_count":0,"buckets":[{"key":"bkmonitor-unify-query-64bd4f5df4-599f9","doc_count":767743,"dtEventTimeStamp":{"buckets":[{"key_as_string":"1723593600000","key":1723593600000,"doc_count":375064,"_value":{"value":375064}},{"key_as_string":"1723636800000","key":1723636800000,"doc_count":392679,"_value":{"value":392679}}]}},{"key":"bkmonitor-unify-query-64bd4f5df4-llp94","doc_count":755511,"dtEventTimeStamp":{"buckets":[{"key_as_string":"1723593600000","key":1723593600000,"doc_count":381173,"_value":{"value":381173}},{"key_as_string":"1723636800000","key":1723636800000,"doc_count":374338,"_value":{"value":374338}}]}}]}},{"key":"sync-apigw","doc_count":48,"__ext.io_kubernetes_pod":{"doc_count_error_upper_bound":0,"sum_other_doc_count":0,"buckets":[{"key":"bkmonitor-unify-query-apigw-sync-1178-cl8k8","doc_count":24,"dtEventTimeStamp":{"buckets":[{"key_as_string":"1723593600000","key":1723593600000,"doc_count":24,"_value":{"value":24}},{"key_as_string":"1723636800000","key":1723636800000,"doc_count":0,"_value":{"value":0}}]}},{"key":"bkmonitor-unify-query-apigw-sync-1179-9h9xv","doc_count":24,"dtEventTimeStamp":{"buckets":[{"key_as_string":"1723593600000","key":1723593600000,"doc_count":24,"_value":{"value":24}},{"key_as_string":"1723636800000","key":1723636800000,"doc_count":0,"_value":{"value":0}}]}}]}}]}}}`,
@@ -197,7 +206,7 @@ func TestInstance_queryReference(t *testing.T) {
 		`{"_source":{"includes":["__ext.io_kubernetes_pod_namespace"]},"aggregations":{"__ext.io_kubernetes_pod_namespace":{"aggregations":{"_value":{"value_count":{"field":"__ext.io_kubernetes_pod_namespace"}}},"terms":{"field":"__ext.io_kubernetes_pod_namespace","missing":" ","order":[{"_key":"desc"}]}}},"collapse":{"field":"__ext.io_kubernetes_pod_namespace"},"query":{"bool":{"filter":[{"exists":{"field":"__ext.io_kubernetes_pod_namespace"}},{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1756987540,"include_lower":true,"include_upper":true,"to":1756991140}}}]}},"size":0}`: `{"took":806,"timed_out":false,"_shards":{"total":2,"successful":2,"skipped":0,"failed":0},"hits":{"total":{"value":10000,"relation":"gte"},"max_score":null,"hits":[]},"aggregations":{"__ext.io_kubernetes_pod_namespace":{"doc_count_error_upper_bound":0,"sum_other_doc_count":0,"buckets":[{"key":"blueking","doc_count":356250,"_value":{"value":356250}}]}}}`,
 
 		// "nested aggregate + query 测试
-		`{"_source":{"includes":["group","user.first","user.last"]},"aggregations":{"user":{"aggregations":{"_value":{"value_count":{"field":"user.first"}}},"nested":{"path":"user"}}},"query":{"bool":{"filter":{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}}}},"size":0,"sort":[{"dtEventTimeStamp":{"order":"desc"}}]}`: `{"took":2,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":17,"relation":"eq"},"max_score":null,"hits":[]},"aggregations":{"user":{"doc_count":18,"_value":{"value":18}}}}`,
+		`{"_source":{"includes":["group","user.first","user.last"]},"aggregations":{"user":{"aggregations":{"_value":{"value_count":{"field":"user.first"}}},"nested":{"path":"user"}}},"query":{"bool":{"filter":{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}}}},"size":0,"sort":[{"dtEventTimeStamp":{"order":"desc","unmapped_type":"date"}}]}`: `{"took":2,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":17,"relation":"eq"},"max_score":null,"hits":[]},"aggregations":{"user":{"doc_count":18,"_value":{"value":18}}}}`,
 	})
 
 	for idx, c := range map[string]struct {
@@ -584,24 +593,24 @@ func TestInstance_queryRawData(t *testing.T) {
 
 	mock.Es.Set(map[string]any{
 		// 测试大整数精度缺失问题
-		`{"_source":{"includes":["_id","trace_id","span_id","start_time","end_time","elapsed_time","attributes"]},"from":0,"query":{"bool":{"filter":{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}}}},"size":2,"sort":[{"dtEventTimeStamp":{"order":"desc"}}]}`: `{"took":5,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":1,"relation":"eq"},"max_score":null,"hits":[{"_index":"v2_2_bkapm_trace_tilapia_20251110_0","_type":"_doc","_id":"11198970968214182562","_score":null,"_source":{"_id":"11198970968214182562","trace_id":"ac84c276757ac58fcf36b66204bb8c93","span_id":"52449ee1b7cfb6dc","start_time":1762732828226681,"end_time":1762732828226696,"elapsed_time":15,"span_name":"test-span","attributes":{"query-max-routing":4,"tsdb-num":2,"large_uint":9223372036854775808}}}]}}`,
+		`{"_source":{"includes":["_id","trace_id","span_id","start_time","end_time","elapsed_time","attributes"]},"from":0,"query":{"bool":{"filter":{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}}}},"size":2,"sort":[{"dtEventTimeStamp":{"order":"desc","unmapped_type":"date"}}]}`: `{"took":5,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":1,"relation":"eq"},"max_score":null,"hits":[{"_index":"v2_2_bkapm_trace_tilapia_20251110_0","_type":"_doc","_id":"11198970968214182562","_score":null,"_source":{"_id":"11198970968214182562","trace_id":"ac84c276757ac58fcf36b66204bb8c93","span_id":"52449ee1b7cfb6dc","start_time":1762732828226681,"end_time":1762732828226696,"elapsed_time":15,"span_name":"test-span","attributes":{"query-max-routing":4,"tsdb-num":2,"large_uint":9223372036854775808}}}]}}`,
 
 		// nested query + query string 测试 + highlight
-		`{"_source":{"includes":["group","user.first","user.last"]},"from":0,"query":{"bool":{"filter":[{"nested":{"path":"user","query":{"match_phrase":{"user.first":{"query":"John"}}}}},{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}},{"term":{"group":"fans"}}]}},"size":5,"sort":[{"dtEventTimeStamp":{"order":"desc"}}]}`: `{"took":2,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":1,"relation":"eq"},"max_score":0.0,"hits":[{"_index":"bk_unify_query_demo_2","_type":"_doc","_id":"aS3KjpEBbwEm76LbcH1G","_score":0.0,"_source":{"group":"fans","user":[{"first":"John","last":"Smith"},{"first":"Alice","last":"White"}]},"highlight":{"group":["<mark>fans</mark>"],"user.first":["<mark>John</mark>"]}}]}}`,
+		`{"_source":{"includes":["group","user.first","user.last"]},"from":0,"query":{"bool":{"filter":[{"nested":{"path":"user","query":{"match_phrase":{"user.first":{"query":"John"}}}}},{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}},{"term":{"group":"fans"}}]}},"size":5,"sort":[{"dtEventTimeStamp":{"order":"desc","unmapped_type":"date"}}]}`: `{"took":2,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":1,"relation":"eq"},"max_score":0.0,"hits":[{"_index":"bk_unify_query_demo_2","_type":"_doc","_id":"aS3KjpEBbwEm76LbcH1G","_score":0.0,"_source":{"group":"fans","user":[{"first":"John","last":"Smith"},{"first":"Alice","last":"White"}]},"highlight":{"group":["<mark>fans</mark>"],"user.first":["<mark>John</mark>"]}}]}}`,
 		// high light from condition
-		`{"_source":{"includes":["status","message"]},"from":0,"query":{"bool":{"filter":[{"match_phrase":{"status":{"query":"error"}}},{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}}]}},"size":5,"sort":[{"dtEventTimeStamp":{"order":"desc"}}]}`: `{"took":2,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":1,"relation":"eq"},"max_score":0.0,"hits":[{"_index":"bk_unify_query_demo_2","_type":"_doc","_id":"bT4KjpEBbwEm76LbdH2H","_score":0.0,"_source":{"status":"error","message":"Something went wrong"},"highlight":{"status":["<mark>error</mark>"]}}]}}`,
+		`{"_source":{"includes":["status","message"]},"from":0,"query":{"bool":{"filter":[{"match_phrase":{"status":{"query":"error"}}},{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}}]}},"size":5,"sort":[{"dtEventTimeStamp":{"order":"desc","unmapped_type":"date"}}]}`: `{"took":2,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":1,"relation":"eq"},"max_score":0.0,"hits":[{"_index":"bk_unify_query_demo_2","_type":"_doc","_id":"bT4KjpEBbwEm76LbdH2H","_score":0.0,"_source":{"status":"error","message":"Something went wrong"},"highlight":{"status":["<mark>error</mark>"]}}]}}`,
 
 		// "nested aggregate + query 测试
 		`{"_source":{"includes":["group","user.first","user.last"]},"aggregations":{"user":{"aggregations":{"_value":{"value_count":{"field":"user.first"}}},"nested":{"path":"user"}}},"query":{"bool":{"filter":{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}}}},"size":0}`: `{"took":2,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":17,"relation":"eq"},"max_score":null,"hits":[]},"aggregations":{"user":{"doc_count":18,"_value":{"value":18}}}}`,
 
 		// 获取 10条 不 field 为空的原始数据
-		`{"_source":{"includes":["__ext.container_id"]},"from":0,"query":{"bool":{"filter":[{"exists":{"field":"dtEventTimeStamp"}},{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}}]}},"size":10,"sort":[{"dtEventTimeStamp":{"order":"desc"}}]}`: `{"took":13,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":10000,"relation":"gte"},"max_score":0.0,"hits":[{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"27bdd842c5f2929cf4bd90f1e4534a9d","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"d21cf5cf373b4a26a31774ff7ab38fad","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"e07e9f6437e64cc04e945dc0bf604e62","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"01fb133625637ee3b0b8e689b8126da2","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"7eaa9e9edfc5e6bd8ba5df06fd2d5c00","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"bcabf17aca864416784c0b1054b6056e","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"3edf7236b8fc45c1aec67ea68fa92c61","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"77d08d253f11554c5290b4cac515c4e1","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"9fb5bb5f9bce7e0ab59e0cd1f410c57b","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"573b3e1b4a499e4b7e7fab35f316ac8a","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}}]}}`,
+		`{"_source":{"includes":["__ext.container_id"]},"from":0,"query":{"bool":{"filter":[{"exists":{"field":"dtEventTimeStamp"}},{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}}]}},"size":10,"sort":[{"dtEventTimeStamp":{"order":"desc","unmapped_type":"date"}}]}`: `{"took":13,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":10000,"relation":"gte"},"max_score":0.0,"hits":[{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"27bdd842c5f2929cf4bd90f1e4534a9d","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"d21cf5cf373b4a26a31774ff7ab38fad","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"e07e9f6437e64cc04e945dc0bf604e62","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"01fb133625637ee3b0b8e689b8126da2","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"7eaa9e9edfc5e6bd8ba5df06fd2d5c00","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"bcabf17aca864416784c0b1054b6056e","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"3edf7236b8fc45c1aec67ea68fa92c61","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"77d08d253f11554c5290b4cac515c4e1","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"9fb5bb5f9bce7e0ab59e0cd1f410c57b","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"573b3e1b4a499e4b7e7fab35f316ac8a","_score":0.0,"_source":{"__ext":{"container_id":"77bd897e66402eb66ee97a1f832fb55b2114d83dc369f01e36ce4cec8483786f"}}}]}}`,
 
 		// 获取 10条 原始数据
-		`{"_source":{"includes":["__ext.io_kubernetes_pod","__ext.container_name"]},"from":0,"query":{"bool":{"filter":{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}}}},"size":10,"sort":[{"dtEventTimeStamp":{"order":"desc"}}]}`: `{"took":2,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":10000,"relation":"gte"},"max_score":0.0,"hits":[{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"8defd23f1c2599e70f3ace3a042b2b5f","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"ba0a6e66f01d6cb77ae25b13ddf4ad1b","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"74ea55e7397582b101f0e21efbc876c6","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"084792484f943e314e31ef2b2e878115","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"0a3f47a7c57d0af7d40d82c729c37155","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"85981293cca7102b9560b49a7f089737","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"b429dc6611efafc4d02b90f882271dea","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"01213026ae064c6726fd99dc8276e842","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"93027432b40ccb01b1be8f4ea06a6853","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"bc31babcb5d1075fc421bd641199d3aa","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}}]}}`,
+		`{"_source":{"includes":["__ext.io_kubernetes_pod","__ext.container_name"]},"from":0,"query":{"bool":{"filter":{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}}}},"size":10,"sort":[{"dtEventTimeStamp":{"order":"desc","unmapped_type":"date"}}]}`: `{"took":2,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":10000,"relation":"gte"},"max_score":0.0,"hits":[{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"8defd23f1c2599e70f3ace3a042b2b5f","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"ba0a6e66f01d6cb77ae25b13ddf4ad1b","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"74ea55e7397582b101f0e21efbc876c6","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"084792484f943e314e31ef2b2e878115","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"0a3f47a7c57d0af7d40d82c729c37155","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"85981293cca7102b9560b49a7f089737","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"b429dc6611efafc4d02b90f882271dea","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"01213026ae064c6726fd99dc8276e842","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"93027432b40ccb01b1be8f4ea06a6853","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}},{"_index":"v2_2_bklog_bk_unify_query_20240814_0","_type":"_doc","_id":"bc31babcb5d1075fc421bd641199d3aa","_score":0.0,"_source":{"__ext":{"container_name":"unify-query","io_kubernetes_pod":"bkmonitor-unify-query-64bd4f5df4-599f9"}}}]}}`,
 
 		// 测试大整数精度缺失问题 - 匹配查询
-		`{"_source":{"includes":["_id","trace_id","start_time","end_time"]},"from":0,"query":{"bool":{"filter":[{"exists":{"field":"dtEventTimeStamp"}},{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}}]}},"size":2,"sort":[{"dtEventTimeStamp":{"order":"desc"}}]}`: `{"took":5,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":10000,"relation":"gte"},"max_score":null,"hits":[{"_index":"v2_2_bkapm_trace_tilapia_20251110_0","_type":"_doc","_id":"11198970968214182562","_score":null,"_source":{"_id":"11198970968214182562","trace_id":"ac84c276757ac58fcf36b66204bb8c93","start_time":1762732828226681,"end_time":1762732828226696}}]}}`,
+		`{"_source":{"includes":["_id","trace_id","start_time","end_time"]},"from":0,"query":{"bool":{"filter":[{"exists":{"field":"dtEventTimeStamp"}},{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}}]}},"size":2,"sort":[{"dtEventTimeStamp":{"order":"desc","unmapped_type":"date"}}]}`: `{"took":5,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":10000,"relation":"gte"},"max_score":null,"hits":[{"_index":"v2_2_bkapm_trace_tilapia_20251110_0","_type":"_doc","_id":"11198970968214182562","_score":null,"_source":{"_id":"11198970968214182562","trace_id":"ac84c276757ac58fcf36b66204bb8c93","start_time":1762732828226681,"end_time":1762732828226696}}]}}`,
 
 		`{"from":0,"query":{"bool":{"filter":{"range":{"dtEventTimeStamp":{"format":"epoch_second","from":1723593608,"include_lower":true,"include_upper":true,"to":1723679962}}}}},"size":0}`: `{"error":{"root_cause":[{"type":"x_content_parse_exception","reason":"[1:138] [highlight] unknown field [max_analyzed_offset]"}],"type":"x_content_parse_exception","reason":"[1:138] [highlight] unknown field [max_analyzed_offset]"},"status":400}`,
 
@@ -1301,6 +1310,61 @@ func TestInstance_queryRawData(t *testing.T) {
 	}
 }
 
+func TestInstance_QueryRawDataSharedQueryDoesNotMutate(t *testing.T) {
+	mock.Init()
+	ctx := metadata.InitHashID(context.Background())
+
+	httpmock.RegisterResponder(
+		http.MethodPost,
+		mock.EsUrl+"/es_index/_search",
+		httpmock.NewStringResponder(http.StatusOK, `{"took":1,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":0,"relation":"eq"},"max_score":null,"hits":[]}}`),
+	)
+
+	ins, err := NewInstance(ctx, &InstanceOption{
+		Connect: Connect{
+			Address: mock.EsUrl,
+		},
+		MaxSize: 1,
+		Timeout: 3 * time.Second,
+	})
+	assert.NoError(t, err)
+
+	optionFrom := 7
+	query := &metadata.Query{
+		DB:    "es_index",
+		Field: "a",
+		From:  3,
+		Size:  10,
+		TimeField: metadata.TimeField{
+			Name: "dtEventTimeStamp",
+			Type: TimeFieldTypeTime,
+			Unit: "millisecond",
+		},
+		TableID:     "es_index",
+		StorageType: metadata.ElasticsearchStorageType,
+		Source:      []string{"a"},
+		ResultTableOption: &metadata.ResultTableOption{
+			From: &optionFrom,
+		},
+	}
+	originalOption := query.ResultTableOption.Clone()
+
+	dataCh := make(chan map[string]any)
+	size, total, resultOption, err := ins.QueryRawData(ctx, query, time.UnixMilli(1723593608000), time.UnixMilli(1723679962000), dataCh)
+	close(dataCh)
+
+	assert.NoError(t, err)
+	assert.Equal(t, int64(0), size)
+	assert.Equal(t, int64(0), total)
+	assert.Equal(t, 10, query.Size)
+	assert.Equal(t, 3, query.From)
+	assert.Equal(t, originalOption, query.ResultTableOption)
+	assert.NotSame(t, query.ResultTableOption, resultOption)
+	assert.NotSame(t, query.ResultTableOption.From, resultOption.From)
+	assert.Equal(t, 7, *query.ResultTableOption.From)
+	assert.Equal(t, 7, *resultOption.From)
+}
+
 func TestInstance_fieldMap(t *testing.T) {
 	mock.Init()
 
@@ -1394,6 +1458,94 @@ func TestInstance_QueryLabelNames(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestInstance_QueryLabelValuesConcurrentSharedQueryDoesNotMutate(t *testing.T) {
+	mock.Init()
+	metadata.InitMetadata()
+	ctx := metadata.InitHashID(context.Background())
+
+	httpmock.RegisterResponder(
+		http.MethodPost,
+		mock.EsUrl+"/es_index/_search",
+		httpmock.NewStringResponder(http.StatusOK, `{"took":1,"timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":0,"relation":"eq"},"max_score":null,"hits":[]},"aggregations":{"a":{"doc_count_error_upper_bound":0,"sum_other_doc_count":0,"buckets":[{"key":"a-value","doc_count":1,"_value":{"value":1}}]},"b":{"doc_count_error_upper_bound":0,"sum_other_doc_count":0,"buckets":[{"key":"b-value","doc_count":1,"_value":{"value":1}}]},"level":{"doc_count_error_upper_bound":0,"sum_other_doc_count":0,"buckets":[{"key":"INFO","doc_count":1,"_value":{"value":1}}]}}}`),
+	)
+
+	inst, err := NewInstance(ctx, &InstanceOption{
+		Connect: Connect{
+			Address: mock.EsUrl,
+		},
+		Timeout: time.Minute,
+	})
+	assert.NoError(t, err)
+
+	query := &metadata.Query{
+		DB:    "es_index",
+		Field: "a",
+		TimeField: metadata.TimeField{
+			Name: "dtEventTimeStamp",
+			Type: TimeFieldTypeTime,
+			Unit: "millisecond",
+		},
+		TableID:     "test_table",
+		StorageType: metadata.ElasticsearchStorageType,
+		AllConditions: metadata.AllConditions{
+			{
+				{
+					DimensionName: "level",
+					Operator:      "eq",
+					Value:         []string{"INFO"},
+				},
+			},
+		},
+		Aggregates: metadata.Aggregates{
+			{
+				Name:       Count,
+				Field:      "a",
+				Dimensions: []string{"level"},
+			},
+		},
+	}
+	originalAllConditions := cloneAllConditions(query.AllConditions)
+	originalAggregates := make(metadata.Aggregates, len(query.Aggregates))
+	for i, aggregate := range query.Aggregates {
+		originalAggregates[i] = aggregate
+		originalAggregates[i].Dimensions = append([]string{}, aggregate.Dimensions...)
+		if aggregate.Args != nil {
+			originalAggregates[i].Args = append([]any{}, aggregate.Args...)
+		}
+	}
+
+	start := time.UnixMilli(1723593608000)
+	end := time.UnixMilli(1723679962000)
+	labelNames := []string{"a", "b", "level"}
+	errCh := make(chan error, len(labelNames)*10)
+	var wg sync.WaitGroup
+
+	for i := 0; i < 10; i++ {
+		for _, labelName := range labelNames {
+			wg.Add(1)
+			go func(labelName string) {
+				defer wg.Done()
+				values, err := inst.QueryLabelValues(ctx, query, labelName, start, end)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				if len(values) == 0 {
+					errCh <- fmt.Errorf("empty label values for %s", labelName)
+				}
+			}(labelName)
+		}
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		assert.NoError(t, err)
+	}
+	assert.Equal(t, originalAllConditions, query.AllConditions)
+	assert.Equal(t, originalAggregates, query.Aggregates)
 }
 
 func TestInstance_QuerySeries(t *testing.T) {
@@ -1507,4 +1659,179 @@ func TestInstance_QuerySeries(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRecordESQueryShards(t *testing.T) {
+	log.InitTestLogger()
+
+	t.Run("records shard counters on healthy response", func(t *testing.T) {
+		rec := setupESTraceRecorder(t)
+		_, span := uqtrace.NewSpan(context.Background(), "test-span")
+
+		recordESQueryShards(context.Background(), span, &queryOption{indexes: []string{"index-1"}}, &elastic.SearchResult{
+			TimedOut: false,
+			Shards: &elastic.ShardsInfo{
+				Total:      4,
+				Successful: 4,
+				Failed:     0,
+				Skipped:    1,
+			},
+		})
+		var err error
+		span.End(&err)
+
+		attrs := endedSpanAttrs(t, rec)
+		timedOut, ok := esSpanAttrBool(attrs, "timed_out")
+		require.True(t, ok)
+		assert.False(t, timedOut)
+		shardsTotal, ok := esSpanAttrInt(attrs, "shards_total")
+		require.True(t, ok)
+		assert.Equal(t, int64(4), shardsTotal)
+		shardsSkipped, ok := esSpanAttrInt(attrs, "shards_skipped")
+		require.True(t, ok)
+		assert.Equal(t, int64(1), shardsSkipped)
+		_, ok = esSpanAttrInt(attrs, "shards_failures_count")
+		assert.False(t, ok)
+		_, ok = esSpanAttrString(attrs, "shards_failures_sample")
+		assert.False(t, ok)
+	})
+
+	t.Run("records bounded failure sample", func(t *testing.T) {
+		rec := setupESTraceRecorder(t)
+		_, span := uqtrace.NewSpan(context.Background(), "test-span")
+		longReason := strings.Repeat("x", esShardFailureReasonMaxLength+64)
+
+		recordESQueryShards(context.Background(), span, &queryOption{indexes: []string{"index-*"}}, &elastic.SearchResult{
+			Shards: &elastic.ShardsInfo{
+				Total:      5,
+				Successful: 1,
+				Failed:     4,
+				Failures: []*elastic.ShardOperationFailedException{
+					{Shard: 1, Index: "index-1", Status: "INTERNAL_SERVER_ERROR", Reason: map[string]interface{}{"type": "illegal_argument_exception", "reason": longReason}},
+					{Shard: 2, Index: "index-2", Reason: map[string]interface{}{"reason": "second"}},
+					{Shard: 3, Index: "index-3", Reason: map[string]interface{}{"reason": "third"}},
+					{Shard: 4, Index: "index-4", Reason: map[string]interface{}{"reason": "fourth"}},
+				},
+			},
+		})
+		var err error
+		span.End(&err)
+
+		attrs := endedSpanAttrs(t, rec)
+		shardsFailed, ok := esSpanAttrInt(attrs, "shards_failed")
+		require.True(t, ok)
+		assert.Equal(t, int64(4), shardsFailed)
+		failuresCount, ok := esSpanAttrInt(attrs, "shards_failures_count")
+		require.True(t, ok)
+		assert.Equal(t, int64(4), failuresCount)
+		failuresSampleJson, ok := esSpanAttrString(attrs, "shards_failures_sample")
+		require.True(t, ok)
+		assert.NotContains(t, failuresSampleJson, "index-4")
+
+		var failuresSample []esShardFailureSample
+		require.NoError(t, stdjson.Unmarshal([]byte(failuresSampleJson), &failuresSample))
+		require.Len(t, failuresSample, esShardFailureSampleLimit)
+		assert.Equal(t, 1, failuresSample[0].Shard)
+		assert.Equal(t, "index-1", failuresSample[0].Index)
+		assert.Equal(t, "INTERNAL_SERVER_ERROR", failuresSample[0].Status)
+		assert.LessOrEqual(t, len([]rune(failuresSample[0].Reason)), esShardFailureReasonMaxLength)
+	})
+
+	t.Run("records timeout without failures", func(t *testing.T) {
+		rec := setupESTraceRecorder(t)
+		_, span := uqtrace.NewSpan(context.Background(), "test-span")
+
+		recordESQueryShards(context.Background(), span, &queryOption{indexes: []string{"index-1"}}, &elastic.SearchResult{
+			TimedOut: true,
+			Shards: &elastic.ShardsInfo{
+				Total:      2,
+				Successful: 2,
+			},
+		})
+		var err error
+		span.End(&err)
+
+		attrs := endedSpanAttrs(t, rec)
+		timedOut, ok := esSpanAttrBool(attrs, "timed_out")
+		require.True(t, ok)
+		assert.True(t, timedOut)
+		failuresCount, ok := esSpanAttrInt(attrs, "shards_failures_count")
+		require.True(t, ok)
+		assert.Equal(t, int64(0), failuresCount)
+		_, ok = esSpanAttrString(attrs, "shards_failures_sample")
+		assert.False(t, ok)
+	})
+
+	t.Run("handles nil result and nil shards", func(t *testing.T) {
+		rec := setupESTraceRecorder(t)
+		_, span := uqtrace.NewSpan(context.Background(), "test-span")
+		assert.NotPanics(t, func() {
+			recordESQueryShards(context.Background(), span, nil, nil)
+		})
+		var err error
+		span.End(&err)
+		assert.Empty(t, endedSpanAttrs(t, rec))
+
+		rec = setupESTraceRecorder(t)
+		_, span = uqtrace.NewSpan(context.Background(), "test-span")
+		assert.NotPanics(t, func() {
+			recordESQueryShards(context.Background(), span, nil, &elastic.SearchResult{TimedOut: true})
+		})
+		span.End(&err)
+
+		attrs := endedSpanAttrs(t, rec)
+		timedOut, ok := esSpanAttrBool(attrs, "timed_out")
+		require.True(t, ok)
+		assert.True(t, timedOut)
+		failuresCount, ok := esSpanAttrInt(attrs, "shards_failures_count")
+		require.True(t, ok)
+		assert.Equal(t, int64(0), failuresCount)
+	})
+}
+
+func setupESTraceRecorder(t *testing.T) *tracetest.SpanRecorder {
+	t.Helper()
+	rec := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+	prevTP := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() {
+		_ = tp.Shutdown(context.Background())
+		otel.SetTracerProvider(prevTP)
+	})
+	return rec
+}
+
+func endedSpanAttrs(t *testing.T, rec *tracetest.SpanRecorder) []attribute.KeyValue {
+	t.Helper()
+	ended := rec.Ended()
+	require.Len(t, ended, 1)
+	return ended[0].Attributes()
+}
+
+func esSpanAttrBool(attrs []attribute.KeyValue, key string) (bool, bool) {
+	for _, kv := range attrs {
+		if string(kv.Key) == key {
+			return kv.Value.AsBool(), true
+		}
+	}
+	return false, false
+}
+
+func esSpanAttrInt(attrs []attribute.KeyValue, key string) (int64, bool) {
+	for _, kv := range attrs {
+		if string(kv.Key) == key {
+			return kv.Value.AsInt64(), true
+		}
+	}
+	return 0, false
+}
+
+func esSpanAttrString(attrs []attribute.KeyValue, key string) (string, bool) {
+	for _, kv := range attrs {
+		if string(kv.Key) == key {
+			return kv.Value.AsString(), true
+		}
+	}
+	return "", false
 }

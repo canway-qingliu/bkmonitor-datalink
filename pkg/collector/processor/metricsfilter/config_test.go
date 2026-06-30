@@ -111,6 +111,58 @@ func TestRelabelConfigValidate(t *testing.T) {
 	}
 }
 
+func TestDropConfigValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		rules   []*DropRule
+		wantErr string
+	}{
+		{
+			name: "valid resource predicate key",
+			rules: []*DropRule{{
+				PredicateKey: "resource.telemetry.sdk.language",
+				MatchConfig:  MatchConfig{Op: "eq", Value: "go"},
+			}},
+		},
+		{
+			name: "invalid attributes predicate key",
+			rules: []*DropRule{{
+				PredicateKey: "attributes.telemetry.sdk.language",
+				MatchConfig:  MatchConfig{Op: "eq", Value: "go"},
+			}},
+			wantErr: "only resource.* is supported",
+		},
+		{
+			name: "invalid bare predicate key",
+			rules: []*DropRule{{
+				PredicateKey: "telemetry.sdk.language",
+				MatchConfig:  MatchConfig{Op: "eq", Value: "go"},
+			}},
+			wantErr: "only resource.* is supported",
+		},
+		{
+			name: "empty predicate key",
+			rules: []*DropRule{{
+				PredicateKey: " ",
+				MatchConfig:  MatchConfig{Op: "eq", Value: "go"},
+			}},
+			wantErr: "predicate_key is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := Config{Drop: DropAction{Rules: tt.rules}}
+			err := c.Validate()
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+				return
+			}
+			assert.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
+
 func TestCodeRelabelConfigValidate(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -135,6 +187,18 @@ func TestCodeRelabelConfigValidate(t *testing.T) {
 				},
 			}},
 			targets: RelabelTarget{Label: "target_label", Value: "foo", Action: relabelUpsert},
+			wantErr: false,
+		},
+		{
+			name:    "valid global source",
+			metrics: []string{"test_metric"},
+			source:  "*",
+			services: []*CodeRelabelService{{
+				Name: "my.server;my.service;my.method",
+				Codes: []*CodeRelabelCode{
+					{Rule: "err_200~300"},
+				},
+			}},
 			wantErr: false,
 		},
 		{
@@ -186,6 +250,28 @@ func TestCodeRelabelConfigValidate(t *testing.T) {
 			assert.Equal(t, tt.wantErr, c.Validate() != nil)
 		})
 	}
+}
+
+func TestCodeRelabelGlobalSourceMatch(t *testing.T) {
+	action := CodeRelabelAction{
+		Metrics: []string{"rpc_client_handled_total"},
+		Source:  "*",
+		Services: []*CodeRelabelService{{
+			Name:  "my.server;my.service;my.method",
+			Codes: []*CodeRelabelCode{{Rule: "err_200~300"}},
+		}},
+	}
+	assert.NoError(t, action.Validate())
+
+	assert.True(t, action.MatchMap(createTestMap("service_name", "any.service")))
+	assert.True(t, action.MatchMap(createTestMap("service_name", "another.service")))
+	assert.True(t, action.MatchMap(createTestMap()))
+
+	labels := promlabels.Labels([]prompb.Label{{Name: "service_name", Value: "random.svc"}})
+	assert.True(t, action.MatchLabels(labels))
+
+	labelsEmpty := promlabels.Labels([]prompb.Label{})
+	assert.True(t, action.MatchLabels(labelsEmpty))
 }
 
 func TestRelabelRuleMatch(t *testing.T) {

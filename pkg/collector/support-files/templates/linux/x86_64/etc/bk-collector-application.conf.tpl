@@ -275,6 +275,12 @@ default:
               {%- for drop_key in resource_filter_config.get("drop", {}).get("keys", []) %}
               - '{{ drop_key }}'
               {%- endfor %}
+          replace:
+            {%- for replace_config in resource_filter_config.replace %}
+            - source: '{{ replace_config.source }}'
+              destination: '{{ replace_config.destination }}'
+              extract_pattern: '{{ replace_config.extract_pattern }}'
+            {%- endfor %}
 {%- endif %}
 
 {% if resource_filter_config_logs is defined %}
@@ -294,6 +300,24 @@ default:
               {%- for drop_key in resource_filter_config_logs.get("drop", {}).get("keys", []) %}
               - '{{ drop_key }}'
               {%- endfor %}
+          replace:
+            {%- for replace_config in resource_filter_config_logs.replace %}
+            - source: '{{ replace_config.source }}'
+              destination: '{{ replace_config.destination }}'
+              extract_pattern: '{{ replace_config.extract_pattern }}'
+            {%- endfor %}
+          {%- if resource_filter_config_logs.get("from_record") %}
+          from_record:
+            {%- for record_item in resource_filter_config_logs.from_record %}
+            - source: '{{ record_item.source }}'
+              destination: '{{ record_item.destination }}'
+            {%- endfor %}
+          {%- endif %}
+          {%- if resource_filter_config_logs.get("from_cache") %}
+          from_cache:
+            key: '{{ resource_filter_config_logs.from_cache.get("key", "") }}'
+            cache_name: '{{ resource_filter_config_logs.from_cache.get("cache_name", "") }}'
+          {%- endif %}
 {%- endif %}
 
 {% if resource_filter_config_metrics is defined %}
@@ -317,6 +341,12 @@ default:
               - '{{ drop_key }}'
               {%- endfor %}
           {%- endif %}
+          replace:
+            {%- for replace_config in resource_filter_config_metrics.replace %}
+            - source: '{{ replace_config.source }}'
+              destination: '{{ replace_config.destination }}'
+              extract_pattern: '{{ replace_config.extract_pattern }}'
+            {%- endfor %}
           {%- if resource_filter_config_metrics.get("from_token") %}
           from_token:
             keys:
