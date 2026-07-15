@@ -12,6 +12,7 @@ package receiver
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
 	"sync"
@@ -31,6 +32,7 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/grpcmiddleware"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/httpmiddleware"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/throttle"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/receiver/networkflow"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
 )
 
@@ -38,6 +40,7 @@ type Receiver struct {
 	wg sync.WaitGroup
 
 	config      Config
+	networkflow *networkflow.Receiver
 	adminServer *http.Server // 管理员服务 一般不对外暴露
 	recvServer  *http.Server // 接收服务
 	recvTls     *transport.TLSConfig
@@ -46,8 +49,9 @@ type Receiver struct {
 }
 
 var (
-	globalRecords          = define.NewRecordQueue(define.PushModeGuarantee)
-	globalSkywalkingConfig map[string]SkywalkingConfig
+	globalRecords                = define.NewRecordQueue(define.PushModeGuarantee)
+	globalSkywalkingConfig       map[string]SkywalkingConfig
+	errNetworkFlowConfigNotFound = errors.New("networkflow config not found")
 )
 
 // Records 返回 Receiver 全局消息管道
@@ -91,6 +95,19 @@ func New(conf *confengine.Config) (*Receiver, error) {
 	if err = conf.UnpackChild(define.ConfigFieldReceiver, &c); err != nil {
 		return nil, err
 	}
+
+	if len(c.NetworkFlow.ListenersFile) > 0 {
+		nf, err := loadNetworkFlowConfig(c.NetworkFlow.ListenersFile)
+		if err != nil {
+			if errors.Is(err, errNetworkFlowConfigNotFound) {
+				logger.Warnf("networkflow sub-config is missing, skip loading listeners_file=%v, err: %v", c.NetworkFlow.ListenersFile, err)
+			} else {
+				return nil, fmt.Errorf("load networkflow sub-config failed: %w", err)
+			}
+		} else {
+			c.NetworkFlow = *nf
+		}
+	}
 	logger.Infof("receiver config: %+v", c)
 
 	var tlsConfig *tlscommon.TLSConfig
@@ -112,7 +129,17 @@ func New(conf *confengine.Config) (*Receiver, error) {
 	}
 
 	return &Receiver{
-		config:  c,
+		config: c,
+		networkflow: networkflow.New(
+			c.NetworkFlow.Enabled,
+			c.NetworkFlow.DataID,
+			c.NetworkFlow.Listeners,
+			c.NetworkFlow.Workers,
+			c.NetworkFlow.Sockets,
+			c.NetworkFlow.QueueSize,
+			c.NetworkFlow.Blocking,
+			publishRecord,
+		),
 		recvTls: tlsConfig,
 		recvServer: &http.Server{
 			Handler:      RecvHttpRouter(),
@@ -125,6 +152,18 @@ func New(conf *confengine.Config) (*Receiver, error) {
 			WriteTimeout: time.Minute * 5, // 写超时
 		},
 	}, nil
+}
+
+func loadNetworkFlowConfig(patterns []string) (*NetworkFlowConfig, error) {
+	cfgs := confengine.LoadConfigPatterns(patterns)
+	for _, cfg := range cfgs {
+		var nf NetworkFlowConfig
+		if err := cfg.Unpack(&nf); err != nil {
+			return nil, err
+		}
+		return &nf, nil
+	}
+	return nil, fmt.Errorf("%w from patterns: %v", errNetworkFlowConfigNotFound, patterns)
 }
 
 func (r *Receiver) ready() {
@@ -242,6 +281,11 @@ func (r *Receiver) Start() error {
 	logger.Info("receiver start working...")
 
 	r.ready()
+	if r.networkflow != nil {
+		if err := r.networkflow.Start(); err != nil {
+			return err
+		}
+	}
 	errs := make(chan error, 8)
 
 	// 启动 Recv HTTP 服务
@@ -382,6 +426,11 @@ func (r *Receiver) Stop() error {
 		defer throttle.Stop()
 	}
 
+	if r.networkflow != nil {
+		if err := r.networkflow.Stop(); err != nil && !errors.Is(err, networkflow.ErrNotStarted) {
+			return err
+		}
+	}
 	if err := r.shutdownRecvServer(); err != nil {
 		return err
 	}
