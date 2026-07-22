@@ -64,19 +64,27 @@ var (
 
 func printVersionAndExitIfRequested() {
 	for _, arg := range os.Args[1:] {
+		if arg == "-vv" {
+			printDetailVersion()
+			os.Exit(0)
+		}
 		if arg == "-v" || arg == "--version" {
-			fmt.Printf("Version: %s\n", Version)
-			fmt.Printf("CommitId: %s\n", GitHash)
-			fmt.Printf("Tag: %s\n", GitTag)
-			fmt.Printf("Committer: %s\n", GitCommitter)
-			fmt.Printf("CommitTime: %s\n", GitCommitTime)
-			fmt.Printf("BuildTime: %s\n", BuildTime)
-			fmt.Printf("BuildId: %s\n", BuildId)
-			fmt.Printf("BuildNo: %s\n", BuildNo)
-			fmt.Printf("Release: %s\n", Release)
+			fmt.Printf("%s\n", Version)
 			os.Exit(0)
 		}
 	}
+}
+
+func printDetailVersion() {
+	fmt.Printf("Version: %s\n", Version)
+	fmt.Printf("CommitId: %s\n", GitHash)
+	fmt.Printf("Tag: %s\n", GitTag)
+	fmt.Printf("Committer: %s\n", GitCommitter)
+	fmt.Printf("CommitTime: %s\n", GitCommitTime)
+	fmt.Printf("BuildTime: %s\n", BuildTime)
+	fmt.Printf("BuildId: %s\n", BuildId)
+	fmt.Printf("BuildNo: %s\n", BuildNo)
+	fmt.Printf("Release: %s\n", Release)
 }
 
 func registerValidators() {

@@ -34,18 +34,12 @@ var (
 func main() {
 	path := flag.String("config", "./sliwebhook.yaml", "configuration filepath")
 	v := flag.Bool("version", false, "display version")
+	flag.Bool("v", false, "display version")
+	printVersionAndExitIfRequested()
 	flag.Parse()
 
 	if *v {
-		fmt.Println("Version:", version)
-		fmt.Println("CommitId:", gitHash)
-		fmt.Println("Tag:", gitTag)
-		fmt.Println("Committer:", gitCommitter)
-		fmt.Println("CommitTime:", gitCommitTime)
-		fmt.Println("BuildTime:", buildTime)
-		fmt.Println("BuildId:", buildId)
-		fmt.Println("BuildNo:", buildNo)
-		fmt.Println("Release:", release)
+		fmt.Println(version)
 		return
 	}
 
@@ -72,6 +66,31 @@ func main() {
 			return
 		}
 	}
+}
+
+func printVersionAndExitIfRequested() {
+	for _, arg := range os.Args[1:] {
+		if arg == "-vv" {
+			printDetailVersion()
+			os.Exit(0)
+		}
+		if arg == "-v" || arg == "--version" || arg == "-version" {
+			fmt.Println(version)
+			os.Exit(0)
+		}
+	}
+}
+
+func printDetailVersion() {
+	fmt.Println("Version:", version)
+	fmt.Println("CommitId:", gitHash)
+	fmt.Println("Tag:", gitTag)
+	fmt.Println("Committer:", gitCommitter)
+	fmt.Println("CommitTime:", gitCommitTime)
+	fmt.Println("BuildTime:", buildTime)
+	fmt.Println("BuildId:", buildId)
+	fmt.Println("BuildNo:", buildNo)
+	fmt.Println("Release:", release)
 }
 
 func loadConfig(path string) (*Config, error) {

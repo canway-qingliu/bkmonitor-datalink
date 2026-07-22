@@ -31,6 +31,12 @@ var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "display version of bkmonitor-operator",
 	Run: func(cmd *cobra.Command, args []string) {
+		all, _ := cmd.Flags().GetBool("all")
+		if !all {
+			fmt.Println(Version)
+			return
+		}
+
 		fmt.Println("Version:", Version)
 		fmt.Println("CommitId:", GitHash)
 		fmt.Println("Tag:", GitTag)
@@ -45,4 +51,5 @@ var versionCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(versionCmd)
+	versionCmd.Flags().BoolP("all", "a", false, "show all version info")
 }

@@ -40,19 +40,27 @@ var (
 
 func printVersionAndExitIfRequested() {
 	for _, arg := range os.Args[1:] {
+		if arg == "-vv" {
+			printDetailVersion()
+			os.Exit(0)
+		}
 		if arg == "-v" || arg == "--version" {
-			fmt.Printf("Version: %s\n", version)
-			fmt.Printf("CommitId: %s\n", gitHash)
-			fmt.Printf("Tag: %s\n", tag)
-			fmt.Printf("Committer: %s\n", committer)
-			fmt.Printf("CommitTime: %s\n", commitTime)
-			fmt.Printf("BuildTime: %s\n", buildTime)
-			fmt.Printf("BuildId: %s\n", buildId)
-			fmt.Printf("BuildNo: %s\n", buildNo)
-			fmt.Printf("Release: %s\n", release)
+			fmt.Printf("%s\n", version)
 			os.Exit(0)
 		}
 	}
+}
+
+func printDetailVersion() {
+	fmt.Printf("Version: %s\n", version)
+	fmt.Printf("CommitId: %s\n", gitHash)
+	fmt.Printf("Tag: %s\n", tag)
+	fmt.Printf("Committer: %s\n", committer)
+	fmt.Printf("CommitTime: %s\n", commitTime)
+	fmt.Printf("BuildTime: %s\n", buildTime)
+	fmt.Printf("BuildId: %s\n", buildId)
+	fmt.Printf("BuildNo: %s\n", buildNo)
+	fmt.Printf("Release: %s\n", release)
 }
 
 func main() {
