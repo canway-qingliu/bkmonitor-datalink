@@ -1,14 +1,22 @@
 type: "platform"
 
 processor:
-  # TokenChecker: 权限校验处理器
   - name: "token_checker/aes256"
     config:
       type: "aes256"
+      version: ""
       resource_key: "bk.data.token"
-      salt: "bk" # 加盐解密标识
+      salt: "bk"
+      decoded_key: "5c0243de-ef38-4f52-a901-79ed9808e4b5"
       decoded_iv: "bkbkbkbkbkbkbkbk"
-      decoded_key: "81be7fc6-5476-4934-9417-6d4d593728db"
+      must_empty_token: true
+      fixed_token: ""
+      traces_dataid: 0
+      metrics_dataid: 0
+      logs_dataid: 0
+      profiles_dataid: 0
+      bk_biz_id: 0
+      bk_app_name: ""
 
 
   - name: "resource_filter/common"

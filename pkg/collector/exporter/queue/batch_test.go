@@ -44,6 +44,14 @@ func (t testLogsEvent) RecordType() define.RecordType {
 	return define.RecordLogs
 }
 
+type testDatadogRumEvent struct {
+	define.CommonEvent
+}
+
+func (t testDatadogRumEvent) RecordType() define.RecordType {
+	return define.RecordDatadogRum
+}
+
 func TestQueueOut(t *testing.T) {
 	conf := Config{
 		MetricsBatchSize: 100,

@@ -108,10 +108,18 @@ func (p *tokenChecker) Process(record *define.Record) (*define.Record, error) {
 		err = p.processProxy(decoder, record)
 	case define.RecordFta:
 		err = p.processFta(decoder, record)
+	case define.RecordDatadogRum:
+		err = p.processDatadogRum(decoder, record)
 	default:
 		err = p.processCommon(decoder, record)
 	}
 	return nil, err
+}
+
+func (p *tokenChecker) processDatadogRum(decoder TokenDecoder, record *define.Record) error {
+	// Datadog RUM receiver currently uses the standard BK token sources
+	// carried by HTTP query/header/auth and maps the record to logs data ID.
+	return p.processCommon(decoder, record)
 }
 
 // processFta Fta Token 解析

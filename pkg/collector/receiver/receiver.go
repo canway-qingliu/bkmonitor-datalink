@@ -48,7 +48,36 @@ type Receiver struct {
 var (
 	globalRecords          = define.NewRecordQueue(define.PushModeGuarantee)
 	globalSkywalkingConfig map[string]SkywalkingConfig
+	configLoaders          = map[string]ConfigLoadFunc{}
+	configLoadersMu        sync.RWMutex
 )
+
+// ConfigLoadFunc loads a receiver-specific configuration from the complete collector config.
+type ConfigLoadFunc func(conf *confengine.Config)
+
+// RegisterConfigLoadFunc registers a receiver-specific configuration loader.
+// Loaders run before receiver startup and on every receiver reload.
+func RegisterConfigLoadFunc(source string, f ConfigLoadFunc) {
+	if f == nil {
+		return
+	}
+	configLoadersMu.Lock()
+	defer configLoadersMu.Unlock()
+	configLoaders[source] = f
+}
+
+func loadConfigLoaders(conf *confengine.Config) {
+	configLoadersMu.RLock()
+	loaders := make([]ConfigLoadFunc, 0, len(configLoaders))
+	for _, f := range configLoaders {
+		loaders = append(loaders, f)
+	}
+	configLoadersMu.RUnlock()
+
+	for _, f := range loaders {
+		f(conf)
+	}
+}
 
 // Records 返回 Receiver 全局消息管道
 func Records() <-chan *define.Record {
@@ -103,6 +132,7 @@ func New(conf *confengine.Config) (*Receiver, error) {
 
 	// 全局状态记录
 	globalSkywalkingConfig = LoadConfigFrom(conf)
+	loadConfigLoaders(conf)
 	if c.Throttle.Enabled {
 		if err = throttle.Init(c.Throttle); err != nil {
 			return nil, err
@@ -136,6 +166,7 @@ func (r *Receiver) ready() {
 
 func (r *Receiver) Reload(conf *confengine.Config) {
 	globalSkywalkingConfig = LoadConfigFrom(conf)
+	loadConfigLoaders(conf)
 }
 
 func (r *Receiver) startRecvHttpServer() error {

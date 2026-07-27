@@ -83,9 +83,8 @@ func registerHttpRoute(source, httpMethod, relativePath string, handleFunc http.
 
 // RegisterRecvHttpRoute 注册 Http 路由 失败直接 panic
 func RegisterRecvHttpRoute(source string, routes []RouteWithFunc) {
-	for i := 0; i < len(routes); i++ {
-		r := routes[i]
-		if err := registerHttpRoute(source, r.Method, r.RelativePath, r.HandlerFunc, serviceMgr); err != nil {
+	for _, route := range routes {
+		if err := registerHttpRoute(source, route.Method, route.RelativePath, route.HandlerFunc, serviceMgr); err != nil {
 			panic(err)
 		}
 	}

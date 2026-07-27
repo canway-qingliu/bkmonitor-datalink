@@ -35,6 +35,7 @@ const (
 	SourceJaeger      = "jaeger"
 	SourcePyroscope   = "pyroscope"
 	SourceOtlp        = "otlp"
+	SourceRum         = "otlprum"
 	SourcePushGateway = "pushgateway"
 	SourceRemoteWrite = "remotewrite"
 	SourceZipkin      = "zipkin"
@@ -43,6 +44,7 @@ const (
 	SourceBeat        = "beat"
 	SourceTars        = "tars"
 	SourceLogPush     = "logpush"
+	SourceDatadogRum  = "datadogrum"
 
 	KeyToken        = "X-BK-TOKEN"
 	KeyDataID       = "X-BK-DATA-ID"
@@ -57,6 +59,7 @@ func (r RecordType) S() string { return string(r) }
 const (
 	RecordUndefined      RecordType = "undefined"
 	RecordTraces         RecordType = "traces"
+	RecordRum            RecordType = "rum"
 	RecordProfiles       RecordType = "profiles"
 	RecordMetrics        RecordType = "metrics"
 	RecordLogs           RecordType = "logs"
@@ -71,12 +74,15 @@ const (
 	RecordBeat           RecordType = "beat"
 	RecordTars           RecordType = "tars"
 	RecordLogPush        RecordType = "logpush"
+	RecordDatadogRum     RecordType = "datadogrum"
 )
 
 // IntoRecordType 将字符串描述转换为 RecordType 并返回是否为 Derived 类型
 func IntoRecordType(s string) (RecordType, bool) {
 	var t RecordType
 	switch s {
+	case RecordRum.S():
+		t = RecordRum
 	case RecordTraces.S():
 		t = RecordTraces
 	case RecordMetrics.S():
@@ -107,6 +113,8 @@ func IntoRecordType(s string) (RecordType, bool) {
 		t = RecordTars
 	case RecordLogPush.S():
 		t = RecordLogPush
+	case RecordDatadogRum.S():
+		t = RecordDatadogRum
 	default:
 		t = RecordUndefined
 	}
@@ -214,6 +222,16 @@ type ProxyData struct {
 
 type BeatData struct {
 	Data []byte
+}
+
+// DatadogRumEvent 标识 Datadog RUM 事件模型，避免在公共 Record 数据中使用裸 []any。
+type DatadogRumEvent interface {
+	DatadogRumEvent()
+}
+
+// DatadogRumData 保存 Datadog RUM 上报的事件数据
+type DatadogRumData struct {
+	Events []DatadogRumEvent
 }
 
 const (
@@ -343,6 +361,8 @@ func (t Token) GetDataID(rtype RecordType) int32 {
 		return t.ProxyDataId
 	case RecordBeat:
 		return t.BeatDataId
+	case RecordDatadogRum:
+		return t.LogsDataId
 	}
 	return -1
 }

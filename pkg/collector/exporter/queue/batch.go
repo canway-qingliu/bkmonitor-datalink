@@ -116,7 +116,7 @@ func (bq *BatchQueue) resize(rtype define.RecordType, token string, backup int) 
 	batchSize := backup
 
 	switch rtype {
-	case define.RecordLogs:
+	case define.RecordLogs, define.RecordDatadogRum:
 		if v.LogsBatchSize > 0 && batchSize != v.LogsBatchSize {
 			batchSize = v.LogsBatchSize
 			logger.Infof("resize logs batch, token=%s, prev.size=%d, curr.size=%d", token, backup, batchSize)
@@ -161,8 +161,9 @@ func (bq *BatchQueue) compact(dc DataIDChan) {
 	sentOut := func() {
 		DefaultMetricMonitor.ObserveQueuePopBatchSizeDistribution(len(data), dc.dataID, dc.rtype)
 		switch dc.rtype {
-		case define.RecordTraces, define.RecordLogs:
+		case define.RecordTraces, define.RecordLogs, define.RecordDatadogRum:
 			bq.out <- NewEventsMapStr(dc.dataID, data)
+
 		case define.RecordMetrics, define.RecordPushGateway, define.RecordRemoteWrite, define.RecordTars:
 			bq.out <- NewMetricsMapStr(dc.dataID, data)
 		case define.RecordProfiles:
@@ -237,6 +238,9 @@ func (bq *BatchQueue) Put(events ...define.Event) {
 			batchSize = bq.conf.MetricsBatchSize
 		case define.RecordLogs:
 			batchSize = bq.conf.LogsBatchSize
+		case define.RecordDatadogRum:
+			batchSize = bq.conf.LogsBatchSize
+
 		case define.RecordTraces:
 			batchSize = bq.conf.TracesBatchSize
 		case define.RecordProxy:

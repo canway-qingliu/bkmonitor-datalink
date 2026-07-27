@@ -10,15 +10,15 @@ logging:
 
 # ================================ Output ====================================
 # console for debugging
-output.console:
+# output.console:
 
 # drop data for debugging
 #output.dropper:
 
 # bkpipe for production
-#output.bkpipe:
-#  endpoint: /var/run/ipc.state.report
-#  synccfg: true
+output.bkpipe:
+ endpoint: /Users/liuqing-super-mac/Project/code/cwoa/gse-server/tmp/ipc.state.report
+ synccfg: true
 
 
 # ================================= Path =====================================
@@ -1037,6 +1037,12 @@ bk-collector:
   # type: pipeline 处理类型，可选项：traces/metrics/logs 以及派生项: traces.derived/metrics.derived/logs.derived
   # processors: 上述定义的处理器名称
   pipeline:
+    - name: "rum_pipeline/direct"
+      type: "rum"
+      processors:
+        # - "token_checker/aes256"
+        # - "rate_limiter/token_bucket"
+
     - name: "traces_pipeline/common"
       type: "traces"
       processors:
