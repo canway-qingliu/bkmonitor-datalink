@@ -243,11 +243,6 @@ bk-collector:
                 op: or
                 values:
                   - attributes.url.scheme
-              - key: attributes.net.peer.name
-                op: concat
-                values:
-                  - attributes.client.address
-                  - attributes.client.port
               - key: attributes.net.peer.ip
                 op: or
                 values:
@@ -256,6 +251,11 @@ bk-collector:
                 op: or
                 values:
                   - attributes.client.port
+              - key: attributes.net.peer.name
+                op: concat
+                values:
+                  - attributes.net.peer.ip
+                  - attributes.net.peer.port
               - key: attributes.http.client_ip
                 op: or
                 values:
@@ -276,11 +276,6 @@ bk-collector:
           - kind: SPAN_KIND_CLIENT
             predicate_key: attributes.http.method,attributes.http.request.method
             rules:
-              - key: attributes.net.peer.name
-                op: concat
-                values:
-                  - attributes.server.address
-                  - attributes.server.port
               - key: attributes.net.peer.ip
                 op: or
                 values:
@@ -291,6 +286,11 @@ bk-collector:
                 values:
                   - attributes.server.port
                   - attributes.network.peer.port
+              - key: attributes.net.peer.name
+                op: concat
+                values:
+                  - attributes.net.peer.ip
+                  - attributes.net.peer.port
               - key: attributes.net.host.name
                 op: concat
                 values:
@@ -327,11 +327,6 @@ bk-collector:
                 op: "or"
                 values:
                   - "attributes.db.system.name"
-              - key: attributes.net.peer.name
-                op: concat
-                values:
-                  - attributes.server.address
-                  - attributes.server.port
               - key: attributes.net.peer.ip
                 op: or
                 values:
@@ -342,6 +337,11 @@ bk-collector:
                 values:
                   - attributes.server.port
                   - attributes.network.peer.port
+              - key: attributes.net.peer.name
+                op: concat
+                values:
+                  - attributes.net.peer.ip
+                  - attributes.net.peer.port
               - key: attributes.db.name
                 op: or
                 values:
@@ -353,52 +353,58 @@ bk-collector:
           - kind: 'SPAN_KIND_PRODUCER'
             predicate_key: attributes.messaging.system
             rules:
-              - key: "attributes.net.peer.name"
-                op: "or"
-                values:
-                  - "attributes.server.address"
               - key: "attributes.net.peer.ip"
                 op: "or"
                 values:
+                  - "attributes.server.address"
                   - "attributes.network.peer.address"
               - key: "attributes.net.peer.port"
                 op: "or"
                 values:
                   - "attributes.server.port"
                   - "attributes.network.peer.port"
+              - key: "attributes.net.peer.name"
+                op: "concat"
+                values:
+                  - "attributes.net.peer.ip"
+                  - "attributes.net.peer.port"
           - kind: "SPAN_KIND_CONSUMER"
             predicate_key: "attributes.messaging.system"
             rules:
-              - key: "attributes.net.peer.name"
-                op: "or"
-                values:
-                  - "attributes.server.address"
               - key: "attributes.net.peer.ip"
                 op: "or"
                 values:
+                  - "attributes.server.address"
                   - "attributes.network.peer.address"
               - key: "attributes.net.peer.port"
                 op: "or"
                 values:
                   - "attributes.server.port"
                   - "attributes.network.peer.port"
+              - key: "attributes.net.peer.name"
+                op: "concat"
+                values:
+                  - "attributes.net.peer.ip"
+                  - "attributes.net.peer.port"
           # MESSAGING CLIENT：兼容部分探针将消息 span 标记为 CLIENT。
           - kind: "SPAN_KIND_CLIENT"
             predicate_key: "attributes.messaging.system"
             rules:
-              - key: "attributes.net.peer.name"
-                op: "or"
-                values:
-                  - "attributes.server.address"
               - key: "attributes.net.peer.ip"
                 op: "or"
                 values:
+                  - "attributes.server.address"
                   - "attributes.network.peer.address"
               - key: "attributes.net.peer.port"
                 op: "or"
                 values:
                   - "attributes.server.port"
                   - "attributes.network.peer.port"
+              - key: "attributes.net.peer.name"
+                op: "concat"
+                values:
+                  - "attributes.net.peer.ip"
+                  - "attributes.net.peer.port"
 
     # ResourceFilter: 资源过滤处理器（嘉为）
     - name: "resource_filter/instance_id"
