@@ -178,7 +178,12 @@ func TestConvertIDsAndResourceAttributes(t *testing.T) {
 }
 
 func TestConvertViewResourceErrorAndLongTaskDetails(t *testing.T) {
-	fcp, lcp, timingStart, duration := int64(10), int64(20), int64(5), int64(30)
+	fcp := int64(10 * time.Millisecond)
+	lcp := int64(20 * time.Millisecond)
+	timingStart := int64(5 * time.Millisecond)
+	duration := int64(30 * time.Millisecond)
+	loadingTime := int64(25 * time.Millisecond)
+	timeSpent := int64(35 * time.Millisecond)
 	status := 503
 	performance := &model.ViewPerformance{
 		FCP:       &model.FCPPerformance{Timestamp: &fcp},
@@ -191,33 +196,112 @@ func TestConvertViewResourceErrorAndLongTaskDetails(t *testing.T) {
 	}}
 	view := &model.ViewEvent{CommonFields: common(1000, model.EventTypeView, "view"), View: model.View{
 		ViewContext: model.ViewContext{ID: "view"}, Performance: performance,
+		LoadingTime: &loadingTime, TimeSpent: &timeSpent,
 	}}
 	errorEvent := &model.ErrorEvent{CommonFields: common(1000, model.EventTypeError, "error"), Error: model.Error{Message: "failed"}}
-	longTaskDuration := int64(40)
+	longTaskDuration := int64(40 * time.Millisecond)
 	longTask := &model.LongTaskEvent{CommonFields: common(1000, model.EventTypeLongTask, "long"), LongTask: model.LongTask{
 		Duration: &longTaskDuration,
 	}}
 
 	traces := Convert(&model.Batch{Events: []model.Event{view, resource, errorEvent, longTask}}, "")
+	start := pcommon.NewTimestampFromTime(time.UnixMilli(1000))
 	viewSpan := traces.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
-	assert.Equal(t, pcommonTimestamp(10), viewSpan.Events().At(0).Timestamp()-viewSpan.StartTimestamp())
+	assert.Equal(t, start, viewSpan.StartTimestamp())
+	assert.Equal(t, pcommonTimestamp(int64(35*time.Millisecond)), viewSpan.EndTimestamp()-viewSpan.StartTimestamp())
+	assert.Equal(t, pcommonTimestamp(int64(10*time.Millisecond)), viewSpan.Events().At(0).Timestamp()-viewSpan.StartTimestamp())
 	assert.Equal(t, 3, viewSpan.Events().Len())
 
 	resourceSpan := traces.ResourceSpans().At(1).ScopeSpans().At(0).Spans().At(0)
+	assert.Equal(t, pcommonTimestamp(int64(30*time.Millisecond)), resourceSpan.EndTimestamp()-resourceSpan.StartTimestamp())
 	assert.Equal(t, "GET", resourceSpan.Name())
 	assert.Equal(t, int64(503), resourceSpan.Attributes().AsRaw()["http.response.status_code"])
 	assert.Equal(t, ptrace.StatusCodeError, resourceSpan.Status().Code())
 	assert.Equal(t, 1, resourceSpan.Events().Len())
 	assert.Equal(t, "resource.dns", resourceSpan.Events().At(0).Name())
+	assert.Equal(t, pcommonTimestamp(int64(5*time.Millisecond)), resourceSpan.Events().At(0).Timestamp()-resourceSpan.StartTimestamp())
+	timingAttrs := resourceSpan.Events().At(0).Attributes().AsRaw()
+	assert.Equal(t, int64(5*time.Millisecond), timingAttrs["timing.start_ns"])
+	assert.Equal(t, int64(30*time.Millisecond), timingAttrs["timing.duration_ns"])
+	assert.Equal(t, int64(35*time.Millisecond), timingAttrs["timing.end_ns"])
 
 	errorSpan := traces.ResourceSpans().At(2).ScopeSpans().At(0).Spans().At(0)
 	assert.Equal(t, ptrace.StatusCodeError, errorSpan.Status().Code())
 	assert.Equal(t, "failed", errorSpan.Status().Message())
+	assert.Equal(t, pcommonTimestamp(int64(time.Millisecond)), errorSpan.EndTimestamp()-errorSpan.StartTimestamp())
 
 	longTaskSpan := traces.ResourceSpans().At(3).ScopeSpans().At(0).Spans().At(0)
-	assert.Equal(t, time.Duration(longTaskDuration), time.Duration(longTaskSpan.EndTimestamp()-longTaskSpan.StartTimestamp()))
+	assert.Equal(t, pcommonTimestamp(int64(40*time.Millisecond)), longTaskSpan.EndTimestamp()-longTaskSpan.StartTimestamp())
 }
 
+func TestConvertDurationsUseServerNanoseconds(t *testing.T) {
+	duration := int64(30 * time.Millisecond)
+	cases := []struct {
+		name  string
+		event model.Event
+		span  string
+	}{
+		{
+			name: "action loading time",
+			event: &model.ActionEvent{
+				CommonFields: common(1000, model.EventTypeAction, "action"),
+				Action:       model.Action{LoadingTime: &duration},
+			},
+			span: "ui.action",
+		},
+		{
+			name: "resource duration",
+			event: &model.ResourceEvent{
+				CommonFields: common(1000, model.EventTypeResource, "resource"),
+				Resource:     model.Resource{Duration: &duration},
+			},
+			span: "resource.load",
+		},
+		{
+			name: "long task duration",
+			event: &model.LongTaskEvent{
+				CommonFields: common(1000, model.EventTypeLongTask, "long-task"),
+				LongTask:     model.LongTask{Duration: &duration},
+			},
+			span: "browser.long_task",
+		},
+		{
+			name: "vital duration",
+			event: &model.VitalEvent{
+				CommonFields: common(1000, model.EventTypeVital, "vital"),
+				Vital:        model.Vital{Name: "fcp", Duration: &duration},
+			},
+			span: "vital.fcp",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			span := Convert(&model.Batch{Events: []model.Event{tc.event}}, "").
+				ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+			assert.Equal(t, tc.span, span.Name())
+			assert.Equal(t, pcommonTimestamp(duration), span.EndTimestamp()-span.StartTimestamp())
+		})
+	}
+}
+
+func TestConvertDurationFallbackUsesOneMillisecond(t *testing.T) {
+	zero := int64(0)
+	negative := int64(-1)
+	cases := []model.Event{
+		&model.ViewEvent{CommonFields: common(1000, model.EventTypeView, "view")},
+		&model.ActionEvent{CommonFields: common(1000, model.EventTypeAction, "action"), Action: model.Action{LoadingTime: &zero}},
+		&model.ResourceEvent{CommonFields: common(1000, model.EventTypeResource, "resource"), Resource: model.Resource{Duration: &negative}},
+		&model.LongTaskEvent{CommonFields: common(1000, model.EventTypeLongTask, "long-task")},
+		&model.VitalEvent{CommonFields: common(1000, model.EventTypeVital, "vital")},
+	}
+
+	for _, event := range cases {
+		span := Convert(&model.Batch{Events: []model.Event{event}}, "").
+			ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+		assert.Equal(t, pcommonTimestamp(int64(time.Millisecond)), span.EndTimestamp()-span.StartTimestamp())
+	}
+}
 func TestConvertErrorMapping(t *testing.T) {
 	line, column := int64(42), int64(7)
 	crossOrigin := true

@@ -181,11 +181,18 @@ func eventStart(date int64) pcommon.Timestamp {
 	return pcommon.NewTimestampFromTime(time.UnixMilli(date))
 }
 
+// serverDurationTimestamp converts a Datadog ServerDuration to an OTLP timestamp
+// offset. ServerDuration is already encoded in nanoseconds by the RUM intake
+// protocol; only CommonFields.Date is an epoch millisecond value.
+func serverDurationTimestamp(duration int64) pcommon.Timestamp {
+	return pcommon.Timestamp(duration)
+}
+
 func setEnd(span ptrace.Span, duration int64) {
 	if duration <= 0 {
 		duration = int64(time.Millisecond)
 	}
-	span.SetEndTimestamp(span.StartTimestamp() + pcommon.Timestamp(duration))
+	span.SetEndTimestamp(span.StartTimestamp() + serverDurationTimestamp(duration))
 }
 
 // traceIDFor 生成 OTLP TraceID。
@@ -626,7 +633,7 @@ func addValueEventWithAttrs(span ptrace.Span, name string, value *int64, attrs p
 	if offset < 0 {
 		offset = 0
 	}
-	timestamp := span.StartTimestamp() + pcommon.Timestamp(offset)
+	timestamp := span.StartTimestamp() + serverDurationTimestamp(offset)
 	if last != nil && timestamp < *last {
 		attrs.PutInt("original_offset_ns", *value)
 		timestamp = *last
@@ -781,7 +788,7 @@ func addTimingEvent(span ptrace.Span, name string, timing *model.Timing, last *p
 	if start < 0 {
 		start = 0
 	}
-	timestamp := span.StartTimestamp() + pcommon.Timestamp(start)
+	timestamp := span.StartTimestamp() + serverDurationTimestamp(start)
 	if timestamp < *last {
 		timestamp = *last
 	}
