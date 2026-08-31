@@ -50,19 +50,19 @@ type EventConverter interface {
 
 func NewCommonConverter(conf *Config) Converter {
 	return commonConverter{
-		traces:       tracesConverter{},
-		metrics:      metricsConverter{},
-		logs:         logsConverter{},
-		pushGateway:  pushGatewayConverter{},
-		remoteWrite:  remoteWriteConverter{},
-		proxy:        proxyConverter{},
-		pingserver:   pingserverConverter{},
-		profiles:     profilesConverter{},
-		fta:          ftaConverter{},
-		beat:         beatConverter{},
-		logPush:      logPushConverter{},
-		tars:         newTarsConverter(conf.Tars),
-		networkflow:  networkflowConverter{},
+		traces:      tracesConverter{},
+		metrics:     metricsConverter{},
+		logs:        logsConverter{},
+		pushGateway: pushGatewayConverter{},
+		remoteWrite: remoteWriteConverter{},
+		proxy:       proxyConverter{},
+		pingserver:  pingserverConverter{},
+		profiles:    profilesConverter{},
+		fta:         ftaConverter{},
+		beat:        beatConverter{},
+		logPush:     logPushConverter{},
+		tars:        newTarsConverter(conf.Tars),
+		networkflow: networkflowConverter{},
 	}
 }
 

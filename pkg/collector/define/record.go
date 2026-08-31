@@ -38,12 +38,13 @@ const (
 	SourcePushGateway = "pushgateway"
 	SourceRemoteWrite = "remotewrite"
 	SourceZipkin      = "zipkin"
-	SourceProxy       = "proxy"
 	SourceSkywalking  = "skywalking"
 	SourceBeat        = "beat"
 	SourceTars        = "tars"
 	SourceLogPush     = "logpush"
-	SourceNetworkFlow = "networkflow"
+
+	ResourceAttributeDataSource = "bk.data.source"
+	SourceSkywalkingMeterData   = "skywalking_meterdata"
 
 	KeyToken        = "X-BK-TOKEN"
 	KeyDataID       = "X-BK-DATA-ID"

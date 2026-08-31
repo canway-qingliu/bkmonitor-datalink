@@ -145,22 +145,29 @@ $ make build
 
 ### Processor
 
-bk-collector 提供了多种内置的 Processor 进行数据的清洗，具体配置请参考 [example.yml](./example/example.yml)
+bk-collector 提供了多种内置的 Processor 进行数据清洗，具体配置请参考 [example.yml](./example/example.yml)。以下名称与配置中的 processor type 保持一致：
 
-* apdexcakcalator: 耗时健康度处理器
-* attributefilter: 属性清洗处理器
-* dbfilteer: db 数据处理器
-* forwarder: 数据转发器
-* licensecheker: license 校验器
-* metricsfilter: 指标清洗处理器
-* pproftranslator: pprof 数据协议转换器
-* probefilter: 探针根据配置上报数据处理器
-* ratelimiter: 限流处理器
-* resourcefilter: 资源清洗处理器
-* sampler: 采样处理器
-* servicediscover: 服务发现处理器
-* tokenchecker: 令牌检查处理器
-* tracesderiver: traces 数据派生处理器
+* `apdex_calculator`：耗时健康度处理器
+* `attribute_filter`：属性清洗处理器
+* `db_filter`：数据库数据处理器
+* `field_normalizer`：字段标准化处理器
+* `license_checker`：License 校验器
+* `method_filter`：方法过滤处理器
+* `metrics_deriver`：指标数据衍生处理器
+* `metrics_filter`：指标清洗处理器
+* `pprof_translator`：Pprof 数据协议转换器
+* `probe_filter`：探针配置上报数据处理器
+* `proxy_validator`：Proxy 数据校验处理器
+* `rate_limiter`：限流处理器
+* `resource_filter`：Resource 清洗处理器
+* `sampler`：采样处理器
+* `service_discover`：服务发现处理器
+* `skywalking_processor`：SkyWalking 数据处理器
+* `span_processor`：Span 数据处理器
+* `text_spliter`：文本切割处理器
+* `token_checker`：令牌校验处理器
+* `token_replacer`：令牌替换处理器
+* `traces_deriver`：Trace 数据衍生处理器
 
 processor 接口定义。
 

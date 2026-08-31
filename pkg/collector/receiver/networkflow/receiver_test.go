@@ -15,10 +15,9 @@ import (
 	"testing"
 	"time"
 
+	flowutils "github.com/netsampler/goflow2/v2/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	flowutils "github.com/netsampler/goflow2/v2/utils"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 )

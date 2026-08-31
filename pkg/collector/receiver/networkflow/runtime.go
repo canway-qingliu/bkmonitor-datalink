@@ -190,7 +190,7 @@ func (r *runtime) watchErrors(lr listenerRuntime) {
 }
 
 func filterDecoder(dataID int32, next flowutils.DecoderFunc) flowutils.DecoderFunc {
-	return func(msg interface{}) error {
+	return func(msg any) error {
 		packet, ok := msg.(*flowutils.Message)
 		if !ok {
 			return fmt.Errorf("flow is not *utils.Message")

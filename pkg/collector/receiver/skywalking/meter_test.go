@@ -10,143 +10,181 @@
 package skywalking
 
 import (
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	agentv3 "skywalking.apache.org/repo/goapi/collect/language/agent/v3"
 
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/foreach"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 )
 
-func mockMeters() *agentv3.MeterDataCollection {
+func TestMeterConverterConvertSingleValue(t *testing.T) {
+	const timestamp = int64(1758276000000)
+	converter := newMeterConverter("service", "instance", timestamp, "my-token")
 	meters := []*agentv3.MeterData{
-		{
-			Metric: &agentv3.MeterData_SingleValue{
-				SingleValue: &agentv3.MeterSingleValue{
-					Name:  "datasource",
-					Value: 1,
-					Labels: []*agentv3.Label{
-						{Name: "status", Value: "activeConnections"},
-						{Name: "name", Value: "1.1.1.1:3306"},
-					},
-				},
-			},
-			Service:         "service",
-			ServiceInstance: "instance",
-			Timestamp:       1758276000000000,
-		},
-		{
-			Metric: &agentv3.MeterData_SingleValue{
-				SingleValue: &agentv3.MeterSingleValue{
-					Name:  "datasource",
-					Value: 1,
-					Labels: []*agentv3.Label{
-						{Name: "status", Value: "numActive"},
-						{Name: "name", Value: "1.1.1.2:3306"},
-					},
-				},
-			},
-			Service:         "service",
-			ServiceInstance: "instance",
-			Timestamp:       1758276000000000,
-		},
-		{
-			Metric: &agentv3.MeterData_SingleValue{
-				SingleValue: &agentv3.MeterSingleValue{
-					Name:  "datasource",
-					Value: 1,
-					Labels: []*agentv3.Label{
-						{Name: "status", Value: "activeCount"},
-						{Name: "name", Value: "1.1.1.3:3306"},
-					},
-				},
-			},
-			Service:         "service",
-			ServiceInstance: "instance",
-			Timestamp:       1758276000000000,
-		},
-		{
-			Metric: &agentv3.MeterData_SingleValue{
-				SingleValue: &agentv3.MeterSingleValue{
-					Name:  "datasource",
-					Value: 1,
-					Labels: []*agentv3.Label{
-						{Name: "status", Value: "dropDimVal"},
-						{Name: "name", Value: "1.1.1.4:3306"},
-					},
-				},
-			},
-			Service:         "service",
-			ServiceInstance: "instance",
-			Timestamp:       1758276000000000,
-		},
-		{
-			Metric: &agentv3.MeterData_SingleValue{
-				SingleValue: &agentv3.MeterSingleValue{
-					Name:  "datasource",
-					Value: 1,
-					Labels: []*agentv3.Label{
-						{Name: "dropDim", Value: "activeConnections"},
-						{Name: "name", Value: "1.1.1.4:3306"},
-					},
-				},
-			},
-			Service:         "service",
-			ServiceInstance: "instance",
-			Timestamp:       1758276000000000,
-		},
-		{
-			Metric: &agentv3.MeterData_SingleValue{
-				SingleValue: &agentv3.MeterSingleValue{
-					Name:  "dropMetric",
-					Value: 1,
-					Labels: []*agentv3.Label{
-						{Name: "status", Value: "activeConnections"},
-						{Name: "name", Value: "1.1.1.4:3306"},
-					},
-				},
-			},
-			Service:         "service",
-			ServiceInstance: "instance",
-			Timestamp:       1758276000000000,
-		},
+		newSingleValueMeter("activeConnections", 1, map[string]string{
+			"type": "hikaricp-3.x-4.x",
+			"name": "1.1.1.1:3306",
+		}),
+		newSingleValueMeter("numActive", 2, map[string]string{
+			"type": "dbcp-2.x",
+			"name": "1.1.1.2:3306",
+		}),
+		newSingleValueMeter("customMetric", 3, map[string]string{
+			"type": "custom-pool",
+		}),
 	}
-	return &agentv3.MeterDataCollection{
-		MeterData: meters,
-	}
-}
-
-func TestConvertMeters(t *testing.T) {
-	converter := newMeterConverter("service", "instance", 1758276000000000, "my-token")
-	for _, meter := range mockMeters().GetMeterData() {
+	for _, meter := range meters {
 		converter.Convert(meter)
 	}
 
-	tests := []struct {
-		metric     string
-		dimensions map[string]string
-		val        float64
-	}{
-		{metric: "datasource", val: 1, dimensions: map[string]string{"status": "activeConnections", "name": "1.1.1.1:3306"}},
-		{metric: "datasource", val: 1, dimensions: map[string]string{"status": "activeConnections", "name": "1.1.1.2:3306"}},
-		{metric: "datasource", val: 1, dimensions: map[string]string{"status": "activeConnections", "name": "1.1.1.3:3306"}},
-	}
 	metrics := converter.Get()
+	require.Equal(t, 3, metrics.MetricCount())
+	resourceMetrics := metrics.ResourceMetrics().At(0)
+	resource := resourceMetrics.Resource().Attributes()
+	assertResourceString(t, resource, "service_name", "service")
+	assertResourceString(t, resource, "bk_instance_id", "instance")
+	assertResourceString(t, resource, "bk.data.token", "my-token")
+	assertResourceString(t, resource, define.ResourceAttributeDataSource, define.SourceSkywalkingMeterData)
 
-	n := 0
-	foreach.Metrics(metrics, func(metric pmetric.Metric) {
-		c := tests[n]
-		assert.Equal(t, metric.Name(), c.metric)
-		assert.Equal(t, metric.Gauge().DataPoints().Len(), 1)
-		assert.Equal(t, metric.Gauge().DataPoints().At(0).DoubleVal(), c.val)
-		for k, v := range c.dimensions {
-			dimVal, set := metric.Gauge().DataPoints().At(0).Attributes().Get(k)
-			assert.Equal(t, set, true)
-			assert.Equal(t, v, dimVal.AsString())
-		}
-		n++
-	})
+	actualMetrics := resourceMetrics.ScopeMetrics().At(0).Metrics()
+	for i, expected := range []struct {
+		name      string
+		value     float64
+		framework string
+	}{
+		{name: "activeConnections", value: 1, framework: "hikaricp-3.x-4.x"},
+		{name: "numActive", value: 2, framework: "dbcp-2.x"},
+		{name: "customMetric", value: 3, framework: "custom-pool"},
+	} {
+		metric := actualMetrics.At(i)
+		assert.Equal(t, expected.name, metric.Name())
+		assert.Equal(t, pmetric.MetricDataTypeGauge, metric.DataType())
+		dataPoint := metric.Gauge().DataPoints().At(0)
+		assert.Equal(t, expected.value, dataPoint.DoubleVal())
+		assert.Equal(t, microsecondsToTimestamp(timestamp), dataPoint.Timestamp())
+		framework, ok := dataPoint.Attributes().Get("type")
+		require.True(t, ok)
+		assert.Equal(t, expected.framework, framework.AsString())
+	}
+}
 
-	assert.Equal(t, 3, n)
+func TestMeterConverterKeepsValidLabels(t *testing.T) {
+	tests := []struct {
+		name     string
+		labels   []*agentv3.Label
+		expected map[string]string
+	}{
+		{
+			name: "ignore nil and empty label names",
+			labels: []*agentv3.Label{
+				nil,
+				{Name: "  ", Value: "ignored"},
+				{Name: "type", Value: "dbcp-2.x"},
+			},
+			expected: map[string]string{"type": "dbcp-2.x"},
+		},
+		{
+			name: "deduplicate labels with identical values",
+			labels: []*agentv3.Label{
+				{Name: "type", Value: "dbcp-2.x"},
+				{Name: "type", Value: "dbcp-2.x"},
+			},
+			expected: map[string]string{"type": "dbcp-2.x"},
+		},
+		{
+			name: "trim label names",
+			labels: []*agentv3.Label{
+				{Name: " type ", Value: "dbcp-2.x"},
+				{Name: " name ", Value: "orders-db"},
+			},
+			expected: map[string]string{"type": "dbcp-2.x", "name": "orders-db"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			converter := newMeterConverter("service", "instance", 1758276000000, "my-token")
+			converted := converter.Convert(&agentv3.MeterData{Metric: &agentv3.MeterData_SingleValue{
+				SingleValue: &agentv3.MeterSingleValue{
+					Name:   "activeConnections",
+					Labels: tt.labels,
+					Value:  1,
+				},
+			}})
+			require.True(t, converted)
+
+			attributes := converter.Get().ResourceMetrics().At(0).ScopeMetrics().At(0).
+				Metrics().At(0).Gauge().DataPoints().At(0).Attributes()
+			assert.Equal(t, len(tt.expected), attributes.Len())
+			for key, expected := range tt.expected {
+				actual, ok := attributes.Get(key)
+				require.True(t, ok)
+				assert.Equal(t, expected, actual.AsString())
+			}
+		})
+	}
+}
+
+func TestMeterConverterDropInvalidData(t *testing.T) {
+	tests := []struct {
+		name  string
+		meter *agentv3.MeterData
+	}{
+		{name: "nil meter"},
+		{name: "empty name", meter: newSingleValueMeter("", 1, nil)},
+		{name: "invalid value", meter: newSingleValueMeter("activeConnections", math.NaN(), nil)},
+		{name: "no labels", meter: newSingleValueMeter("activeConnections", 1, nil)},
+		{name: "all labels invalid", meter: &agentv3.MeterData{Metric: &agentv3.MeterData_SingleValue{
+			SingleValue: &agentv3.MeterSingleValue{
+				Name:   "activeConnections",
+				Labels: []*agentv3.Label{nil, {Name: " ", Value: "ignored"}},
+				Value:  1,
+			},
+		}}},
+		{name: "conflicting duplicate labels", meter: &agentv3.MeterData{Metric: &agentv3.MeterData_SingleValue{
+			SingleValue: &agentv3.MeterSingleValue{
+				Name: "activeConnections",
+				Labels: []*agentv3.Label{
+					{Name: "type", Value: "first"},
+					{Name: "type", Value: "second"},
+				},
+				Value: 1,
+			},
+		}}},
+		{name: "unsupported histogram", meter: &agentv3.MeterData{Metric: &agentv3.MeterData_Histogram{
+			Histogram: &agentv3.MeterHistogram{
+				Name: "requestDuration",
+			},
+		}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			converter := newMeterConverter("service", "instance", 1758276000000, "my-token")
+			assert.False(t, converter.Convert(tt.meter))
+			assert.Equal(t, 0, converter.Get().MetricCount())
+		})
+	}
+}
+
+func newSingleValueMeter(name string, value float64, labels map[string]string) *agentv3.MeterData {
+	meterLabels := make([]*agentv3.Label, 0, len(labels))
+	for key, val := range labels {
+		meterLabels = append(meterLabels, &agentv3.Label{Name: key, Value: val})
+	}
+	return &agentv3.MeterData{Metric: &agentv3.MeterData_SingleValue{
+		SingleValue: &agentv3.MeterSingleValue{Name: name, Value: value, Labels: meterLabels},
+	}}
+}
+
+func assertResourceString(t *testing.T, resource pcommon.Map, key, expected string) {
+	t.Helper()
+	value, ok := resource.Get(key)
+	require.True(t, ok)
+	assert.Equal(t, expected, value.AsString())
 }

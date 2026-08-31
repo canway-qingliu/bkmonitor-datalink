@@ -45,7 +45,7 @@ func newFlowRecordProducer(dataID int32, publish RecordPublisher) (*flowRecordPr
 	return &flowRecordProducer{dataID: dataID, publish: publish, inner: inner}, nil
 }
 
-func (p *flowRecordProducer) Produce(msg interface{}, args *producer.ProduceArgs) ([]producer.ProducerMessage, error) {
+func (p *flowRecordProducer) Produce(msg any, args *producer.ProduceArgs) ([]producer.ProducerMessage, error) {
 	flowMessages, err := p.inner.Produce(msg, args)
 	if err != nil {
 		return flowMessages, err

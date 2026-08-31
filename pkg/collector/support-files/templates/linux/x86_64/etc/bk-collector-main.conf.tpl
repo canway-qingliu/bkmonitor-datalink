@@ -475,6 +475,23 @@ bk-collector:
     # MetricsDeriver: 指标派生处理器
     - name: "metrics_deriver/ot_java_agent"
 
+    # SkyWalkingProcessor: SkyWalking 数据处理器
+    - name: "skywalking_processor/default"
+      config:
+        meter_data:
+          enabled: true
+          rules:
+            - types: ["*"]
+              metrics:
+                db_pool_max_connections: db_pool_max_connections
+                db_pool_active_connections: db_pool_active_connections
+                db_pool_idle_connections: db_pool_idle_connections
+                db_pool_connection_usage_percent: db_pool_connection_usage_percent
+                db_pool_connection_wait_queue_size: db_pool_connection_wait_queue_size
+                web_thread_pool_usage_percent: web_thread_pool_usage_percent
+                web_thread_pool_busy_threads: web_thread_pool_busy_threads
+                web_thread_pool_max_threads: web_thread_pool_max_threads
+
     # MethodFilter: method 过滤处理器（做 span 丢弃处理）
     - name: "method_filter/drop_span"
 
@@ -633,6 +650,7 @@ bk-collector:
         - "token_replacer/token_mapping"
         - "token_checker/aes256"
         - "rate_limiter/token_bucket"
+        - "skywalking_processor/default"
         - "metrics_filter/jvm"
         - "metrics_deriver/ot_java_agent"
         - "resource_filter/metrics"

@@ -1,9 +1,10 @@
 PWD = $(shell pwd)
+SHELL := /bin/bash
 MODULES ?= bkmonitorbeat collector operator transfer unify-query influxdb-proxy ingester offline-data-archive bk-monitor-worker sliwebhook bkm-ksm-exporter
 RELEASE_PATH ?= $(PWD)/dist
 BUILD_NO ?= 1
 COMMIT_ID = $(shell git rev-parse HEAD)
-MODULE = ''
+MODULE =
 RELEASE ?= false
 
 VERSION_FILE = $(if $(strip $(MODULE)),$(PWD)/pkg/$(MODULE)/VERSION,)

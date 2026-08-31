@@ -442,6 +442,22 @@ default:
           {%- endif %}
 {%- endif %}
 
+{% if skywalking_processor_config is defined %}
+      - name: '{{ skywalking_processor_config.name }}'
+        config:
+          {%- if skywalking_processor_config.meter_data is defined %}
+          meter_data:
+            enabled: {{ skywalking_processor_config.meter_data.get("enabled", false) }}
+            {%- if skywalking_processor_config.meter_data.rules is defined %}
+            rules:
+              {%- for rule in skywalking_processor_config.meter_data.rules %}
+              - types: {{ rule.types | tojson }}
+                metrics: {{ rule.metrics | tojson }}
+              {%- endfor %}
+            {%- endif %}
+          {%- endif %}
+{%- endif %}
+
 {% if span_processor_config is defined %}
       - name: '{{ span_processor_config.name }}'
         config:

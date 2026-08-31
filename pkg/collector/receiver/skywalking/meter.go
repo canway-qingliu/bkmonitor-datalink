@@ -10,110 +10,96 @@
 package skywalking
 
 import (
+	"math"
+	"strings"
+
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	agentv3 "skywalking.apache.org/repo/goapi/collect/language/agent/v3"
 
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/metricsbuilder"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 )
-
-const (
-	activeConnections = "activeConnections"
-	idleConnections   = "idleConnections"
-	totalConnections  = "totalConnections"
-)
-
-// whitelistMetrics 白名单
-//
-// map[name]dimensions{key: metric}
-var whitelistMetrics = map[string]map[string]map[string]string{
-	"datasource": {
-		"status": {
-			// hikaricp-3.x-4.x
-			"activeConnections": activeConnections,
-			"idleConnections":   idleConnections,
-			"totalConnections":  totalConnections,
-
-			// dbcp-2.x
-			"numActive": activeConnections,
-			"numIdle":   idleConnections,
-			"maxTotal":  totalConnections,
-
-			// druid-1.x
-			"activeCount":  activeConnections,
-			"idleCount":    idleConnections,
-			"poolingCount": totalConnections,
-		},
-	},
-}
 
 func newMeterConverter(service, instance string, ts int64, token string) *meterConverter {
+	pbMetrics := pmetric.NewMetrics()
+	resourceMetrics := pbMetrics.ResourceMetrics().AppendEmpty()
+	resource := resourceMetrics.Resource().Attributes()
+	resource.InsertString("service_name", service)
+	resource.InsertString("bk_instance_id", instance)
+	resource.InsertString("bk.data.token", token)
+	resource.InsertString(define.ResourceAttributeDataSource, define.SourceSkywalkingMeterData)
+
 	return &meterConverter{
-		mb: metricsbuilder.New(
-			metricsbuilder.ResourceKv{Key: "service_name", Value: service},
-			metricsbuilder.ResourceKv{Key: "bk_instance_id", Value: instance},
-			metricsbuilder.ResourceKv{Key: "bk.data.token", Value: token},
-		),
+		pbMetrics: pbMetrics,
+		metrics:   resourceMetrics.ScopeMetrics().AppendEmpty().Metrics(),
 		timestamp: ts,
 	}
 }
 
 type meterConverter struct {
 	timestamp int64
-	mb        *metricsbuilder.Builder
+	pbMetrics pmetric.Metrics
+	metrics   pmetric.MetricSlice
 }
 
 func (c *meterConverter) Get() pmetric.Metrics {
-	return c.mb.Get()
+	return c.pbMetrics
 }
 
-func (c *meterConverter) Convert(meter *agentv3.MeterData) {
-	metric := meter.GetMetric()
-	switch metric.(type) {
-	case *agentv3.MeterData_SingleValue:
-		c.convertSingleValue(meter)
-	}
-}
-
-func (c *meterConverter) convertSingleValue(meter *agentv3.MeterData) {
-	val := meter.GetSingleValue()
-	if val == nil {
-		return
-	}
-
-	ts := microsecondsToTimestamp(c.timestamp)
-	dims := c.toDims(val.GetLabels())
-	name := val.GetName()
-	if c.filterMetrics(name, dims) {
-		c.mb.Build(name, metricsbuilder.Metric{Val: val.Value, Dimensions: dims, Ts: ts})
-	}
-}
-
-func (c *meterConverter) toDims(labels []*agentv3.Label) map[string]string {
-	dims := make(map[string]string)
-	for _, label := range labels {
-		dims[label.GetName()] = label.GetValue()
-	}
-	return dims
-}
-
-func (c *meterConverter) filterMetrics(name string, dims map[string]string) bool {
-	filter, ok := whitelistMetrics[name]
-	if !ok {
+func (c *meterConverter) Convert(meter *agentv3.MeterData) bool {
+	if meter == nil {
 		return false
 	}
 
-	for dim, dimMapping := range filter {
-		oldVal, ok := dims[dim]
-		if !ok {
-			continue
-		}
-		newVal, ok := dimMapping[oldVal]
-		if !ok {
+	return c.convertSingleValue(meter.GetSingleValue())
+}
+
+func (c *meterConverter) convertSingleValue(value *agentv3.MeterSingleValue) bool {
+	if value == nil || strings.TrimSpace(value.GetName()) == "" || !isFinite(value.GetValue()) {
+		return false
+	}
+	attributes := pcommon.NewMap()
+	if !copyMeterLabels(value.GetLabels(), attributes) {
+		return false
+	}
+
+	metric := c.metrics.AppendEmpty()
+	metric.SetName(value.GetName())
+	metric.SetDataType(pmetric.MetricDataTypeGauge)
+	dataPoint := metric.Gauge().DataPoints().AppendEmpty()
+	dataPoint.SetDoubleVal(value.GetValue())
+	dataPoint.SetTimestamp(microsecondsToTimestamp(c.timestamp))
+	attributes.CopyTo(dataPoint.Attributes())
+	return true
+}
+
+func copyMeterLabels(labels []*agentv3.Label, attributes pcommon.Map) bool {
+	seen := make(map[string]string, len(labels))
+	copied := 0
+	for _, label := range labels {
+		if label == nil {
 			continue
 		}
 
-		dims[dim] = newVal
-		return true
+		name := strings.TrimSpace(label.GetName())
+		if name == "" {
+			continue
+		}
+		value := label.GetValue()
+		if previous, ok := seen[name]; ok {
+			if previous == value {
+				continue
+			}
+			return false
+		}
+
+		seen[name] = value
+		attributes.InsertString(name, value)
+		copied++
 	}
-	return false
+	return copied > 0
+}
+
+func isFinite(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }
