@@ -11,8 +11,9 @@ package fieldnormalizer
 
 import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/utils"
+
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/fields"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/utils"
 )
 
 type funcKey struct {

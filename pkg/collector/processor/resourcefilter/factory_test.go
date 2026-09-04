@@ -181,7 +181,7 @@ func makeSkyWalkingTraces(spanCount int, traceID string) ptrace.Traces {
 // addOpenTelemetryResourceSpan adds an OpenTelemetry resource span to traces
 func addOpenTelemetryResourceSpan(traces ptrace.Traces, traceID pcommon.TraceID, spanCount int) {
 	rs := traces.ResourceSpans().AppendEmpty()
-	utils.InsertString(rs.Resource().Attributes(),keySdkName, sdkOpenTelemetry)
+	utils.InsertString(rs.Resource().Attributes(), keySdkName, sdkOpenTelemetry)
 	addScopeSpanWithSpans(rs, "", traceID, spanCount)
 }
 
@@ -570,7 +570,7 @@ func assertFromRecordEmptyFallback(
 	t.Helper()
 
 	if initial != nil {
-	    utils.InsertString(attrs, "net.host.ip", *initial)
+		utils.InsertString(attrs, "net.host.ip", *initial)
 	}
 
 	testkits.MustProcess(t, factory, record)

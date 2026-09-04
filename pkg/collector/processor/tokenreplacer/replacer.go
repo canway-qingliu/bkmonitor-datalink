@@ -38,7 +38,7 @@ func (p *Replacer) replaceToken(config Config, record *define.Record, attrs pcom
 	case typeAppName:
 		if found && attrValue != "" {
 			if replace, ok := config.appTokenMapping[attrValue]; ok {
-				attrs.UpdateString(attrKey, replace.Original)
+				attrs.PutString(attrKey, replace.Original)
 				record.Token.Original = replace.Original
 			}
 		} else if replace, ok := config.appTokenMapping[record.Token.Original]; ok {
@@ -47,7 +47,7 @@ func (p *Replacer) replaceToken(config Config, record *define.Record, attrs pcom
 	default:
 		if found && attrValue != "" {
 			if replace, ok := config.replaceMapping[attrValue]; ok {
-				attrs.UpdateString(attrKey, replace)
+				attrs.PutString(attrKey, replace)
 				record.Token.Original = replace
 			}
 		} else if replace, ok := config.replaceMapping[record.Token.Original]; ok {

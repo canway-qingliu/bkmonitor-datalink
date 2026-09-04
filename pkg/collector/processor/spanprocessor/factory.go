@@ -255,7 +255,7 @@ func (p *spanProcessor) updateFieldValue(span ptrace.Span, updateMapping map[str
 				span.SetName(value)
 			}
 		case fields.FieldFromAttributes:
-			span.Attributes().UpsertString(pk, value)
+			span.Attributes().PutString(pk, value)
 		default:
 			logger.Warnf("spanProcessor: unsupported update field %s", field)
 		}

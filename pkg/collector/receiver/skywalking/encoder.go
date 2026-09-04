@@ -246,7 +246,7 @@ func swTagsToAttributesByRule(dest pcommon.Map, span *agentv3.SpanObject) {
 			// 2) 尝试获取 refs[0]的 parent.service.name 进行插入
 			// 3) 使用 unknownVal 作为兜底值
 			if refs := span.Refs; len(refs) > 0 && refs[0].ParentService != "" {
-			    utils.InsertString(dest, semconv.AttributeNetPeerName, refs[0].ParentService)
+				utils.InsertString(dest, semconv.AttributeNetPeerName, refs[0].ParentService)
 			} else {
 				if peerName != "" {
 					utils.InsertString(dest, semconv.AttributeNetPeerName, peerName)

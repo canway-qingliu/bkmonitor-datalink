@@ -1,3 +1,4 @@
+SHELL := /bin/bash
 PWD = $(shell pwd)
 MODULES ?= bkmonitorbeat collector operator transfer unify-query influxdb-proxy ingester offline-data-archive bk-monitor-worker sliwebhook bkm-ksm-exporter alarmd
 RELEASE_PATH ?= $(PWD)/dist

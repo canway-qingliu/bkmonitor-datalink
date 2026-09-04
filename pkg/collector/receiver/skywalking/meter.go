@@ -18,16 +18,17 @@ import (
 	agentv3 "skywalking.apache.org/repo/goapi/collect/language/agent/v3"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/utils"
 )
 
 func newMeterConverter(service, instance string, ts int64, token string) *meterConverter {
 	pbMetrics := pmetric.NewMetrics()
 	resourceMetrics := pbMetrics.ResourceMetrics().AppendEmpty()
 	resource := resourceMetrics.Resource().Attributes()
-	resource.InsertString("service_name", service)
-	resource.InsertString("bk_instance_id", instance)
-	resource.InsertString("bk.data.token", token)
-	resource.InsertString(define.ResourceAttributeDataSource, define.SourceSkywalkingMeterData)
+	utils.InsertString(resource, "service_name", service)
+	utils.InsertString(resource, "bk_instance_id", instance)
+	utils.InsertString(resource, "bk.data.token", token)
+	utils.InsertString(resource, define.ResourceAttributeDataSource, define.SourceSkywalkingMeterData)
 
 	return &meterConverter{
 		pbMetrics: pbMetrics,
@@ -65,7 +66,7 @@ func (c *meterConverter) convertSingleValue(value *agentv3.MeterSingleValue) boo
 
 	metric := c.metrics.AppendEmpty()
 	metric.SetName(value.GetName())
-	metric.SetDataType(pmetric.MetricDataTypeGauge)
+	metric.SetEmptyGauge()
 	dataPoint := metric.Gauge().DataPoints().AppendEmpty()
 	dataPoint.SetDoubleVal(value.GetValue())
 	dataPoint.SetTimestamp(microsecondsToTimestamp(c.timestamp))
@@ -94,7 +95,7 @@ func copyMeterLabels(labels []*agentv3.Label, attributes pcommon.Map) bool {
 		}
 
 		seen[name] = value
-		attributes.InsertString(name, value)
+		utils.InsertString(attributes, name, value)
 		copied++
 	}
 	return copied > 0

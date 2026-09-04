@@ -75,7 +75,7 @@ func makeMetricsRecord(resource map[string]string) pmetric.Metrics {
 	rm := metrics.ResourceMetrics().AppendEmpty()
 
 	for k, v := range resource {
-		rm.Resource().Attributes().UpsertString(k, v)
+		rm.Resource().Attributes().PutString(k, v)
 	}
 	return metrics
 }
@@ -83,7 +83,7 @@ func makeMetricsRecord(resource map[string]string) pmetric.Metrics {
 func addHistogramMetric(metrics pmetric.MetricSlice, name string, attrs map[string]string, count uint64, sum float64) {
 	metric := metrics.AppendEmpty()
 	metric.SetName(name)
-	metric.SetDataType(pmetric.MetricDataTypeHistogram)
+	metric.SetEmptyHistogram()
 
 	dp := metric.Histogram().DataPoints().AppendEmpty()
 	dp.SetStartTimestamp(pcommon.NewTimestampFromTime(time.Now()))
@@ -91,32 +91,32 @@ func addHistogramMetric(metrics pmetric.MetricSlice, name string, attrs map[stri
 	dp.SetSum(sum)
 
 	for k, v := range attrs {
-		dp.Attributes().UpsertString(k, v)
+		dp.Attributes().PutString(k, v)
 	}
 }
 
 func addSumMetric(metrics pmetric.MetricSlice, name string, attrs map[string]string, value int64) {
 	metric := metrics.AppendEmpty()
 	metric.SetName(name)
-	metric.SetDataType(pmetric.MetricDataTypeSum)
+	metric.SetEmptySum()
 
 	dp := metric.Sum().DataPoints().AppendEmpty()
 	dp.SetStartTimestamp(pcommon.NewTimestampFromTime(time.Now()))
 	dp.SetIntVal(value)
 
 	for k, v := range attrs {
-		dp.Attributes().UpsertString(k, v)
+		dp.Attributes().PutString(k, v)
 	}
 }
 
 func makeHistogramMetricData(metricName string, attrs map[string]string, count uint64, sum float64) pmetric.Metric {
 	metric := pmetric.NewMetric()
 	metric.SetName(metricName)
-	metric.SetDataType(pmetric.MetricDataTypeHistogram)
+	metric.SetEmptyHistogram()
 
 	dp := metric.Histogram().DataPoints().AppendEmpty()
 	for k, v := range attrs {
-		dp.Attributes().UpsertString(k, v)
+		dp.Attributes().PutString(k, v)
 	}
 	dp.SetStartTimestamp(pcommon.NewTimestampFromTime(time.Now()))
 	dp.SetCount(count)
@@ -128,11 +128,11 @@ func makeHistogramMetricData(metricName string, attrs map[string]string, count u
 func makeSumMetricData(metricName string, attrs map[string]pcommon.Value, val int64) pmetric.Metric {
 	metric := pmetric.NewMetric()
 	metric.SetName(metricName)
-	metric.SetDataType(pmetric.MetricDataTypeSum)
+	metric.SetEmptySum()
 
 	dp := metric.Sum().DataPoints().AppendEmpty()
 	for k, v := range attrs {
-		dp.Attributes().Upsert(k, v)
+		v.CopyTo(dp.Attributes().PutEmpty(k))
 	}
 	dp.SetStartTimestamp(pcommon.NewTimestampFromTime(time.Now()))
 	dp.SetIntVal(val)
@@ -701,7 +701,7 @@ func addHistogramDataPoint(dps pmetric.HistogramDataPointSlice, attrs map[string
 ) {
 	dp := dps.AppendEmpty()
 	for k, v := range attrs {
-		dp.Attributes().Upsert(k, v)
+		v.CopyTo(dp.Attributes().PutEmpty(k))
 	}
 	dp.SetStartTimestamp(ts)
 	dp.SetCount(count)
@@ -846,10 +846,10 @@ func TestProcessMemoryByType(t *testing.T) {
 
 			attrs := pcommon.NewMap()
 			if tt.memType != "" {
-				attrs.UpsertString(jvmMemoryType, tt.memType)
+				attrs.PutString(jvmMemoryType, tt.memType)
 			}
 			if tt.poolName != "" {
-				attrs.UpsertString(jvmMemoryPoolName, tt.poolName)
+				attrs.PutString(jvmMemoryPoolName, tt.poolName)
 			}
 
 			now := pcommon.NewTimestampFromTime(time.Now())
@@ -946,7 +946,7 @@ func TestProcessThreadByState(t *testing.T) {
 
 			attrs := pcommon.NewMap()
 			if tt.state != "" {
-				attrs.UpsertString(jvmThreadState, tt.state)
+				attrs.PutString(jvmThreadState, tt.state)
 			}
 
 			now := pcommon.NewTimestampFromTime(time.Now())
@@ -978,7 +978,7 @@ func TestProcessDaemonThread(t *testing.T) {
 	t.Run("Daemon thread", func(t *testing.T) {
 		mappings := newThreadMappings()
 		attrs := pcommon.NewMap()
-		attrs.UpsertBool(jvmThreadDaemon, true)
+		attrs.PutBool(jvmThreadDaemon, true)
 
 		processDaemonThread(attrs, now, 2, mappings)
 		assert.Equal(t, int64(2), mappings.daemon[now])
@@ -987,7 +987,7 @@ func TestProcessDaemonThread(t *testing.T) {
 	t.Run("Non-daemon thread", func(t *testing.T) {
 		mappings := newThreadMappings()
 		attrs := pcommon.NewMap()
-		attrs.UpsertBool(jvmThreadDaemon, false)
+		attrs.PutBool(jvmThreadDaemon, false)
 
 		processDaemonThread(attrs, now, 1, mappings)
 		assert.Len(t, mappings.daemon, 0)

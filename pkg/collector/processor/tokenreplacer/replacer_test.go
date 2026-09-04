@@ -38,7 +38,7 @@ func TestReplacer_ReplaceToken(t *testing.T) {
 		}
 
 		attrs := pcommon.NewMap()
-		attrs.UpsertString("bk.data.token", "app1")
+		attrs.PutString("bk.data.token", "app1")
 
 		replacer := NewReplacer()
 		replacer.replaceToken(config, record, attrs)
@@ -82,7 +82,7 @@ func TestReplacer_ReplaceToken(t *testing.T) {
 		}
 
 		attrs := pcommon.NewMap()
-		attrs.UpsertString("bk.data.token", "unknown_app")
+		attrs.PutString("bk.data.token", "unknown_app")
 
 		replacer := NewReplacer()
 		replacer.replaceToken(config, record, attrs)
@@ -107,7 +107,7 @@ func TestReplacer_ReplaceToken(t *testing.T) {
 		}
 
 		attrs := pcommon.NewMap()
-		attrs.UpsertString("bk.data.token", "token1")
+		attrs.PutString("bk.data.token", "token1")
 
 		replacer := NewReplacer()
 		replacer.replaceToken(config, record, attrs)
@@ -153,7 +153,7 @@ func TestReplacer_ReplaceToken(t *testing.T) {
 		}
 
 		attrs := pcommon.NewMap()
-		attrs.UpsertString("bk.data.token", "unknown_value")
+		attrs.PutString("bk.data.token", "unknown_value")
 
 		replacer := NewReplacer()
 		replacer.replaceToken(config, record, attrs)
@@ -178,8 +178,8 @@ func TestReplacer_ReplaceToken(t *testing.T) {
 		}
 
 		attrs := pcommon.NewMap()
-		attrs.UpsertString("key2", "token1")
-		attrs.UpsertString("key3", "other_value")
+		attrs.PutString("key2", "token1")
+		attrs.PutString("key3", "other_value")
 
 		replacer := NewReplacer()
 		replacer.replaceToken(config, record, attrs)

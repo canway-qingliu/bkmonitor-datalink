@@ -43,8 +43,6 @@ func (c metricsConverter) ToDataID(record *define.Record) int32 {
 	return record.Token.MetricsDataId
 }
 
-
-
 func (c metricsConverter) Convert(record *define.Record, f define.GatherFunc) {
 	pdMetrics := record.Data.(pmetric.Metrics)
 	resourceMetricsSlice := pdMetrics.ResourceMetrics()
@@ -62,7 +60,7 @@ func (c metricsConverter) Convert(record *define.Record, f define.GatherFunc) {
 			scopeMetric := scopeMetricsSlice.At(j)
 			dimensions := pcommon.NewMap()
 			rs.CopyTo(dimensions)
-            utils.InsertString(dimensions, "scope_name", scopeMetric.Scope().Name())
+			utils.InsertString(dimensions, "scope_name", scopeMetric.Scope().Name())
 			metrics := scopeMetric.Metrics()
 			for k := 0; k < metrics.Len(); k++ {
 				for _, dp := range c.Extract(metrics.At(k), dimensions) {

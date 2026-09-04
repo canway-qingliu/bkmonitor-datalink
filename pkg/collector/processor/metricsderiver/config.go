@@ -92,14 +92,14 @@ type MetricItem struct {
 func (mb *MetricBuilder) build(scopeMetrics pmetric.ScopeMetrics) {
 	for _, metricItem := range mb.metricSlice {
 		metrics := scopeMetrics.Metrics().AppendEmpty()
-		metrics.SetDataType(pmetric.MetricDataTypeGauge)
+		metrics.SetEmptyGauge()
 		metrics.SetName(metricItem.Name)
 
 		metric := metrics.Gauge().DataPoints().AppendEmpty()
 		metric.SetDoubleVal(metricItem.Val)
 		metric.SetTimestamp(metricItem.Ts)
 		for k, v := range metricItem.Dimensions {
-			metric.Attributes().UpsertString(k, v)
+			metric.Attributes().PutString(k, v)
 		}
 	}
 	clear(mb.metricSlice)

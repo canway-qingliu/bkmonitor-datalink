@@ -387,18 +387,18 @@ func newTestSpanProcessor() *spanProcessor {
 func newDropRecord() *define.Record {
 	traces := ptrace.NewTraces()
 	rs := traces.ResourceSpans().AppendEmpty()
-	rs.Resource().Attributes().UpsertString("service.name", "svc")
+	rs.Resource().Attributes().PutString("service.name", "svc")
 	spans := rs.ScopeSpans().AppendEmpty().Spans()
 
 	span := spans.AppendEmpty()
 	span.SetName("drop-me")
-	span.Attributes().UpsertString("http.method", "POST")
-	span.Attributes().UpsertString("tag", "value")
+	span.Attributes().PutString("http.method", "POST")
+	span.Attributes().PutString("tag", "value")
 
 	span = spans.AppendEmpty()
 	span.SetName("keep-me")
-	span.Attributes().UpsertString("http.method", "GET")
-	span.Attributes().UpsertString("tag", "other")
+	span.Attributes().PutString("http.method", "GET")
+	span.Attributes().PutString("tag", "other")
 
 	span = spans.AppendEmpty()
 	span.SetName("keep-empty")
@@ -409,12 +409,12 @@ func newDropRecord() *define.Record {
 func newReplaceRecord() *define.Record {
 	traces := ptrace.NewTraces()
 	rs := traces.ResourceSpans().AppendEmpty()
-	rs.Resource().Attributes().UpsertString("service.name", "svc")
-	rs.Resource().Attributes().UpsertString("cluster", "prod")
+	rs.Resource().Attributes().PutString("service.name", "svc")
+	rs.Resource().Attributes().PutString("cluster", "prod")
 	span := rs.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
 	span.SetName("original")
-	span.Attributes().UpsertString("tag", "value")
-	span.Attributes().UpsertString("empty", "")
+	span.Attributes().PutString("tag", "value")
+	span.Attributes().PutString("empty", "")
 	return &define.Record{RecordType: define.RecordTraces, Data: traces}
 }
 
@@ -484,10 +484,10 @@ func TestMatchField(t *testing.T) {
 
 	traces := ptrace.NewTraces()
 	rs := traces.ResourceSpans().AppendEmpty()
-	rs.Resource().Attributes().UpsertString("service.name", "my-service")
+	rs.Resource().Attributes().PutString("service.name", "my-service")
 	span := rs.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
 	span.SetName("my-span")
-	span.Attributes().UpsertString("http.method", "POST")
+	span.Attributes().PutString("http.method", "POST")
 
 	t.Run("Matches supported method resource and attribute fields", func(t *testing.T) {
 		assert.True(
@@ -674,7 +674,7 @@ func TestCheckSpanField(t *testing.T) {
 	traces := ptrace.NewTraces()
 	span := traces.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
 	span.SetName("my-span")
-	span.Attributes().UpsertString("http.method", "POST")
+	span.Attributes().PutString("http.method", "POST")
 
 	t.Run("Returns true for existing supported fields", func(t *testing.T) {
 		assert.True(t, p.checkSpanField(span, "span_name"))
@@ -726,7 +726,7 @@ func TestUpdateFieldValue(t *testing.T) {
 		traces := ptrace.NewTraces()
 		span := traces.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
 		span.SetName("old")
-		span.Attributes().UpsertString("a1", "old_val")
+		span.Attributes().PutString("a1", "old_val")
 
 		p.updateFieldValue(span, map[string]string{
 			"span_name":     "new",

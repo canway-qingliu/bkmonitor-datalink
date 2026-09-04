@@ -113,7 +113,7 @@ func TestProcessMeterDataCollectsDropReasons(t *testing.T) {
 	metrics := record.Data.(pmetric.Metrics)
 	metric := metrics.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().AppendEmpty()
 	metric.SetName("unsupported")
-	metric.SetDataType(pmetric.MetricDataTypeHistogram)
+	metric.SetEmptyHistogram()
 
 	result := processMeterData(metrics, config.MeterData)
 
@@ -147,14 +147,14 @@ func TestProcessEndsPipelineForUnsupportedMetricType(t *testing.T) {
 	factory := newTestProcessor(t)
 	metrics := pmetric.NewMetrics()
 	resourceMetrics := metrics.ResourceMetrics().AppendEmpty()
-	resourceMetrics.Resource().Attributes().InsertString(
+	resourceMetrics.Resource().Attributes().PutString(
 		define.ResourceAttributeDataSource,
 		define.SourceSkywalkingMeterData,
 	)
 	metric := resourceMetrics.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
 	metric.SetName("activeConnections")
-	metric.SetDataType(pmetric.MetricDataTypeHistogram)
-	metric.Histogram().DataPoints().AppendEmpty().Attributes().InsertString(frameworkTypeAttribute, "custom-framework")
+	metric.SetEmptyHistogram()
+	metric.Histogram().DataPoints().AppendEmpty().Attributes().PutString(frameworkTypeAttribute, "custom-framework")
 	record := &define.Record{
 		RecordType: define.RecordMetrics,
 		Token:      define.Token{Original: "enabled-token"},
@@ -213,20 +213,20 @@ func newMetricsRecord(token, source string, specs ...metricSpec) *define.Record 
 	metrics := pmetric.NewMetrics()
 	resourceMetrics := metrics.ResourceMetrics().AppendEmpty()
 	if source != "" {
-		resourceMetrics.Resource().Attributes().InsertString(define.ResourceAttributeDataSource, source)
+		resourceMetrics.Resource().Attributes().PutString(define.ResourceAttributeDataSource, source)
 	}
 	metricSlice := resourceMetrics.ScopeMetrics().AppendEmpty().Metrics()
 	for _, spec := range specs {
 		metric := metricSlice.AppendEmpty()
 		metric.SetName(spec.name)
-		metric.SetDataType(pmetric.MetricDataTypeGauge)
+		metric.SetEmptyGauge()
 		dataPoint := metric.Gauge().DataPoints().AppendEmpty()
 		dataPoint.SetDoubleVal(spec.value)
 		if spec.framework != "" {
-			dataPoint.Attributes().InsertString(frameworkTypeAttribute, spec.framework)
+			dataPoint.Attributes().PutString(frameworkTypeAttribute, spec.framework)
 		}
 		for key, value := range spec.attributes {
-			dataPoint.Attributes().InsertString(key, value)
+			dataPoint.Attributes().PutString(key, value)
 		}
 	}
 	return &define.Record{

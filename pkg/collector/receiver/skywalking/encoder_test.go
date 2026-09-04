@@ -319,7 +319,7 @@ func TestSegmentIdToSpanIdUnique(t *testing.T) {
 		tt := tests[i]
 		t.Run(tt.name, func(t *testing.T) {
 			got := segmentIDToSpanID(tt.args.segmentID, tt.args.spanID)
-				results[i] = got
+			results[i] = got
 		})
 	}
 

@@ -19,8 +19,8 @@ import (
 	"strings"
 
 	"github.com/TarsCloud/TarsGo/tars/util/current"
-	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/grpc/peer"
 )
 
@@ -94,7 +94,6 @@ func PathExist(path string) bool {
 	}
 	return true
 }
-
 
 func InsertString(m pcommon.Map, key string, value string) {
 	if _, ok := m.Get(key); !ok {
