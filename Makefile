@@ -1,6 +1,5 @@
 PWD = $(shell pwd)
-SHELL := /bin/bash
-MODULES ?= bkmonitorbeat collector operator transfer unify-query influxdb-proxy ingester offline-data-archive bk-monitor-worker sliwebhook bkm-ksm-exporter
+MODULES ?= bkmonitorbeat collector operator transfer unify-query influxdb-proxy ingester offline-data-archive bk-monitor-worker sliwebhook bkm-ksm-exporter alarmd
 RELEASE_PATH ?= $(PWD)/dist
 BUILD_NO ?= 1
 COMMIT_ID = $(shell git rev-parse HEAD)
@@ -97,7 +96,7 @@ TAG = pkg/$(MODULE)/$(if $(filter v%,$(VERSION)),$(VERSION),v$(VERSION))
 PIP_PATH ?= $(shell which pip)
 
 .PHONY: all
-all: bkmonitorbeat collector operator transfer unify-query influxdb-proxy ingester offline-data-archive bk-monitor-worker sliwebhook bkm-ksm-exporter
+all: bkmonitorbeat collector operator transfer unify-query influxdb-proxy ingester offline-data-archive bk-monitor-worker sliwebhook bkm-ksm-exporter alarmd
 
 .PHONY: .check_module_vars
 .check_module_vars:
@@ -174,6 +173,10 @@ sliwebhook:
 bkm-ksm-exporter:
 	$(MAKE) MODULE=bkm-ksm-exporter build
 
+.PHONY: alarmd
+alarmd:
+	$(MAKE) MODULE=alarmd build
+
 .PHONY: transfer
 transfer:
 	$(MAKE) MODULE=transfer build
@@ -217,9 +220,17 @@ tag: .check_module_vars
 lint:
 	cd $(PWD)/pkg/$(MODULE) && make lint
 
+.PHONY: verify
+verify:
+	cd $(PWD)/pkg/$(MODULE) && make verify
+
 .PHONY: test
 test:
 	cd $(PWD)/pkg/$(MODULE) && make test
+
+.PHONY: race
+race:
+	cd $(PWD)/pkg/$(MODULE) && make race
 
 .PHONY: fmt
 fmt:

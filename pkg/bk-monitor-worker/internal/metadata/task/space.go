@@ -24,6 +24,7 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/internal/metadata/service"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/store/mysql"
 	t "github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/task"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/utils/slicex"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
 )
 
@@ -33,7 +34,7 @@ const (
 )
 
 // preFetchSpaceTableIds 提前获取部分空间路由信息，减少后续的查询次数
-// 1. 预计算表路由 2. VM 短链路表路由 3. APM 全局表路由
+// 1. 预计算表路由 2. VM 短链路表路由 3. APM 全局表路由 4. ES/Doris 日志全局表路由
 func preFetchSpaceTableIds(ctx context.Context, t *t.Task, spaceList []space.Space) (service.SpaceTableIdValuesBySpace, error) {
 	logger.Info("start pre fetch space table ids task")
 
@@ -63,6 +64,13 @@ func preFetchSpaceTableIds(ctx context.Context, t *t.Task, spaceList []space.Spa
 		return nil, err
 	}
 	mergeSpaceTableIdValuesBySpace(prefetchedValuesBySpace, apmValuesBySpace)
+
+	logGlobalValuesBySpace, err := preFetchLogGlobalTableIdValues(pusher, spaceList)
+	if err != nil {
+		return nil, err
+	}
+	// 日志全局表与 Python metadata 的组装顺序一致，最后覆盖同名的其他特殊路由。
+	mergeSpaceTableIdValuesBySpace(prefetchedValuesBySpace, logGlobalValuesBySpace)
 
 	logger.Infof("pre fetch space table ids success, space_count [%d]", len(prefetchedValuesBySpace))
 	return prefetchedValuesBySpace, nil
@@ -161,6 +169,60 @@ func preFetchApmAllTypeTableIdValues(pusher *service.SpacePusher, spaceList []sp
 	return valuesBySpace, nil
 }
 
+func preFetchLogGlobalTableIdValues(pusher *service.SpacePusher, spaceList []space.Space) (service.SpaceTableIdValuesBySpace, error) {
+	db := mysql.GetDBSession().DB
+	var options []resulttable.ResultTableOption
+	if err := db.Model(&resulttable.ResultTableOption{}).
+		Select("bk_tenant_id, table_id, value, value_type").
+		Where("name = ?", models.OptionQueryRouterConfig).
+		Find(&options).Error; err != nil {
+		logger.Errorf("pre fetch log global table ids failed, err: %s", err)
+		return nil, err
+	}
+	if len(options) == 0 {
+		return make(service.SpaceTableIdValuesBySpace), nil
+	}
+
+	tableIDSet := make(map[string]struct{}, len(options))
+	for _, option := range options {
+		tableIDSet[option.TableID] = struct{}{}
+	}
+	tableIDs := make([]string, 0, len(tableIDSet))
+	for tableID := range tableIDSet {
+		tableIDs = append(tableIDs, tableID)
+	}
+
+	var resultTables []resulttable.ResultTable
+	for _, chunkTableIDs := range slicex.ChunkSlice(tableIDs, 0) {
+		var chunkResultTables []resulttable.ResultTable
+		if err := resulttable.NewResultTableQuerySet(db).
+			Select(
+				resulttable.ResultTableDBSchema.BkTenantId,
+				resulttable.ResultTableDBSchema.TableId,
+				resulttable.ResultTableDBSchema.BkBizId,
+				resulttable.ResultTableDBSchema.DefaultStorage,
+				resulttable.ResultTableDBSchema.IsDeleted,
+				resulttable.ResultTableDBSchema.IsEnable,
+			).
+			TableIdIn(chunkTableIDs...).
+			DefaultStorageIn(models.StorageTypeES, models.StorageTypeDoris).
+			IsDeletedEq(false).
+			IsEnableEq(true).
+			All(&chunkResultTables); err != nil {
+			logger.Errorf("pre fetch log global result tables failed, err: %s", err)
+			return nil, err
+		}
+		resultTables = append(resultTables, chunkResultTables...)
+	}
+
+	valuesBySpace := pusher.ComposeLogGlobalTableIdValuesBySpace(options, resultTables, spaceList)
+	logger.Infof(
+		"pre fetch log global table ids success, option_count [%d], result_table_count [%d], space_count [%d]",
+		len(options), len(resultTables), len(valuesBySpace),
+	)
+	return valuesBySpace, nil
+}
+
 func limitedApmAllTypeTableIds(rtList []resulttable.ResultTable, limit int) []string {
 	if limit <= 0 {
 		return []string{}
@@ -198,10 +260,7 @@ func PushAndPublishSpaceRouterInfo(ctx context.Context, t *t.Task) error {
 		}
 	}()
 
-	var (
-		wg  sync.WaitGroup
-		err error
-	)
+	var wg sync.WaitGroup
 
 	logger.Info("start push and publish space router task")
 	db := mysql.GetDBSession().DB
@@ -212,7 +271,7 @@ func PushAndPublishSpaceRouterInfo(ctx context.Context, t *t.Task) error {
 		return err
 	}
 
-	// 获取租户ID
+	// 沿用原调度语义：直接从已加载的空间列表去重租户，避免为枚举租户额外扫描大表。
 	bkTenantIdSet := make(map[string]struct{})
 	for _, sp := range spaceList {
 		if sp.BkTenantId != "" {
@@ -241,8 +300,8 @@ func PushAndPublishSpaceRouterInfo(ctx context.Context, t *t.Task) error {
 		defer wg.Done()
 		t1 := time.Now()
 		name := "[task] PushAndPublishSpaceRouterInfo bk_app_to_space"
-		if err = pusher.PushBkAppToSpace(); err != nil {
-			logger.Errorf("%s error %s", name, err)
+		if pushErr := pusher.PushBkAppToSpace(); pushErr != nil {
+			logger.Errorf("%s error %s", name, pushErr)
 			return
 		}
 		logger.Infof("%s success, cost: %s", name, time.Since(t1))
@@ -259,8 +318,8 @@ func PushAndPublishSpaceRouterInfo(ctx context.Context, t *t.Task) error {
 			// 所有预取路由（v1/v4 RecordRule + VM 短链路 + APM）统一按 (tenant, spaceType, spaceId) 入桶，
 			// 此处直接按当前空间的租户键一次取出即可，不再做 plain key 兼容合并。
 			prefetchedValues := prefetchedValuesBySpace[service.SpaceRouteKeyWithTenant(sp.BkTenantId, sp.SpaceTypeId, sp.SpaceId)]
-			if err = pusher.PushSpaceTableIds(sp.BkTenantId, sp.SpaceTypeId, sp.SpaceId, prefetchedValues); err != nil {
-				logger.Errorf("%s error %s", name, err)
+			if pushErr := pusher.PushSpaceTableIds(sp.BkTenantId, sp.SpaceTypeId, sp.SpaceId, prefetchedValues); pushErr != nil {
+				logger.Errorf("%s error %s", name, pushErr)
 				return
 			}
 			logger.Infof("%s success, cost: %s", name, time.Since(t1))
@@ -275,107 +334,31 @@ func PushAndPublishSpaceRouterInfo(ctx context.Context, t *t.Task) error {
 			defer wg.Done()
 			t1 := time.Now()
 			name := fmt.Sprintf("[task] PushAndPublishSpaceRouterInfo data_label_to_result_table tenant[%s]", bkTenantId)
-			if err = pusher.PushDataLabelTableIds(bkTenantId, nil, true); err != nil {
-				logger.Errorf("%s error %s", name, err)
+			if pushErr := pusher.PushDataLabelTableIds(bkTenantId, nil, true); pushErr != nil {
+				logger.Errorf("%s error %s", name, pushErr)
 				return
 			}
 			logger.Infof("%s success, cost: %s", name, time.Since(t1))
 		})
 	}
 
-	// 处理 result_table_detail 路由
+	// 每个租户只调用一次统一入口；nil 表示由 service 层全量枚举并组装
+	// ES、Doris、AccessVMRecord 和 RecordRule 路由。
 	for bkTenantId := range bkTenantIdSet {
 		wg.Add(1)
+		bkTenantId := bkTenantId
 		_ = p.Submit(func() {
 			defer wg.Done()
 			t1 := time.Now()
 
 			name := fmt.Sprintf("[task] PushAndPublishSpaceRouterInfo result_table_detail tenant[%s]", bkTenantId)
-			var tableIdList []string
-			var rtList []resulttable.ResultTable
-			if err = resulttable.NewResultTableQuerySet(db).Select(resulttable.ResultTableDBSchema.TableId).BkTenantIdEq(bkTenantId).DefaultStorageIn(models.StorageTypeInfluxdb, models.StorageTypeVM).IsEnableEq(true).IsDeletedEq(false).All(&rtList); err != nil {
-				logger.Errorf("%s error, %s", name, err)
-				return
-			}
-			// 获取结果表
-			for _, rt := range rtList {
-				tableIdList = append(tableIdList, rt.TableId)
-			}
-
-			if err = pusher.PushTableIdDetail(bkTenantId, tableIdList, true); err != nil {
-				logger.Errorf("%s error %s", name, err)
+			if pushErr := pusher.PushTableIdDetail(bkTenantId, nil, true); pushErr != nil {
+				logger.Errorf("%s error %s", name, pushErr)
 				return
 			}
 			logger.Infof("%s success, cost: %s", name, time.Since(t1))
 		})
 	}
-
-	// 处理 result_table_detail 路由: Elasticsearch 类型
-	wg.Add(1)
-	_ = p.Submit(func() {
-		defer wg.Done()
-		t1 := time.Now()
-		name := "[task] PushAndPublishSpaceRouterInfo result_table_detail (elasticsearch)"
-
-		var tableIdList []string
-		var rtList []resulttable.ResultTable
-
-		// 查询 default_storage 为 "elasticsearch"，启用且未删除的结果表
-		if err = resulttable.NewResultTableQuerySet(db).
-			Select(resulttable.ResultTableDBSchema.TableId).
-			DefaultStorageEq(models.StorageTypeES).
-			IsEnableEq(true).IsDeletedEq(false).
-			All(&rtList); err != nil {
-			logger.Errorf("%s error, %s", name, err)
-			return
-		}
-
-		// 提取 TableID 列表
-		for _, rt := range rtList {
-			tableIdList = append(tableIdList, rt.TableId)
-		}
-
-		// 调用 PushEsTableIdDetail 方法
-		if err = pusher.PushEsTableIdDetail(tableIdList, true); err != nil {
-			logger.Errorf("%s error %s", name, err)
-			return
-		}
-		logger.Infof("%s success, cost: %s", name, time.Since(t1))
-	})
-
-	// 处理 result_table_detail 路由: Doris 类型
-	wg.Add(1)
-	_ = p.Submit(func() {
-		defer wg.Done()
-		t1 := time.Now()
-		name := "[task] PushAndPublishSpaceRouterInfo result_table_detail (doris)"
-
-		var tableIdList []string
-		var rtList []resulttable.ResultTable
-
-		// 查询 default_storage 为 "elasticsearch"，启用且未删除的结果表
-		if err = resulttable.NewResultTableQuerySet(db).
-			Select(resulttable.ResultTableDBSchema.TableId).
-			DefaultStorageEq(models.StorageTypeDoris).
-			IsEnableEq(true).IsDeletedEq(false).
-			All(&rtList); err != nil {
-			logger.Errorf("%s error, %s", name, err)
-			return
-		}
-
-		// 提取 TableID 列表
-		for _, rt := range rtList {
-			tableIdList = append(tableIdList, rt.TableId)
-		}
-
-		// 调用 PushEsTableIdDetail 方法
-		if err = pusher.PushDorisTableIdDetail(tableIdList, true); err != nil {
-			logger.Errorf("%s error %s", name, err)
-			return
-		}
-		logger.Infof("%s success, cost: %s", name, time.Since(t1))
-	})
-
 	wg.Wait()
 	logger.Infof("push and publish space router successfully, cost: %s", time.Since(t0))
 	return nil
