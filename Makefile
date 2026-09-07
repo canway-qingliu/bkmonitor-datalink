@@ -147,7 +147,13 @@ build: .check_module_vars
 				found=1; \
 			done < <(find "$$tmp_dir" -type d -name "$$inner_dir" -print0); \
 			if [ "$$found" -eq 1 ]; then \
-				tar -zcf "$$archive" -C "$$tmp_dir" .; \
+				archive_path="$$(cd "$$(dirname "$$archive")" && pwd)/$$(basename "$$archive")"; \
+				( \
+					cd "$$tmp_dir"; \
+					shopt -s dotglob nullglob; \
+					entries=( * ); \
+					tar -zcf "$$archive_path" -- "$${entries[@]}"; \
+				); \
 				echo "inject ci_git.yaml into $$archive"; \
 			fi; \
 			rm -rf "$$tmp_dir"; \
