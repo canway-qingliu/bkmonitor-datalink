@@ -23,10 +23,10 @@ else
 endif
 
 # TAG_INPUT 优先取 CI 显式传入的 BUILD_GIT_TAG，其次取 GIT_TAG。
-# 只有 tag 形如 release/<module>/a.b.c 或 beta/<module>/a.b.c.d 时，才视为可解析的发布 tag。
+# 只有 tag 形如 release/<module>/[v]a.b.c 或 beta/<module>/[v]a.b.c.d 时，才视为可解析的发布 tag。
 TAG_INPUT = $(strip $(if $(BUILD_GIT_TAG),$(BUILD_GIT_TAG),$(GIT_TAG)))
 # 用于判断 TAG_INPUT 是否真的是符合规则的 tag，避免把普通分支名/引用误判成 tag。
-TAG_PATTERN_MATCH = $(shell tag="$(TAG_INPUT)"; if echo "$$tag" | grep -Eq '^release/[^/]+/[0-9]+\.[0-9]+\.[0-9]+$$|^beta/[^/]+/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$$'; then echo true; else echo false; fi)
+TAG_PATTERN_MATCH = $(shell tag="$(TAG_INPUT)"; if echo "$$tag" | grep -Eq '^release/[^/]+/v?[0-9]+\.[0-9]+\.[0-9]+$$|^beta/[^/]+/v?[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$$'; then echo true; else echo false; fi)
 # GIT_REF_KIND 判定规则：
 # 1. 显式传了 GIT_REF 时，以其值为准（常见为 TAG / BRANCH）；
 # 2. 未传 GIT_REF 时，仅当 TAG_INPUT 符合支持的 tag 规则才按 TAG 处理；
@@ -34,8 +34,8 @@ TAG_PATTERN_MATCH = $(shell tag="$(TAG_INPUT)"; if echo "$$tag" | grep -Eq '^rel
 GIT_REF_KIND = $(shell printf '%s' '$(strip $(if $(GIT_REF),$(GIT_REF),$(if $(filter true,$(TAG_PATTERN_MATCH)),TAG,BRANCH)))' | tr '[:lower:]' '[:upper:]')
 MODULE_CHECK_INPUT = $(strip $(if $(MODULE_NAME),$(MODULE_NAME),$(MODULE)))
 # 仅 TAG 构建才解析 tag 中的 <module> 和版本号：
-# - release/<module>/a.b.c      -> TAG_MODULE=<module>, TAG_VERSION=a.b.c
-# - beta/<module>/a.b.c.d       -> TAG_MODULE=<module>, TAG_VERSION=a.b.c.d
+# - release/<module>/[v]a.b.c      -> TAG_MODULE=<module>, TAG_VERSION=a.b.c
+# - beta/<module>/[v]a.b.c.d       -> TAG_MODULE=<module>, TAG_VERSION=a.b.c.d
 # 只要 TAG_INPUT 本身匹配规则，就可提取出基础版本号；
 # 其中只有真正的 TAG 构建才会额外执行 tag/module 一致性校验。
 TAG_MODULE = $(shell \
@@ -43,9 +43,9 @@ TAG_MODULE = $(shell \
 		exit 0; \
 	fi; \
 	tag="$(TAG_INPUT)"; \
-	if echo "$$tag" | grep -Eq '^release/[^/]+/[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+	if echo "$$tag" | grep -Eq '^release/[^/]+/v?[0-9]+\.[0-9]+\.[0-9]+$$'; then \
 		echo "$$tag" | cut -d/ -f2; \
-	elif echo "$$tag" | grep -Eq '^beta/[^/]+/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+	elif echo "$$tag" | grep -Eq '^beta/[^/]+/v?[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$$'; then \
 		echo "$$tag" | cut -d/ -f2; \
 	fi)
 TAG_VERSION = $(shell \
@@ -53,10 +53,10 @@ TAG_VERSION = $(shell \
 		exit 0; \
 	fi; \
 	tag="$(TAG_INPUT)"; \
-	if echo "$$tag" | grep -Eq '^release/[^/]+/[0-9]+\.[0-9]+\.[0-9]+$$'; then \
-		echo "$$tag" | cut -d/ -f3; \
-	elif echo "$$tag" | grep -Eq '^beta/[^/]+/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$$'; then \
-		echo "$$tag" | cut -d/ -f3; \
+	if echo "$$tag" | grep -Eq '^release/[^/]+/v?[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+		echo "$$tag" | cut -d/ -f3 | sed -E 's/^v//'; \
+	elif echo "$$tag" | grep -Eq '^beta/[^/]+/v?[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+		echo "$$tag" | cut -d/ -f3 | sed -E 's/^v//'; \
 	fi)
 VERSION_SOURCE = default
 ifneq ($(strip $(TAG_VERSION)),)
@@ -110,7 +110,7 @@ build: .check_module_vars
 	@if [ "$(GIT_REF_KIND)" = "TAG" ] && [ -n "$(TAG_INPUT)" ] && [ -n "$(MODULE_CHECK_INPUT)" ]; then \
 		tag_module="$(TAG_MODULE)"; \
 		if [ -z "$$tag_module" ] || ! printf '%s' "$$tag_module" | grep -Fq "$(MODULE_CHECK_INPUT)"; then \
-			echo "打包错误：tag号未包含$(MODULE_CHECK_INPUT)信息，示例为：release/\$${module}/a.b.c或beta/\$${module}/a.b.c.d"; \
+			echo "打包错误：tag号未包含$(MODULE_CHECK_INPUT)信息，示例为：release/\$${module}/[v]a.b.c或beta/\$${module}/[v]a.b.c.d"; \
 			exit 1; \
 		fi; \
 	fi
