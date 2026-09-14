@@ -530,8 +530,11 @@ bk-collector:
     # ServiceDiscover: 服务发现处理器
     - name: "service_discover/common"
 
-    # SpanProcessor: span 处理器
+    # SpanProcessor: 应用级 span 处理器
     - name: "span_processor/common"
+
+    # SpanProcessor: Client HTTP span 名称处理器
+    - name: "span_processor/common_client_http"
       config:
         replace_value:
           - predicate_key: "span_name"
@@ -632,6 +635,7 @@ bk-collector:
         - "attribute_filter/app"
         - "probe_filter/common"
         - "span_processor/common"
+        - "span_processor/common_client_http"
         - "service_discover/common"
         - "apdex_calculator/standard"
         - "traces_deriver/delta"
