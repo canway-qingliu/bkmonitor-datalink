@@ -1,0 +1,2 @@
+# 真实运行配置（含 broker/ES 凭据）。样例配置见同目录 task.example.json。
+/k8s-deploy/docker/task.json
