@@ -45,6 +45,14 @@ func TestQueryTsIsESBatchJSON(t *testing.T) {
 	assert.JSONEq(t, `{"instant":false,"not_time_align":false,"is_es_batch":true}`, string(content))
 }
 
+func TestQueryExactTotalPassesToESMetadata(t *testing.T) {
+	var queryItem Query
+	require.NoError(t, json.Unmarshal([]byte(`{"exact_total":true}`), &queryItem))
+	ctx := md.InitHashID(context.Background())
+	prepared := queryItem.BuildMetadataQuery(ctx, &uqQuery.TsDBV2{}, nil)
+	assert.True(t, prepared.ExactTotal)
+}
+
 func TestQueryToMetric(t *testing.T) {
 	db := "result_table"
 	tableID := influxdb.ResultTableInfluxDB

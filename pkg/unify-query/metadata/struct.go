@@ -134,6 +134,14 @@ type OffSetInfo struct {
 
 type Aggregates []Aggregate
 
+// TraceProfile identifies a closed logical Trace read contract.
+type TraceProfile string
+
+const (
+	TraceProfileSpan    TraceProfile = "trace_span"
+	TraceProfileSummary TraceProfile = "trace_summary"
+)
+
 // Query 查询扩展信息，为后面查询提供定位
 type Query struct {
 	SourceType string `json:"source_type,omitempty"`
@@ -206,6 +214,8 @@ type Query struct {
 	Source []string `json:"source,omitempty"`
 	From   int      `json:"from,omitempty"`
 	Size   int      `json:"size,omitempty"`
+	// ExactTotal 仅在显式请求时令 ES 统计全部命中，供跨分支真实 total 归并。
+	ExactTotal bool `json:"exact_total,omitempty"`
 
 	Scroll            string             `json:"scroll,omitempty"`
 	ResultTableOption *ResultTableOption `json:"result_table_option,omitempty"`

@@ -11,6 +11,7 @@ package structured
 
 import (
 	"context"
+	stdjson "encoding/json"
 	"fmt"
 	"regexp"
 	"sort"
@@ -53,6 +54,10 @@ type QueryOutput struct {
 }
 
 type QueryTs struct {
+	// 以下字段只检测外部 Trace 信封是否出现，不能设置内部 TraceProfile。
+	TraceProfileEnvelope         stdjson.RawMessage `json:"trace_profile,omitempty" swaggerignore:"true"`
+	TraceContractVersionEnvelope stdjson.RawMessage `json:"trace_contract_version,omitempty" swaggerignore:"true"`
+	TraceRequestEnvelope         stdjson.RawMessage `json:"trace_request,omitempty" swaggerignore:"true"`
 	// TsDBMap 查询路由匹配中的 tsDB 列表 key:reference_name
 	TsDBMap map[string]TsDBs `json:"tsdb_map,omitempty"`
 	// SpaceUid 空间ID
@@ -131,6 +136,10 @@ type QueryTs struct {
 
 	// AddDimensions 额外添加的聚合维度，会与每个 function.dimensions 合并
 	AddDimensions []string `json:"add_dimensions,omitempty"`
+}
+
+func (q *QueryTs) HasTraceEnvelope() bool {
+	return q != nil && (q.TraceProfileEnvelope != nil || q.TraceContractVersionEnvelope != nil || q.TraceRequestEnvelope != nil)
 }
 
 // ValidateNamedOutputs 在任何路由和存储 I/O 前校验命名多输出契约。
@@ -260,6 +269,9 @@ func (q *QueryTs) ToTime(ctx context.Context) error {
 }
 
 func (q *QueryTs) ToQueryReference(ctx context.Context) (metadata.QueryReference, error) {
+	if q.HasTraceEnvelope() {
+		return nil, fmt.Errorf("Trace profile 查询入口尚未启用")
+	}
 	// 优先解析 queryTs 里面的时间元素
 	err := q.ToTime(ctx)
 	if err != nil {
@@ -602,6 +614,8 @@ type Query struct {
 	Limit int `json:"limit,omitempty" example:"0"`
 	// From 翻页开启数字
 	From int `json:"from,omitempty" example:"0"`
+	// ExactTotal 仅由需要真实 ES 命中总数的受控查询显式开启。
+	ExactTotal bool `json:"exact_total,omitempty"`
 	// Timestamp @-modifier 标记
 	Timestamp *int64 `json:"timestamp,omitempty"`
 	// StartOrEnd @-modifier 标记，start or end
@@ -1380,6 +1394,7 @@ func (q *Query) BuildMetadataQuery(
 
 	query.Size = q.Limit
 	query.From = q.From
+	query.ExactTotal = q.ExactTotal
 
 	if len(q.OrderBy) > 0 {
 		query.Orders = q.OrderBy.Orders()

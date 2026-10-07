@@ -191,3 +191,76 @@ func TestJwtAuthMiddleware(t *testing.T) {
 		})
 	}
 }
+
+func TestVerifiedJWTAppCodeRequiresSignedAuthorizedAppEvenWhenLegacyJWTOptional(t *testing.T) {
+	metadata.InitMetadata()
+	ctx := metadata.InitHashID(context.Background())
+	influxdb.MockSpaceRouter(ctx)
+	publicKey, privateKey, err := mockRSAKey()
+	assert.NoError(t, err)
+	token, err := generateToken(map[string]any{
+		ClaimsAppKey: map[string]any{"verified": true, "app_code": "kingeye-apm"},
+	}, []byte(privateKey))
+	assert.NoError(t, err)
+	for _, enabled := range []bool{true, false} {
+		router := gin.New()
+		router.Use(MetaData(nil), JwtAuthMiddleware(enabled, publicKey,
+			map[string][]string{"kingeye-apm": {"bkcc__42"}}))
+		router.POST("/typed", func(c *gin.Context) {
+			appCode, ok := VerifiedJWTAppCode(c)
+			if !ok {
+				c.Status(http.StatusForbidden)
+				return
+			}
+			c.String(http.StatusOK, appCode)
+		})
+		request := httptest.NewRequest(http.MethodPost, "/typed", nil).WithContext(ctx)
+		request.Header.Set(JwtHeaderKey, token)
+		request.Header.Set(metadata.SpaceUIDHeader, "bkcc__42")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		assert.Equal(t, http.StatusOK, response.Code)
+		assert.Equal(t, "kingeye-apm", response.Body.String())
+	}
+	optionalRouter := gin.New()
+	optionalRouter.Use(MetaData(nil), JwtAuthMiddleware(false, publicKey,
+		map[string][]string{"kingeye-apm": {"bkcc__42"}}))
+	optionalRouter.POST("/typed", func(c *gin.Context) {
+		if _, ok := VerifiedJWTAppCode(c); ok {
+			c.Status(http.StatusOK)
+			return
+		}
+		c.Status(http.StatusForbidden)
+	})
+	foreignSpace := httptest.NewRequest(http.MethodPost, "/typed", nil).WithContext(ctx)
+	foreignSpace.Header.Set(JwtHeaderKey, token)
+	foreignSpace.Header.Set(metadata.SpaceUIDHeader, "bkcc__133")
+	foreignResponse := httptest.NewRecorder()
+	optionalRouter.ServeHTTP(foreignResponse, foreignSpace)
+	assert.Equal(t, http.StatusForbidden, foreignResponse.Code)
+	missingToken := httptest.NewRequest(http.MethodPost, "/typed", nil).WithContext(ctx)
+	missingToken.Header.Set(metadata.SpaceUIDHeader, "bkcc__42")
+	missingResponse := httptest.NewRecorder()
+	optionalRouter.ServeHTTP(missingResponse, missingToken)
+	assert.Equal(t, http.StatusForbidden, missingResponse.Code)
+	unverifiedToken, err := generateToken(map[string]any{
+		ClaimsAppKey: map[string]any{"verified": false, "app_code": "kingeye-apm"},
+	}, []byte(privateKey))
+	assert.NoError(t, err)
+	router := gin.New()
+	router.Use(MetaData(nil), JwtAuthMiddleware(true, publicKey,
+		map[string][]string{"kingeye-apm": {"bkcc__42"}}))
+	router.POST("/typed", func(c *gin.Context) {
+		if _, ok := VerifiedJWTAppCode(c); ok {
+			c.Status(http.StatusOK)
+			return
+		}
+		c.Status(http.StatusForbidden)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/typed", nil).WithContext(ctx)
+	request.Header.Set(JwtHeaderKey, unverifiedToken)
+	request.Header.Set(metadata.SpaceUIDHeader, "bkcc__42")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	assert.Equal(t, http.StatusForbidden, response.Code)
+}

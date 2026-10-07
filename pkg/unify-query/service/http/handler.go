@@ -245,10 +245,21 @@ func HandlerQueryRaw(c *gin.Context) {
 	span.Set("query-tenant-id", user.TenantID)
 	span.Set("query-space-uid", user.SpaceUID)
 
+	// typed Trace 信封走直连存储读取；未配置直连读取时保持既有拒绝行为。
+	if probeTraceEnvelope(c) {
+		handleTraceProfileQuery(c, ctx, span)
+		return
+	}
+
 	// 解析请求 body
 	queryTs := &structured.QueryTs{}
 	err = json.NewDecoder(c.Request.Body).Decode(queryTs)
 	if err != nil {
+		resp.failed(ctx, err)
+		return
+	}
+	if queryTs.HasTraceEnvelope() {
+		err = fmt.Errorf("Trace profile 直连存储查询入口尚未完成")
 		resp.failed(ctx, err)
 		return
 	}
@@ -277,6 +288,10 @@ func HandlerQueryRaw(c *gin.Context) {
 		resp.failed(ctx, err)
 		return
 	}
+	if err = requireExactTotalAttestation(queryTs, routeInfo); err != nil {
+		resp.failed(ctx, err)
+		return
+	}
 
 	// 避免空切片被解析成 null 的问题
 	if listData.List == nil {
@@ -286,9 +301,45 @@ func HandlerQueryRaw(c *gin.Context) {
 		listData.ResultTableOptions = make(metadata.ResultTableOptions)
 	}
 	listData.ResultTableID = resultTableIDFromRouteInfo(routeInfo)
+	listData.TotalExact = exactTotalAttested(queryTs, routeInfo)
 
 	listData.Status = metadata.GetStatus(ctx)
 	resp.success(ctx, listData)
+}
+
+func exactTotalAttested(request *structured.QueryTs, routes []metadata.RouteInfo) bool {
+	if request == nil || len(request.QueryList) != 1 || request.QueryList[0] == nil ||
+		!request.QueryList[0].ExactTotal || request.IsESBatch || len(routes) == 0 ||
+		request.MetricMerge != "" || request.ResponseContract != "" || len(request.OutputList) != 0 {
+		return false
+	}
+	item := request.QueryList[0]
+	if item.Collapse != nil || len(item.AggregateMethodList) != 0 || item.SQL != "" || item.Scroll != "" {
+		return false
+	}
+	for _, route := range routes {
+		if route.StorageType != metadata.ElasticsearchStorageType {
+			return false
+		}
+	}
+	return true
+}
+
+func requireExactTotalAttestation(request *structured.QueryTs, routes []metadata.RouteInfo) error {
+	if request == nil {
+		return nil
+	}
+	requested := false
+	for _, item := range request.QueryList {
+		if item != nil && item.ExactTotal {
+			requested = true
+			break
+		}
+	}
+	if requested && !exactTotalAttested(request, routes) {
+		return fmt.Errorf("ES exact total request requires one non-aggregated ES raw branch")
+	}
+	return nil
 }
 
 // HandlerQueryRawWithScroll
@@ -336,6 +387,10 @@ func HandlerQueryRawWithScroll(c *gin.Context) {
 	queryTs := &structured.QueryTs{}
 	err = json.NewDecoder(c.Request.Body).Decode(queryTs)
 	if err != nil {
+		return
+	}
+	if queryTs.HasTraceEnvelope() {
+		err = fmt.Errorf("Trace profile 查询入口尚未启用")
 		return
 	}
 
@@ -446,6 +501,11 @@ func HandlerQueryTs(c *gin.Context) {
 			metadata.MsgQueryTs,
 			"json 格式解析异常",
 		).Error(ctx, err))
+		return
+	}
+	if query.HasTraceEnvelope() {
+		err = fmt.Errorf("Trace profile 查询入口尚未启用")
+		resp.failed(ctx, err)
 		return
 	}
 

@@ -25,14 +25,27 @@ import (
 )
 
 const (
-	JwtHeaderKey  = "X-Bkapi-Jwt"
-	ClaimsAppKey  = "app"
-	ClaimsUserKey = "user"
+	JwtHeaderKey          = "X-Bkapi-Jwt"
+	ClaimsAppKey          = "app"
+	ClaimsUserKey         = "user"
+	verifiedJWTAppCodeKey = "unify_query_verified_jwt_app_code"
 )
 
+// VerifiedJWTAppCode is present only when a JWT signature and its app/space
+// authorization have been verified, even when legacy routes allow no JWT.
+func VerifiedJWTAppCode(c *gin.Context) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	value, exists := c.Get(verifiedJWTAppCodeKey)
+	appCode, ok := value.(string)
+	return appCode, exists && ok && appCode != ""
+}
+
 const (
-	AppCodeKey  = "app.app_code"
-	UserNameKey = "user.username"
+	AppCodeKey     = "app.app_code"
+	AppVerifiedKey = "app.verified"
+	UserNameKey    = "user.username"
 
 	AuthAll = "*"
 )
@@ -56,6 +69,11 @@ func (j JwtPayLoad) AppCode() string {
 		}
 	}
 	return ""
+}
+
+func (j JwtPayLoad) AppVerified() bool {
+	verified, ok := j[AppVerifiedKey].(bool)
+	return ok && verified
 }
 
 func (j JwtPayLoad) UserName() string {
@@ -223,6 +241,9 @@ func JwtAuthMiddleware(enabled bool, publicKey string, defaultAppCodeSpaces map[
 
 		// 如果配置了全局查询则，通过校验
 		if spaceUIDs.Existed(AuthAll) {
+			if appCode != "" && payLoad.AppVerified() {
+				c.Set(verifiedJWTAppCodeKey, appCode)
+			}
 			return
 		}
 
@@ -235,6 +256,9 @@ func JwtAuthMiddleware(enabled bool, publicKey string, defaultAppCodeSpaces map[
 		if !spaceUIDs.Existed(spaceUID) {
 			err = errAppUnauthorized
 			return
+		}
+		if appCode != "" && payLoad.AppVerified() {
+			c.Set(verifiedJWTAppCodeKey, appCode)
 		}
 	}
 }

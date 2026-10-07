@@ -67,6 +67,11 @@ func (s *Service) Reload(ctx context.Context) {
 
 	log.Debugf(ctx, "waiting for http service close")
 	s.Wait()
+	if traceProfileUsesConsul() {
+		if err := reloadTraceProfilePublishedRuntime(); err != nil {
+			log.Errorf(ctx, "load trace profile published routes failed: %s", err)
+		}
+	}
 
 	gin.SetMode(gin.ReleaseMode)
 	s.g = gin.New()
@@ -110,6 +115,11 @@ func (s *Service) Reload(ctx context.Context) {
 	// 更新上下文控制方法
 	s.ctx, s.cancelFunc = context.WithCancel(ctx)
 	log.Debugf(ctx, "http service context update success.")
+	if traceProfileUsesConsul() {
+		if err := startTraceProfileRouteWatch(s.ctx, &s.wg); err != nil {
+			log.Errorf(ctx, "watch trace profile published routes failed: %s", err)
+		}
+	}
 	// 起一个goroutine去跟踪ctx，ctx关闭时server也关闭
 	s.wg.Add(1)
 	go func() {

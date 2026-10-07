@@ -173,6 +173,11 @@ func (i *Instance) Watch(path string) (<-chan any, error) {
 	return i.client.Watch(path, "")
 }
 
+// WatchContext owns the watch plan for one caller and stops it on cancellation.
+func (i *Instance) WatchContext(ctx context.Context, path string) (<-chan any, error) {
+	return i.client.WatchContext(ctx, path, "")
+}
+
 // WatchOnce: 仅监听，触发一次
 func (i *Instance) WatchOnce(path, separator string) (<-chan any, error) {
 	i.pathLock.Lock()

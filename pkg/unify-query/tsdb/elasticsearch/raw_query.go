@@ -348,7 +348,13 @@ func decodePreparedRawResult(
 	}
 
 	if sr == nil {
+		if rawQuery.ExactTotal {
+			return size, total, option, fmt.Errorf("ES exact total unavailable: search response is missing")
+		}
 		return size, total, option, nil
+	}
+	if rawQuery.ExactTotal && (sr.Hits == nil || sr.Hits.TotalHits == nil || sr.Hits.TotalHits.Relation != "eq") {
+		return size, total, option, fmt.Errorf("ES exact total unavailable: total hits relation is not eq")
 	}
 	if sr.Hits != nil {
 		for idx, d := range sr.Hits.Hits {

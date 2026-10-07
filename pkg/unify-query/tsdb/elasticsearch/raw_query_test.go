@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/jarcoal/httpmock"
+	elastic "github.com/olivere/elastic/v7"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -83,6 +84,62 @@ func TestPrepareRawQuery_FinalBodyIncludesSearchAfterAndDoesNotMutateInput(t *te
 	assert.Equal(t, originalOption, query.ResultTableOption)
 	assert.NotSame(t, query.ResultTableOption, prepared.query.ResultTableOption)
 	assert.NotSame(t, query.ResultTableOption.From, prepared.query.ResultTableOption.From)
+}
+
+func TestPrepareRawQuery_OptInExactTotalRequestsAllHits(t *testing.T) {
+	mock.Init()
+	ctx := metadata.InitHashID(context.Background())
+	instance, err := NewInstance(ctx, &InstanceOption{
+		Connect: Connect{Address: mock.EsUrl},
+		MaxSize: 100,
+		Timeout: 3 * time.Second,
+	})
+	require.NoError(t, err)
+	query := &metadata.Query{}
+	require.NoError(t, json.Unmarshal([]byte(`{"exact_total":true}`), query))
+	query.DB = "es_index"
+	query.Field = "a"
+	query.TableID = "result_table.es"
+	query.StorageID = "3"
+	query.StorageType = metadata.ElasticsearchStorageType
+	query.Size = 2
+	query.TimeField = metadata.TimeField{
+		Name: "dtEventTimeStamp", Type: TimeFieldTypeTime, Unit: "millisecond",
+	}
+	prepared, err := instance.PrepareRawQuery(ctx, query,
+		time.UnixMilli(1723593608000), time.UnixMilli(1723679962000), nil)
+	require.NoError(t, err)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal([]byte(prepared.body), &body))
+	assert.Equal(t, true, body["track_total_hits"])
+}
+
+func TestDecodePreparedRawResult_ExactTotalRejectsApproximateHits(t *testing.T) {
+	mock.Init()
+	ctx := metadata.InitHashID(context.Background())
+	instance, err := NewInstance(ctx, &InstanceOption{
+		Connect: Connect{Address: mock.EsUrl}, MaxSize: 100, Timeout: 3 * time.Second,
+	})
+	require.NoError(t, err)
+	query := &metadata.Query{
+		DB: "es_index", Field: "a", TableID: "result_table.es", StorageID: "3",
+		StorageType: metadata.ElasticsearchStorageType, Size: 2, ExactTotal: true,
+		TimeField: metadata.TimeField{Name: "dtEventTimeStamp", Type: TimeFieldTypeTime, Unit: "millisecond"},
+	}
+	prepared, err := instance.PrepareRawQuery(ctx, query,
+		time.UnixMilli(1723593608000), time.UnixMilli(1723679962000), nil)
+	require.NoError(t, err)
+	_, _, _, err = decodePreparedRawResult(prepared, nil, make(chan map[string]any, 1))
+	require.ErrorContains(t, err, "exact total")
+	var response elastic.SearchResult
+	require.NoError(t, json.Unmarshal([]byte(`{"hits":{"total":{"value":10000,"relation":"gte"},"hits":[]}}`), &response))
+	_, _, _, err = decodePreparedRawResult(prepared, &response, make(chan map[string]any, 1))
+	require.ErrorContains(t, err, "exact total")
+
+	prepared.query.ExactTotal = false
+	_, total, _, err := decodePreparedRawResult(prepared, &response, make(chan map[string]any, 1))
+	require.NoError(t, err)
+	assert.Equal(t, int64(10000), total)
 }
 
 func TestQueryPreparedRawDataMatchesQueryRawData(t *testing.T) {

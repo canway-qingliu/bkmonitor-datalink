@@ -65,6 +65,32 @@ func excludeElasticsearchIndexPrefixMissingQueries(ctx context.Context, queryRef
 	})
 }
 
+// Exact total may not omit one resolved ES subroute and then attest only the remainder.
+// Legacy raw requests retain their existing warn-and-skip behavior.
+func filterRawRoutesForExactTotal(ctx context.Context, queryRef metadata.QueryReference, queryTs *structured.QueryTs) (metadata.QueryReference, error) {
+	requested := false
+	if queryTs != nil {
+		for _, item := range queryTs.QueryList {
+			if item != nil && item.ExactTotal {
+				requested = true
+				break
+			}
+		}
+	}
+	if requested {
+		missing := false
+		queryRef.Range("", func(qry *metadata.Query) {
+			if qry.IsElasticsearchIndexPrefixMissing() {
+				missing = true
+			}
+		})
+		if missing {
+			return nil, fmt.Errorf("ES exact total route is missing an index prefix")
+		}
+	}
+	return excludeElasticsearchIndexPrefixMissingQueries(ctx, queryRef, metadata.MsgQueryRaw, nil), nil
+}
+
 func parseLookBackDelta(s string) (time.Duration, error) {
 	duration, err := model.ParseDuration(s)
 	if err == nil {
@@ -198,6 +224,12 @@ func queryExemplar(ctx context.Context, query *structured.QueryTs) (any, error) 
 }
 
 func queryRawWithInstance(ctx context.Context, queryTs *structured.QueryTs) (total int64, list []map[string]any, resultTableOptions metadata.ResultTableOptions, routeInfo []metadata.RouteInfo, err error) {
+	return queryRawWithResolvedInstance(ctx, queryTs, nil)
+}
+
+// queryRawWithResolvedInstance 允许受信调用方固定已校验的路由快照。
+// 其他 raw 查询仍由本函数自行解析一次路由。
+func queryRawWithResolvedInstance(ctx context.Context, queryTs *structured.QueryTs, resolved metadata.QueryReference) (total int64, list []map[string]any, resultTableOptions metadata.ResultTableOptions, routeInfo []metadata.RouteInfo, err error) {
 	ignoreDimensions := []string{metadata.KeyTableUUID}
 	list = make([]map[string]any, 0)
 	resultTableOptions = make(metadata.ResultTableOptions)
@@ -220,11 +252,18 @@ func queryRawWithInstance(ctx context.Context, queryTs *structured.QueryTs) (tot
 		queryRef metadata.QueryReference
 	)
 
-	queryRef, err = queryTs.ToQueryReference(ctx)
+	if resolved == nil {
+		queryRef, err = queryTs.ToQueryReference(ctx)
+		if err != nil {
+			return total, list, resultTableOptions, routeInfo, err
+		}
+	} else {
+		queryRef = resolved
+	}
+	queryRef, err = filterRawRoutesForExactTotal(ctx, queryRef, queryTs)
 	if err != nil {
 		return total, list, resultTableOptions, routeInfo, err
 	}
-	queryRef = excludeElasticsearchIndexPrefixMissingQueries(ctx, queryRef, metadata.MsgQueryRaw, nil)
 	// routeInfo 只描述本次解析出的路由范围，不能从返回行或分页状态反推。
 	routeInfo = queryRef.CollectRouteInfo()
 

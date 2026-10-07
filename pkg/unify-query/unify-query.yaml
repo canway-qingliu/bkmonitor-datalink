@@ -100,3 +100,36 @@ bk_data:
   cluster_space_uid:
     test:
     - bkcc__test
+
+# Trace profile 直连存储读取（T6.1）。未配置时保持 fail closed：带 Trace 信封的
+# /query/ts/raw 请求返回固定拒绝，绝不回落到老的 BKBase/ES 链路。
+# 生产读目标来自 Kingeye Metadata 的逐租户 Consul 发布物；发布物中的业务 ID
+# 与 profile 必须对应 otel_trace_span_<bk_biz_id> / otel_trace_summary_<bk_biz_id>。
+# 发布路径由 Kingeye 的 CONSUL_PATH 派生，需按部署环境填写完整前缀。
+trace_profile:
+  # read_target_data_path: kingeye_<platform>_<environment>/metadata/unify-query/data/trace/read_target
+  # read_target_version_path: kingeye_<platform>_<environment>/metadata/unify-query/version/trace/read_target
+  # 单请求预算上限；缺省为 max_body_bytes=65536、max_limit=10000、max_offset=100000、max_range_days=30。
+  # max_body_bytes: 65536
+  # max_limit: 10000
+  # max_offset: 100000
+  # max_range_days: 30
+  # 允许调用直连读取的已验证 bk_app_code。全局 jwt.enabled 可以保持 false，
+  # 但必须配置 jwt.public_key 与该 app_code 的 jwt.bk_app_code_spaces；typed 请求
+  # 仍要求签名有效、app.verified=true 且空间授权成功。
+  # allowed_bk_app_codes:
+  # - kingeye-apm
+  # T6.6 内部精确成员查询还需单独允许列表；缺省为空时该模式拒绝。
+  # member_lookup_allowed_bk_app_codes:
+  # - kingeye-apm
+  # 只读连接凭据仅留在 UQ；cluster_id 必须覆盖发布路由引用的全部集群。
+  # readonly_connections:
+  # - cluster_id: "18"
+  #   host: 127.0.0.1
+  #   port: 9030
+  #   username: read_only
+  #   password: ""
+  #   max_open_conns: 8
+  #   connect_timeout: 3s
+  #   query_timeout: 30s
+  #   max_rows: 10000

@@ -10,6 +10,7 @@
 package base
 
 import (
+	"context"
 	"strings"
 
 	"github.com/hashicorp/consul/api"
@@ -336,6 +337,44 @@ func (bc *Client) Watch(path string, separator string) (<-chan any, error) {
 	if err != nil {
 		return nil, err
 	}
+	return outChan, nil
+}
+
+// WatchContext creates a subscription owned by ctx. Unlike Watch, its plan is
+// not kept in the shared path map: a closed stream can be subscribed again
+// without retaining a plan whose output no longer has a reader.
+func (bc *Client) WatchContext(ctx context.Context, path, separator string) (<-chan any, error) {
+	if ctx == nil {
+		return nil, context.Canceled
+	}
+	params, err := bc.makeWatchParams(path, separator)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := watch.Parse(params)
+	if err != nil {
+		return nil, err
+	}
+	outChan := make(chan any)
+	plan.Handler = func(_ uint64, value any) {
+		select {
+		case outChan <- value:
+		case <-ctx.Done():
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			plan.Stop()
+		case <-done:
+		}
+	}()
+	go func() {
+		defer close(done)
+		defer close(outChan)
+		_ = plan.Run(bc.address)
+	}()
 	return outChan, nil
 }
 

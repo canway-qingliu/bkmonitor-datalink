@@ -83,9 +83,14 @@ const (
 	ClusterMetricQueryPrefixConfigPath  = "http.cluster_metric.prefix"
 	ClusterMetricQueryTimeoutConfigPath = "http.cluster_metric.timeout"
 
-	JwtPublicKeyConfigPath       = "jwt.public_key"
-	JwtBkAppCodeSpacesConfigPath = "jwt.bk_app_code_spaces"
-	JwtEnabledConfigPath         = "jwt.enabled"
+	JwtPublicKeyConfigPath                      = "jwt.public_key"
+	JwtBkAppCodeSpacesConfigPath                = "jwt.bk_app_code_spaces"
+	JwtEnabledConfigPath                        = "jwt.enabled"
+	TraceProfileAllowedAppCodesConfigPath       = "trace_profile.allowed_bk_app_codes"
+	TraceMemberLookupAllowedAppCodesConfigPath  = "trace_profile.member_lookup_allowed_bk_app_codes"
+	TraceProfileConfigPath                      = "trace_profile"
+	TraceProfileReadTargetDataPathConfigPath    = "trace_profile.read_target_data_path"
+	TraceProfileReadTargetVersionPathConfigPath = "trace_profile.read_target_version_path"
 
 	// LabelValuesDefaultLimitConfigPath label_values 接口返回值的默认数量，如果为空则使用该值，因为如果为空传到后端的话，bksql 会默认补上 100
 	LabelValuesDefaultLimitConfigPath = "http.label_values.default_limit"
@@ -125,9 +130,11 @@ var (
 	ClusterMetricQueryPrefix  string
 	ClusterMetricQueryTimeout time.Duration
 
-	JwtPublicKey       string
-	JwtBkAppCodeSpaces map[string][]string
-	JwtEnabled         bool
+	JwtPublicKey                     string
+	JwtBkAppCodeSpaces               map[string][]string
+	JwtEnabled                       bool
+	TraceProfileAllowedAppCodes      []string
+	TraceMemberLookupAllowedAppCodes []string
 
 	ScrollWindowTimeout      string
 	ScrollSessionLockTimeout string

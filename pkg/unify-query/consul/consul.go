@@ -81,6 +81,15 @@ var WatchChange = func(ctx context.Context, watchPath string) (<-chan any, error
 	return kvChan, nil
 }
 
+// WatchChangeContext 为需要在关闭后重新订阅的调用方创建独立且可取消的监听。
+var WatchChangeContext = func(ctx context.Context, watchPath string) (<-chan any, error) {
+	kvChan, err := globalInstance.WatchContext(ctx, watchPath)
+	if err != nil {
+		return nil, err
+	}
+	return kvChan, nil
+}
+
 // WatchChangeOnce 监听指定地址，监听触发时，channel将会传出信息
 var WatchChangeOnce = func(ctx context.Context, watchPath, separator string) (<-chan any, error) {
 	kvChan, err := globalInstance.WatchOnce(watchPath, separator)

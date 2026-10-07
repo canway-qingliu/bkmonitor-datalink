@@ -241,6 +241,10 @@ func LoadConfig() {
 	JwtPublicKey = viper.GetString(JwtPublicKeyConfigPath)
 	JwtBkAppCodeSpaces = viper.GetStringMapStringSlice(JwtBkAppCodeSpacesConfigPath)
 	JwtEnabled = viper.GetBool(JwtEnabledConfigPath)
+	TraceProfileAllowedAppCodes = viper.GetStringSlice(TraceProfileAllowedAppCodesConfigPath)
+	TraceMemberLookupAllowedAppCodes = viper.GetStringSlice(TraceMemberLookupAllowedAppCodesConfigPath)
+
+	loadTraceProfileConfig()
 
 	loadQueryRawESBatchSettings()
 	loadNamedOutputSettings()

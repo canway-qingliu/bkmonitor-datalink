@@ -396,6 +396,16 @@
 
 **请求体**: 同结构体查询
 
+`trace_profile`、`trace_contract_version`、`trace_request` 是 `trace_query_v2` 的 typed Trace 信封；出现任一字段（包括显式 `null`）时不能作为普通 raw 查询返回成功。UQ 对 `trace_span` / `trace_summary` 依据 Kingeye Metadata 的逐业务 Consul 读目标直连 Doris，库表由受信 `(租户, 业务, profile)` 路由确定；只读连接、JWT 验证及专用 app code 允许列表缺失时明确返回 400，不回落到 BKSQL/QueryEngine。typed 时间为 UTC epoch **微秒字符串**，结束时间为排他边界；Span/Summary 均支持预算内的 `offset`，`offset` 与 `page_token` 不能同时使用；直读配置 `max_offset` 必须为正数。客户端不得提交 RT、库表、集群或 SQL。结构化 `/query/ts` 和 raw-with-scroll 拒绝 typed 信封，普通 raw 请求沿用原路径。A3 边/覆盖直读与目标环境验收另行完成。
+
+T6.6 的 Doris `trace_summary` 内部 `member_lookup` 形如 `{"trace_id":"<32 位小写 hex>","expected_route_version":3,"allowed_pairs":[{"app_id":7,"bk_biz_id":42}]}`，只接受 `scene=global`、空过滤/排序且无 offset 的请求。允许对按业务 ID、应用 ID 严格排序并去重，单请求最多 128 对，且每对业务必须等于受信空间对应的业务物理表；UQ 在 SQL 前要求期望版本与已加载的发布读路由快照一致。SQL 使用成对 OR 条件与精确 Trace ID，不把两列拆成独立 IN。真实命中数超过 `limit`、查询行数不等于 total 或回包出现范围外行均失败，不返回截断成员。该模式还要求 `trace_profile.member_lookup_allowed_bk_app_codes` 单独授权，默认关闭。KAPM 授权目录编排、ES 分支、保留期覆盖和目标读回仍由 T6.6 后续验收。
+
+Kingeye 单租户发布物可选 `es_summary_targets`，每项目标包含租户、业务、应用 ID/名称、观测域、新 ES Summary 逻辑 `read_result_table_id`、ES 存储集群与保留期。UQ 现严格解析并随发布版本冻结这些候选路由；旧发布文档不含此段时继续加载 Doris。A3 段此阶段仅检查为数组，不加载为查询路由。启用 Kingeye 的 `--include-es-summary` 前须先部署能解析该段的 UQ，目标 RT→读别名、索引暖机和真实行仍须独立验证。
+
+`member_lookup.backend` 可显式为 `elasticsearch`，省略时按原 Doris 分支执行；ES 模式只接受一个 `(app_id,bk_biz_id)` 对。UQ 先按已发布的租户/业务/应用/域目标和单租户版本核对，再用受信逻辑 RT 生成精确 Trace、成对应用/业务、租户/域及微秒时间条件，走现有 raw ES 执行器。实际 RT 路由的时间字段必须在 ES I/O 前解析为 `min_start_time/long/microsecond`，默认 `dtEventTimeStamp` 明确拒绝；校验后的路由引用直接用于 ES 执行，避免再次解析时切到不同的时间字段。返回前复核 RT、ES 存储类型/集群、真实 total、全部命中行和版本，把兼容 ES Summary 字段转换为闭合 typed Summary 行；任一子路由部分失败拒绝整次。本地模拟 Metadata RT 与 ES `_search` 已跑通真实 raw 路由，统计对象的点号展平字段按 Flink 固定的 6+4 键完整还原。目标 RT 读别名、ES mapping、保留期暖机与真实数据面仍待验证，不代表 T6.6 产品准入。
+
+可选本机真 ES 验证：设置 `ES_TEST_URL`（只接受 loopback HTTP）、`ES_TEST_USERNAME`、`ES_TEST_PASSWORD`，运行 `go test ./service/http -run '^TestESSummaryMemberLookupAgainstLocalElasticsearch$' -count=1`。测试在隔离临时索引及读别名写入同 Trace 的目标/外来应用 Summary，用真实 ES mapping 和 `_search` 验证精确过滤、typed 行及统计字段还原，结束时删除临时索引。缺环境变量时跳过；这不证明目标 RT 与目标读别名、保留期暖机或真实业务数据可查。
+
 **响应格式**: 返回 `ListData` 格式
 
 **响应示例**:
@@ -438,6 +448,8 @@
 **请求头**: 同结构体查询（需要 `X-Bk-Scope-Space-Uid`）
 
 **请求体**: 同结构体查询，需要设置 `scroll` 参数（滚动窗口超时时间，如 `3m`）
+
+typed Trace 信封不支持 scroll；上述预留字段在本入口会先返回 400，不创建滚动会话。
 
 **响应格式**: 返回 `ListData` 格式，包含 `done` 字段表示是否还有更多数据
 
