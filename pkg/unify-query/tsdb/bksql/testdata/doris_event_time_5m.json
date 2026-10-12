@@ -1,0 +1,50 @@
+{
+  "start_ms": 1791512999999,
+  "end_ms": 1791514199999,
+  "evaluation_start_ms": 1791513000000,
+  "evaluation_end_ms": 1791513900000,
+  "window_ms": 300000,
+  "offset_ms": 0,
+  "old_rows": [
+    {
+      "_timestamp_": 29858400000,
+      "_value_": 396
+    }
+  ],
+  "new_rows": [
+    {
+      "_timestamp_": 1791513000000,
+      "_value_": 61
+    },
+    {
+      "_timestamp_": 1791513300000,
+      "_value_": 113
+    },
+    {
+      "_timestamp_": 1791513600000,
+      "_value_": 100
+    },
+    {
+      "_timestamp_": 1791513900000,
+      "_value_": 122
+    }
+  ],
+  "expected_rows": [
+    {
+      "timestamp": 1791513000000,
+      "count": 61
+    },
+    {
+      "timestamp": 1791513300000,
+      "count": 113
+    },
+    {
+      "timestamp": 1791513600000,
+      "count": 100
+    },
+    {
+      "timestamp": 1791513900000,
+      "count": 122
+    }
+  ]
+}

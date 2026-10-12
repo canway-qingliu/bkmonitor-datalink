@@ -82,11 +82,7 @@ type DorisSQLExpr struct {
 	// 而是直接使用 = / != 进行精确匹配。适用于 TSpider 等不支持全文检索的存储。
 	forceEq bool
 
-	// disableShardKeyTimeBucket 为 true 时，分钟级时间聚合也使用 timeField。
-	// TSpider 以及字段结构不完整或没有 __shard_key__ 的 Doris 表，需要走该兼容路径。
-	disableShardKeyTimeBucket bool
-
-	// disableTimeBucketCast 为 true 时，timeField 时间桶不生成 CAST(... AS INT)。
+	// disableTimeBucketCast 为 true 时，timeField 时间桶不生成整数 CAST。
 	// TSpider 的 MySQL 语法检查不兼容该 CAST 写法。
 	disableTimeBucketCast bool
 
@@ -125,13 +121,6 @@ func (d *DorisSQLExpr) WithFieldsMap(fieldsMap metadata.FieldsMap) SQLExpr {
 	return d
 }
 
-// WithShardKeyTimeBucket 用显式开关控制是否启用 __shard_key__ 时间分桶。
-// BKBase 返回的部分 Doris 表结构不包含 __shard_key__ 时，上层会关闭该开关。
-func (d *DorisSQLExpr) WithShardKeyTimeBucket(enabled bool) SQLExpr {
-	d.disableShardKeyTimeBucket = !enabled
-	return d
-}
-
 func (d *DorisSQLExpr) WithKeepColumns(cols []string) SQLExpr {
 	d.keepColumns = cols
 	return d
@@ -139,14 +128,6 @@ func (d *DorisSQLExpr) WithKeepColumns(cols []string) SQLExpr {
 
 func (d *DorisSQLExpr) FieldMap() metadata.FieldsMap {
 	return d.fieldsMap
-}
-
-func (d *DorisSQLExpr) useShardKeyTimeBucket(window time.Duration) bool {
-	if d.disableShardKeyTimeBucket || int64(window.Seconds())%60 != 0 {
-		return false
-	}
-
-	return true
 }
 
 func (d *DorisSQLExpr) ParserQueryString(ctx context.Context, qs string) (string, error) {
@@ -275,15 +256,12 @@ func (d *DorisSQLExpr) ParserAggregatesAndOrders(selectDistinct []string, aggreg
 			timeZoneOffset *= -1
 		}
 
-		// Doris 按分钟聚合时优先使用 __shard_key__；当上层根据字段表关闭该优化时回退到 timeField。
+		// 时间桶使用事件时间（epoch 毫秒），不能从存储分片键推断事件粒度。
 		var timeField string
-		if d.useShardKeyTimeBucket(window) {
-			windowMinutes := int(window.Minutes())
-			timeField = fmt.Sprintf(`((CAST((FLOOR(%s / 1000) %s %d) / %d AS INT) * %d %s %d) * 60 * 1000)`, ShardKey, fh1, timeZoneOffset/6e4, windowMinutes, windowMinutes, fh2, timeZoneOffset/6e4)
-		} else if d.disableTimeBucketCast {
+		if d.disableTimeBucketCast {
 			timeField = fmt.Sprintf(`(FLOOR((%s %s %d) / %d) * %d %s %d)`, d.timeField, fh1, timeZoneOffset, window.Milliseconds(), window.Milliseconds(), fh2, timeZoneOffset)
 		} else {
-			timeField = fmt.Sprintf(`(CAST((FLOOR(%s %s %d) / %d) AS INT) * %d %s %d)`, d.timeField, fh1, timeZoneOffset, window.Milliseconds(), window.Milliseconds(), fh2, timeZoneOffset)
+			timeField = fmt.Sprintf(`(CAST(FLOOR((%s %s %d) / %d) AS BIGINT) * %d %s %d)`, d.timeField, fh1, timeZoneOffset, window.Milliseconds(), window.Milliseconds(), fh2, timeZoneOffset)
 		}
 
 		if d.groupTimeBucketByExpr {
