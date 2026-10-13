@@ -11,13 +11,13 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/contract"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
 )
 
-const executionStateSchemaV2 = "alarmd-runtime-state-v2"
 const executionGapSchemaV2 = "alarmd-plan-gap-v2"
 
 type CompareAndSetBackend interface {
@@ -38,20 +38,57 @@ type CompareAndSetBackend interface {
 // not passed over: a renewal nobody performs leaves keys immortal, and the only
 // place that shows up is a Redis instance months later.
 type LifetimeBackend interface {
-	RenewIfBelow(context.Context, string, time.Duration, time.Duration) (bool, error)
+	RenewIfBelow(context.Context, string, time.Duration, time.Duration) (RenewalOutcome, error)
+	// RenewManyIfBelow is the same decision for a batch of keys, answered in
+	// one round trip rather than one per key. Both are required: a caller that
+	// holds one key must not pay for a slice, and a caller holding a Slot's
+	// worth of them must not pay for a round trip each.
+	RenewManyIfBelow(context.Context, []string, time.Duration, time.Duration) ([]RenewalOutcome, error)
 }
+
+// RenewalOutcome is what one renewal found when it looked.
+//
+// Three states, not a bool, because the third one is the reason this exists.
+// A renewal that finds no key is the moment a piece of state was lost without
+// anything noticing -- the Plan will rebuild it as a new series and report
+// nothing -- and a bool return spells that "not renewed", which is also what a
+// key with plenty of life left says. Those two readings are opposites and the
+// old signature could not tell them apart.
+type RenewalOutcome string
+
+const (
+	// RenewalRenewed is a key that was running out and now is not.
+	RenewalRenewed RenewalOutcome = "RENEWED"
+	// RenewalFresh is a key with more than the threshold still to live. No
+	// expiry was set; the round trip was still spent.
+	RenewalFresh RenewalOutcome = "FRESH"
+	// RenewalMissing is a key that was read this round and was gone by the
+	// time the renewal asked about it. Nothing recreates it here: writing a
+	// key with no value would only make every reader classify it as corrupt.
+	RenewalMissing RenewalOutcome = "MISSING"
+)
 
 type ExecutionStoreOptions struct {
 	Prefix          string
 	Router          StorageRouter
 	MaxValueBytes   int
 	MaxItemsPerCall int
+	// MaxNoDataGroups bounds how many groups one Plan's no-data memory may
+	// hold. It is a guard against an expected set that has run away, not a
+	// working limit: the memory is stored one field per group and has no size
+	// ceiling, so this is an order of magnitude beyond what any Plan reaches.
+	// Zero takes DefaultMaxNoDataGroups rather than meaning no bound, because
+	// an unset field must not be the way a guard is removed.
+	MaxNoDataGroups int
 	// MinTTL, MaxTTL and RestartMargin bound the write TTL the store derives
 	// per apply request from that request's Plan retention. MaxTTL is the
 	// ceiling a derived TTL may not exceed, not the value keys are written at.
 	MinTTL        time.Duration
 	MaxTTL        time.Duration
 	RestartMargin time.Duration
+	// Bound on the scheduler's read hold. A reporting series must survive
+	// an immediate jump to this bound, even if the current Slot has no hold.
+	ReadHoldBound time.Duration
 	// FenceKeys locates the ownership lease that fenced Runtime State writes
 	// verify inside storage. It is optional: without it ApplyRuntimeFenced
 	// applies unfenced and the admission-time fence check stands alone.
@@ -65,18 +102,21 @@ type ExecutionStore struct {
 	// generation-scoped keys it loads. Per store rather than per package so
 	// two stores in one process cannot answer for each other's keys.
 	renewals *renewalGate
-}
-
-type runtimeEnvelope struct {
-	Schema         string                                `json:"schema"`
-	Identity       execution.StateKeyIdentity            `json:"identity"`
-	BlobRevision   uint64                                `json:"blob_revision"`
-	ApplyVersion   execution.ApplyVersion                `json:"apply_version"`
-	MutationDigest execution.MutationDigest              `json:"mutation_digest"`
-	LastEventTime  int64                                 `json:"last_event_time"`
-	SeriesGuard    *execution.StateGuardFact             `json:"series_guard,omitempty"`
-	Levels         []execution.RuntimeLevelStateMutation `json:"levels"`
-	History        []execution.StateHistoryPoint         `json:"history"`
+	// frozenRenewals is the same memory for Runtime State keys whose Level was
+	// frozen this round. A second table rather than a shared one because the
+	// two populations are sized differently -- generation-scoped keys are two
+	// per Plan, Runtime State keys are one per series, thousands for a single
+	// query group -- so one table would let a burst of series keys evict every
+	// Plan's entry, and the reset counter could not say which population
+	// overflowed.
+	frozenRenewals *renewalGate
+	// valueSizes is what one stored record has been costing, per Query Group,
+	// learned from the reads that returned - so a preflight batch is bounded by
+	// what it is expected to move rather than by key count alone.
+	valueSizes struct {
+		mu    sync.RWMutex
+		bytes map[execution.QueryGroupIdentity]uint64
+	}
 }
 
 type gapEnvelope struct {
@@ -89,26 +129,98 @@ type gapEnvelope struct {
 	Scopes           []execution.GapScopeState      `json:"scopes,omitempty"`
 }
 
+// DefaultMaxNoDataGroups is the group guard a store takes when none is given.
+//
+// It is derived from what the container can hold rather than from what a Plan
+// is expected to have: the largest memory seen in production is a few thousand
+// groups, and this is two orders of magnitude above it, which is what makes it
+// a guard rather than something a Plan can reach by growing normally.
+const DefaultMaxNoDataGroups = 100000
+
 func NewExecutionStore(options ExecutionStoreOptions) (*ExecutionStore, error) {
 	if options.Prefix == "" || options.Router == nil || options.MaxValueBytes <= 0 ||
 		options.MaxItemsPerCall <= 0 || options.MinTTL <= 0 || options.MaxTTL < options.MinTTL ||
-		options.RestartMargin < 0 {
+		options.RestartMargin < 0 || options.MaxNoDataGroups < 0 || options.ReadHoldBound < 0 ||
+		options.ReadHoldBound.Milliseconds() > execution.MaxReadHoldMillis {
 		return nil, fmt.Errorf("state: invalid execution store options")
 	}
-	return &ExecutionStore{options: options, witnesses: newRuntimeWitnessCache(), renewals: newRenewalGate()}, nil
+	if options.MaxNoDataGroups == 0 {
+		options.MaxNoDataGroups = DefaultMaxNoDataGroups
+	}
+	if err := probeBackendCapabilities("execution store", options.Router, executionStoreCapabilities); err != nil {
+		return nil, err
+	}
+	return &ExecutionStore{options: options, witnesses: newRuntimeWitnessCache(),
+		renewals: newRenewalGate(), frozenRenewals: newRenewalGate()}, nil
 }
 
 // runtimeTTL derives how long the keys of one apply request have to survive
 // from that request's Plan retention. StateTTL owns the formula so the two
 // stores cannot drift; the execution store only supplies the deployment bounds.
-func (store *ExecutionStore) runtimeTTL(retention []execution.StateRetentionRequirement) (time.Duration, error) {
+//
+// horizonSeconds, when positive, caps it: a series' runtime state lives at
+// most H past its last write, so one that stops appearing is gone H later
+// rather than a retention span or the deployment's maximum later. The cap
+// never goes below what a series that keeps reporting needs to survive until
+// its next Slot - one evaluation interval, its lateness and the restart
+// margin - because a lifetime shorter than that would lose the state of a
+// series that never went away. Lowering H therefore shortens lifetimes from
+// the next write on, and raising it lengthens them from the next write on:
+// a key that already expired is gone, so nothing reclaimed comes back.
+//
+// The ceiling bounds the lifetime a key is given, so under a horizon it is
+// held against the capped lifetime, not the retention span. A retention whose
+// span is past the ceiling - fourteen points of a sixty-hour interval are 840
+// hours against a 720-hour ceiling - is written for its horizon cap all the
+// same, which is sixty hours and change. Holding the span against the ceiling
+// first refused every round of such a Plan as STATE_BUDGET_EXCEEDED, for a
+// lifetime it was never going to be given: the strategy stopped detecting and
+// nothing about it changed from one round to the next.
+func (store *ExecutionStore) runtimeTTL(retention []execution.StateRetentionRequirement, horizonSeconds int64) (time.Duration, error) {
 	requirements := make([]LevelRequirement, len(retention))
 	for index, level := range retention {
 		// The window facts are left empty: StateTTL reads only the retention,
 		// and it must read exactly the retention the window was built from.
 		requirements[index] = NewLevelRequirement(level, "", 0)
 	}
-	return StateTTL(requirements, store.options.RestartMargin, store.options.MinTTL, store.options.MaxTTL)
+	ttl, err := StateTTL(requirements, store.options.RestartMargin, store.options.MinTTL, store.options.MaxTTL, store.options.ReadHoldBound)
+	if horizonSeconds <= 0 {
+		return ttl, err
+	}
+	limit := horizonLimit(requirements, store.options.RestartMargin, store.options.MinTTL, time.Duration(horizonSeconds)*time.Second, store.options.ReadHoldBound)
+	if err != nil {
+		if !errors.Is(err, ErrStateBudget) {
+			return 0, err
+		}
+		// The span is past the ceiling, so it is past the cap too: the
+		// lifetime written is the cap, and the cap is what has to fit.
+		if limit > store.options.MaxTTL {
+			return 0, fmt.Errorf("%w: lifetime capped at the horizon %s exceeds maximum %s", ErrStateBudget, limit, store.options.MaxTTL)
+		}
+		return limit, nil
+	}
+	return min(ttl, limit), nil
+}
+
+// horizonLimit is the longest a series' runtime state lives under a horizon:
+// the horizon, floored at what a reporting series needs between two writes.
+func horizonLimit(requirements []LevelRequirement, restartMargin, minimum, horizon time.Duration, readHoldBound ...time.Duration) time.Duration {
+	return max(horizon, StateLifetimeFloor(requirements, restartMargin, readHoldBound...), minimum)
+}
+
+// StateLifetimeFloor is the shortest lifetime a series' runtime state can
+// have and still survive from one write to the next while the series keeps
+// reporting: the longest evaluation interval plus its lateness, and the
+// restart margin.
+func StateLifetimeFloor(requirements []LevelRequirement, restartMargin time.Duration, readHoldBound ...time.Duration) time.Duration {
+	var floor time.Duration
+	for _, requirement := range requirements {
+		floor = max(floor, requirement.EvaluationInterval+requirement.LatenessTolerance)
+	}
+	if len(readHoldBound) > 0 {
+		floor += readHoldBound[0]
+	}
+	return floor + restartMargin
 }
 
 // rejectRuntimeBudget reports a retention need no configured TTL can satisfy.
@@ -119,8 +231,9 @@ func rejectRuntimeBudget(items []execution.StateMutation) []execution.StateApply
 	results := make([]execution.StateApplyItemResult, len(items))
 	for index, mutation := range items {
 		results[index] = execution.StateApplyItemResult{Identity: mutation.Identity,
-			Status:     execution.StateApplyDeterministicInvalid,
-			ReasonCode: execution.ReasonCode(contract.ReasonStateBudgetExceeded)}
+			Status:      execution.StateApplyDeterministicInvalid,
+			ReasonCode:  execution.ReasonCode(contract.ReasonStateBudgetExceeded),
+			RefusalRule: RuntimeRuleLifetimePastCeiling}
 	}
 	return results
 }
@@ -129,15 +242,42 @@ func rejectRuntimeBudget(items []execution.StateMutation) []execution.StateApply
 // consecutive items that route to the same storage target. Each value is still
 // classified on its own; a preflight witness is kept per readable key so the
 // following ApplyRuntime can prove what it saw without reading again.
+//
+// Only the framed record is read. The JSON envelope under the older runtime
+// key is not: no binary since the framed record was introduced writes it, the
+// previous upstream snapshot included, so an envelope still present is a
+// record from before that and leaves on its own TTL. A series that only has
+// one starts warming, as a new series does.
+//
+// A second pass reads, for the series still without a record whose Plan
+// carries history from the generation it moved from, that generation's frame.
 func (store *ExecutionStore) LoadRuntime(ctx context.Context, request execution.StatePreflightRequest) (execution.StatePreflightResult, error) {
 	if err := request.Contract.Validate(); err != nil || len(request.Items) == 0 || len(request.Items) > store.options.MaxItemsPerCall {
 		return execution.StatePreflightResult{}, fmt.Errorf("state: invalid runtime load request")
 	}
 	result := execution.StatePreflightResult{Items: make([]execution.RuntimeStateView, len(request.Items))}
+	pass := &runtimeLoadPass{}
 	batch := &runtimeLoadBatch{}
+	roundLargest, anyRead := 0, false
+	flush := func() {
+		bytes, largest, read := store.loadRuntimeBatch(ctx, request, batch, result.Items, pass)
+		result.LoadedBytes += bytes
+		// The frame pass measures, and so does the carry pass: a record it
+		// reads is written this round under the new generation at the size it
+		// was read, and the next round's frame pass reads it there. Leaving it
+		// out committed the empty frame pass's zero as the Query Group's size,
+		// and the next round asked for every carried record in one batch.
+		if read {
+			anyRead = true
+			if largest > roundLargest {
+				roundLargest = largest
+			}
+		}
+		batch.reset()
+	}
 	for index, item := range request.Items {
 		view := execution.RuntimeStateView{Identity: item.Identity, Status: execution.StateMissingWarming}
-		key, err := RuntimeStateKeyV2(store.options.Prefix, item.Identity)
+		framedKey, err := RuntimeStateKeyV3(store.options.Prefix, item.Identity)
 		var target StorageTarget
 		if err == nil {
 			target, err = store.options.Router.Route(item.Identity.Plan.TenantID, item.Identity.Plan.StrategyID)
@@ -146,15 +286,50 @@ func (store *ExecutionStore) LoadRuntime(ctx context.Context, request execution.
 			result.Items[index] = runtimeLoadFailure(view, err)
 			continue
 		}
-		if len(batch.indexes) > 0 && (batch.target.Name != target.Name || len(batch.indexes) >= runtimeLoadBatchItems) {
-			store.loadRuntimeBatch(ctx, request, batch, result.Items)
-			batch.reset()
+		if len(batch.indexes) > 0 && (batch.target.Name != target.Name || len(batch.indexes) >= store.runtimeLoadBatchLimit(request.Contract.Slot.QueryGroup, roundLargest, anyRead)) {
+			flush()
 		}
 		batch.target = target
 		batch.indexes = append(batch.indexes, index)
-		batch.keys = append(batch.keys, key)
+		batch.keys = append(batch.keys, framedKey)
 	}
-	store.loadRuntimeBatch(ctx, request, batch, result.Items)
+	flush()
+	// The second pass, for the series still without a record whose Plan
+	// carries history from the generation it moved from: that generation's
+	// frame, under the same batching and the same byte count as the first.
+	pass.carry = true
+	for index, item := range request.Items {
+		if item.CarryFrom == "" || item.CarryFrom == item.Identity.StateGeneration || result.Items[index].Status != execution.StateMissingWarming {
+			continue
+		}
+		previous := item.Identity
+		previous.StateGeneration = item.CarryFrom
+		carriedKey, err := RuntimeStateKeyV3(store.options.Prefix, previous)
+		var target StorageTarget
+		if err == nil {
+			target, err = store.options.Router.Route(item.Identity.Plan.TenantID, item.Identity.Plan.StrategyID)
+		}
+		if err != nil {
+			pass.carryUnreadable++
+			continue
+		}
+		// Bounded by the largest value the store accepts and not by anything
+		// learned: the frame pass has just found no record for every one of
+		// these series, so what it learned about this Query Group says nothing
+		// about the size of what the previous generation holds.
+		if len(batch.indexes) > 0 && (batch.target.Name != target.Name || len(batch.indexes) >= store.carryLoadBatchLimit()) {
+			flush()
+		}
+		batch.target = target
+		batch.indexes = append(batch.indexes, index)
+		batch.keys = append(batch.keys, carriedKey)
+	}
+	flush()
+	result.CarryFound, result.CarryMissing, result.CarryUnreadable = pass.carryFound, pass.carryMissing, pass.carryUnreadable
+	// One commit for the whole preflight: the round read every key of the
+	// Query Group, so this is a complete measurement of the population rather
+	// than whatever the last batch happened to hold.
+	store.commitValueBytes(request.Contract.Slot.QueryGroup, roundLargest, anyRead)
 	return execution.ClassifyStatePreflight(request, result)
 }
 
@@ -162,15 +337,18 @@ func (store *ExecutionStore) AdmitRuntime(_ context.Context, request execution.S
 	if err := request.Contract.Validate(); err != nil || len(request.Items) == 0 || len(request.Items) > store.options.MaxItemsPerCall {
 		return execution.StateAdmissionResult{}, fmt.Errorf("state: invalid runtime admission request")
 	}
-	if _, err := store.runtimeTTL(request.Retention); err != nil {
+	if _, err := store.runtimeTTL(request.Retention, request.HorizonSeconds); err != nil {
 		if !errors.Is(err, ErrStateBudget) {
 			return execution.StateAdmissionResult{}, fmt.Errorf("state: invalid runtime admission request: %w", err)
 		}
+		// Every mutation of the Plan, under the rule and with the sentence,
+		// which names the lifetime required and the ceiling.
 		result := execution.StateAdmissionResult{Items: make([]execution.StateAdmissionItemResult, len(request.Items))}
 		for index, mutation := range request.Items {
 			result.Items[index] = execution.StateAdmissionItemResult{Identity: mutation.Identity,
-				Status:     execution.StateAdmissionDeterministicInvalid,
-				ReasonCode: execution.ReasonCode(contract.ReasonStateBudgetExceeded)}
+				Status:      execution.StateAdmissionDeterministicInvalid,
+				ReasonCode:  execution.ReasonCode(contract.ReasonStateBudgetExceeded),
+				RefusalRule: RuntimeRuleLifetimePastCeiling, RefusalText: err.Error()}
 		}
 		return result, result.Validate()
 	}
@@ -179,18 +357,41 @@ func (store *ExecutionStore) AdmitRuntime(_ context.Context, request execution.S
 		item := execution.StateAdmissionItemResult{Identity: mutation.Identity, Status: execution.StateAdmissionAccepted}
 		if err := mutation.ValidateDigest(); err != nil {
 			item.Status, item.ReasonCode = execution.StateAdmissionDeterministicInvalid, execution.ReasonCode(contract.ReasonStateCorrupt)
+			item.RefusalRule = PackedRuleMutationDigestMismatch
 			result.Items[index] = item
 			continue
 		}
-		encoded, err := encodeRuntime(mutation, mutation.ExpectedBlobRevision+1)
-		if err != nil || len(encoded) > store.options.MaxValueBytes {
-			item.Status, item.ReasonCode = execution.StateAdmissionDeterministicInvalid, execution.ReasonCode(contract.ReasonStateBudgetExceeded)
+		// Sized in the representation the write stores. The revision only
+		// widens one varint in the header, so any revision measures the same.
+		encoded, refusal, legacyIDs := store.encodeForWrite(mutation, mutation.ExpectedBlobRevision+1)
+		if refusal.reason != "" {
+			item.Status, item.ReasonCode = execution.StateAdmissionDeterministicInvalid, execution.ReasonCode(refusal.reason)
+			item.RefusalRule, item.RefusalText = refusal.rule, refusal.text
 		} else {
-			item.EncodedBytes = len(encoded)
+			item.EncodedBytes, item.LegacyRecordIDs = len(encoded), legacyIDs
+			// The frame measured is the frame the write stores when the key's
+			// revision is still the one the mutation expects; handed back so
+			// a caller that holds it spares the write the same encode.
+			item.Frame = &execution.EncodedStateFrame{MutationDigest: mutation.MutationDigest,
+				Revision: mutation.ExpectedBlobRevision + 1, Bytes: encoded, LegacyRecordIDs: legacyIDs}
 		}
 		result.Items[index] = item
 	}
 	return result, result.Validate()
+}
+
+// frameForWrite is the frame the write stores for one item: the one admission
+// encoded, when it was encoded from this mutation for this revision, and a
+// fresh encode otherwise. The two are the same bytes where the first is used
+// -- one encoder, one mutation, one revision -- so which one is written is a
+// matter of cost only.
+func (store *ExecutionStore) frameForWrite(request execution.StateApplyRequest, index int, mutation execution.StateMutation, revision uint64) ([]byte, writeRefusal, int) {
+	if index < len(request.Frames) {
+		if frame := request.Frames[index]; frame != nil && frame.Revision == revision && frame.MutationDigest == mutation.MutationDigest {
+			return frame.Bytes, writeRefusal{}, frame.LegacyRecordIDs
+		}
+	}
+	return store.encodeForWrite(mutation, revision)
 }
 
 // ApplyRuntime applies without an owner fence. Items whose key was witnessed by
@@ -200,62 +401,54 @@ func (store *ExecutionStore) ApplyRuntime(ctx context.Context, request execution
 	return store.applyRuntime(ctx, request, nil)
 }
 
-func encodeRuntime(mutation execution.StateMutation, revision uint64) ([]byte, error) {
-	levels := append([]execution.RuntimeLevelStateMutation(nil), mutation.Levels...)
-	sort.Slice(levels, func(i, j int) bool { return levels[i].LevelID < levels[j].LevelID })
-	last := int64(0)
-	for _, level := range levels {
-		if level.LastProcessedEventTime > last {
-			last = level.LastProcessedEventTime
-		}
-	}
-	return json.Marshal(runtimeEnvelope{executionStateSchemaV2, mutation.Identity, revision, mutation.ApplyVersion,
-		mutation.MutationDigest, last, mutation.SeriesGuard, levels, mutation.Points})
-}
-
+// decodeRuntime reads a stored framed record and classifies it against the
+// candidate the caller is about to apply. Bytes that do not carry the frame's
+// magic are corrupt: no writer of this or the previous snapshot stores any
+// other shape under the runtime key.
 func decodeRuntime(raw []byte, identity execution.StateKeyIdentity, contractRef execution.FrozenExecutionContractRef, candidate execution.ApplyVersion) execution.RuntimeStateView {
 	invalid := func(reason string) execution.RuntimeStateView {
 		return execution.RuntimeStateView{Identity: identity, BlobRevision: 1, Status: execution.StateDeterministicInvalid,
 			ReasonCode: execution.ReasonCode(reason)}
 	}
-	var value runtimeEnvelope
-	if err := json.Unmarshal(raw, &value); err != nil {
+	if !packedFrame(raw) {
 		return invalid(contract.ReasonStateCorrupt)
 	}
-	if value.Schema != executionStateSchemaV2 {
+	view, err := decodeRuntimePacked(raw, identity)
+	switch {
+	case errors.Is(err, ErrUnsupportedState):
 		return invalid(contract.ReasonStateSchemaUnsupported)
-	}
-	if value.Identity != identity || value.BlobRevision == 0 {
+	case err != nil:
 		return invalid(contract.ReasonStateCorrupt)
 	}
-	levels := make([]execution.RuntimeLevelStateView, len(value.Levels))
-	status := execution.StateFoundReady
-	for i, level := range value.Levels {
-		levels[i] = execution.RuntimeLevelStateView{LevelID: level.LevelID, LevelStateCompatibility: level.LevelStateCompatibility,
-			HistoryCompleteness: level.HistoryCompleteness, GapReasonCode: level.GapReasonCode,
-			WarmupRequirementRef: level.WarmupRequirementRef, LastProcessedEventTime: level.LastProcessedEventTime}
-		if level.HistoryCompleteness == execution.HistoryGapped {
-			status = execution.StateFoundGapped
-		} else if level.HistoryCompleteness == execution.HistoryWarming && status != execution.StateFoundGapped {
-			status = execution.StateFoundWarming
-		}
-	}
-	if value.SeriesGuard != nil {
-		if value.SeriesGuard.Status == execution.HistoryGapped {
-			status = execution.StateFoundGapped
-		} else if value.SeriesGuard.Status == execution.HistoryWarming && status != execution.StateFoundGapped {
-			status = execution.StateFoundWarming
-		}
-	}
-	view := execution.RuntimeStateView{Identity: identity, BlobRevision: value.BlobRevision,
-		PersistedApplyVersion: value.ApplyVersion, PersistedMutationDigest: value.MutationDigest,
-		LastProcessedEventTime: value.LastEventTime, SeriesGuard: value.SeriesGuard, Levels: levels, History: value.History, Status: status}
+	view.Representation = execution.StateRepresentationFramed
+	view.Status = storedLoadStatus(view.Levels, view.SeriesGuard)
 	classified, err := execution.ClassifyStatePreflight(execution.StatePreflightRequest{Contract: contractRef,
 		Items: []execution.StatePreflightItem{{Identity: identity, ApplyVersion: candidate}}}, execution.StatePreflightResult{Items: []execution.RuntimeStateView{view}})
 	if err != nil {
 		return invalid(contract.ReasonStateCorrupt)
 	}
 	return classified.Items[0]
+}
+
+// storedLoadStatus is what the Levels and the series guard say about a record
+// that was found: gapped wins over warming wins over ready.
+func storedLoadStatus(levels []execution.RuntimeLevelStateView, guard *execution.StateGuardFact) execution.StateLoadStatus {
+	status := execution.StateFoundReady
+	for _, level := range levels {
+		if level.HistoryCompleteness == execution.HistoryGapped {
+			status = execution.StateFoundGapped
+		} else if level.HistoryCompleteness == execution.HistoryWarming && status != execution.StateFoundGapped {
+			status = execution.StateFoundWarming
+		}
+	}
+	if guard != nil {
+		if guard.Status == execution.HistoryGapped {
+			status = execution.StateFoundGapped
+		} else if guard.Status == execution.HistoryWarming && status != execution.StateFoundGapped {
+			status = execution.StateFoundWarming
+		}
+	}
+	return status
 }
 
 // readOneRenewing reads one generation-scoped key and, when it is there and its
@@ -293,7 +486,7 @@ func (store *ExecutionStore) readOneRenewing(
 		return nil, nil
 	}
 	if err := RenewGenerationKey(ctx, target, resolved, retention,
-		store.options.RestartMargin, store.options.MinTTL, store.options.MaxTTL, store.renewals); err != nil {
+		store.options.RestartMargin, store.options.MinTTL, store.options.MaxTTL, store.renewals, store.options.ReadHoldBound); err != nil {
 		return nil, err
 	}
 	return values[0], nil
@@ -357,6 +550,17 @@ func (store *ExecutionStore) ApplyGap(ctx context.Context, request execution.Gap
 	if err := request.Contract.Validate(); err != nil || len(request.Items) == 0 || len(request.Items) > store.options.MaxItemsPerCall {
 		return execution.GapGuardApplyResult{}, fmt.Errorf("state: invalid gap apply request")
 	}
+	// Every marker's lifetime before any is written: a request that does not
+	// say what one of its Plans needs is refused whole, not written in part.
+	lifetimes := make([]time.Duration, len(request.Items))
+	for index, mutation := range request.Items {
+		ttl, err := generationWriteTTL(request.Retention, mutation.Identity.Plan,
+			store.options.RestartMargin, store.options.MinTTL, store.options.MaxTTL, store.options.ReadHoldBound)
+		if err != nil {
+			return execution.GapGuardApplyResult{}, fmt.Errorf("state: invalid gap apply request: %w", err)
+		}
+		lifetimes[index] = ttl
+	}
 	result := execution.GapGuardApplyResult{Items: make([]execution.GapGuardApplyItemResult, len(request.Items))}
 	for index, mutation := range request.Items {
 		item := execution.GapGuardApplyItemResult{Identity: mutation.Identity}
@@ -396,6 +600,7 @@ func (store *ExecutionStore) ApplyGap(ctx context.Context, request execution.Gap
 		}
 		raw := values[0]
 		var previous gapEnvelope
+		var sameSlotScopes []execution.GapScopeState
 		if raw != nil {
 			if len(raw) > store.options.MaxValueBytes {
 				item.Status, item.ReasonCode = execution.GapGuardRejected, execution.ReasonCode(contract.ReasonStateBudgetExceeded)
@@ -418,11 +623,18 @@ func (store *ExecutionStore) ApplyGap(ctx context.Context, request execution.Gap
 			if comparison == execution.ApplyVersionEqual {
 				if previous.MutationDigest == mutation.MutationDigest {
 					item.Status = execution.GapGuardAlreadyApplied
-				} else {
-					item.Status = execution.GapGuardConflict
+					result.Items[index] = item
+					continue
 				}
-				result.Items[index] = item
-				continue
+				var extended bool
+				if previous.ScheduleRevision == mutation.ScheduleRevision {
+					sameSlotScopes, extended = execution.ExtendSameSlotGap(previous.Scopes, mutation.Scopes)
+				}
+				if !extended {
+					item.Status = execution.GapGuardConflict
+					result.Items[index] = item
+					continue
+				}
 			}
 		}
 		if previous.MarkerRevision != mutation.ExpectedMarkerRevision {
@@ -430,7 +642,10 @@ func (store *ExecutionStore) ApplyGap(ctx context.Context, request execution.Gap
 			result.Items[index] = item
 			continue
 		}
-		nextScopes := applyGapScopes(previous.Scopes, mutation.Scopes, previous.ScheduleRevision, mutation.ScheduleRevision)
+		nextScopes := sameSlotScopes
+		if nextScopes == nil {
+			nextScopes = applyGapScopes(previous.Scopes, mutation.Scopes, previous.ScheduleRevision, mutation.ScheduleRevision)
+		}
 		if err := validatePersistedGapScopes(nextScopes); err != nil {
 			item.Status, item.ReasonCode = execution.GapGuardRejected, execution.ReasonCode(contract.ReasonStateCorrupt)
 			result.Items[index] = item
@@ -446,14 +661,12 @@ func (store *ExecutionStore) ApplyGap(ctx context.Context, request execution.Gap
 			result.Items[index] = item
 			continue
 		}
-		// Written at the floor, not at the Plan's own derived lifetime and not
-		// without one. The load that runs at the start of every Slot renews it
-		// to whatever this Plan actually needs, so the write only has to make
-		// sure the key is never born immortal - which is what a Plan whose last
-		// act was creating this key used to leave behind. Carrying the Plan's
-		// retention here as well would be a third copy of one fact for a value
-		// the next Slot overwrites anyway.
-		applied, applyErr := backend.CompareAndSet(ctx, key, raw, raw == nil, encoded, GenerationScopedFloor)
+		// Written for the Plan's own lifetime, the one the load renews it to.
+		// It used to be written at the floor on the reasoning that the next
+		// load renews it anyway, and that load comes a whole interval later:
+		// for a Plan whose interval is past a day, the marker this round wrote
+		// was gone before the round that had to read it, every round.
+		applied, applyErr := backend.CompareAndSet(ctx, key, raw, raw == nil, encoded, lifetimes[index])
 		if applyErr != nil {
 			item.Status, item.ReasonCode = execution.GapGuardRetryable, execution.ReasonCode(contract.ReasonStateWriteRetryable)
 		} else if !applied {
@@ -505,6 +718,18 @@ func decodeGap(raw []byte, identity execution.PlanGapIdentity, contractRef execu
 func applyGapScopes(previous []execution.GapScopeState, mutations []execution.GapScopeMutation, previousSchedule, nextSchedule execution.PlanScheduleRevision) []execution.GapScopeState {
 	states := make(map[execution.GapScope]execution.GapScopeState, len(previous))
 	for _, state := range previous {
+		// A warmup count belongs to the schedule revision it was earned under,
+		// and this write moves the marker to a new one. Every scope loses its
+		// count, not only the scopes this mutation names: the envelope carries
+		// one revision for all of them, so a scope left out of the mutation
+		// would keep counting slots observed under a schedule that no longer
+		// exists. It held while every recovery named every scope; the first
+		// mutation that names a subset -- a Slot with no series, which can
+		// speak for the Plan's scopes and not for a Level's -- separated
+		// "the envelope's revision moved" from "the counts were discarded".
+		if previousSchedule != nextSchedule {
+			state.ObservedFullSlots = 0
+		}
 		states[state.Scope] = state
 	}
 	for _, mutation := range mutations {
@@ -516,7 +741,11 @@ func applyGapScopes(previous []execution.GapScopeState, mutations []execution.Ga
 				ReasonCode: mutation.ReasonCode, RequiredFullSlots: mutation.RequiredFullSlots}
 		case execution.GapWarmup:
 			current := states[mutation.Scope]
-			if previousSchedule != nextSchedule || current.RequiredFullSlots != mutation.RequiredFullSlots || current.ReasonCode != mutation.ReasonCode {
+			// The schedule revision is not asked about here: the sweep above
+			// has already discarded every count it invalidates, and asking
+			// again would put one rule in two places. What is left are the
+			// per-scope reasons a count stops applying to its own scope.
+			if current.RequiredFullSlots != mutation.RequiredFullSlots || current.ReasonCode != mutation.ReasonCode {
 				current.ObservedFullSlots = 0
 			}
 			current.Scope, current.Status = mutation.Scope, execution.GapStatusWarming

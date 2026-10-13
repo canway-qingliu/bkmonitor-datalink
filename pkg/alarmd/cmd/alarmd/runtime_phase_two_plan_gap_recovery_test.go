@@ -147,7 +147,6 @@ func TestProductionPhaseTwoPlanGapMarkerRecoversUnderEveryReasonAndScheduleRevis
 			cutoverStallTriggerWindow = variant.triggerWindow
 			t.Cleanup(func() { cutoverStallTriggerWindow = previousWindow })
 			fixture := newCutoverStalledFixture(t, func(cfg *config.Config) {
-				cfg.PhaseTwo.Scheduler.ExpiredRangeEnabled = true
 			})
 			ctx := context.Background()
 			requiredFullSlots := fixture.requiredFullSlots(ctx)
@@ -186,7 +185,6 @@ func TestProductionPhaseTwoPlanGapMarkerRecoversUnderEveryReasonAndScheduleRevis
 // the Query Group keeps its guard instead of reaching FULL.
 func TestProductionPhaseTwoPlanGapMarkerSurvivesPartialData(t *testing.T) {
 	fixture := newCutoverStalledFixture(t, func(cfg *config.Config) {
-		cfg.PhaseTwo.Scheduler.ExpiredRangeEnabled = true
 	})
 	ctx := context.Background()
 	requiredFullSlots := fixture.requiredFullSlots(ctx)
@@ -264,7 +262,15 @@ func (fixture *cutoverStallFixture) driveRecovery(ctx context.Context, options d
 	var result driveResult
 	attempts := 0
 	const maxIterations = 1000
-	for iteration := 1; iteration <= maxIterations && result.firstCurrentFull == 0; iteration++ {
+	// Driven until the marker has had its required FULL Slots, not until the
+	// first FULL completion. The two used to be the same round: a Level under
+	// an active guard could not complete, so the Slot that completed was the
+	// Slot that cleared the marker. Since decision-022 a guarded Level can
+	// recover, so its Slot completes while the marker is still warming, and
+	// stopping at the first completion left the marker one warmup short and
+	// read that as a failure to recover.
+	for iteration := 1; iteration <= maxIterations &&
+		(result.firstCurrentFull == 0 || result.currentDataSlots < options.maxCurrentDataSlots); iteration++ {
 		if nextAt := fixture.runner.NextReadyAt(); nextAt.After(fixture.now()) {
 			fixture.clock.Store(nextAt.UnixMilli() + 1)
 		}

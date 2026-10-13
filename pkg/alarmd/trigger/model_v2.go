@@ -129,6 +129,21 @@ type HistoryView interface {
 	// whether the range held one at all. Zero is a valid source time, so the
 	// answer cannot be carried by the value alone.
 	FirstAnomaly(fromTime, untilTime int64) (int64, bool)
+	// CountObserved reports how many positions in the range the window actually
+	// holds. It separates "nothing was seen here" from "something was seen and
+	// it was not anomalous", which CountAnomalies alone cannot: that returns
+	// zero for both.
+	//
+	// The recovery walk needs the count, not a yes/no on one position. A window
+	// mostly made of holes counts few anomalies for the same reason an empty
+	// one does, so "did this window trigger" can only be answered once the
+	// holes are counted alongside the anomalies.
+	//
+	// Required rather than an optional interface on purpose. An implementation
+	// that silently lacked it would have every position read as unobserved,
+	// and the recovery walk would step over a whole window of real data
+	// looking for evidence it already had.
+	CountObserved(fromTime, untilTime int64) uint32
 }
 
 type LevelHistory struct {
@@ -170,6 +185,16 @@ type EvaluationRequestV2 struct {
 	// answers from what this process sent, and is never nil. The two are
 	// told apart in the gate outcome, not folded into one another.
 	OpenAlerts contract.OpenAlertSet
+	// HoldRecovery is asked about a Level this record would recover: whether
+	// that recovery is held, and why. The caller's own inputs for the Level
+	// this round may have been incomplete, which this package cannot see --
+	// it is handed facts, not the bindings they were detected from. A held
+	// Level is unavailable for that reason instead, before the record's
+	// result, the recovery gate and the envelope are derived, so every one
+	// of them agrees with the verdict. Asked only for a Level that would
+	// recover, so a round that recovers nothing costs nothing. Nil holds
+	// nothing.
+	HoldRecovery func(levelID uint32) (reason string, held bool)
 }
 
 type LevelOutcomeV2 struct {
@@ -202,19 +227,25 @@ type EvaluationCountsV2 struct {
 	Events      uint64
 }
 
-// The causes a RECOVERY envelope is held for. The set is closed: a metric
-// label is made of it.
+// The states of another Level a RECOVERY record can be decided beside. The
+// set is closed: a metric label is made of it. None of them holds the
+// envelope; see recoveryGateV2.
 const (
-	// RecoveryHeldLevelUnavailable: a Level could not be evaluated at all, so
-	// whether it is still in alarm is unknown.
-	RecoveryHeldLevelUnavailable = "level_unavailable"
-	// RecoveryHeldLevelRecovering: a Level read NORMAL with recovery enabled,
-	// which means a window inside its recovery span still meets its trigger.
-	RecoveryHeldLevelRecovering = "level_recovering"
-	// RecoveryHeldNoOpenAlert: every Level agreed, and the consumer holds no
-	// open alert on the series, so there is nothing for the envelope to
-	// resolve. This is the second gate's cause; it is counted apart from the
-	// two above, which are about Levels.
+	// RecoveryBesideLevelUnavailable: another Level could not be evaluated.
+	RecoveryBesideLevelUnavailable = "level_unavailable"
+	// RecoveryBesideLevelRecovering: another Level read NORMAL with recovery
+	// enabled, so a window inside its recovery span still meets its trigger.
+	RecoveryBesideLevelRecovering = "level_recovering"
+	// RecoveryBesideLevelWithoutRecovery: another Level read NORMAL with its
+	// recovery disabled.
+	RecoveryBesideLevelWithoutRecovery = "level_without_recovery"
+)
+
+// The causes a RECOVERY envelope is held for, all from the open alert set.
+// The set is closed: a metric label is made of it.
+const (
+	// RecoveryHeldNoOpenAlert: the consumer holds no open alert on the
+	// series, so there is nothing for the envelope to resolve.
 	RecoveryHeldNoOpenAlert = "no_open_alert"
 	// RecoveryHeldFingerprintUnknown: the series identity the consumer keys
 	// alerts by could not be built, so membership cannot be asked. Not "not a
@@ -223,13 +254,19 @@ const (
 	RecoveryHeldFingerprintUnknown = "fingerprint_unknown"
 )
 
-// The outcomes of the second recovery gate, the open alert set. The set is
+// The outcomes of the recovery gate, the open alert set. The set is
 // closed: a metric label is made of it. Each is reachable in production:
 // the first four from a Plan on the alert consumer's protocol against a
 // set, the last from a Plan on any other protocol.
 const (
 	// OpenAlertGatePassed: the consumer holds an open alert; the envelope goes.
 	OpenAlertGatePassed = "passed"
+	// OpenAlertGatePassedOneTimeClose: the one close of a group the target
+	// dropped, asked against a set that lets it through (a
+	// contract.OneTimeCloseSet); the envelope goes whether or not the
+	// consumer holds the alert, and where it does not the close is an orphan
+	// there.
+	OpenAlertGatePassedOneTimeClose = "passed_one_time_close"
 	// OpenAlertGateHeldNoOpenAlert: see RecoveryHeldNoOpenAlert.
 	OpenAlertGateHeldNoOpenAlert = "held_no_open_alert"
 	// OpenAlertGateHeldFingerprintUnknown: see RecoveryHeldFingerprintUnknown.
@@ -240,31 +277,27 @@ const (
 	OpenAlertGateNotConfigured = "not_configured"
 	// OpenAlertGateProtocolNotGated: the Plan does not publish the alert
 	// consumer's protocol, so the consumer's open alert set has nothing to
-	// say about its envelope. The compatibility protocol carries anomalies
-	// only and drops the RECOVERY envelope at the sink; alarmd's own decision
-	// event has no consumer that keeps an open alert set. The set is not
-	// asked.
+	// say about its envelope. That is the compatibility protocol, which
+	// carries anomalies only: its RECOVERY envelope is not built at all
+	// (EvaluationResultV2.WithoutMessageFormat). The set is not asked.
 	OpenAlertGateProtocolNotGated = "protocol_not_gated"
 )
 
-// RecoveryGateV2 is what became of a record whose evaluated Levels agreed on
-// RECOVERY. The envelope that record would produce resolves the alert on its
-// series at the consumer, whatever Level that alert stands at, so every Level
-// has to have had its say: a Level whose state is unknown, or whose recovery
-// span still holds a triggering window, has not agreed and holds the envelope.
-// The Level results themselves are unaffected and still reach the state.
+// RecoveryGateV2 is what became of a record whose evaluated Levels came to
+// RECOVERY and none to ABNORMAL. Only the open alert set holds its envelope;
+// another Level's state does not (recoveryGateV2).
 type RecoveryGateV2 struct {
-	Held bool
-	// Cause and LevelID name the first Level that held the envelope.
-	Cause   string
-	LevelID uint32
-	// PassedLevelWithoutRecovery reports an envelope sent past a NORMAL Level
-	// whose recovery is disabled. Such a Level can never say RECOVERY, so it is
-	// not asked; the count says whether that shape exists in a deployment.
-	PassedLevelWithoutRecovery bool
-	// OpenAlertGate is the second gate's outcome, one of the OpenAlertGate*
-	// values. It is empty when the first gate held, because the second was
-	// then not asked: a record is counted by at most one of the two.
+	// Held and Cause are the open alert set's: one of the RecoveryHeld*
+	// values when it held the envelope.
+	Held  bool
+	Cause string
+	// Beside and BesideLevelID name the first other Level the record was
+	// decided beside, one of the RecoveryBeside* values, or empty when every
+	// other Level agreed or was suppressed.
+	Beside        string
+	BesideLevelID uint32
+	// OpenAlertGate is the open alert set's outcome, one of the
+	// OpenAlertGate* values, for every RECOVERY record.
 	OpenAlertGate string
 }
 
@@ -278,4 +311,11 @@ type EvaluationResultV2 struct {
 	// leaves TriggerEvent nil while RecordResult stays RECOVERY. Held is the
 	// union of both gates; Cause says which.
 	RecoveryGate RecoveryGateV2
+	// WithoutMessageFormat is set when the record decided an event its
+	// Plan's protocol has no message for (contract.NoMessageFor): under the
+	// compatibility protocol, every RECOVERY that passed the gates. The
+	// envelope is not built and TriggerEvent stays nil; this names the
+	// resolved wire format, and RecordResult the kind, so the record still
+	// stands for one event the protocol had no message for.
+	WithoutMessageFormat string
 }

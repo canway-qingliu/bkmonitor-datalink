@@ -17,33 +17,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Shopify/sarama"
+	enginekafka "github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/kafka"
 )
-
-// InputMode selects the only active input source for one phase-two worker.
-// Runtime dispatch is mode-specific; neither source identity enters Slot,
-// State, Progress or Event contracts.
-type InputMode string
-
-const InputModeGoAccess InputMode = "go_access"
-
-// PhaseTwoInputConfig is the input-selection schema. Go Access is the only
-// mode, and the default; the field stays so that a deployment naming a mode
-// this build does not have is refused by name rather than ignored.
-type PhaseTwoInputConfig struct {
-	Mode InputMode `yaml:"mode"`
-}
-
-func DefaultPhaseTwoInput() PhaseTwoInputConfig {
-	return PhaseTwoInputConfig{Mode: InputModeGoAccess}
-}
-
-func (c PhaseTwoInputConfig) Validate() error {
-	if c.Mode != InputModeGoAccess {
-		return fmt.Errorf("phase-two input mode %q is not supported", c.Mode)
-	}
-	return nil
-}
 
 var phaseTwoKafkaTopicNamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
@@ -88,15 +63,8 @@ func validatePhaseTwoKafkaOutput(c KafkaConfig) error {
 	if c.TriggerEvent.MaxMessageBytes <= 0 {
 		return errors.New("kafka producer: trigger_event.max_message_bytes must be positive")
 	}
-	version, err := sarama.ParseKafkaVersion(c.BrokerVersion)
-	if err != nil {
-		return fmt.Errorf("kafka producer: broker_version %q: %w", c.BrokerVersion, err)
-	}
-	if !version.IsAtLeast(sarama.V0_10_2_0) || !sarama.MaxVersion.IsAtLeast(version) {
-		return fmt.Errorf(
-			"kafka producer: broker_version %q is outside supported range 0.10.2.0..%s",
-			c.BrokerVersion, sarama.MaxVersion,
-		)
+	if _, err := enginekafka.ValidateBrokerVersion("kafka producer", c.BrokerVersion); err != nil {
+		return err
 	}
 	return nil
 }

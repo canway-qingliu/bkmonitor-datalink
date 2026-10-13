@@ -97,3 +97,43 @@ func TestDiagnosticsListenMustNotCollideWithQuerySurface(t *testing.T) {
 		})
 	}
 }
+
+// The configuration asks for a restricted surface exactly when the process
+// serves the CLI with an administrator key; whether it is restricted is the
+// runtime's to settle once the CLI is up. Neither a key without an internal
+// listener nor a key with the CLI off is refused: the process runs and
+// reports what it lacks rather than stop detecting.
+func TestTheKeyAsksForRestrictionAndNothingAboutItIsRefused(t *testing.T) {
+	key := strings.Repeat("k", 40)
+	cases := []struct {
+		name, key, listener, wantErr string
+		requested                    bool
+	}{
+		{name: "no key, no internal listener"},
+		{name: "no key, internal listener", listener: "0.0.0.0:8081"},
+		{name: "key without internal listener", key: key, requested: true},
+		{name: "key with internal listener", key: key, listener: "0.0.0.0:8081", requested: true},
+		{name: "internal listener on the query port", listener: "0.0.0.0:8080", wantErr: "must differ from http listen"},
+		{name: "internal listener on the diagnostics port", listener: "127.0.0.1:6060", wantErr: "must differ from http diagnostics_listen"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			cfg := validGoAccessConfigObject()
+			cfg.HTTP.Listen, cfg.HTTP.DiagnosticsListen = "127.0.0.1:8080", "127.0.0.1:6060"
+			cfg.CLI.AdminKey, cfg.HTTP.InternalListen = testCase.key, testCase.listener
+			if cfg.PublicSurfaceRestrictionRequested() != testCase.requested {
+				t.Fatalf("requested = %v, want %v", cfg.PublicSurfaceRestrictionRequested(), testCase.requested)
+			}
+			err := cfg.Validate()
+			if testCase.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validate = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), testCase.wantErr) {
+				t.Fatalf("validate = %v, want error containing %q", err, testCase.wantErr)
+			}
+		})
+	}
+}

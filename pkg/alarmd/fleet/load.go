@@ -98,12 +98,16 @@ const (
 // its own; and the demoted objects that skipped within the window -- the
 // refusal's consequence, apart because no capacity changes it.
 type LoadLoss struct {
-	State               LossState `json:"state"`
-	Ongoing             int       `json:"ongoing"`
-	AfterRestart        int       `json:"after_restart"`
-	WhileDemotedRecent  int       `json:"while_demoted_recent"`
-	WindowSeconds       int       `json:"window_seconds"`
-	RestartGraceSeconds int       `json:"restart_grace_seconds"`
+	State        LossState `json:"state"`
+	Ongoing      int       `json:"ongoing"`
+	AfterRestart int       `json:"after_restart"`
+	// AfterCooldown is the recent records a cooldown held on an object that
+	// has since left the pool: with the restart's, a loss that names its
+	// mechanism and asks no capacity question. In progress all the same.
+	AfterCooldown       int `json:"after_cooldown"`
+	WhileDemotedRecent  int `json:"while_demoted_recent"`
+	WindowSeconds       int `json:"window_seconds"`
+	RestartGraceSeconds int `json:"restart_grace_seconds"`
 }
 
 // Bottleneck is the resource the evidence points at, or that it points at
@@ -205,11 +209,13 @@ const (
 	permitWaitShareBottleneck = 0.5
 )
 
-// LoadOf decides the judgment from the view.
-func LoadOf(view *View, now time.Time) Load {
+// loadOf decides the judgment from the view's replica facts and the loss
+// its records were counted into, which replicas' parts add up to
+// (ReplicaPart.Loss).
+func loadOf(view *View, loss LoadLoss) Load {
 	load := Load{Limits: []LoadLimit{LimitNoHeadroomEstimate}}
 	load.OnTime, load.Backlog = onTimeOf(view.Schedule), backlogOf(view.Schedule)
-	load.Loss = lossOfView(view, now)
+	load.Loss = loss
 	// The restart's catch-up asks no capacity question: only a loss by some
 	// other mechanism does.
 	behind := load.OnTime.State == OnTimeFallingBehind || load.OnTime.State == OnTimeCatchingUp ||
@@ -287,28 +293,62 @@ func backlogOf(census *ScheduleCensus) LoadBacklog {
 	return reading
 }
 
-// lossOfView counts the records the way the first screen does: in progress
-// when not demoted and within the window; the demoted objects' recent
-// skips apart.
-func lossOfView(view *View, now time.Time) LoadLoss {
-	reading := LoadLoss{State: LossNone, WindowSeconds: int(RecentSkipWindow / time.Second),
+// lossesOfView walks the view's records once for two readings. reading is
+// the load's loss, counted the way the first screen counts: in progress when
+// not demoted and within the window; the demoted objects' recent skips apart.
+// byLoss is the census: the retained records by what each is, every kind
+// present at zero, and graceUnknown how many could not be judged against a
+// restart for want of an anchor. Distinct records, one per object per record
+// kind, the same walk the lines make -- so the family a scrape exports and
+// the counts the page prints come from one reading. Bookkeeping records are
+// not losses of detection and are left out, as the lines leave them out.
+func lossesOfView(view *View, now time.Time) (reading LoadLoss, byLoss map[Loss]int, graceUnknown int) {
+	reading = LoadLoss{State: LossNone, WindowSeconds: int(RecentSkipWindow / time.Second),
 		RestartGraceSeconds: int(RestartCatchUpGrace / time.Second)}
-	lossRecords(view, now, func(_ string, _, _ Check, _ string, skip SkippedSpan, loss Loss) {
+	byLoss = make(map[Loss]int, len(Losses))
+	for _, loss := range Losses {
+		byLoss[loss] = 0
+	}
+	lossRecords(view, now, func(_ string, check, _ Check, _ string, skip SkippedSpan, loss Loss, unknown bool) {
 		switch loss {
 		case LossOngoing:
 			reading.Ongoing++
 		case LossAfterRestart:
 			reading.AfterRestart++
+		case LossAfterCooldown:
+			reading.AfterCooldown++
 		case LossWhileDemoted:
 			if now.Sub(skip.At) <= RecentSkipWindow {
 				reading.WhileDemotedRecent++
 			}
 		}
+		if check == CheckBookkeepingAbandoned {
+			return
+		}
+		byLoss[loss]++
+		if unknown && now.Sub(skip.At) <= RecentSkipWindow {
+			graceUnknown++
+		}
 	})
-	if reading.Ongoing > 0 || reading.AfterRestart > 0 {
+	return reading.settled(), byLoss, graceUnknown
+}
+
+// settled names the loss's state from its counts.
+func (reading LoadLoss) settled() LoadLoss {
+	reading.State = LossNone
+	if reading.Ongoing > 0 || reading.AfterRestart > 0 || reading.AfterCooldown > 0 {
 		reading.State = LossInProgress
 	}
 	return reading
+}
+
+// mergeLoss adds one replica's loss counts into another's.
+func mergeLoss(into *LoadLoss, from LoadLoss) {
+	into.Ongoing += from.Ongoing
+	into.AfterRestart += from.AfterRestart
+	into.AfterCooldown += from.AfterCooldown
+	into.WhileDemotedRecent += from.WhileDemotedRecent
+	into.WindowSeconds, into.RestartGraceSeconds = from.WindowSeconds, from.RestartGraceSeconds
 }
 
 // bottleneckOf names the resource the evidence points at. Most specific

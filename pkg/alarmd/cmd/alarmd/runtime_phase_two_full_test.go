@@ -12,12 +12,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -32,6 +29,7 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/contract"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/controlplane"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/internal/redistest"
 	enginekafka "github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/kafka"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/metric"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/observability"
@@ -76,6 +74,7 @@ func TestProductionPhaseTwoBundleKeepsThePlatformCacheApartFromItsOwnStore(t *te
 	}
 
 	uqServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
 		_, _ = writer.Write([]byte(`{"series":[],"status":null,"trace_id":"unused","is_partial":false,"result_table_id":[]}`))
 	}))
 	defer uqServer.Close()
@@ -101,9 +100,9 @@ func TestProductionPhaseTwoBundleKeepsThePlatformCacheApartFromItsOwnStore(t *te
 		},
 		phaseTwoProductionExternalDependencies{
 			Now: time.Now, HTTPClient: uqServer.Client(),
-			OpenEvents: func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
+			PrepareEvents: preparedEvents(func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
 				return &recordingPhaseTwoEventSink{}, nil
-			},
+			}),
 		},
 	)
 	if err != nil {
@@ -114,6 +113,9 @@ func TestProductionPhaseTwoBundleKeepsThePlatformCacheApartFromItsOwnStore(t *te
 	}
 	if len(bundle.queryGroups) != 1 {
 		t.Fatalf("selected strategies compiled to Query Groups = %v, want exactly one", bundle.queryGroups)
+	}
+	if bundle.dependencies.ActivationBlocked == nil {
+		t.Fatal("the production bundle does not read the Query Groups a cutover held back")
 	}
 	sourceKeys, err := sourceClient.Keys(ctx, cfg.Redis.StatePrefix+"*").Result()
 	if err != nil || len(sourceKeys) != 0 {
@@ -143,6 +145,7 @@ func TestProductionPhaseTwoBundleStartsIdleWithEmptyCatalogThenActivatesQueryGro
 	}
 
 	uqServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
 		_, _ = writer.Write([]byte(`{"series":[],"status":null,"trace_id":"unused","is_partial":false,"result_table_id":[]}`))
 	}))
 	defer uqServer.Close()
@@ -168,9 +171,9 @@ func TestProductionPhaseTwoBundleStartsIdleWithEmptyCatalogThenActivatesQueryGro
 				defer observationsMu.Unlock()
 				observations = append(observations, observation)
 			}),
-			OpenEvents: func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
+			PrepareEvents: preparedEvents(func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
 				return &recordingPhaseTwoEventSink{}, nil
-			},
+			}),
 		},
 	)
 	if err != nil {
@@ -183,7 +186,7 @@ func TestProductionPhaseTwoBundleStartsIdleWithEmptyCatalogThenActivatesQueryGro
 		t.Fatalf("empty Catalog runtime Query Groups/runners = %v/%d, want healthy idle", bundle.queryGroups, len(bundle.runners))
 	}
 	productionControl := bundle.dependencies.Control.(*productionPhaseTwoControl)
-	activation, err := productionControl.dependencies.Repository.LoadActivation(ctx)
+	activation, err := productionControl.dependencies.Repository.(*controlplane.RedisCatalogRepository).LoadActivation(ctx)
 	if err != nil || activation.RecordRevision != 1 || len(activation.Plans) != 0 {
 		t.Fatalf("empty Catalog activation = %+v, %v", activation, err)
 	}
@@ -203,7 +206,7 @@ func TestProductionPhaseTwoBundleStartsIdleWithEmptyCatalogThenActivatesQueryGro
 	if len(bundle.queryGroups) != 1 || len(bundle.runners) != 1 {
 		t.Fatalf("activated Query Groups/runners = %v/%d, want one", bundle.queryGroups, len(bundle.runners))
 	}
-	activation, err = productionControl.dependencies.Repository.LoadActivation(ctx)
+	activation, err = productionControl.dependencies.Repository.(*controlplane.RedisCatalogRepository).LoadActivation(ctx)
 	if err != nil || activation.RecordRevision != 2 || len(activation.Plans) != 1 {
 		t.Fatalf("non-empty Catalog activation = %+v, %v", activation, err)
 	}
@@ -238,6 +241,7 @@ func TestProductionPhaseTwoBundleRebuildsExpiredSnapshotReferencedByPersistentAc
 	}
 
 	uqServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
 		_, _ = writer.Write([]byte(`{"series":[],"status":null,"trace_id":"unused","is_partial":false,"result_table_id":[]}`))
 	}))
 	defer uqServer.Close()
@@ -255,9 +259,9 @@ func TestProductionPhaseTwoBundleRebuildsExpiredSnapshotReferencedByPersistentAc
 			},
 			phaseTwoProductionExternalDependencies{
 				Now: time.Now, HTTPClient: uqServer.Client(),
-				OpenEvents: func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
+				PrepareEvents: preparedEvents(func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
 					return &recordingPhaseTwoEventSink{}, nil
-				},
+				}),
 			},
 		)
 		if openErr != nil {
@@ -271,7 +275,7 @@ func TestProductionPhaseTwoBundleRebuildsExpiredSnapshotReferencedByPersistentAc
 		t.Fatalf("first Start() error = %v", err)
 	}
 	firstControl := first.dependencies.Control.(*productionPhaseTwoControl)
-	oldActivation, err := firstControl.dependencies.Repository.LoadActivation(ctx)
+	oldActivation, err := firstControl.dependencies.Repository.LoadActivationHead(ctx)
 	if err != nil || oldActivation.Current.SnapshotRevision == "" {
 		t.Fatalf("first activation = %+v, %v", oldActivation, err)
 	}
@@ -282,28 +286,8 @@ func TestProductionPhaseTwoBundleRebuildsExpiredSnapshotReferencedByPersistentAc
 	if groups, loadErr := firstControl.LoadActive(ctx); loadErr != nil || len(groups.QueryGroups) != 1 {
 		t.Fatalf("v2 follower LoadActive()=(%+v,%v)", groups, loadErr)
 	}
-	originalActivation, err := redisClient.Get(ctx, activationKey).Bytes()
-	if err != nil {
-		t.Fatal(err)
-	}
-	legacyActivation := oldActivation
-	legacyActivation.SchemaVersion = "alarmd-control-activation-v1"
-	legacyActivation.ActiveQGSetRef = controlplane.ActiveQueryGroupSetRef{}
-	legacyPayload, err := json.Marshal(legacyActivation)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := redisClient.Set(ctx, activationKey, legacyPayload, 0).Err(); err != nil {
-		t.Fatal(err)
-	}
-	if groups, loadErr := firstControl.LoadActive(ctx); loadErr != nil || len(groups.QueryGroups) != 1 {
-		t.Fatalf("v1 follower LoadActive()=(%+v,%v)", groups, loadErr)
-	}
 	if got := scanHook.count.Load(); got != 0 {
-		t.Fatalf("v1/v2 follower LoadActive SCAN calls=%d, want 0", got)
-	}
-	if err := redisClient.Set(ctx, activationKey, originalActivation, 0).Err(); err != nil {
-		t.Fatal(err)
+		t.Fatalf("v2 follower LoadActive SCAN calls=%d, want 0", got)
 	}
 	if err := first.Shutdown(ctx); err != nil {
 		t.Fatalf("first Shutdown() error = %v", err)
@@ -362,7 +346,7 @@ func TestProductionPhaseTwoBundleRebuildsExpiredSnapshotReferencedByPersistentAc
 		t.Fatalf("refreshAndReconcile(rebuild expired Snapshot) error = %v", err)
 	}
 	recoveredControl := recovered.dependencies.Control.(*productionPhaseTwoControl)
-	newActivation, err := recoveredControl.dependencies.Repository.LoadActivation(ctx)
+	newActivation, err := recoveredControl.dependencies.Repository.LoadActivationHead(ctx)
 	if err != nil {
 		t.Fatalf("recovered activation error = %v", err)
 	}
@@ -508,6 +492,7 @@ func testProductionPhaseTwoStrandedLatest(
 	}
 
 	uqServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
 		_, _ = writer.Write([]byte(`{"series":[],"status":null,"trace_id":"unused","is_partial":false,"result_table_id":[]}`))
 	}))
 	defer uqServer.Close()
@@ -527,9 +512,9 @@ func testProductionPhaseTwoStrandedLatest(
 			},
 			phaseTwoProductionExternalDependencies{
 				Now: func() time.Time { return time.Unix(nowUnix.Load(), 0) }, HTTPClient: uqServer.Client(),
-				OpenEvents: func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
+				PrepareEvents: preparedEvents(func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
 					return &recordingPhaseTwoEventSink{}, nil
-				},
+				}),
 			},
 		)
 		if openErr != nil {
@@ -543,7 +528,7 @@ func testProductionPhaseTwoStrandedLatest(
 		t.Fatalf("first Start() error = %v", err)
 	}
 	firstControl := first.dependencies.Control.(*productionPhaseTwoControl)
-	oldActivation, err := firstControl.dependencies.Repository.LoadActivation(ctx)
+	oldActivation, err := firstControl.dependencies.Repository.(*controlplane.RedisCatalogRepository).LoadActivation(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -563,12 +548,9 @@ func testProductionPhaseTwoStrandedLatest(
 		}
 		return result
 	}
-	if result := refreshSource(); result.Status != controlplane.SourceRefreshPendingConfirmation {
-		t.Fatalf("first changed source refresh = %+v, want pending", result)
-	}
 	latest := refreshSource()
 	if latest.Status != controlplane.SourceRefreshPublished || latest.Publication == oldActivation.Current {
-		t.Fatalf("confirmed changed source refresh = %+v, want a new publication", latest)
+		t.Fatalf("changed source refresh = %+v, want a new publication", latest)
 	}
 	defer func() { _ = first.Shutdown(ctx) }()
 	nowUnix.Add(2)
@@ -608,7 +590,7 @@ func testProductionPhaseTwoStrandedLatest(
 	var scheduleBefore string
 	scheduleKey := catalogPrefix + ":schedule_timeline:" + string(oldSnapshot.QueryGroups[0].Identity)
 	if !wantRecovery {
-		activationBefore, err = firstControl.dependencies.Repository.LoadActivation(ctx)
+		activationBefore, err = firstControl.dependencies.Repository.LoadActivationHead(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -659,7 +641,7 @@ func testProductionPhaseTwoStrandedLatest(
 		!errors.Is(result.Cause, controlplane.ErrSnapshotUnavailable) {
 		t.Fatalf("rejected Refresh()=(%+v,%v), want Snapshot unavailable without activation", result, refreshErr)
 	}
-	activation, err := firstControl.dependencies.Repository.LoadActivation(ctx)
+	activation, err := firstControl.dependencies.Repository.LoadActivationHead(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -726,6 +708,7 @@ func testProductionFullTargetFlow(t *testing.T, diagnostic bool) {
 	now := func() time.Time { return time.Unix(clock.Load(), 0) }
 	var uqCalls atomic.Int64
 	uqServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
 		uqCalls.Add(1)
 		if request.URL.Path != "/query/ts" || request.Header.Get("Bk-Query-Source") != "alarmd" ||
 			request.Header.Get("X-Bk-Tenant-Id") != "tenant-a" || request.Header.Get("X-Bk-Scope-Space-Uid") != "bkcc__2" {
@@ -779,9 +762,9 @@ func testProductionFullTargetFlow(t *testing.T, diagnostic bool) {
 		},
 		phaseTwoProductionExternalDependencies{
 			Now: now, HTTPClient: uqServer.Client(), AdditionalObserver: additionalObserver,
-			OpenEvents: func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
+			PrepareEvents: preparedEvents(func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
 				return events, nil
-			},
+			}),
 		},
 	)
 	if err != nil {
@@ -802,7 +785,7 @@ func testProductionFullTargetFlow(t *testing.T, diagnostic bool) {
 		bundle.dependencies.TargetFlow = f
 	}
 	clock.Store(base + 1)
-	if err := bundle.runScheduledOnce(ctx); err != nil {
+	if err := runScheduledOnceSettled(ctx, bundle); err != nil {
 		t.Fatalf("phase-two production Slot error = %v", err)
 	}
 	if uqCalls.Load() != 1 {
@@ -945,6 +928,7 @@ func TestProductionPhaseTwoBundleKeepsHealthyQueryGroupWhenSiblingEventACKIsRetr
 	now := func() time.Time { return time.Unix(clock.Load(), 0) }
 	var uqCalls atomic.Int64
 	uqServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
 		uqCalls.Add(1)
 		_, _ = writer.Write([]byte(`{"series":[{"name":"_result0","columns":["_time","_result"],"types":["int64","float64"],"group_keys":["host"],"group_values":["127.0.0.1"],"values":[[` +
 			strconv.FormatInt((base-1)*1000, 10) + `,95]]}],"status":null,"trace_id":"g3b-query","is_partial":false,"result_table_id":[]}`))
@@ -982,9 +966,9 @@ func TestProductionPhaseTwoBundleKeepsHealthyQueryGroupWhenSiblingEventACKIsRetr
 				defer observationsMu.Unlock()
 				observations = append(observations, observation)
 			}),
-			OpenEvents: func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
+			PrepareEvents: preparedEvents(func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
 				return events, nil
-			},
+			}),
 		},
 	)
 	if err != nil {
@@ -1005,7 +989,7 @@ func TestProductionPhaseTwoBundleKeepsHealthyQueryGroupWhenSiblingEventACKIsRetr
 	}
 	bundle.mu.Unlock()
 	clock.Store(base + 1)
-	if err := bundle.runScheduledOnce(ctx); err != nil {
+	if err := runScheduledOnceSettled(ctx, bundle); err != nil {
 		t.Fatalf("runScheduledOnce(retryable sibling) error = %v", err)
 	}
 	if uqCalls.Load() != 2 {
@@ -1086,12 +1070,13 @@ func TestProductionPhaseTwoBundleKeepsHealthyQueryGroupWhenSiblingInitialFreezeL
 	ctx := context.Background()
 	installTwoPhaseTwoStrategies(t, ctx, redisClient)
 
-	base := time.Now().Unix()
+	base := phaseTwoClockAhead(1)
 	var clock atomic.Int64
 	clock.Store(base * 1000)
 	now := func() time.Time { return time.UnixMilli(clock.Load()) }
 	var uqCalls atomic.Int64
 	uqServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
 		uqCalls.Add(1)
 		_, _ = writer.Write([]byte(`{"series":[],"status":null,"trace_id":"g3b-snapshot-isolation","is_partial":false,"result_table_id":[]}`))
 	}))
@@ -1121,7 +1106,7 @@ func TestProductionPhaseTwoBundleKeepsHealthyQueryGroupWhenSiblingInitialFreezeL
 		},
 		phaseTwoProductionExternalDependencies{
 			Now: now, HTTPClient: uqServer.Client(),
-			OpenEvents: func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) { return events, nil },
+			PrepareEvents: preparedEvents(func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) { return events, nil }),
 		},
 	)
 	if err != nil {
@@ -1156,7 +1141,7 @@ func TestProductionPhaseTwoBundleKeepsHealthyQueryGroupWhenSiblingInitialFreezeL
 	clock.Store((base + 1) * 1000)
 	healthy := queryGroupsByStrategy["1002"]
 	failed := queryGroupsByStrategy["1001"]
-	healthyResult, healthyAttempted, err := bundle.runners[healthy].runner.RunOne(ctx)
+	healthyResult, healthyAttempted, err := settledRunner(bundle, healthy).RunOne(ctx)
 	if err != nil || !healthyAttempted || !healthyResult.Completed {
 		t.Fatalf("healthy RunOne() = (%+v, %t, %v)", healthyResult, healthyAttempted, err)
 	}
@@ -1178,7 +1163,7 @@ func TestProductionPhaseTwoBundleKeepsHealthyQueryGroupWhenSiblingInitialFreezeL
 	if err := repository.ConfigureObjectCache(1, 1); err != nil {
 		t.Fatal(err)
 	}
-	failedResult, failedAttempted, failedErr := bundle.runners[failed].runner.RunOne(ctx)
+	failedResult, failedAttempted, failedErr := settledRunner(bundle, failed).RunOne(ctx)
 	if failedErr != nil || !failedAttempted || failedResult.Completed || failedResult.Result != observability.ResultRetrying ||
 		failedResult.ReasonCode != execution.ReasonCode(contract.ReasonSlotSourceRetry) {
 		t.Fatalf("failed RunOne() = (%+v, %t, %v)", failedResult, failedAttempted, failedErr)
@@ -1206,7 +1191,7 @@ func TestProductionPhaseTwoBundleKeepsHealthyQueryGroupWhenSiblingInitialFreezeL
 		t.Fatal(err)
 	}
 	clock.Store((base + int64((30*time.Minute)/time.Second)) * 1000)
-	recoveredResult, recoveredAttempted, err := bundle.runners[failed].runner.RunOne(ctx)
+	recoveredResult, recoveredAttempted, err := settledRunner(bundle, failed).RunOne(ctx)
 	if err != nil || !recoveredAttempted || !recoveredResult.Completed ||
 		recoveredResult.ReasonCode != execution.ReasonCode(contract.ReasonSnapshotUnavailable) {
 		t.Fatalf("RunOne(recovered after deadline) = (%+v, %t, %v)", recoveredResult, recoveredAttempted, err)
@@ -1228,13 +1213,13 @@ func TestProductionPhaseTwoBundleDrainsExpiredRetiredBacklogWithoutProjection(t 
 	ctx := context.Background()
 	installTwoPhaseTwoStrategies(t, ctx, redisClient)
 
-	base := time.Now().Unix()
-	base -= base % 60
+	base := phaseTwoClockAhead(60)
 	var clock atomic.Int64
 	clock.Store(base * 1000)
 	now := func() time.Time { return time.UnixMilli(clock.Load()) }
 	var uqCalls atomic.Int64
 	uqServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
 		uqCalls.Add(1)
 		_, _ = writer.Write([]byte(`{"series":[],"status":null,"trace_id":"unexpected-retired-query","is_partial":false,"result_table_id":[]}`))
 	}))
@@ -1263,9 +1248,9 @@ func TestProductionPhaseTwoBundleDrainsExpiredRetiredBacklogWithoutProjection(t 
 		},
 		phaseTwoProductionExternalDependencies{
 			Now: now, HTTPClient: uqServer.Client(),
-			OpenEvents: func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
+			PrepareEvents: preparedEvents(func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
 				return &recordingPhaseTwoEventSink{}, nil
-			},
+			}),
 		},
 	)
 	if err != nil {
@@ -1324,7 +1309,7 @@ func TestProductionPhaseTwoBundleDrainsExpiredRetiredBacklogWithoutProjection(t 
 		t.Fatalf("refreshAndReconcile(confirm strategy 1001 retirement) error = %v", err)
 	}
 	productionControl := bundle.dependencies.Control.(*productionPhaseTwoControl)
-	activation, err := productionControl.dependencies.Repository.LoadActivation(ctx)
+	activation, err := productionControl.dependencies.Repository.LoadActivationHead(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1343,7 +1328,7 @@ func TestProductionPhaseTwoBundleDrainsExpiredRetiredBacklogWithoutProjection(t 
 	}
 
 	clock.Store((int64(retiredBoundary) + int64((30*time.Minute)/time.Second)) * 1000)
-	result, attempted, err := bundle.runners[retired].runner.RunOne(ctx)
+	result, attempted, err := settledRunner(bundle, retired).RunOne(ctx)
 	if err != nil || !attempted || !result.Completed ||
 		result.ReasonCode != execution.ReasonCode(contract.ReasonSnapshotUnavailable) {
 		t.Fatalf("RunOne(expired retired backlog) = (%+v, %t, %v)", result, attempted, err)
@@ -1381,6 +1366,7 @@ func TestProductionPhaseTwoBundleSharesOneProcessRecoveryPermitBudgetAcrossOwned
 	var inflight atomic.Int64
 	var maxInflight atomic.Int64
 	uqServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
 		call := uqCalls.Add(1)
 		current := inflight.Add(1)
 		defer inflight.Add(-1)
@@ -1440,9 +1426,9 @@ func TestProductionPhaseTwoBundleSharesOneProcessRecoveryPermitBudgetAcrossOwned
 					}
 				}
 			}),
-			OpenEvents: func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
+			PrepareEvents: preparedEvents(func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
 				return &recordingPhaseTwoEventSink{}, nil
-			},
+			}),
 		},
 	)
 	if err != nil {
@@ -1470,7 +1456,7 @@ func TestProductionPhaseTwoBundleSharesOneProcessRecoveryPermitBudgetAcrossOwned
 	clock.Store(time.Unix(base, 0).Add(500 * time.Millisecond).UnixMilli())
 
 	tickDone := make(chan error, 1)
-	go func() { tickDone <- bundle.runScheduledOnce(ctx) }()
+	go func() { tickDone <- runScheduledOnceSettled(ctx, bundle) }()
 	select {
 	case <-firstEntered:
 	case err := <-tickDone:
@@ -1484,14 +1470,14 @@ func TestProductionPhaseTwoBundleSharesOneProcessRecoveryPermitBudgetAcrossOwned
 		// Query enters UQ; R is enforced at this shared inner boundary.
 	case <-secondEntered:
 		t.Fatal("owned Query Groups used copied recovery permit budgets or bypassed recovery-aware SlotSource")
-	case <-time.After(time.Second):
+	case <-time.After(signalWaitBound):
 		t.Fatal("replay sibling did not reach the shared query-permit queue")
 	}
 	release()
 	if err := <-tickDone; err != nil {
 		t.Fatalf("production tick error = %v", err)
 	}
-	if err := bundle.runScheduledOnce(ctx); err != nil {
+	if err := runScheduledOnceSettled(ctx, bundle); err != nil {
 		t.Fatalf("second production tick error = %v", err)
 	}
 	if uqCalls.Load() != 2 || maxInflight.Load() != 1 {
@@ -1504,12 +1490,13 @@ func TestProductionPhaseTwoBundleCommitsBudgetExhaustedRecoveryCompletionWithout
 	ctx := context.Background()
 	installTwoPhaseTwoStrategies(t, ctx, redisClient)
 
-	base := time.Now().Unix()
+	base := phaseTwoClockAhead(1)
 	var clock atomic.Int64
 	clock.Store(time.Unix(base, 0).UnixMilli())
 	now := func() time.Time { return time.UnixMilli(clock.Load()) }
 	var uqCalls atomic.Int64
 	uqServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
 		uqCalls.Add(1)
 		_, _ = writer.Write([]byte(`{"series":[],"status":null,"trace_id":"unexpected","is_partial":false,"result_table_id":[]}`))
 	}))
@@ -1547,9 +1534,9 @@ func TestProductionPhaseTwoBundleCommitsBudgetExhaustedRecoveryCompletionWithout
 				defer observationsMu.Unlock()
 				observations = append(observations, observation)
 			}),
-			OpenEvents: func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
+			PrepareEvents: preparedEvents(func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
 				return &recordingPhaseTwoEventSink{}, nil
-			},
+			}),
 		},
 	)
 	if err != nil {
@@ -1574,7 +1561,7 @@ func TestProductionPhaseTwoBundleCommitsBudgetExhaustedRecoveryCompletionWithout
 
 	clock.Store(time.Unix(base, 0).Add(500 * time.Millisecond).UnixMilli())
 	for tick := 1; tick <= 2; tick++ {
-		if err := bundle.runScheduledOnce(ctx); err != nil {
+		if err := runScheduledOnceSettled(ctx, bundle); err != nil {
 			t.Fatalf("budget-exhausted production tick %d error = %v", tick, err)
 		}
 	}
@@ -1613,7 +1600,7 @@ func TestProductionPhaseTwoBundleLetsNormalUseRemainingProcessPermitDuringRecove
 	ctx := context.Background()
 	installTwoPhaseTwoStrategies(t, ctx, redisClient)
 
-	base := time.Now().Unix()
+	base := phaseTwoClockAhead(1)
 	var clock atomic.Int64
 	// Keep the configured one-millisecond readiness boundary due without
 	// changing the integer-second Slot identities exercised below.
@@ -1628,6 +1615,7 @@ func TestProductionPhaseTwoBundleLetsNormalUseRemainingProcessPermitDuringRecove
 	release := func() { releaseOnce.Do(func() { close(releaseQueries) }) }
 	var recoveryCalls, normalCalls atomic.Int64
 	uqServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
 		body, err := io.ReadAll(request.Body)
 		if err != nil {
 			http.Error(writer, err.Error(), http.StatusBadRequest)
@@ -1684,9 +1672,9 @@ func TestProductionPhaseTwoBundleLetsNormalUseRemainingProcessPermitDuringRecove
 				defer observationsMu.Unlock()
 				observations = append(observations, observation)
 			}),
-			OpenEvents: func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
+			PrepareEvents: preparedEvents(func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
 				return &recordingPhaseTwoEventSink{}, nil
-			},
+			}),
 		},
 	)
 	if err != nil {
@@ -1711,11 +1699,14 @@ func TestProductionPhaseTwoBundleLetsNormalUseRemainingProcessPermitDuringRecove
 		}
 		queryGroupsByStrategy[schedule.Plans[0].Identity.StrategyID] = queryGroup
 	}
-	bundle.mu.RLock()
-	normalRunner := bundle.runners[queryGroupsByStrategy["1002"]].runner
-	bundle.mu.RUnlock()
-	if _, attempted, runErr := normalRunner.RunOne(ctx); runErr != nil || !attempted {
-		t.Fatalf("prepare normal Query Group attempted=%t error=%v", attempted, runErr)
+	normalRunner := settledRunner(bundle, queryGroupsByStrategy["1002"])
+	// The preparation has to have been answered, not only attempted: a round
+	// that timed out before its query was sent leaves this Query Group's Slot
+	// to the tick below as well, and the tick then waits on a recovery query
+	// that never comes instead of saying why.
+	prepared, attempted, runErr := normalRunner.RunOne(ctx)
+	if runErr != nil || !attempted || !prepared.Completed || prepared.Result != observability.ResultSuccess {
+		t.Fatalf("prepare normal Query Group = (%+v, attempted %t, %v), want its Slot answered", prepared, attempted, runErr)
 	}
 	setup.Store(false)
 	observationsMu.Lock()
@@ -1724,7 +1715,7 @@ func TestProductionPhaseTwoBundleLetsNormalUseRemainingProcessPermitDuringRecove
 	clock.Store(time.Unix(base+1, 0).Add(2 * time.Millisecond).UnixMilli())
 
 	tickDone := make(chan error, 1)
-	go func() { tickDone <- bundle.runScheduledOnce(ctx) }()
+	go func() { tickDone <- runScheduledOnceSettled(ctx, bundle) }()
 	waitSignal(t, recoveryEntered, "recovery Query Group UQ")
 	waitSignal(t, normalEntered, "normal Query Group UQ while recovery is inflight")
 	release()
@@ -1761,6 +1752,7 @@ func TestProductionPhaseTwoBundleCompletesIncompleteAccessWithoutStoppingHealthy
 	now := func() time.Time { return time.Unix(clock.Load(), 0).Add(2 * time.Millisecond) }
 	var cpuAttempts atomic.Int64
 	uqServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
 		var payload struct {
 			QueryList []struct {
 				TableID string `json:"table_id"`
@@ -1824,7 +1816,7 @@ func TestProductionPhaseTwoBundleCompletesIncompleteAccessWithoutStoppingHealthy
 					fatal.Store(true)
 				}
 			}),
-			OpenEvents: func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) { return events, nil },
+			PrepareEvents: preparedEvents(func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) { return events, nil }),
 		},
 	)
 	if err != nil {
@@ -1850,7 +1842,7 @@ func TestProductionPhaseTwoBundleCompletesIncompleteAccessWithoutStoppingHealthy
 	}
 
 	clock.Store(base)
-	if err := bundle.runScheduledOnce(ctx); err != nil {
+	if err := runScheduledOnceSettled(ctx, bundle); err != nil {
 		t.Fatalf("runScheduledOnce(partial sibling) error = %v", err)
 	}
 	failed := loadPhaseTwoProgress(t, ctx, productionOwnership, queryGroupsByStrategy["1001"])
@@ -1881,7 +1873,7 @@ func TestProductionPhaseTwoBundleCompletesIncompleteAccessWithoutStoppingHealthy
 	}
 
 	clock.Store(base + 1)
-	if err := bundle.runScheduledOnce(ctx); err != nil {
+	if err := runScheduledOnceSettled(ctx, bundle); err != nil {
 		t.Fatalf("runScheduledOnce(unavailable sibling) error = %v", err)
 	}
 	failed = loadPhaseTwoProgress(t, ctx, productionOwnership, queryGroupsByStrategy["1001"])
@@ -1895,7 +1887,7 @@ func TestProductionPhaseTwoBundleCompletesIncompleteAccessWithoutStoppingHealthy
 	}
 
 	clock.Store(base + 2)
-	if err := bundle.runScheduledOnce(ctx); err != nil {
+	if err := runScheduledOnceSettled(ctx, bundle); err != nil {
 		t.Fatalf("runScheduledOnce(recovered sibling) error = %v", err)
 	}
 	recovered := loadPhaseTwoProgress(t, ctx, productionOwnership, queryGroupsByStrategy["1001"])
@@ -1966,9 +1958,10 @@ func loadPhaseTwoProgress(
 }
 
 type recordingPhaseTwoEventSink struct {
-	mu     sync.Mutex
-	events []contract.TriggerEventV1
-	closed bool
+	mu       sync.Mutex
+	events   []contract.TriggerEventV1
+	closed   bool
+	protocol *enginekafka.ProtocolNegotiation
 }
 
 func (s *recordingPhaseTwoEventSink) ConfigureStandardOutput(enginekafka.StandardEventConverter) error {
@@ -1977,6 +1970,14 @@ func (s *recordingPhaseTwoEventSink) ConfigureStandardOutput(enginekafka.Standar
 
 func (s *recordingPhaseTwoEventSink) ConfigureLegacyOutput(enginekafka.LegacyEventConverter, string, int) error {
 	return nil
+}
+
+// protocol is what the fake reports as its agreement with its brokers; nil,
+// the default, is a sink that asked nobody.
+func (s *recordingPhaseTwoEventSink) ProtocolNegotiation() *enginekafka.ProtocolNegotiation {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.protocol
 }
 
 type selectiveRetryablePhaseTwoEventSink struct {
@@ -1992,6 +1993,10 @@ func (s *selectiveRetryablePhaseTwoEventSink) ConfigureStandardOutput(enginekafk
 }
 
 func (s *selectiveRetryablePhaseTwoEventSink) ConfigureLegacyOutput(enginekafka.LegacyEventConverter, string, int) error {
+	return nil
+}
+
+func (s *selectiveRetryablePhaseTwoEventSink) ProtocolNegotiation() *enginekafka.ProtocolNegotiation {
 	return nil
 }
 
@@ -2085,9 +2090,17 @@ func (runtime *recordingPhaseTwoQueryGroupRuntime) NextReadyAt() time.Time {
 	return runtime.next.NextReadyAt()
 }
 
+func (runtime *recordingPhaseTwoQueryGroupRuntime) NextDeadline() time.Time { return time.Time{} }
+
 func (runtime *recordingPhaseTwoQueryGroupRuntime) DueBound() scheduler.RunnerDueBound {
 	return scheduler.RunnerDueBound{}
 }
+
+func (*recordingPhaseTwoQueryGroupRuntime) DeclineHung(time.Time, time.Duration) (string, time.Time, bool) {
+	return "", time.Time{}, false
+}
+
+func (*recordingPhaseTwoQueryGroupRuntime) ExecutionDeadline() time.Time { return time.Time{} }
 
 func (runtime *recordingPhaseTwoQueryGroupRuntime) MaintainLease(ctx context.Context, interval, ttl time.Duration) error {
 	return runtime.next.MaintainLease(ctx, interval, ttl)
@@ -2150,114 +2163,17 @@ func assertObservedOrder(t *testing.T, got, want []observability.Stage) {
 }
 
 // startPhaseTwoRedis starts a redis-server for this test and hands back a
-// client that has been checked to be talking to that server and no other.
-//
-// The port is picked by asking the kernel for a free one and closing the
-// socket, so between that close and redis-server's bind anything else on the
-// machine may take the port: another package's fixture under `go test ./...`,
-// or a second checkout running the same suite. When that happens redis-server
-// exits with "Address already in use" while Ping on the port keeps succeeding,
-// answered by whoever does hold it - and the fixture used to hand that foreign
-// server back without a word. The test then ran against a Redis another test
-// was also writing to, under the key prefixes this suite fixes per test and
-// which therefore collide exactly. Asking the server which directory it was
-// started in turns that into a retry on a fresh port, and into a named failure
-// if it keeps happening, instead of into a result somewhere else in the test.
+// client of it. redistest.Start checks the server on the port is the one it
+// started - between finding a port free and redis-server binding it, another
+// fixture on the machine may take it - and tries another port when it is not.
 func startPhaseTwoRedis(t *testing.T) (string, *redis.Client) {
 	t.Helper()
-	executable, err := exec.LookPath("redis-server")
-	if err != nil {
-		t.Skip("redis-server is not installed")
-	}
-	var refusals []string
-	for attempt := 0; attempt < 5; attempt++ {
-		address, client, refused := startOwnPhaseTwoRedis(t, executable, "")
-		if refused == "" {
-			return address, client
-		}
-		refusals = append(refusals, refused)
-	}
-	t.Fatalf("redis-server never came up on a port of its own: %v", refusals)
-	return "", nil
-}
-
-// startOwnPhaseTwoRedis makes one attempt. It returns an empty refusal when the
-// server on the port is the one it just started.
-func startOwnPhaseTwoRedis(t *testing.T, executable string, port string) (string, *redis.Client, string) {
-	t.Helper()
-	if port == "" {
-		listener, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, chosen, err := net.SplitHostPort(listener.Addr().String()); err == nil {
-			port = chosen
-		} else {
-			t.Fatal(err)
-		}
-		if err := listener.Close(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	address := net.JoinHostPort("127.0.0.1", port)
-	// The directory is this attempt's name for its own server. t.TempDir() is a
-	// fresh directory per call, and redis reports it back resolved, so it tells
-	// one server on this port apart from any other.
-	directory := t.TempDir()
-	resolved, err := filepath.EvalSymlinks(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	command := exec.Command(executable, "--bind", "127.0.0.1", "--port", port,
-		"--save", "", "--appendonly", "no", "--dir", directory, "--daemonize", "no", "--loglevel", "warning")
-	var output bytes.Buffer
-	command.Stdout, command.Stderr = &output, &output
-	if err := command.Start(); err != nil {
-		t.Fatal(err)
-	}
+	server := redistest.Start(t)
 	client := redis.NewClient(&redis.Options{
-		Addr: address, DialTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second,
+		Addr: server.Addr, DialTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second,
 	})
-	stop := func() {
-		_ = client.Close()
-		if command.ProcessState == nil || !command.ProcessState.Exited() {
-			_ = command.Process.Kill()
-		}
-		_ = command.Wait()
-	}
-	// The wait is generous on purpose. Three seconds encoded an assumption about
-	// machine load rather than about redis: under `go test ./...` dozens of
-	// packages start their own server at the same moment, and a window that is
-	// ample on an idle machine is not on a loaded one - which turned a whole-tree
-	// "all green" into a function of load rather than of the code. A healthy
-	// server answers Ping in milliseconds, so a longer budget costs the normal
-	// path nothing; it only matters when the server genuinely cannot start, and
-	// that case is meant to be read from the server's own output.
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		if client.Ping(context.Background()).Err() == nil {
-			if serving := phaseTwoRedisDirectory(client); serving != resolved {
-				stop()
-				return "", nil, fmt.Sprintf("port %s is served from %q, not this attempt's %q", port, serving, resolved)
-			}
-			t.Cleanup(stop)
-			return address, client, ""
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	stop()
-	return "", nil, fmt.Sprintf("port %s never answered: %s", port, output.String())
-}
-
-// phaseTwoRedisDirectory reports the directory the server on this client was
-// started in, or "" when it cannot be read.
-func phaseTwoRedisDirectory(client *redis.Client) string {
-	values, err := client.ConfigGet(context.Background(), "dir").Result()
-	if err != nil || len(values) != 2 {
-		return ""
-	}
-	directory, _ := values[1].(string)
-	return directory
+	t.Cleanup(func() { _ = client.Close() })
+	return server.Addr, client
 }
 
 // The Snapshot body is transferred once per revision by a complete verified
@@ -2275,6 +2191,7 @@ func TestProductionRunOneReadsControlBodiesOncePerRevisionAndVersion(t *testing.
 	now := func() time.Time { return time.UnixMilli(clock.Load()) }
 	var uqCalls atomic.Int64
 	uqServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
 		uqCalls.Add(1)
 		_, _ = writer.Write([]byte(`{"series":[],"status":null,"trace_id":"g3b-snapshot-isolation","is_partial":false,"result_table_id":[]}`))
 	}))
@@ -2304,7 +2221,7 @@ func TestProductionRunOneReadsControlBodiesOncePerRevisionAndVersion(t *testing.
 		},
 		phaseTwoProductionExternalDependencies{
 			Now: now, HTTPClient: uqServer.Client(),
-			OpenEvents: func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) { return events, nil },
+			PrepareEvents: preparedEvents(func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) { return events, nil }),
 		},
 	)
 	if err != nil {
@@ -2404,10 +2321,10 @@ func TestProductionRunOneReadsControlBodiesOncePerRevisionAndVersion(t *testing.
 		var result execution.SlotExecutionResult
 		var attempted bool
 		if strategyID == "1002" {
-			result, attempted, err = bundle.runners[queryGroupsByStrategy[strategyID]].runner.RunOne(ctx)
+			result, attempted, err = settledRunner(bundle, queryGroupsByStrategy[strategyID]).RunOne(ctx)
 		} else {
 			var denied bool
-			result, attempted, denied, err = bundle.runners[queryGroupsByStrategy[strategyID]].runner.RunOneAdmitted(ctx, func(execution.Operation) (func(), bool) { return func() {}, true })
+			result, attempted, denied, err = settledRunner(bundle, queryGroupsByStrategy[strategyID]).RunOneAdmitted(ctx, func(execution.Operation) (func(), bool) { return func() {}, true })
 			if denied {
 				t.Fatal("denied")
 			}
@@ -2438,8 +2355,16 @@ func TestProductionRunOneReadsControlBodiesOncePerRevisionAndVersion(t *testing.
 		}
 		// Guard and Progress re-read the activation before acting; each re-read
 		// probes the live header and transfers no activation body.
-		if activationBodyReads != 0 || headerProbes < 2 {
-			t.Fatalf("RunOne(%s) activation body reads=%d header probes=%d, want 0 body reads and at least two probes", strategyID, activationBodyReads, headerProbes)
+		// Batch 4b of decision-016: a Query Group executed from the installed
+		// view reads its timeline by the revision the record and the view
+		// agree on and its activation from that timeline, so a RunOne
+		// probes the activation header zero times. Under batch 4a and before,
+		// the same round probed it at least twice; that number is what
+		// batch 4 was built to take away, so it is asserted gone rather than
+		// merely allowed to fall.
+		if activationBodyReads != 0 || headerProbes != 0 {
+			t.Fatalf("RunOne(%s) activation body reads=%d header probes=%d, want 0 body reads and 0 probes: a Query Group "+
+				"executed from the view reads no activation header", strategyID, activationBodyReads, headerProbes)
 		}
 		if timelineBodyReads > 1 {
 			t.Fatalf("RunOne(%s) timeline body reads=%d, want at most the first touch of this Query Group", strategyID, timelineBodyReads)
@@ -2453,9 +2378,13 @@ func TestProductionRunOneReadsControlBodiesOncePerRevisionAndVersion(t *testing.
 			headerProbes, headerBytes, epochProbes, lengthProbes)
 	}
 	statsAfter := repository.ControlReadCacheStats()
-	if statsAfter.Activation.Hits-statsBefore.Activation.Hits < 4 ||
-		statsAfter.Activation.Refreshes != statsBefore.Activation.Refreshes {
-		t.Fatalf("cache stats before=%+v after=%+v, want only activation hits during two RunOnes", statsBefore, statsAfter)
+	// The activation cache is not consulted at all by a hinted round: the
+	// two RunOnes leave its hits where they were and the hinted timeline
+	// object is what moved.
+	if statsAfter.Activation.Hits != statsBefore.Activation.Hits ||
+		statsAfter.Activation.Refreshes != statsBefore.Activation.Refreshes ||
+		statsAfter.HintedTimeline.Hits+statsAfter.HintedTimeline.Misses <= statsBefore.HintedTimeline.Hits+statsBefore.HintedTimeline.Misses {
+		t.Fatalf("cache stats before=%+v after=%+v, want the activation cache untouched and hinted timeline reads during two RunOnes", statsBefore, statsAfter)
 	}
 	beforeDeferredCalls := uqCalls.Load()
 	beforeDeferred, err := redisClient.SlowLogGet(ctx, 1).Result()
@@ -2466,7 +2395,7 @@ func TestProductionRunOneReadsControlBodiesOncePerRevisionAndVersion(t *testing.
 	if len(beforeDeferred) > 0 {
 		deferredLastID = beforeDeferred[0].ID
 	}
-	deferredResult, deferredAttempted, err := bundle.runners[queryGroupsByStrategy["1002"]].runner.RunOne(ctx)
+	deferredResult, deferredAttempted, err := settledRunner(bundle, queryGroupsByStrategy["1002"]).RunOne(ctx)
 	if err != nil || !deferredAttempted || deferredResult.Completed || uqCalls.Load() != beforeDeferredCalls {
 		t.Fatalf("expected readiness deferral before Query: %+v %v calls=%d", deferredResult, err, uqCalls.Load())
 	}
@@ -2492,43 +2421,29 @@ func TestProductionRunOneReadsControlBodiesOncePerRevisionAndVersion(t *testing.
 		t.Fatal(err)
 	}
 	clock.Store(bundle.runners[queryGroupsByStrategy["1002"]].runner.NextReadyAt().UnixMilli())
-	reentry, _, err := bundle.runners[queryGroupsByStrategy["1002"]].runner.RunOne(ctx)
+	reentry, _, err := settledRunner(bundle, queryGroupsByStrategy["1002"]).RunOne(ctx)
 	if err != nil || reentry.Completed || reentry.ReasonCode != execution.ReasonCode(contract.ReasonSnapshotRetryPending) || uqCalls.Load() != beforeDeferredCalls {
 		t.Fatalf("deferred reentry result=%+v error=%v clock=%v", reentry, err, now())
 	}
 }
 
-// TestPhaseTwoRedisFixtureRefusesAServerItDidNotStart pins the check that the
-// fixture hands back its own server.
+// phaseTwoClockAhead is the first multiple of period at least a minute ahead
+// of the real clock, for a case that freezes its injected clock there.
 //
-// It is written as a forced collision because the real one cannot be scheduled:
-// the fixture asks the kernel for a free port and closes the socket, and
-// whether anything grabs that port in the gap depends on what else is running
-// on the machine. Forcing the port reproduces the same end state - redis-server
-// cannot bind, exits, and Ping on the port is answered by the process that does
-// hold it - which is the state in which the fixture used to hand the foreign
-// server to the test.
-func TestPhaseTwoRedisFixtureRefusesAServerItDidNotStart(t *testing.T) {
-	executable, err := exec.LookPath("redis-server")
-	if err != nil {
-		t.Skip("redis-server is not installed")
-	}
-	occupiedAddress, occupied := startPhaseTwoRedis(t)
-	_, port, err := net.SplitHostPort(occupiedAddress)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := occupied.Set(context.Background(), "phase-two-fixture-marker", "occupant", 0).Err(); err != nil {
-		t.Fatal(err)
-	}
-	address, client, refused := startOwnPhaseTwoRedis(t, executable, port)
-	if refused == "" {
-		marker, markerErr := client.Get(context.Background(), "phase-two-fixture-marker").Result()
-		t.Fatalf("fixture accepted a server it did not start at %s: marker=%q error=%v", address, marker, markerErr)
-	}
-	if !strings.Contains(refused, port) {
-		t.Fatalf("refusal %q does not name the port it was refused on", refused)
-	}
+// It is the contract phaseTwoProductionExternalDependencies.Now states: an
+// injected clock only ever goes ahead of the real one, because a Slot's query
+// deadline is derived from it and measured against the real clock. A base
+// taken from the current second, or rounded down to a period, leaves a
+// strategy on a one-second interval about a second before its deadline is in
+// the real past. Under the whole suite with the race detector that second is
+// gone before the query is sent: the round completes as QUERY_TIMEOUT without
+// reaching the query backend, a case waiting for the query waits until its
+// bound, and a case asserting that no query was made passes without the
+// query ever having had the chance. A minute is several times the longest
+// such case takes.
+func phaseTwoClockAhead(period int64) int64 {
+	start := time.Now().Unix() + 60
+	return start + (period-start%period)%period
 }
 
 // phaseTwoQueryableSlotBoundary picks the Slot boundary these production tests

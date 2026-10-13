@@ -23,7 +23,12 @@ import (
 type openAlertSetFixture struct {
 	members map[string]bool
 	asked   []string
+	// oneTime marks the set a one-time close is asked against
+	// (contract.OneTimeCloseSet).
+	oneTime bool
 }
+
+func (set *openAlertSetFixture) OneTimeClose() bool { return set.oneTime }
 
 func (set *openAlertSetFixture) Contains(tenantID, strategyID, fingerprint string) bool {
 	key := tenantID + "/" + strategyID + "/" + fingerprint
@@ -78,6 +83,19 @@ func TestRecoveryEnvelopeGoesOnlyToAnOpenAlert(t *testing.T) {
 			envelope: true, asked: 1,
 		},
 		{
+			// The one close of a group the target dropped is let through by
+			// the set it is asked against, and named apart from a pass the
+			// consumer's copy vouched for: some of these are orphans at the
+			// consumer, and only a name of their own counts them.
+			name: "the one close of a dropped group: let through, named as such",
+			plan: func(t *testing.T) *strategy.CompiledPlan { return nativePlanV2(t, recovered, identity) },
+			set: func(t *testing.T) *openAlertSetFixture {
+				return &openAlertSetFixture{members: map[string]bool{"default/1001/" + fingerprint(t): true}, oneTime: true}
+			},
+			wantGate: RecoveryGateV2{OpenAlertGate: OpenAlertGatePassedOneTimeClose},
+			envelope: true, asked: 1,
+		},
+		{
 			name:     "the consumer holds no alert on the series: held, nothing to resolve",
 			plan:     func(t *testing.T) *strategy.CompiledPlan { return nativePlanV2(t, recovered, identity) },
 			set:      func(t *testing.T) *openAlertSetFixture { return &openAlertSetFixture{} },
@@ -106,7 +124,7 @@ func TestRecoveryEnvelopeGoesOnlyToAnOpenAlert(t *testing.T) {
 			envelope: true, asked: 0,
 		},
 		{
-			name: "a Plan on alarmd's own decision event, identity and all: not the consumer's protocol, the set is not asked",
+			name: "a historical decision-event Plan now uses the consumer recovery gate",
 			plan: func(t *testing.T) *strategy.CompiledPlan {
 				return compilePlanV2WithOutput(t, recovered, func(p *contract.EvaluationPlanV2) {
 					p.WireFormat = contract.WireFormatTriggerEvent
@@ -116,14 +134,27 @@ func TestRecoveryEnvelopeGoesOnlyToAnOpenAlert(t *testing.T) {
 				})
 			},
 			set:      func(t *testing.T) *openAlertSetFixture { return &openAlertSetFixture{} },
-			wantGate: RecoveryGateV2{OpenAlertGate: OpenAlertGateProtocolNotGated},
-			envelope: true, asked: 0,
+			wantGate: RecoveryGateV2{Held: true, Cause: RecoveryHeldNoOpenAlert, OpenAlertGate: OpenAlertGateHeldNoOpenAlert},
+			envelope: false, asked: 1,
+		}, {
+			name: "a historical empty-format Plan with revision uses the consumer recovery gate",
+			plan: func(t *testing.T) *strategy.CompiledPlan {
+				return compilePlanV2WithOutput(t, recovered, func(p *contract.EvaluationPlanV2) {
+					p.WireFormat = ""
+					p.StrategyRef.SnapshotRevision = 7
+					p.StrategyIR.StrategyRef.SnapshotRevision = 7
+					p.OutputIdentity = identity
+				})
+			},
+			set:      func(t *testing.T) *openAlertSetFixture { return &openAlertSetFixture{} },
+			wantGate: RecoveryGateV2{Held: true, Cause: RecoveryHeldNoOpenAlert, OpenAlertGate: OpenAlertGateHeldNoOpenAlert},
+			envelope: false, asked: 1,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			plan := test.plan(t)
-			levels := plan.Levels()
+			levels := plan.Levels().Copy()
 			request := requestV2(t, plan, source,
 				[]DetectionFact{factV2(levels[0], DetectionNormal), factV2(levels[1], DetectionNormal)},
 				[]LevelHistory{
@@ -157,14 +188,15 @@ func TestRecoveryEnvelopeGoesOnlyToAnOpenAlert(t *testing.T) {
 	}
 }
 
-// The two gates are asked in order and a record is counted by at most one:
-// when a Level holds the envelope the set is not asked, and its outcome
-// stays empty rather than reading as "passed" or "not configured".
-func TestOpenAlertSetIsNotAskedWhenALevelHolds(t *testing.T) {
+// Another Level's state no longer holds the envelope, so the set is asked
+// for a RECOVERY decided beside an unavailable Level too, and its verdict
+// keeps the Level the record went beside: the set holds for no open alert,
+// and the record still says what it was decided beside.
+func TestOpenAlertSetIsAskedBesideAnUnavailableLevel(t *testing.T) {
 	const source = int64(300)
 	identity := &contract.MonitorOutputIdentity{DimensionFields: []string{"host"}}
 	plan := nativePlanV2(t, []contract.LevelIRV2{levelV2(1, 1, 1, 1, 1, nil), levelV2(2, 2, 1, 1, 1, nil)}, identity)
-	levels := plan.Levels()
+	levels := plan.Levels().Copy()
 	set := &openAlertSetFixture{}
 	request := requestV2(t, plan, source,
 		[]DetectionFact{unavailableFactV2(levels[0], contract.ReasonRequiredValueMissing), factV2(levels[1], DetectionNormal)},
@@ -177,12 +209,13 @@ func TestOpenAlertSetIsNotAskedWhenALevelHolds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvaluateV2() error = %v", err)
 	}
-	want := RecoveryGateV2{Held: true, Cause: RecoveryHeldLevelUnavailable, LevelID: 1}
+	want := RecoveryGateV2{Held: true, Cause: RecoveryHeldNoOpenAlert, Beside: RecoveryBesideLevelUnavailable, BesideLevelID: 1,
+		OpenAlertGate: OpenAlertGateHeldNoOpenAlert}
 	if result.RecoveryGate != want {
 		t.Fatalf("gate = %+v, want %+v", result.RecoveryGate, want)
 	}
-	if len(set.asked) != 0 {
-		t.Fatalf("the set was asked %v although a Level held the envelope", set.asked)
+	if len(set.asked) != 1 || result.TriggerEvent != nil {
+		t.Fatalf("the set was asked %v, envelope %+v; want it asked once and no envelope for a series with no open alert", set.asked, result.TriggerEvent)
 	}
 }
 
@@ -193,7 +226,7 @@ func TestOpenAlertSetDoesNotTouchAnAbnormalRecord(t *testing.T) {
 	identity := &contract.MonitorOutputIdentity{DimensionFields: []string{"host"}}
 	plan := nativePlanV2(t, []contract.LevelIRV2{levelV2(1, 1, 1, 1, 1, nil)}, identity)
 	set := &openAlertSetFixture{}
-	request := requestV2(t, plan, source, []DetectionFact{factV2(plan.Levels()[0], DetectionAnomalous)},
+	request := requestV2(t, plan, source, []DetectionFact{factV2(plan.Levels().At(0), DetectionAnomalous)},
 		[]LevelHistory{{LevelID: 1, View: pointHistory{step: 60, points: map[int64]bool{source: true}}}}, activeFactsV2(t, plan, source))
 	request.OpenAlerts = set
 	result, err := EvaluateV2(request)

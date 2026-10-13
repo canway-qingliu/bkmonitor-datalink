@@ -13,6 +13,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/contract"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/controlplane"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/fleet"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/metric"
@@ -46,6 +47,11 @@ type controlSourceState struct {
 	// line that does not scroll away, cleared when a round succeeds.
 	lastFailureExit string
 	lastFailure     string
+	// set is the account of the source's active set across this process's
+	// rounds -- which strategies it dropped, since when, and whether they
+	// came back -- what one round's composition cannot say. Nil until the
+	// first composition, so a follower publishes no account of its own.
+	set *fleet.SourceSetLedger
 	// composition is what the Catalog this process last saw built is made
 	// of. Kept from the last round that built one: a degraded round and an
 	// activation load compose nothing, and reporting empty then would read
@@ -120,7 +126,15 @@ func (bundle *phaseTwoWorkerBundle) noteControlRoundLocked(result phaseTwoContro
 	}
 	if result.Composition != nil {
 		state.composition = result.Composition
-		state.source = sourceFactsOf(result, bundle.dependencies.Now())
+		at := bundle.dependencies.Now()
+		if state.set == nil {
+			state.set = fleet.NewSourceSetLedger(bundle.dependencies.Now)
+		}
+		if returned := state.set.NoteRound(sourceSetRoundOf(result.Composition, at)); returned > 0 {
+			bundle.dependencies.Recorder.AddStrategiesReturnedAfterRemoval(returned)
+		}
+		state.source = sourceFactsOf(result, at)
+		state.source.Set = state.set.Facts(at)
 	}
 	bundle.noteActivationLocked(result.Activation)
 }
@@ -242,12 +256,47 @@ func sourceFactsOf(result phaseTwoControlRefreshResult, at time.Time) *fleet.Sou
 			LevelID: object.LevelID, Disposition: string(object.Disposition), Reason: object.Reason, FieldPath: object.FieldPath})
 	}
 	facts := fleet.NewSourceFacts(at, objects, withheld)
+	facts.Plans, facts.RevisionedPlans, facts.PlansKnown = composition.PlansTotal, composition.RevisionedPlans, true
+	facts.StandardPlans = composition.PlansByWireFormat[contract.WireFormatStandardRawEvent]
 	facts.ChangeSignalPresent = result.ChangeSignalPresent
 	if result.ChangeSignalPresent {
 		age := result.ChangeSignalAgeSeconds
 		facts.ChangeSignalAgeSeconds = &age
 	}
 	return facts
+}
+
+// sourceSetRoundOf is the composition's word on the active set for the
+// ledger: the strategies the source listed, and the ones the grace cycle
+// holds or has removed, by their dispositions.
+//
+// The two sides are disjoint by construction: the catalog gives
+// PENDING_REMOVAL and REMOVED only to a strategy the round did not observe
+// in the source (catalog.go, the grace loop starts with "observed ->
+// continue"), and every observed strategy gets its own disposition and so
+// lands in Listed. The ledger relies on that: it clears an absence on Listed
+// after it records one on PendingRemoval, and a strategy on both sides would
+// have its grace quietly erased -- the page then says a strategy about to be
+// dropped is fine. Anyone changing that loop changes this too.
+func sourceSetRoundOf(composition *controlplane.CatalogComposition, at time.Time) fleet.SourceSetRound {
+	round := fleet.SourceSetRound{At: at, Listed: composition.ListedStrategies}
+	for _, object := range composition.WithheldObjects {
+		absent := fleet.AbsentStrategy{StrategyID: object.SourceID}
+		if object.AbsentSince > 0 {
+			// The catalog's own word on when the strategy was first found
+			// absent: the true start, kept on the published audit across
+			// leader restarts, where this process's first sight is only a
+			// lower bound.
+			absent.AbsentSince = time.Unix(object.AbsentSince, 0).UTC()
+		}
+		switch object.Disposition {
+		case controlplane.DispositionPendingRemoval:
+			round.PendingRemoval = append(round.PendingRemoval, absent)
+		case controlplane.DispositionRemoved:
+			round.Removed = append(round.Removed, absent)
+		}
+	}
+	return round
 }
 
 // sourceFleetFacts is what the fleet publishes about the source: the last

@@ -107,18 +107,30 @@ func TestDetailReturnsTheObjectWhenTheViewIsComplete(t *testing.T) {
 	if body["view_complete"] != true {
 		t.Fatalf("view_complete = %v, want true", body["view_complete"])
 	}
+	if _, moved := body["deployment_health"]; moved || body["health"] == nil {
+		t.Fatalf("a found object's health moved: health %v deployment_health %v", body["health"], body["deployment_health"])
+	}
 }
 
 // Absent from an incomplete view is not the same as healthy, and the response
 // has to let a caller tell those apart.
 func TestDetailSaysWhetherNotFoundCanBeTrusted(t *testing.T) {
-	complete := handlerWith(t, snapshotsWithAnomalies(3), Expectation{QueryGroups: 949, Known: true}, replicas())
+	ids := make([]string, 949)
+	for index := range ids {
+		ids[index] = fmt.Sprintf("qg-%03d", index)
+	}
+	complete := handlerWith(t, snapshotsWithAnomalies(3), Expectation{QueryGroups: 949, Known: true, IDs: ids}, replicas())
 	status, body := get(t, complete, "/api/objects/qg-absent")
 	if status != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", status)
 	}
-	if body["view_complete"] != true || body["health"] != string(HealthDegraded) {
+	if body["view_complete"] != true || body["deployment_health"] != string(HealthDegraded) {
 		t.Fatalf("body = %+v, want a trustworthy not-found", body)
+	}
+	// The verdict is the deployment's: beside existence "absent" it is not
+	// carried as the object's health.
+	if _, present := body["health"]; present || body["existence"] != "absent" {
+		t.Fatalf("an absent object carries health %v (existence %v), want it only as deployment_health", body["health"], body["existence"])
 	}
 
 	service := mustService(t,
@@ -131,11 +143,11 @@ func TestDetailSaysWhetherNotFoundCanBeTrusted(t *testing.T) {
 		t.Fatal(err)
 	}
 	status, body = get(t, incompleteHandler, "/api/objects/qg-absent")
-	if status != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", status)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", status)
 	}
-	if body["view_complete"] != false || body["health"] != string(HealthUnknown) {
-		t.Fatalf("body = %+v, want not-found marked untrustworthy", body)
+	if body["view_complete"] != false || body["health"] != string(HealthUnknown) || body["existence"] != "unknown" {
+		t.Fatalf("body = %+v, want unknown membership", body)
 	}
 }
 
@@ -259,7 +271,7 @@ func handlerWithStrategies(t *testing.T) http.Handler {
 	t.Helper()
 	snapshots := healthySnapshots()
 	snapshots[1].Anomalies = []Anomaly{
-		strategyAnomaly("qg-a", "2864", "7"),
+		strategyAnomaly("qg-a", "850", "7"),
 		strategyAnomaly("qg-b", "8904", "47"),
 		strategyAnomaly("qg-c", "1449", "7"),
 	}
@@ -270,9 +282,9 @@ func handlerWithStrategies(t *testing.T) http.Handler {
 func TestObjectsCanBeNarrowedByStrategyAndBusiness(t *testing.T) {
 	handler := handlerWithStrategies(t)
 	for target, want := range map[string]int{
-		"/api/objects?strategy=2864": 1,
-		"/api/objects?business=7":    2,
-		"/api/objects":               3,
+		"/api/objects?strategy=850": 1,
+		"/api/objects?business=7":   2,
+		"/api/objects":              3,
 	} {
 		_, body := get(t, handler, target)
 		anomalies, _ := body["anomalies"].([]any)
@@ -447,9 +459,9 @@ func TestTheStalledTotalSurvivesAFilter(t *testing.T) {
 	budget := 10 * time.Minute
 	snapshots := healthySnapshots()
 	stuck := agedAnomaly("stuck", "error", 2*time.Hour)
-	stuck.Strategies = []StrategyRef{{StrategyID: "8568", BusinessID: "7"}}
+	stuck.Strategies = []StrategyRef{{StrategyID: "851", BusinessID: "7"}}
 	other := agedAnomaly("also-stuck", "error", 2*time.Hour)
-	other.Strategies = []StrategyRef{{StrategyID: "2849", BusinessID: "7"}}
+	other.Strategies = []StrategyRef{{StrategyID: "849", BusinessID: "7"}}
 	snapshots[1].Anomalies = []Anomaly{stuck, other}
 	snapshots[1].TotalAnomalies = 2
 	handler := handlerWithStallBudget(t, snapshots, budget)
@@ -459,7 +471,7 @@ func TestTheStalledTotalSurvivesAFilter(t *testing.T) {
 		t.Fatalf("unfiltered stalled_total = %v, want 2", body["stalled_total"])
 	}
 
-	_, body = get(t, handler, "/api/objects?strategy=8568")
+	_, body = get(t, handler, "/api/objects?strategy=851")
 	if body["page"].(map[string]any)["total"].(float64) != 1 {
 		t.Fatalf("the filter did not narrow the table: %v", body["page"])
 	}
@@ -496,13 +508,13 @@ func TestHealthResponseCarriesCapacityWhenReplicasReportIt(t *testing.T) {
 	}
 	// The numbers the panel actually shows. A capacity block present but empty
 	// would still leave a heading over nothing.
-	for _, field := range []string{"replicas", "permits_held", "permit_budget", "memory_limit_bytes"} {
+	for _, field := range []string{"replicas", "permits_held_total", "permit_budget_per_replica", "memory_limit_bytes_per_replica"} {
 		if capacity[field] == nil {
 			t.Fatalf("capacity is missing %q, which the panel renders: %v", field, capacity)
 		}
 	}
-	if capacity["permit_budget"].(float64) != 32 {
-		t.Fatalf("a per-replica ceiling was summed: %v", capacity["permit_budget"])
+	if capacity["permit_budget_per_replica"].(float64) != 32 {
+		t.Fatalf("a per-replica ceiling was summed: %v", capacity["permit_budget_per_replica"])
 	}
 }
 
@@ -583,7 +595,7 @@ func TestHealthResponseCarriesTheStandingsTheVerdictIsDecidedOn(t *testing.T) {
 func TestBothRoutesCarryTheOwnershipSplit(t *testing.T) {
 	snapshots := healthySnapshots()
 	snapshots[0].Rebalance = &RebalanceFacts{PlannedAt: now.Add(-10 * time.Second), ReadyWorkers: 2, Assigned: 949, Target: 474,
-		MostOwned: 949, LeastOwned: 0, MostOwnedBy: "pod-a", LeastOwnedBy: "pod-b", Batch: 9, PlannedMoves: 9, StopSpreadPercent: 5, Shadow: true}
+		MostOwned: 949, LeastOwned: 0, MostOwnedBy: "pod-a", LeastOwnedBy: "pod-b", Batch: 9, PlannedMoves: 9, StopSpreadPercent: 5}
 	handler := handlerWith(t, snapshots, Expectation{QueryGroups: 949, Known: true}, []string{"pod-a", "pod-b"})
 
 	body := requestJSON(t, handler, "/api/health")
@@ -591,7 +603,7 @@ func TestBothRoutesCarryTheOwnershipSplit(t *testing.T) {
 		t.Fatalf("health = %v, want HEALTHY: the split is a line, not a degradation", body["health"])
 	}
 	rebalance, ok := body["rebalance"].(map[string]any)
-	if !ok || rebalance["planned_moves"] != 9.0 || rebalance["most_owned_by"] != "pod-a" || rebalance["shadow"] != true ||
+	if !ok || rebalance["planned_moves"] != 9.0 || rebalance["most_owned_by"] != "pod-a" ||
 		rebalance["stop_spread_percent"] != 5.0 || body["rebalance_replica"] != "pod-a" {
 		t.Fatalf("rebalance = %v from %v, want the leader's round whole", body["rebalance"], body["rebalance_replica"])
 	}
@@ -1014,5 +1026,165 @@ func TestTheListResponseSendsOnlyTheRowsItIsAbout(t *testing.T) {
 	_, record := get(t, handler, "/api/objects?check="+string(CheckDetectionAbandoned))
 	if rows, _ := record["anomalies"].([]any); len(rows) != 1 || rows[0].(map[string]any)["query_group"] != "qg-stopped" {
 		t.Errorf("check=DETECTION_ABANDONED serves %v, want the one retained record as a row", rows)
+	}
+}
+
+// The verdict route carries each replica's own dependency record and says how
+// many replicas the one list it shows is one of; the list route, polled every
+// thirty seconds for rows, carries neither the per-replica lists nor a count
+// that pretends to. A reader asking "is every replica's output open" reads
+// the rows on the verdict route and nothing else.
+func TestTheVerdictRouteCarriesEachReplicasDependenciesAndTheListRouteDoesNot(t *testing.T) {
+	snapshots := healthySnapshots()
+	snapshots[0].TakenAt = now.Add(-5 * time.Second)
+	snapshots[0].Dependencies = []Endpoint{outputEntry(true, 1, "")}
+	snapshots[1].Dependencies = []Endpoint{outputEntry(false, 7, "kafka: dial tcp 10.0.0.1:9092: i/o timeout")}
+	handler := handlerWith(t, snapshots, Expectation{QueryGroups: 949, Known: true}, replicas())
+
+	_, health := get(t, handler, "/api/health")
+	if health["dependencies_replica"] != "pod-a" || health["dependencies_replicas"].(float64) != 2 {
+		t.Fatalf("shown list = %v of %v replicas, want pod-a's, one of 2", health["dependencies_replica"], health["dependencies_replicas"])
+	}
+	rows, _ := health["per_replica"].([]any)
+	ready := map[string]bool{}
+	for _, item := range rows {
+		row := item.(map[string]any)
+		list, _ := row["dependencies"].([]any)
+		if len(list) != 1 {
+			t.Fatalf("%v row carries %v, want its one dependency entry", row["replica"], row["dependencies"])
+		}
+		entry := list[0].(map[string]any)
+		ready[row["replica"].(string)] = entry["ready"].(bool)
+	}
+	if !ready["pod-a"] || ready["pod-b"] {
+		t.Fatalf("per-replica readiness = %v, want pod-a open and pod-b not: each row its own record", ready)
+	}
+
+	_, list := get(t, handler, "/api/objects")
+	rows, _ = list["per_replica"].([]any)
+	if len(rows) != 2 {
+		t.Fatalf("list route per_replica = %d rows, want both replicas' counts still there", len(rows))
+	}
+	for _, item := range rows {
+		row := item.(map[string]any)
+		if _, present := row["dependencies"]; present {
+			t.Errorf("the list route ships %v's dependency record on every poll: %v", row["replica"], row["dependencies"])
+		}
+	}
+}
+
+// The verdict route carries each replica's readiness bits and the count of
+// replicas that answer no, so the question a rollout asks -- is every
+// replica ready, and on which bit is the one that is not -- is one read.
+func TestTheVerdictRouteCarriesEachReplicasReadiness(t *testing.T) {
+	snapshots := healthySnapshots()
+	snapshots[0].Readiness = &ReadinessFacts{State: "ready", Ready: true, ConfigLoaded: true, SchemaReady: true,
+		AssignmentReady: true, RuntimeStateReady: true, OutputSinkReady: true, SnapshotReady: true}
+	snapshots[1].Readiness = &ReadinessFacts{State: "not_ready", Ready: false, Reasons: []string{"KAFKA_UNAVAILABLE"},
+		ConfigLoaded: true, SchemaReady: true, AssignmentReady: true, RuntimeStateReady: true, OutputSinkReady: false, SnapshotReady: true}
+	handler := handlerWith(t, snapshots, Expectation{QueryGroups: 949, Known: true}, replicas())
+	_, health := get(t, handler, "/api/health")
+	if health["replicas_not_ready"].(float64) != 1 {
+		t.Fatalf("replicas_not_ready = %v, want 1", health["replicas_not_ready"])
+	}
+	rows, _ := health["per_replica"].([]any)
+	bits := map[string]map[string]any{}
+	for _, item := range rows {
+		row := item.(map[string]any)
+		readiness, _ := row["readiness"].(map[string]any)
+		if readiness == nil {
+			t.Fatalf("%v row carries no readiness: %v", row["replica"], row)
+		}
+		bits[row["replica"].(string)] = readiness
+	}
+	if bits["pod-a"]["ready"] != true || bits["pod-a"]["output_sink_ready"] != true {
+		t.Errorf("pod-a readiness = %v, want ready with the output bit true", bits["pod-a"])
+	}
+	if bits["pod-b"]["ready"] != false || bits["pod-b"]["output_sink_ready"] != false || bits["pod-b"]["runtime_state_ready"] != true {
+		t.Errorf("pod-b readiness = %v, want not ready with the output bit the one that is false", bits["pod-b"])
+	}
+	if reasons, _ := bits["pod-b"]["reasons"].([]any); len(reasons) != 1 || reasons[0] != "KAFKA_UNAVAILABLE" {
+		t.Errorf("pod-b reasons = %v, want the process's one reason", bits["pod-b"]["reasons"])
+	}
+}
+
+// An object two replicas hold during a handover is on the health route's
+// lists once, the later entry, as the view keeps one record of it; each
+// holder's part counts it, so the totals run high for that moment, and the
+// route says so beside them. The same rows on the new holder alone are
+// counted once and carry no note.
+func TestHealthListsAnObjectTwoReplicasHoldOnceAndMarksTheHandover(t *testing.T) {
+	for name, held := range map[string]bool{"held by both": true, "held by one": false} {
+		snapshots := healthySnapshots()
+		snapshots[0].OwnedObjects = []string{"qg-a1"}
+		snapshots[1].OwnedObjects = []string{"qg-b1", "qg-handed-over"}
+		first := 1
+		if held {
+			snapshots[0].OwnedObjects, first = append(snapshots[0].OwnedObjects, "qg-handed-over"), 0
+		}
+		for index := first; index < len(snapshots); index++ {
+			at := []time.Time{now.Add(-time.Hour), now.Add(-time.Minute)}[index]
+			snapshots[index].Owned, snapshots[index].Determined = len(snapshots[index].OwnedObjects), len(snapshots[index].OwnedObjects)
+			snapshots[index].RetainedShare = []Anomaly{{QueryGroup: "qg-handed-over", Replica: snapshots[index].Replica,
+				RetainedShare: &RetainedShareFacts{PercentOfShare: uint64(90 - 20*index), Since: at}}}
+			snapshots[index].ReadEarly = []Anomaly{{QueryGroup: "qg-handed-over", Replica: snapshots[index].Replica,
+				ReadEarly: &ReadEarlyFacts{SuggestedDelaySeconds: int64(90 - 20*index), Since: at}}}
+		}
+		snapshots[0].Owned, snapshots[0].Determined = len(snapshots[0].OwnedObjects), len(snapshots[0].OwnedObjects)
+		// And one object nobody holds, which is no handover and no part of
+		// the note's number.
+		handler := handlerWith(t, snapshots, Expectation{QueryGroups: 4, Known: true,
+			IDs: []string{"qg-a1", "qg-b1", "qg-handed-over", "qg-nobody"}}, []string{"pod-a", "pod-b"})
+		body := requestJSON(t, handler, "/api/health")
+		holders := 1
+		if held {
+			holders = 2
+		}
+		for _, list := range []string{"retained_share", "read_early"} {
+			listed, _ := body[list].([]any)
+			if len(listed) != 1 || body[list+"_total"] != float64(holders) {
+				t.Errorf("%s: %s carried %v with total %v, want the object once, counted by each of its %d holders",
+					name, list, listed, body[list+"_total"], holders)
+				continue
+			}
+			if kept, _ := listed[0].(map[string]any); kept["replica"] != snapshots[1].Replica {
+				t.Errorf("%s: %s kept %v, want the later entry, %s's", name, list, kept, snapshots[1].Replica)
+			}
+		}
+		marker, marked := body["handover"].(map[string]any)
+		if marked != held || (held && marker["objects"] != float64(1)) {
+			t.Errorf("%s: handover %v, want a note naming one object only while two replicas hold it", name, body["handover"])
+		}
+	}
+}
+
+// Past FirstScreenListBound the health route carries the first few of each
+// object list in its order and says how many there are: counted before the
+// cut, or the page reads eight where there are twelve.
+func TestHealthCarriesTheFirstOfEachObjectListAndHowManyThereAre(t *testing.T) {
+	snapshots := healthySnapshots()
+	snapshots[0].PrunedSkips = map[string]PrunedSkip{}
+	for index := 0; index < 12; index++ {
+		queryGroup := fmt.Sprintf("qg-%02d", index)
+		snapshots[0].PrunedSkips[queryGroup] = PrunedSkip{From: 0, To: int64(60 * (index + 1)), At: now.Add(-time.Hour)}
+		snapshots[index%2].RetainedShare = append(snapshots[index%2].RetainedShare, Anomaly{QueryGroup: queryGroup,
+			Replica: snapshots[index%2].Replica, RetainedShare: &RetainedShareFacts{PercentOfShare: uint64(60 + index)}})
+		snapshots[index%2].ReadEarly = append(snapshots[index%2].ReadEarly, Anomaly{QueryGroup: queryGroup,
+			Replica: snapshots[index%2].Replica, ReadEarly: &ReadEarlyFacts{SuggestedDelaySeconds: int64(15 * (index + 1))}})
+	}
+	handler := handlerWith(t, snapshots, Expectation{QueryGroups: 2, Known: true}, []string{"pod-a", "pod-b"})
+	body := requestJSON(t, handler, "/api/health")
+	for _, list := range []string{"pruned_skips", "retained_share", "read_early"} {
+		listed, _ := body[list].([]any)
+		if len(listed) != FirstScreenListBound || body[list+"_total"] != float64(12) {
+			t.Errorf("%s carried %d with total %v, want the first %d and 12", list, len(listed), body[list+"_total"], FirstScreenListBound)
+			continue
+		}
+		// The first is the one the order ranks first across both replicas:
+		// the eleventh object has the longest span, the fullest share and the
+		// furthest suggestion.
+		if first, _ := listed[0].(map[string]any); first["query_group"] != "qg-11" {
+			t.Errorf("%s starts with %v, want qg-11", list, first["query_group"])
+		}
 	}
 }

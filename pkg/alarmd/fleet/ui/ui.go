@@ -27,10 +27,34 @@ import (
 //go:embed index.html
 var page []byte
 
+// The second page: strategies, one line each, in the product vocabulary the
+// server sends. Served beside the first at /v2 until the first is retired;
+// both read the same /api, and neither decides anything the server did not.
+//
+//go:embed v2.html
+var pageV2 []byte
+
+//go:embed cli.html
+var pageCLI []byte
+
 // Modified is the timestamp served for caching. Build time is not available
 // here, so a fixed instant is used: the page changes only when the binary does,
 // and the binary's own version is what an operator checks.
 var modified = time.Unix(0, 0)
+
+// Option configures what the pages say about this deployment.
+type Option func(*options)
+
+type options struct {
+	adminKeySecret AdminKeySecret
+}
+
+// WithAdminKeySecret tells the login page where the administrator key is
+// kept, so it can show the command that reads it. Without it every part of
+// that command is a placeholder.
+func WithAdminKeySecret(secret AdminKeySecret) Option {
+	return func(o *options) { o.adminKeySecret = secret }
+}
 
 // Handler serves the page at the root of whatever it is mounted under.
 //
@@ -38,9 +62,27 @@ var modified = time.Unix(0, 0)
 // every unmatched path through, and answering all of them with the page would
 // turn a typo in an API path into a silent HTML body that the caller parses as
 // JSON and reports as a decode error rather than as a 404.
-func Handler() http.Handler {
+//
+// The login page is rendered once, here: what it says about the deployment
+// is read at startup and does not change while the process runs.
+func Handler(configure ...Option) http.Handler {
+	var o options
+	for _, option := range configure {
+		if option != nil {
+			option(&o)
+		}
+	}
+	login := renderCLIPage(pageCLI, o.adminKeySecret)
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		if path := strings.TrimSuffix(request.URL.Path, "/"); path != "" && path != "/index.html" {
+		body, name := page, "index.html"
+		switch path := strings.TrimSuffix(request.URL.Path, "/"); path {
+		case "", "/index.html":
+		case "/v2", "/v2.html":
+			body, name = pageV2, "v2.html"
+		case "/cli", "/cli.html":
+			body, name = login, "cli.html"
+			response.Header().Set("Cache-Control", "no-store")
+		default:
 			http.NotFound(response, request)
 			return
 		}
@@ -53,6 +95,6 @@ func Handler() http.Handler {
 		// No frame-busting header: being embedded by a host is the delivery
 		// model, and a host that must not be framed enforces that on its own
 		// route rather than here.
-		http.ServeContent(response, request, "index.html", modified, strings.NewReader(string(page)))
+		http.ServeContent(response, request, name, modified, strings.NewReader(string(body)))
 	})
 }

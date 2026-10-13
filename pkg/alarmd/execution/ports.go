@@ -86,6 +86,23 @@ type HostBusiness interface {
 	HostIndexResolved() bool
 }
 
+// TenantHostBusiness is a HostBusiness that answers each tenant from its own
+// CMDB cache: a Plan's hosts are its tenant's, and another tenant's are under
+// keys of their own.
+type TenantHostBusiness interface {
+	HostBusiness
+	ForTenant(tenant string) HostBusiness
+}
+
+// HostBusinessFor is the tenant's view of hosts: its own answers when hosts
+// answers per tenant, hosts itself otherwise.
+func HostBusinessFor(hosts HostBusiness, tenant string) HostBusiness {
+	if tenants, ok := hosts.(TenantHostBusiness); ok {
+		return tenants.ForTenant(tenant)
+	}
+	return hosts
+}
+
 // PlanNoDataStore holds what each Plan remembers about absence between Slots.
 type PlanNoDataStore interface {
 	LoadNoData(context.Context, NoDataLoadRequest) (NoDataLoadResult, error)
@@ -107,7 +124,7 @@ type EventSink interface {
 // consumer's publication is unavailable.
 type OpenAlertCopy interface {
 	contract.OpenAlertSet
-	TrackPlans([]PlanIdentity)
+	TrackPlans(QueryGroupIdentity, []PlanIdentity)
 	Acknowledged([]contract.TriggerEventV1)
 }
 
@@ -115,6 +132,15 @@ type StateStore interface {
 	LoadRuntime(context.Context, StatePreflightRequest) (StatePreflightResult, error)
 	AdmitRuntime(context.Context, StateApplyRequest) (StateAdmissionResult, error)
 	ApplyRuntime(context.Context, StateApplyRequest) (StateApplyResult, error)
+	// RenewFrozenRuntime keeps alive the keys of series that were read and will
+	// not be written this Slot.
+	//
+	// Required rather than an optional extension a store may be asserted for.
+	// A key life is exactly the kind of guarantee that fails silently when one
+	// implementation quietly lacks the method: every test double would have it,
+	// production would not, and the only symptom would be the state loss this
+	// exists to stop, arriving months later and looking like a warming series.
+	RenewFrozenRuntime(context.Context, FrozenStateRenewalRequest) (FrozenStateRenewalResult, error)
 }
 
 type ProgressStore interface {

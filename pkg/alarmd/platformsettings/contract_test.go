@@ -16,13 +16,13 @@ import (
 
 // The keys are the protocol's formulas verbatim: prefix as given, the
 // tenant percent-encoded the way Python's quote(safe="") does it, the DB
-// key under the strategy domain.
+// key under the field's owning domain.
 func TestKeysFollowTheProtocolFormulas(t *testing.T) {
 	if got := RevisionKey(DefaultKeyPrefix); got != "bk_monitor_base:dynamic_config:revision" {
 		t.Fatalf("revision key = %s", got)
 	}
 	if got := ConfigKey(DefaultKeyPrefix, Tenant, FieldHostDisableMonitorStates.DBKey()); got !=
-		"bk_monitor_base:dynamic_config:{system}:base_config.domains.strategy.host_disable_monitor_states" {
+		"bk_monitor_base:dynamic_config:{system}:base_config.metadata.host_disable_monitor_states" {
 		t.Fatalf("config key = %s", got)
 	}
 	for tenant, want := range map[string]string{"tenant/a": "tenant%2Fa", "a b": "a%20b", "ok-._~": "ok-._~", "租户": "%E7%A7%9F%E6%88%B7"} {
@@ -85,8 +85,12 @@ func TestResolveAppliesTheProtocolFallbackRule(t *testing.T) {
 	} {
 		t.Run(arm.name, func(t *testing.T) {
 			got := Resolve(defaults, arm.platform, arm.deployment)
-			if !reflect.DeepEqual(got, arm.want) {
-				t.Fatalf("Resolve() = %+v, want %+v", got, arm.want)
+			// No arm of this table states a horizon, so each resolves the
+			// contract's default; the horizon's own rule is tested apart.
+			want := arm.want
+			want.NoDataTrackingHorizonSeconds, want.NoDataTrackingHorizonSource = DefaultNoDataTrackingHorizonSeconds, HorizonSourceDefault
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("Resolve() = %+v, want %+v", got, want)
 			}
 		})
 	}
@@ -115,5 +119,33 @@ func TestChangedFieldsNamesEveryDifference(t *testing.T) {
 	// way to say nil.
 	if !(Settings{BKDataCMDBLevelTables: nil}).Equal(Settings{BKDataCMDBLevelTables: []string{}}) {
 		t.Fatal("nil and empty read as different lists")
+	}
+}
+
+// Every field reads the layer its effective value came from. A layer that
+// states the code default falls through under the protocol's rule, and the
+// source says so: a platform publishing false beside a deployment stating
+// true is true, from VALUES - the platform's own consumers resolve its DB
+// and deployment layers the same way. A platform stating a value nothing
+// below overrides is DYNAMIC, and nothing stated anywhere is DEFAULT.
+func TestEachSettingNamesTheLayerItCameFrom(t *testing.T) {
+	yes, no := true, false
+	tables := []string{"system.cpu_detail_cmdb_level"}
+	platform := Layer{Origin: HorizonSourceDynamic, IsAccessBKData: &no, BKDataCMDBLevelTables: &tables}
+	deployment := Layer{Origin: HorizonSourceValues, IsAccessBKData: &yes}
+	settings, sources := ResolveSources(CodeDefaults(), platform, deployment)
+	if !settings.IsAccessBKData || sources[FieldIsAccessBKData] != HorizonSourceValues {
+		t.Fatalf("is_access_bk_data = %v from %s, want true from VALUES: the platform's false is the default and falls through",
+			settings.IsAccessBKData, sources[FieldIsAccessBKData])
+	}
+	if sources[FieldBKDataCMDBLevelTables] != HorizonSourceDynamic || sources[FieldFileSystemTypeIgnore] != HorizonSourceDefault {
+		t.Fatalf("sources %v, want the tables from DYNAMIC and the file system types from DEFAULT", sources)
+	}
+	// The platform stating the default with nothing below it: its own word.
+	if _, sources := ResolveSources(CodeDefaults(), platform); sources[FieldIsAccessBKData] != HorizonSourceDynamic {
+		t.Fatalf("a platform stating false alone reads %s, want DYNAMIC", sources[FieldIsAccessBKData])
+	}
+	if _, sources := ResolveSources(CodeDefaults()); len(sources) != len(Fields) || sources[FieldIsAccessBKData] != HorizonSourceDefault {
+		t.Fatalf("no layers = %v, want every field from DEFAULT", sources)
 	}
 }

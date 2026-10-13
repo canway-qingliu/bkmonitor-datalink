@@ -4,23 +4,12 @@ import (
 	"context"
 	"errors"
 	"github.com/prometheus/client_golang/prometheus/testutil"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/observability"
 )
-
-func TestWorkflowContractHasActualReturnFacts(t *testing.T) {
-	o := observability.Observation{Component: observability.ComponentScheduler, Stage: "runner_returned", Result: observability.ResultSuccess}
-	field := reflect.ValueOf(&o).Elem().FieldByName("RunOutcome")
-	if !field.IsValid() {
-		t.Fatal("actual RunOne return facts are missing")
-	}
-	field.SetString("source_retry")
-	NewRecorder(BuildInfo{}).Observe(context.Background(), o)
-}
 
 func TestWorkflowContractCountsAndSeriesBound(t *testing.T) {
 	r := NewRecorder(BuildInfo{})
@@ -29,7 +18,7 @@ func TestWorkflowContractCountsAndSeriesBound(t *testing.T) {
 	for _, out := range runs {
 		r.Observe(ctx, observability.Observation{Component: observability.ComponentScheduler, Stage: observability.StageRunnerReturned, RunOutcome: out, Attempted: out == "source_retry"})
 	}
-	for _, out := range []string{"completed", "readiness_deferred", "retrying", "cancelled", "error", "incomplete"} {
+	for _, out := range []string{"completed", "readiness_deferred", "view_not_executable", "retrying", "cancelled", "error", "incomplete"} {
 		r.Observe(ctx, observability.Observation{Component: observability.ComponentScheduler, Stage: observability.StageSlotCompleted, ExecuteOutcome: out})
 	}
 	kinds := []string{"FULL_COMPLETED", "FULL_EMPTY_COMPLETED", "COMPLETED_WITH_PARTIAL_GAP", "COMPLETED_WITH_UNAVAILABLE", "COMPLETED_WITH_TERMINAL", "GAP_SKIPPED", "SNAPSHOT_UNAVAILABLE"}
@@ -45,9 +34,6 @@ func TestWorkflowContractCountsAndSeriesBound(t *testing.T) {
 		r.Observe(ctx, observability.Observation{Component: observability.ComponentScheduler, Stage: observability.StageQueryPermitWait, PermitWait: &observability.PermitWaitFacts{Recovery: recovery}, Duration: time.Millisecond})
 	}
 	r.Observe(ctx, observability.Observation{Component: observability.ComponentScheduler, Stage: observability.StageDispatcherSnapshot, Dispatcher: &observability.DispatcherFacts{Active: 2, Ready: 7, Delayed: 3, QueuesKnown: true}})
-	if got := testutil.ToFloat64(r.phaseTwo.workflow.attempted); got != 1 {
-		t.Fatalf("attempted=%v", got)
-	}
 	if got := testutil.ToFloat64(r.phaseTwo.workflow.progress.WithLabelValues(kinds[0])); got != 1 {
 		t.Fatalf("failed commit counted: %v", got)
 	}
@@ -66,7 +52,7 @@ func TestWorkflowContractCountsAndSeriesBound(t *testing.T) {
 	for _, f := range families {
 		name := strings.TrimPrefix(f.GetName(), "bkmonitor_alarmd_")
 		switch name {
-		case "run_one_return_total", "run_one_attempted_total", "execute_return_total", "progress_completed_total", "scheduler_active_executions", "scheduler_ready_runners", "scheduler_delayed_runners", "query_permit_wait_seconds", "slot_operation_duration_seconds":
+		case "run_one_return_total", "execute_return_total", "progress_completed_total", "scheduler_active_executions", "scheduler_ready_runners", "scheduler_delayed_runners", "query_permit_wait_seconds", "slot_operation_duration_seconds":
 		default:
 			continue
 		}
@@ -91,7 +77,10 @@ func TestWorkflowContractCountsAndSeriesBound(t *testing.T) {
 			}
 		}
 	}
+	// 74: the executor's view_not_executable return is one more
+	// execute_return_total series, and the attempted counter, which nothing
+	// read, one fewer.
 	if count != 74 {
-		t.Fatalf("new series=%d want74 (including +Inf,sum,count, no created)", count)
+		t.Fatalf("new series=%d want 74 (including +Inf,sum,count, no created)", count)
 	}
 }

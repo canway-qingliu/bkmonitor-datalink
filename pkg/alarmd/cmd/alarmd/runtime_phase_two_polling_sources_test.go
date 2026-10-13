@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,7 +17,6 @@ import (
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/contract"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/controlplane"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
 	enginekafka "github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/kafka"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/metric"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/observability"
@@ -30,7 +30,7 @@ func TestProductionPollingSources(t *testing.T) {
 	for _, source := range []struct{ label, kind string }{
 		{"custom", "time_series"}, {"prometheus", "time_series"}, {"bk_data", "time_series"},
 		{"bk_log_search", "time_series"}, {"bk_log_search", "log"},
-		{"bk_monitor", "log"}, {"custom", "event"}, {"bk_fta", "event"},
+		{"bk_monitor", "log"}, {"custom", "event"},
 	} {
 		for _, second := range []string{"normal", "unavailable", "partial"} {
 			t.Run(source.label+"/"+source.kind+"/"+second, func(t *testing.T) {
@@ -61,12 +61,6 @@ func TestProductionPollingSources(t *testing.T) {
 					query["custom_event_name"], query["result_table_id"] = "synthetic-event", "system_event"
 				}
 				dimension := "host"
-				if source.label == "bk_fta" {
-					dimension = "tags.host"
-					query["agg_dimension"] = []string{dimension}
-					delete(query, "metric_field")
-					query["alert_name"] = "__ALL_EVENT_PLUGIN__"
-				}
 				body, err := json.Marshal(document)
 				if err != nil {
 					t.Fatal(err)
@@ -96,26 +90,6 @@ func TestProductionPollingSources(t *testing.T) {
 						clauses, ok := payload["query_list"].([]any)
 						if !ok || len(clauses) != 1 || clauses[0].(map[string]any)["table_id"] != "bklog_index_set_71" {
 							return nil, fmt.Errorf("log query did not use index_set_id: %v", payload)
-						}
-					}
-					if source.label == "bk_fta" {
-						clauses, ok := payload["query_list"].([]any)
-						if !ok || len(clauses) != 1 || clauses[0].(map[string]any)["field_semantics"] != "fta_event_tags/v1" || payload["tsdb_map"] == nil {
-							return nil, fmt.Errorf("FTA missing ES route or keyed tag semantics: %v", payload)
-						}
-						sourceFilter, ok := clauses[0].(map[string]any)["source_conditions"].(map[string]any)
-						if !ok {
-							return nil, fmt.Errorf("FTA missing independent source filter")
-						}
-						pluginFilter := false
-						for _, raw := range sourceFilter["field_list"].([]any) {
-							field := raw.(map[string]any)
-							if field["field_name"] == "plugin_id" && field["op"] == "ne" && fmt.Sprint(field["value"]) == "[bkmonitor]" {
-								pluginFilter = true
-							}
-						}
-						if !pluginFilter {
-							return nil, fmt.Errorf("FTA alert_name did not filter event plugins: %v", sourceFilter)
 						}
 					}
 					if source.label == "prometheus" {
@@ -148,12 +122,6 @@ func TestProductionPollingSources(t *testing.T) {
 					return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(&buf), Request: request}, nil
 				})}
 				cfg := controlledG4RuntimeConfig(address, "http://controlled-uq", "alarmd-polling-controlled")
-				if source.label == "bk_fta" {
-					cfg.PhaseTwo.Control.LegacyQueryRuntime.FTAEventStorage = &execution.QueryStorage{
-						TableID: "fta.event", StorageID: "1", StorageType: "elasticsearch", DB: "bkfta_event_*_read", Measurement: "__default__",
-						TimeField: execution.QueryTimeField{Name: "time", Type: "date", Unit: "millisecond"},
-					}
-				}
 				events := &recordingPhaseTwoEventSink{}
 				bundle, err := openProductionPhaseTwoBundleWithDependencies(ctx, cfg, metric.NewRecorder(metric.BuildInfo{}), observability.Discard(observability.ComponentRuntime), newPhaseTwoApplicationHealth(),
 					func(client redis.Cmdable, prefix string) (controlplane.StrategySource, error) {
@@ -165,7 +133,7 @@ func TestProductionPollingSources(t *testing.T) {
 							defer mu.Unlock()
 							observations = append(observations, observability.NormalizeObservation(o))
 						}),
-						OpenEvents: func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) { return events, nil },
+						PrepareEvents: preparedEvents(func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) { return events, nil }),
 					})
 				if err != nil {
 					t.Fatal(err)
@@ -180,7 +148,7 @@ func TestProductionPollingSources(t *testing.T) {
 				}
 				for _, slot := range []int64{base, base + 60} {
 					clock.Store(slot + 1)
-					if err := bundle.runScheduledOnce(ctx); err != nil {
+					if err := runScheduledOnceSettled(ctx, bundle); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -193,17 +161,24 @@ func TestProductionPollingSources(t *testing.T) {
 				seen := append([]observability.Observation(nil), observations...)
 				queried := calls
 				mu.Unlock()
-				if len(written) != want || queried == 0 || len(bundle.queryGroups) != 1 {
-					t.Fatalf("events=%v calls=%d groups=%d stages=%v", controlledEventKinds(written), queried, len(bundle.queryGroups), observedStages(seen))
+				// Decided, as the output lines count it; the recoveries have
+				// no message under the Python-compatible protocol these
+				// sources run under, so only the anomalies reach the sink.
+				decided := decidedEventKinds(seen)
+				if len(decided) != want || queried == 0 || len(bundle.queryGroups) != 1 {
+					t.Fatalf("decided=%v written=%v calls=%d groups=%d stages=%v", decided, controlledEventKinds(written), queried, len(bundle.queryGroups), observedStages(seen))
 				}
-				for i, event := range written {
+				for i, kind := range decided {
 					expected := contract.TriggerEventAbnormal
 					if i >= 2 {
 						expected = contract.TriggerEventRecovery
 					}
-					if event.EventKind != expected {
-						t.Fatalf("event %d=%s want=%s", i, event.EventKind, expected)
+					if kind != expected {
+						t.Fatalf("decided %d=%s want=%s", i, kind, expected)
 					}
+				}
+				if got := controlledEventKinds(written); !reflect.DeepEqual(got, []string{contract.TriggerEventAbnormal, contract.TriggerEventAbnormal}) {
+					t.Fatalf("written=%v, want the two anomalies only: a Python-compatible RECOVERY has no message", got)
 				}
 				assertObservedOrder(t, observedStages(seen), []observability.Stage{observability.StageEventACKed, observability.StageStateApplied, observability.StageProgressCommitted})
 			})

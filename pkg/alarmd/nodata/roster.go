@@ -50,6 +50,61 @@ type RosterClass struct {
 	// it with the hosts the CMDB index holds, as the backend intersects its
 	// target values with the business's hosts.
 	Hosts []HostIdentity
+	// Plan is the frozen target plan, and only TARGET_PLAN has one. Its
+	// identity is what turns a resolved member key back into the group the
+	// data reports under.
+	Plan *contract.TargetPlanV1
+}
+
+// ClassifyTarget decides the roster class of an item from whichever frozen
+// target form its Plan carries. The target plan is read first and alone:
+// a Plan carrying one has no TargetScope, and letting the old classification
+// see a nil scope would declare a history roster for a target the strategy
+// stated - the expected set would grow out of the memory and the target
+// would decide nothing.
+//
+// A target plan can express a roster exactly when the item's no-data
+// dimensions are the dimensions its record key is read from - the member
+// keys then split back into groups the data reports under. Any other
+// dimension set is refused by name rather than approximated as history or
+// as the whole item: a superset would need a cross product nobody can
+// enumerate, and the whole item is a semantics this build does not claim
+// for the new form.
+func ClassifyTarget(scope *contract.TargetScopeV2, plan *contract.TargetPlanV1, aggDimension []string) (RosterClass, error) {
+	if plan == nil {
+		return ClassifyRoster(scope, aggDimension)
+	}
+	if !sameDimensionSet(plan.Identity.RosterDimensions(), aggDimension) {
+		return RosterClass{}, &RosterUnsupportedError{
+			Reason: "the no-data dimensions are not the target plan's key dimensions " +
+				strings.Join(plan.Identity.RosterDimensions(), ",") + ", so the expected set cannot be enumerated from the target",
+		}
+	}
+	return RosterClass{Source: RosterTargetPlan, Plan: plan}, nil
+}
+
+// sameDimensionSet compares two dimension lists as sets of non-empty names.
+func sameDimensionSet(expected, actual []string) bool {
+	want := make(map[string]struct{}, len(expected))
+	for _, name := range expected {
+		want[name] = struct{}{}
+	}
+	got := make(map[string]struct{}, len(actual))
+	for _, name := range actual {
+		if name == "" {
+			return false
+		}
+		got[name] = struct{}{}
+	}
+	if len(want) != len(got) {
+		return false
+	}
+	for name := range want {
+		if _, found := got[name]; !found {
+			return false
+		}
+	}
+	return true
 }
 
 // ClassifyRoster decides which of the five combinations an item is.
@@ -138,6 +193,13 @@ type RosterRequest struct {
 	// Scope is the strategy's target, frozen in the Plan. Nil means it names
 	// none.
 	Scope *contract.TargetScopeV2
+	// Plan is the target's second frozen form; nil for every other Plan.
+	Plan *contract.TargetPlanV1
+	// TargetMembers are the member keys the worker resolved Plan to in this
+	// Slot. Read for TARGET_PLAN only, and only once the caller has decided
+	// the resolution is complete: an incomplete or unavailable resolution
+	// never reaches the roster.
+	TargetMembers []string
 	// KnownHosts is the set of "address|cloud" keys the CMDB index holds for
 	// this business. A declared host missing from it is not expected, which is
 	// the backend intersecting its target values with the business's hosts.
@@ -188,20 +250,35 @@ func (err *RosterUnsupportedError) Error() string {
 // returning empty for either would expect nothing where the backend expects a
 // set, silently, every round.
 func BuildRoster(request RosterRequest) (Roster, error) {
-	class, err := ClassifyRoster(request.Scope, request.AggDimension)
+	class, err := ClassifyTarget(request.Scope, request.Plan, request.AggDimension)
 	if err != nil {
 		return Roster{}, err
 	}
 	roster := Roster{Source: class.Source, Groups: map[string]Group{}}
 	switch class.Source {
 	case RosterHistory:
-		roster.Groups = historyGroups(request.Memory)
+		if roster.Groups, err = historyGroups(request.Memory); err != nil {
+			return Roster{}, err
+		}
 	case RosterTargetStatic:
 		for _, host := range class.Hosts {
 			if _, known := request.KnownHosts[host.IP+"|"+host.CloudID]; !known {
 				continue
 			}
 			group := hostTargetGroup(host)
+			roster.Groups[group.Key()] = group
+		}
+	case RosterTargetPlan:
+		// The members are expected as resolved: the writer's static list is
+		// the writer's to keep current, and a dynamic member that left its
+		// group leaves the roster on the next complete resolution, which is
+		// what closes its absence once. No CMDB intersection here; the
+		// resolution already is the CMDB's answer where one was asked.
+		for _, key := range request.TargetMembers {
+			group, ok := targetPlanGroup(class.Plan.Identity, key)
+			if !ok {
+				continue
+			}
 			roster.Groups[group.Key()] = group
 		}
 	}
@@ -265,6 +342,21 @@ func hostPairIsTheWholeDimensionSet(aggDimension []string) bool {
 	return seen[HostIPDimension] && seen[HostCloudDimension]
 }
 
+// targetPlanGroup turns one resolved member key into the group the data
+// reports it under, by the plan's identity dimensions.
+func targetPlanGroup(identity contract.TargetPlanIdentityV1, key string) (Group, bool) {
+	values, ok := identity.Group(key)
+	if !ok {
+		return Group{}, false
+	}
+	dimensions := make([]Dimension, 0, len(values))
+	for name, value := range values {
+		dimensions = append(dimensions, Dimension{Name: name, Value: value})
+	}
+	sort.Slice(dimensions, func(left, right int) bool { return dimensions[left].Name < dimensions[right].Name })
+	return Group{dimensions: dimensions}, true
+}
+
 func hostTargetGroup(host HostIdentity) Group {
 	dimensions := []Dimension{
 		{Name: HostCloudDimension, Value: host.CloudID},
@@ -281,7 +373,13 @@ func hostTargetGroup(host HostIdentity) Group {
 // evaluation records when the item as a whole went absent, and it is not a
 // series - carrying it into a roster would make the item expect itself, so it
 // would be judged as a group whose absence is the very thing that put it there.
-func historyGroups(memory map[string]GroupMemory) map[string]Group {
+//
+// A remembered key that does not parse back into a group is refused by name
+// rather than left out. Every key this package writes parses, so one that does
+// not was written by something else, and leaving it out would quietly stop
+// expecting a group the memory says was seen: its absence would never be
+// reported, and nothing would say why.
+func historyGroups(memory map[string]GroupMemory) (map[string]Group, error) {
 	whole := WholeItemGroup().Key()
 	groups := make(map[string]Group, len(memory))
 	for key, entry := range memory {
@@ -290,9 +388,20 @@ func historyGroups(memory map[string]GroupMemory) map[string]Group {
 		}
 		group, ok := ParseGroupKey(key)
 		if !ok {
-			continue
+			return nil, unparseableGroupKey(key)
 		}
 		groups[key] = group
 	}
-	return groups
+	return groups, nil
+}
+
+// unparseableGroupKey is the refusal of a remembered key this package could
+// not have written. The key is quoted short: it is text from the store, and
+// the error travels to a log line.
+func unparseableGroupKey(key string) error {
+	const shown = 96
+	if len(key) > shown {
+		key = key[:shown] + "..."
+	}
+	return fmt.Errorf("alarmd nodata: remembered group key %q does not parse back into a group", key)
 }

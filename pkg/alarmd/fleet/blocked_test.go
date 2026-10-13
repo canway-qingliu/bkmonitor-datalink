@@ -94,8 +94,8 @@ func TestTheErrorTextNamesTheDependencyTheCodeDoesNot(t *testing.T) {
 			LastError: &LastError{Text: "alarmd progress: commit: redis: connection pool timeout", At: at}}, DependencyRedis, dependencyByText},
 		{"the server's LOADING reply", Anomaly{Kind: KindDegradedRun, ReasonCode: "error",
 			LastError: &LastError{Text: "LOADING Redis is loading the dataset in memory", At: at}}, DependencyRedis, dependencyByText},
-		{"the query failure's detail", Anomaly{Kind: KindDegradedRun, CauseReason: "STATE_WRITE_RETRYABLE",
-			Failure: &FailureRef{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 10.0.0.1:6379: i/o timeout"}}, DependencyRedis, dependencyByText},
+		{"the query failure's detail", Anomaly{Kind: KindDegradedRun, CauseReason: "STATE_WRITE_RETRYABLE", ReasonLastAt: at,
+			Failure: &FailureRef{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 10.0.0.1:6379: i/o timeout", At: &at}}, DependencyRedis, dependencyByText},
 		{"a timeout whose text names nothing stays unlocated", Anomaly{Kind: KindDegradedRun, CauseReason: "QUERY_TIMEOUT",
 			LastError: &LastError{Text: "context deadline exceeded", At: at}}, DependencyUnlocated, ""},
 		{"the code wins over the text when it names one", Anomaly{Kind: KindDegradedRun, CauseReason: "KAFKA_UNAVAILABLE",
@@ -106,6 +106,45 @@ func TestTheErrorTextNamesTheDependencyTheCodeDoesNot(t *testing.T) {
 		if blocked == nil || blocked.Dependency != tc.want || blocked.DependencyEvidence != tc.by {
 			t.Errorf("%s: blocked = %+v, want dependency %s by %q", tc.name, blocked, tc.want, tc.by)
 		}
+	}
+}
+
+// Every field of the reading comes from the row's latest round. The error's
+// words and the query failure's detail are kept until a healthy completion,
+// so on a row whose latest round ended some other way they describe an
+// earlier round: read as current, a new reason borrowed an old Redis error
+// as its dependency, and a round that had just ended was called a retry and
+// then silence. A failure reference from before the timestamp existed is
+// not current either -- it cannot say when it was, so it says nothing.
+func TestTheReadingIsTakenFromTheLatestRoundOnly(t *testing.T) {
+	old := now.Add(-20 * time.Minute)
+	fresh := now.Add(-time.Minute)
+	stale := &LastError{Text: "alarmd progress: commit: redis: connection pool timeout", At: old, Operation: "commit"}
+	row := Anomaly{Kind: KindDegradedRun, Cause: "LEVEL_OUTCOME_UNKNOWN", CauseReason: "QUERY_TIMEOUT", ReasonLastAt: fresh, LastError: stale,
+		Failure: &FailureRef{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 10.0.0.1:6379: i/o timeout", At: &old}}
+	blocked := blockedOf(row, ScheduleOnTime)
+	if blocked.Dependency != DependencyUnlocated || blocked.DependencyEvidence != "" || blocked.Text != "" || blocked.Operation != "" {
+		t.Fatalf("blocked = %+v, want the old error's words and dependency left out of this round's reading", blocked)
+	}
+	if blocked.At == nil || !blocked.At.Equal(fresh) || blocked.Effect != EffectUnconfirmed || blocked.Retrying {
+		t.Fatalf("blocked = %+v, want the latest round's time and its effect (a round that ended, unconfirmed), not a retry", blocked)
+	}
+	// The same error on the round that is the latest: read in full.
+	current := row
+	current.ReasonLastAt, current.LastError = old, stale
+	current.Cause, current.CauseReason = "", ""
+	current.ReasonCode = "error"
+	blocked = blockedOf(current, ScheduleOnTime)
+	if blocked.Dependency != DependencyRedis || blocked.DependencyEvidence != dependencyByText || blocked.Operation != "commit" ||
+		blocked.At == nil || !blocked.At.Equal(old) || blocked.Effect != EffectRetrying {
+		t.Fatalf("blocked = %+v, want the error read in full when its round is the latest", blocked)
+	}
+	// A failure reference without a time is from a publisher that could not
+	// say when it was: not this round's evidence.
+	undated := Anomaly{Kind: KindDegradedRun, CauseReason: "STATE_WRITE_RETRYABLE", ReasonLastAt: fresh,
+		Failure: &FailureRef{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 10.0.0.1:6379: i/o timeout"}}
+	if blocked := blockedOf(undated, ScheduleOnTime); blocked.Dependency != DependencyUnlocated || blocked.Text != "" {
+		t.Fatalf("blocked = %+v, want an undated failure reference left out", blocked)
 	}
 }
 
@@ -124,7 +163,7 @@ func TestEffectIsReadFromTheRowsEvidence(t *testing.T) {
 	}{
 		{"a persisted skip record", Anomaly{Kind: KindSkippedSpan, ReasonCode: "GAP_SKIPPED", Skip: &SkippedSpan{At: at, Slots: 3}}, ScheduleOnTime, EffectSkipped},
 		{"a skip record on a demoted row outranks the cooldown", Anomaly{Kind: KindQueryCooldown, QueryCooldown: &cooldownFacts, Skip: &SkippedSpan{At: at}}, ScheduleOnTime, EffectSkipped},
-		{"a round that failed will run again", Anomaly{Kind: KindDegradedRun, ReasonCode: "error", LastError: &LastError{Text: "x", At: at}}, ScheduleOnTime, EffectRetrying},
+		{"a round that failed will run again", Anomaly{Kind: KindDegradedRun, ReasonCode: "error", ReasonLastAt: at, LastError: &LastError{Text: "x", At: at}}, ScheduleOnTime, EffectRetrying},
 		{"a cooldown is a retry scheduled", Anomaly{Kind: KindQueryCooldown, QueryCooldown: &cooldownFacts}, ScheduleOnTime, EffectRetrying},
 		{"a round nothing came of", Anomaly{Kind: KindBlockedRun, ReasonCode: "source_error"}, ScheduleOnTime, EffectRetrying},
 		{"a stalled round", Anomaly{Kind: KindDegradedRun, Stalled: true, ReasonCode: "error"}, ScheduleOnTime, EffectRetrying},
@@ -213,7 +252,7 @@ func TestTrackerKeepsTheLastHealthyCompletionAcrossRuns(t *testing.T) {
 			Trace: observability.TraceFields{QueryGroupKey: queryGroup, EvaluationTime: slot},
 		})
 	}
-	tracker.Observe(context.Background(), completion("qg-1", "FULL_COMPLETED", "8709"))
+	tracker.Observe(context.Background(), completion("qg-1", "FULL_COMPLETED", "852"))
 	healthyAt := at.at
 	at.at = at.at.Add(time.Minute)
 	for round := 0; round < DefaultDegradedRounds; round++ {
@@ -285,4 +324,494 @@ func containsDependency(dependency Dependency) bool {
 		}
 	}
 	return false
+}
+
+// The tracker stamps the query failure with when it was seen and which Slot
+// it was on, so the reading can tell this round's failure from one kept
+// since an earlier round -- and use this round's detail for the dependency.
+//
+// The clock runs: the failure is observed on its way to the round's end, so
+// it is stamped a moment before the completion that ends the same Slot.
+// Frozen, the clock hid that order, and a reading that compared the two
+// stamps dropped every real failure filed one millisecond before its own
+// round completed -- the row then said the round was stuck with nothing to
+// show for it.
+func TestTrackerStampsTheQueryFailureWithItsTimeAndSlot(t *testing.T) {
+	at := &clock{at: now}
+	tracker := newTracker(t, at)
+	var failedAt time.Time
+	for round := 0; round < DefaultDegradedRounds; round++ {
+		slot := int64(100 + 60*round)
+		failedAt = at.at
+		tracker.Observe(context.Background(), observability.Observation{
+			QueryFailure: &observability.QueryFailureFacts{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 10.0.0.1:6379: i/o timeout"},
+			Trace:        observability.TraceFields{QueryGroupKey: "qg-1", EvaluationTime: slot},
+		})
+		at.at = at.at.Add(time.Millisecond)
+		tracker.Observe(context.Background(), observability.Observation{
+			ProgressCompletionKind: "COMPLETED_WITH_UNAVAILABLE", ProgressCompletionCause: "LEVEL_OUTCOME_UNKNOWN", ProgressCompletionReason: "STATE_WRITE_RETRYABLE",
+			Trace: observability.TraceFields{QueryGroupKey: "qg-1", EvaluationTime: slot},
+		})
+		at.at = at.at.Add(time.Minute)
+	}
+	rows := tracker.Anomalies()
+	if len(rows) != 1 || rows[0].Failure == nil || rows[0].Failure.At == nil || !rows[0].Failure.At.Equal(failedAt) || rows[0].Failure.Slot != 100+60*(DefaultDegradedRounds-1) {
+		t.Fatalf("rows = %+v, want the failure reference stamped with the time it was seen and the Slot it was on", rows)
+	}
+	if rows[0].RoundSlot != rows[0].Failure.Slot {
+		t.Fatalf("round slot = %d, failure slot = %d, want the row's latest round to be the Slot the failure was on", rows[0].RoundSlot, rows[0].Failure.Slot)
+	}
+	Attribute(rows, at.at)
+	blocked := rows[0].Blocked
+	if blocked == nil || blocked.Dependency != DependencyRedis || blocked.DependencyEvidence != dependencyByText || blocked.Text != "dial tcp 10.0.0.1:6379: i/o timeout" {
+		t.Fatalf("blocked = %+v, want Redis named from this round's failure detail, and the detail as the round's words", blocked)
+	}
+	// The round ended -- degraded, but ended -- so it is not being retried,
+	// whatever the failure on its way there said.
+	if blocked.Effect != EffectUnconfirmed {
+		t.Fatalf("effect = %s, want UNCONFIRMED for a round that ended degraded after its own failure", blocked.Effect)
+	}
+}
+
+// A Slot that failed and was then retried to a degraded completion is one
+// round with an error in its history and an end: the error is that round's
+// words, and the round is over, not being retried. The effect is read from
+// how the round ended, not from the error being this round's -- the two
+// used to be one flag.
+func TestARoundThatEndedAfterItsErrorIsNotBeingRetried(t *testing.T) {
+	at := &clock{at: now}
+	tracker := newTracker(t, at)
+	slot := int64(1_700_000_000)
+	for round := 0; round < DefaultDegradedRounds; round++ {
+		tracker.Observe(context.Background(), observability.Observation{
+			ExecuteOutcome: "error", Err: errors.New("alarmd worker: commit: redis: connection pool timeout"),
+			Trace: observability.TraceFields{QueryGroupKey: "qg-1", EvaluationTime: slot},
+		})
+		at.at = at.at.Add(30 * time.Second)
+	}
+	rows := tracker.Anomalies()
+	Attribute(rows, at.at)
+	if len(rows) != 1 || rows[0].Blocked == nil || rows[0].Blocked.Effect != EffectRetrying || rows[0].Blocked.Dependency != DependencyRedis {
+		t.Fatalf("rows = %+v, want the failing Slot read as retrying against Redis", rows)
+	}
+	// The retry of the same Slot ends it, degraded.
+	tracker.Observe(context.Background(), observability.Observation{
+		ProgressCompletionKind: "COMPLETED_WITH_UNAVAILABLE", ProgressCompletionReason: "STATE_WRITE_RETRYABLE",
+		Trace: observability.TraceFields{QueryGroupKey: "qg-1", EvaluationTime: slot},
+	})
+	rows = tracker.Anomalies()
+	Attribute(rows, at.at)
+	blocked := rows[0].Blocked
+	if blocked == nil || blocked.Effect != EffectUnconfirmed || blocked.Retrying {
+		t.Fatalf("blocked = %+v, want the ended round not read as retrying", blocked)
+	}
+	if blocked.Text != "alarmd worker: commit: redis: connection pool timeout" || blocked.Dependency != DependencyRedis {
+		t.Fatalf("blocked = %+v, want the error kept as this round's words, it was this Slot's", blocked)
+	}
+}
+
+// A timeout's row carries this round's query read against its budget, from
+// the observation that reported the failure to the blocked reading: begun
+// 11 s after its 30 s settling wait with 9 s left, and all of it used,
+// reads as a query begun late - which UNLOCATED alone could not say. A
+// failure kept from an earlier Slot times nothing on this round's row.
+func TestATimeoutsRowCarriesThisRoundsQueryAgainstItsBudget(t *testing.T) {
+	at := &clock{at: now}
+	tracker := newTracker(t, at)
+	timing := observability.QueryTiming{SettleMillis: 30_000, StartLateMillis: 11_000, BudgetMillis: 9_000, ElapsedMillis: 9_004}
+	for round := 0; round < DefaultDegradedRounds; round++ {
+		slot := int64(100 + 60*round)
+		reported := timing
+		tracker.Observe(context.Background(), observability.Observation{
+			QueryFailure: &observability.QueryFailureFacts{Stage: "provider", Category: "provider_transport", Code: "QUERY_TIMEOUT",
+				Detail: "transport=timeout", Timing: &reported},
+			Trace: observability.TraceFields{QueryGroupKey: "qg-1", EvaluationTime: slot},
+		})
+		at.at = at.at.Add(time.Millisecond)
+		tracker.Observe(context.Background(), observability.Observation{
+			ProgressCompletionKind: "COMPLETED_WITH_UNAVAILABLE", ProgressCompletionReason: "QUERY_TIMEOUT",
+			Trace: observability.TraceFields{QueryGroupKey: "qg-1", EvaluationTime: slot},
+		})
+		at.at = at.at.Add(time.Minute)
+	}
+	rows := tracker.Anomalies()
+	Attribute(rows, at.at)
+	if len(rows) != 1 || rows[0].Failure == nil || rows[0].Failure.Timing == nil || *rows[0].Failure.Timing != timing {
+		t.Fatalf("rows = %+v, want the failure carrying its timing", rows)
+	}
+	blocked := rows[0].Blocked
+	if blocked == nil || blocked.Timing == nil || *blocked.Timing != timing || blocked.Text != "transport=timeout" {
+		t.Fatalf("blocked = %+v, want this round's timing beside its detail", blocked)
+	}
+	if blocked.Timing == rows[0].Failure.Timing {
+		t.Fatal("the blocked reading aliases the failure's timing")
+	}
+
+	earlier := rows[0]
+	failure := *earlier.Failure
+	failure.Slot = earlier.RoundSlot - 60
+	earlier.Failure = &failure
+	if blocked := blockedOf(earlier, ""); blocked.Timing != nil {
+		t.Fatalf("blocked = %+v, want no timing from an earlier Slot's failure", blocked)
+	}
+}
+
+// Two Slots that are known and differ are two rounds, whatever the clocks
+// say: a failure stamped after the latest round ended, on the next Slot, is
+// the next round's -- in flight -- and not this one's. The clock decides
+// only when a Slot is missing, which a publisher before the field is.
+func TestKnownAndDifferentSlotsAreTwoRoundsWhateverTheClocksSay(t *testing.T) {
+	later := now.Add(time.Second)
+	inFlight := Anomaly{Kind: KindDegradedRun, ReasonCode: "COMPLETED_WITH_UNAVAILABLE", CauseReason: "HISTORY_GAPPED",
+		ReasonLastAt: now, RoundSlot: 1000,
+		Failure: &FailureRef{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 10.0.0.1:6379: i/o timeout", At: &later, Slot: 1060}}
+	blocked := blockedOf(inFlight, "")
+	if blocked.Dependency == DependencyRedis || blocked.Text != "" {
+		t.Fatalf("blocked = %+v, want the next Slot's failure not read as this round's although stamped later", blocked)
+	}
+	// The same row from a publisher that stamps no Slot: the clock decides,
+	// as it did before the field existed.
+	unslotted := inFlight
+	unslotted.RoundSlot = 0
+	unslotted.Failure = &FailureRef{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 10.0.0.1:6379: i/o timeout", At: &later}
+	if blocked := blockedOf(unslotted, ""); blocked.Dependency != DependencyRedis {
+		t.Fatalf("blocked = %+v, want the clock to decide when no Slot is known", blocked)
+	}
+}
+
+// The cause describes the last round that completed. When the latest round
+// failed instead, and the failure named this round, the failure decides the
+// line and the reading: a row whose last completion was skipped past the
+// replay window and whose rounds since are refused by a gap guard is the
+// refusal, not the skip. A completion after the failure puts the cause
+// back first; a failure kept from an earlier Slot never comes first.
+func TestThisRoundsFailureOutranksTheLastCompletionsCause(t *testing.T) {
+	failedAt := now
+	refusedAfterSkip := Anomaly{Kind: KindDegradedRun, ReasonCode: "error", CauseReason: "GAP_SKIPPED", ReasonLastAt: now, RoundSlot: 1060,
+		Failure:   &FailureRef{Stage: "other", Category: "completion_contract", Code: "GAP_GUARD_CONFLICT", At: &failedAt, Slot: 1060},
+		LastError: &LastError{Text: "alarmd worker: finalize query-free Slot: gap marker conflicts", At: now, EvaluationTime: 1060}}
+	rows := []Anomaly{refusedAfterSkip}
+	Attribute(rows, now)
+	if rows[0].Finding.Check != CheckDefect || rows[0].Finding.Group != "EVALUATE/NONE/CONTRACT" || rows[0].Blocked == nil || rows[0].Blocked.Code != "GAP_GUARD_CONFLICT" {
+		t.Fatalf("refused after a skip = %+v / %+v, want the refusal to decide the line and the reading", rows[0].Finding, rows[0].Blocked)
+	}
+	// The latest round completed -- degraded, skipped again: the cause is
+	// this round's and comes first again.
+	skippedAgain := refusedAfterSkip
+	skippedAgain.ReasonCode = "GAP_SKIPPED"
+	skippedAgain.RoundSlot = 1120
+	rows = []Anomaly{skippedAgain}
+	Attribute(rows, now)
+	if rows[0].Finding.Check != CheckDetectionAbandoned || rows[0].Blocked == nil || rows[0].Blocked.Code != "GAP_SKIPPED" {
+		t.Fatalf("skipped again = %+v / %+v, want the completion's cause first again", rows[0].Finding, rows[0].Blocked)
+	}
+	// The latest round failed, and the only failure the row keeps is an
+	// earlier Slot's: neither it nor the old completion's cause is this
+	// round's, so the round is what it is -- a failure nobody named.
+	staleFailure := refusedAfterSkip
+	staleFailure.RoundSlot = 1120
+	rows = []Anomaly{staleFailure}
+	Attribute(rows, now)
+	if rows[0].Finding.Check != CheckDefect || rows[0].Finding.Group != "UNLOCATED/UNLOCATED/UNLOCATED" || rows[0].Blocked == nil || rows[0].Blocked.Code != "error" {
+		t.Fatalf("failed with only a stale failure = %+v / %+v, want an unnamed failure, not the old cause or the old failure", rows[0].Finding, rows[0].Blocked)
+	}
+	// A refusal the backend gave an earlier Slot does not make this round's
+	// unnamed failure a refusal at the query step either.
+	staleRefusal := staleFailure
+	staleRefusal.Failure = &FailureRef{Stage: "provider", Category: "source_backend", Code: "QUERY_UNAVAILABLE", Detail: "http_status=400", At: &failedAt, Slot: 1060}
+	rows = []Anomaly{staleRefusal}
+	Attribute(rows, now)
+	if rows[0].Finding.Check != CheckDefect || rows[0].Blocked == nil || rows[0].Blocked.Class == ClassRefused || rows[0].Blocked.Dependency == DependencyQueryBackend {
+		t.Fatalf("failed with only a stale refusal = %+v / %+v, want no refusal reading borrowed from another Slot", rows[0].Finding, rows[0].Blocked)
+	}
+	// The latest round completed after a failure on the same Slot -- the
+	// retry got through, degraded: the completion's cause is the round's
+	// verdict and the failure on the way is its history, not its line.
+	completedAfterFailure := Anomaly{Kind: KindDegradedRun, ReasonCode: "COMPLETED_WITH_UNAVAILABLE", CauseReason: "HISTORY_GAPPED", ReasonLastAt: now, RoundSlot: 1060,
+		Failure: &FailureRef{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", At: &failedAt, Slot: 1060}}
+	rows = []Anomaly{completedAfterFailure}
+	Attribute(rows, now)
+	if rows[0].Finding.Check == CheckDependencyDown || rows[0].Blocked == nil || rows[0].Blocked.Code != "HISTORY_GAPPED" {
+		t.Fatalf("completed after a failure = %+v / %+v, want the completion's cause to decide, not the failure on the way", rows[0].Finding, rows[0].Blocked)
+	}
+}
+
+// Through the tracker, the shape a live object had: a Slot skipped past the
+// replay window, then the next Slot failing with an error the terminal did
+// not name. The row is not the skip -- that round is over and its record is
+// kept apart -- and the error's words are this round's, so the row is an
+// unnamed failure at an unlocated step, not "检测已停" with a contract
+// error beside it.
+func TestAnUnnamedFailureAfterASkipIsNotExplainedByTheSkip(t *testing.T) {
+	at := &clock{at: now}
+	tracker := newTracker(t, at)
+	for round := 0; round < DefaultDegradedRounds; round++ {
+		tracker.Observe(context.Background(), observability.Observation{
+			ProgressCompletionKind: "GAP_SKIPPED", ProgressCompletionReason: "GAP_SKIPPED",
+			Trace: observability.TraceFields{QueryGroupKey: "qg-1", EvaluationTime: int64(1000 + 60*round)},
+		})
+		at.at = at.at.Add(time.Minute)
+	}
+	tracker.Observe(context.Background(), observability.Observation{
+		ExecuteOutcome: "error", ReasonCode: "internal_unknown",
+		Err:   errors.New("alarmd worker: invalid query result: alarmd worker: invalid series evaluation: alarmd execution: degraded Level outcome lacks an exact durable guard"),
+		Trace: observability.TraceFields{QueryGroupKey: "qg-1", EvaluationTime: 1180},
+	})
+	rows := tracker.Anomalies()
+	Attribute(rows, at.at)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %+v, want the one object", rows)
+	}
+	row := rows[0]
+	if row.Finding.Check != CheckDefect || row.Finding.Group != "UNLOCATED/UNLOCATED/UNLOCATED" {
+		t.Fatalf("finding = %+v, want an unnamed failure under DEFECT at no located step, not the skip's line", row.Finding)
+	}
+	if row.Blocked == nil || row.Blocked.Code == "GAP_SKIPPED" || row.Blocked.Stage == StageSchedule || !strings.Contains(row.Blocked.Text, "durable guard") {
+		t.Fatalf("blocked = %+v, want this round's words and no reading borrowed from the skip", row.Blocked)
+	}
+}
+
+// A failure on the previous Slot is the previous round's: the next round
+// completing on a new Slot with a different reason does not borrow it, which
+// is the guarantee the Slot comparison has to keep from the clock comparison
+// it replaces.
+func TestAFailureOnThePreviousSlotIsNotLentToTheNextRound(t *testing.T) {
+	at := &clock{at: now}
+	tracker := newTracker(t, at)
+	for round := 0; round < DefaultDegradedRounds; round++ {
+		slot := int64(100 + 60*round)
+		tracker.Observe(context.Background(), observability.Observation{
+			ProgressCompletionKind: "COMPLETED_WITH_UNAVAILABLE", ProgressCompletionReason: "HISTORY_GAPPED",
+			Trace: observability.TraceFields{QueryGroupKey: "qg-1", EvaluationTime: slot},
+		})
+		at.at = at.at.Add(time.Minute)
+	}
+	// This round: a Redis failure on the way to the completion.
+	tracker.Observe(context.Background(), observability.Observation{
+		QueryFailure: &observability.QueryFailureFacts{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 10.0.0.1:6379: i/o timeout"},
+		Trace:        observability.TraceFields{QueryGroupKey: "qg-1", EvaluationTime: 1000},
+	})
+	at.at = at.at.Add(time.Millisecond)
+	tracker.Observe(context.Background(), observability.Observation{
+		ProgressCompletionKind: "COMPLETED_WITH_UNAVAILABLE", ProgressCompletionReason: "STATE_WRITE_RETRYABLE",
+		Trace: observability.TraceFields{QueryGroupKey: "qg-1", EvaluationTime: 1000},
+	})
+	rows := tracker.Anomalies()
+	Attribute(rows, at.at)
+	if len(rows) != 1 || rows[0].Blocked == nil || rows[0].Blocked.Dependency != DependencyRedis {
+		t.Fatalf("rows = %+v, want this round's Redis failure read as this round's", rows)
+	}
+	// The next round, on the next Slot, completes with a window reason and no
+	// failure of its own: the Redis detail stays with Slot 1000.
+	at.at = at.at.Add(time.Minute)
+	tracker.Observe(context.Background(), observability.Observation{
+		ProgressCompletionKind: "COMPLETED_WITH_UNAVAILABLE", ProgressCompletionReason: "HISTORY_GAPPED",
+		Trace: observability.TraceFields{QueryGroupKey: "qg-1", EvaluationTime: 1060},
+	})
+	rows = tracker.Anomalies()
+	Attribute(rows, at.at)
+	if len(rows) != 1 || rows[0].RoundSlot != 1060 || rows[0].Failure == nil || rows[0].Failure.Slot != 1000 {
+		t.Fatalf("rows = %+v, want the row on Slot 1060 still carrying the Slot 1000 failure reference", rows)
+	}
+	if rows[0].Blocked == nil || rows[0].Blocked.Dependency == DependencyRedis || rows[0].Blocked.Text != "" {
+		t.Fatalf("blocked = %+v, want the previous Slot's Redis failure not lent to this round", rows[0].Blocked)
+	}
+}
+
+// A round the Slot source or the view refused never completes, so its words
+// arrive only on the run's own outcome. They reach the row and its reading as
+// this round's, counted while they repeat; a later refusal that brings no
+// words does not borrow the earlier ones as its own.
+func TestARefusedRoundKeepsTheWordsItWasRefusedWith(t *testing.T) {
+	now := time.Date(2026, 9, 28, 5, 20, 0, 0, time.UTC)
+	tracker := NewTracker(nil, "pod-a", func() time.Time { return now })
+	refused := errors.New("alarmd scheduler: Snapshot retention cannot cover recovery contract")
+	refuse := func(err error) {
+		now = now.Add(time.Second)
+		tracker.Observe(context.Background(), observability.Observation{
+			Component: observability.ComponentScheduler, Stage: observability.StageRunnerReturned,
+			Result: observability.ResultTerminal, RunOutcome: "source_error", Err: err,
+			Trace: observability.TraceFields{QueryGroupKey: "qg"},
+		})
+	}
+	for round := 0; round < DefaultBlockedRounds+1; round++ {
+		refuse(refused)
+	}
+	rows := tracker.Anomalies()
+	if len(rows) != 1 || rows[0].LastError == nil || rows[0].LastError.Text != refused.Error() ||
+		rows[0].LastError.Attempts != DefaultBlockedRounds+1 {
+		t.Fatalf("rows = %+v, want the refusal's words, %d in a row", rows, DefaultBlockedRounds+1)
+	}
+	if blocked := blockedOf(rows[0], ScheduleOnTime); blocked == nil || blocked.Text != refused.Error() {
+		t.Fatalf("blocked = %+v, want the refusal read as this round's", blocked)
+	}
+
+	// Other words start their own count.
+	other := errors.New("alarmd scheduler: frozen schedule segment is unreadable")
+	refuse(other)
+	rows = tracker.Anomalies()
+	if len(rows) != 1 || rows[0].LastError == nil || rows[0].LastError.Text != other.Error() || rows[0].LastError.Attempts != 1 {
+		t.Fatalf("rows = %+v, want the new words counted from one", rows)
+	}
+
+	refuse(nil)
+	rows = tracker.Anomalies()
+	if len(rows) != 1 {
+		t.Fatalf("rows = %+v", rows)
+	}
+	if blocked := blockedOf(rows[0], ScheduleOnTime); blocked == nil || blocked.Text != "" {
+		t.Fatalf("blocked = %+v, want a round without words read without the earlier ones", blocked)
+	}
+}
+
+// The source answering that nothing is due ends a run the source or the view
+// refused: the gate has let the round through and no Slot is owed. A refusal
+// at startup that ends in seconds no longer stands as this deployment's own
+// until the object's next round. Everything else stays as it was: a panic, an
+// execution failure, a backoff that is not an answer, and a source that says
+// "not due" with nothing refused before it.
+func TestASourceAnsweringNotDueEndsTheRunItRefused(t *testing.T) {
+	type tracked struct {
+		tracker *Tracker
+		now     *time.Time
+	}
+	start := func() tracked {
+		now := time.Date(2026, 9, 28, 5, 20, 0, 0, time.UTC)
+		return tracked{tracker: NewTracker(nil, "pod-a", func() time.Time { return now }), now: &now}
+	}
+	run := func(tr tracked, outcome string, err error) {
+		*tr.now = tr.now.Add(time.Second)
+		tr.tracker.Observe(context.Background(), observability.Observation{
+			Component: observability.ComponentScheduler, Stage: observability.StageRunnerReturned,
+			Result: observability.ResultTerminal, RunOutcome: outcome, Err: err,
+			Trace: observability.TraceFields{QueryGroupKey: "qg"},
+		})
+	}
+	refuse := func(tr tracked, outcome string, rounds int) {
+		for round := 0; round < rounds; round++ {
+			run(tr, outcome, errors.New(outcome))
+		}
+	}
+	for _, outcome := range []string{"view_not_executable", "source_error", "source_retry", "source_blocked"} {
+		t.Run(outcome, func(t *testing.T) {
+			tr := start()
+			refuse(tr, outcome, DefaultBlockedRounds+1)
+			if rows := tr.tracker.Anomalies(); len(rows) != 1 || rows[0].Kind != KindBlockedRun {
+				t.Fatalf("rows = %+v, want the refused run listed", rows)
+			}
+			run(tr, "source_not_due", nil)
+			if rows := tr.tracker.Anomalies(); len(rows) != 0 {
+				t.Fatalf("rows = %+v, want the run ended by the source's answer", rows)
+			}
+			if !tr.tracker.HasConclusion("qg") {
+				t.Fatal("the object lost its conclusion")
+			}
+			// A refusal after the answer starts its own streak.
+			refuse(tr, outcome, DefaultBlockedRounds)
+			if rows := tr.tracker.Anomalies(); len(rows) != 1 || rows[0].Consecutive != DefaultBlockedRounds {
+				t.Fatalf("rows = %+v, want a new streak of %d", rows, DefaultBlockedRounds)
+			}
+		})
+	}
+	t.Run("a panic is the round's own", func(t *testing.T) {
+		tr := start()
+		refuse(tr, "panic", DefaultBlockedRounds+1)
+		run(tr, "source_not_due", nil)
+		if rows := tr.tracker.Anomalies(); len(rows) != 1 || rows[0].ReasonCode != "panic" {
+			t.Fatalf("rows = %+v, want the panic kept", rows)
+		}
+	})
+	t.Run("a backoff is not an answer", func(t *testing.T) {
+		tr := start()
+		refuse(tr, "view_not_executable", DefaultBlockedRounds+1)
+		run(tr, "source_backoff", nil)
+		if rows := tr.tracker.Anomalies(); len(rows) != 1 || rows[0].ReasonCode != "view_not_executable" {
+			t.Fatalf("rows = %+v, want the refusal kept through a backoff", rows)
+		}
+	})
+	t.Run("an execution failure is not a refusal", func(t *testing.T) {
+		tr := start()
+		for round := 0; round < DefaultDegradedRounds+1; round++ {
+			*tr.now = tr.now.Add(time.Second)
+			tr.tracker.Observe(context.Background(), observability.Observation{
+				ExecuteOutcome: "error", Err: errors.New("redis: connection pool timeout"), Operation: "commit",
+				Trace: observability.TraceFields{QueryGroupKey: "qg", EvaluationTime: 160},
+			})
+		}
+		before := tr.tracker.Anomalies()
+		run(tr, "source_not_due", nil)
+		if rows := tr.tracker.Anomalies(); len(before) != 1 || len(rows) != 1 || rows[0].Kind != before[0].Kind {
+			t.Fatalf("rows = %+v (before %+v), want the failure kept", rows, before)
+		}
+	})
+	t.Run("not due with nothing refused", func(t *testing.T) {
+		tr := start()
+		run(tr, "source_not_due", nil)
+		if rows := tr.tracker.Anomalies(); len(rows) != 0 || tr.tracker.HasConclusion("qg") {
+			t.Fatalf("rows = %+v, conclusion = %v, want nothing from an answer alone", rows, tr.tracker.HasConclusion("qg"))
+		}
+	})
+}
+
+// A not-due answer is not a round that went wrong: it neither starts a run nor
+// lends its time to one. A refusal streak after it, or after a run it ended,
+// is dated from its own first refusal; and an object the pool once exposed
+// does not become a row because its source answered.
+func TestANotDueAnswerStartsNoRunAndLendsNoStart(t *testing.T) {
+	now := time.Date(2026, 9, 28, 5, 20, 0, 0, time.UTC)
+	tracker := NewTracker(nil, "pod-a", func() time.Time { return now })
+	run := func(queryGroup, outcome string) {
+		now = now.Add(time.Second)
+		var err error
+		if outcome != "source_not_due" {
+			err = errors.New(outcome)
+		}
+		tracker.Observe(context.Background(), observability.Observation{
+			Component: observability.ComponentScheduler, Stage: observability.StageRunnerReturned,
+			Result: observability.ResultTerminal, RunOutcome: outcome, Err: err,
+			Trace: observability.TraceFields{QueryGroupKey: queryGroup},
+		})
+	}
+	sinceOf := func(queryGroup string) time.Time {
+		for _, row := range tracker.Anomalies() {
+			if row.QueryGroup == queryGroup {
+				return row.Since
+			}
+		}
+		t.Fatalf("%s is not listed: %+v", queryGroup, tracker.Anomalies())
+		return time.Time{}
+	}
+
+	run("qg-a", "source_not_due")
+	now = now.Add(10 * time.Minute)
+	firstRefusal := now.Add(time.Second)
+	for round := 0; round < DefaultBlockedRounds; round++ {
+		run("qg-a", "source_error")
+	}
+	if since := sinceOf("qg-a"); !since.Equal(firstRefusal) {
+		t.Fatalf("since = %v, want the first refusal %v, not the earlier answer", since, firstRefusal)
+	}
+
+	run("qg-a", "source_not_due")
+	now = now.Add(time.Hour)
+	secondStreak := now.Add(time.Second)
+	for round := 0; round < DefaultBlockedRounds; round++ {
+		run("qg-a", "view_not_executable")
+	}
+	if since := sinceOf("qg-a"); !since.Equal(secondStreak) {
+		t.Fatalf("since = %v, want the new streak's first refusal %v, not the ended run's", since, secondStreak)
+	}
+
+	tracker.Observe(context.Background(), observability.Observation{QueryCooldown: &cooldownFacts,
+		Trace: observability.TraceFields{QueryGroupKey: "qg-b"}})
+	tracker.Observe(context.Background(), observability.Observation{
+		QueryCooldown: &observability.QueryCooldownFacts{Event: "recovered"},
+		Trace:         observability.TraceFields{QueryGroupKey: "qg-b"},
+	})
+	run("qg-b", "source_not_due")
+	for _, row := range append(tracker.Anomalies(), tracker.Demoted()...) {
+		if row.QueryGroup == "qg-b" {
+			t.Fatalf("an object the pool once exposed became a row on a not-due answer: %+v", row)
+		}
+	}
 }

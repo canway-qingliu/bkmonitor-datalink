@@ -11,8 +11,8 @@ import (
 )
 
 func newQueryFailureTestObserver(output *bytes.Buffer) *LoggingObserver {
-	l, _ := NewWindowLogLimiter(WindowLogLimiterConfig{Window: time.Hour, MaxEvents: 10})
-	p, _ := NewBoundedLogPolicy(l)
+	l, _ := NewScopedLogLimiter(ScopedLogLimiterConfig{Window: time.Hour, MaxEvents: 10, MaxScopes: 1024})
+	p, _ := NewScopedBoundedLogPolicy(l)
 	return NewLoggingObserver(New("alarmd", output), p)
 }
 
@@ -20,7 +20,7 @@ func TestQueryFailureLogRejectsSensitiveValues(t *testing.T) {
 	secret := "https://user:secret@example.test/?token=secret"
 	for _, facts := range []QueryFailureFacts{
 		{Stage: "execute", Category: "source_backend", Code: "SPACE_TABLE_ID_FIELD_IS_NOT_EXISTS"},
-		{Stage: "stream_complete", Category: "budget", Code: "retained_bytes"},
+		{Stage: "stream_complete", Category: "budget", Code: CapacityBudgetFailureCode(CapacityBudgetRetainedBytes)},
 		{Stage: secret, Category: secret, Code: secret, Detail: secret},
 	} {
 		var output bytes.Buffer
@@ -59,7 +59,12 @@ func TestQueryFailureCodesFollowBoundedGrammarInsteadOfWhitelist(t *testing.T) {
 		{"named input code", QueryFailureFacts{Stage: "stream_complete", Category: "named_input", Code: "COMPLETION_ONLY_REQUIREMENT_MISSING"}, QueryFailureFacts{Stage: "stream_complete", Category: "named_input", Code: "COMPLETION_ONLY_REQUIREMENT_MISSING"}},
 		{"admission code", QueryFailureFacts{Stage: "execute", Category: "admission", Code: "QUERY_PERMIT_DEADLINE"}, QueryFailureFacts{Stage: "execute", Category: "admission", Code: "QUERY_PERMIT_DEADLINE"}},
 		{"evaluation code", QueryFailureFacts{Stage: "stream_complete", Category: "evaluation", Code: "EVALUATION_RESULT_INVALID"}, QueryFailureFacts{Stage: "stream_complete", Category: "evaluation", Code: "EVALUATION_RESULT_INVALID"}},
-		{"capacity budget", QueryFailureFacts{Stage: "stream_complete", Category: "budget", Code: "retained_bytes"}, QueryFailureFacts{Stage: "stream_complete", Category: "budget", Code: "retained_bytes"}},
+		// A budget's own value is a metric label, not a code, and budget has no
+		// exemption from the grammar: a publisher that passes the label through
+		// gets OTHER and has to notice. It used to be kept, which is how every
+		// budget rejection published an unparsable code unnoticed.
+		{"capacity budget label is not a code", QueryFailureFacts{Stage: "stream_complete", Category: "budget", Code: "retained_bytes"}, QueryFailureFacts{Stage: "stream_complete", Category: "budget", Code: "OTHER"}},
+		{"capacity budget code", QueryFailureFacts{Stage: "stream_complete", Category: "budget", Code: CapacityBudgetFailureCode(CapacityBudgetRetainedBytes)}, QueryFailureFacts{Stage: "stream_complete", Category: "budget", Code: CapacityBudgetFailureCode(CapacityBudgetRetainedBytes)}},
 		{"response budget", QueryFailureFacts{Stage: "execute", Category: "budget", Code: "RESPONSE_BYTES_EXCEEDED"}, QueryFailureFacts{Stage: "execute", Category: "budget", Code: "RESPONSE_BYTES_EXCEEDED"}},
 		{"unknown budget", QueryFailureFacts{Stage: "execute", Category: "budget", Code: "free text"}, QueryFailureFacts{Stage: "execute", Category: "budget", Code: "OTHER"}},
 		{"unknown category", QueryFailureFacts{Stage: "execute", Category: "mystery", Code: "VALID_CODE"}, QueryFailureFacts{Stage: "execute", Category: "other", Code: "OTHER"}},
@@ -80,7 +85,7 @@ func TestQueryFailureCodesFollowBoundedGrammarInsteadOfWhitelist(t *testing.T) {
 			}
 		})
 	}
-	if got := normalizeQueryFailure(ComponentDetect, StageDetectCompleted, &QueryFailureFacts{Stage: "execute"}); got != nil {
+	if got := normalizeQueryFailure(ComponentRuntime, StageStartup, &QueryFailureFacts{Stage: "execute"}); got != nil {
 		t.Fatalf("facts outside the Access query boundary were kept: %+v", got)
 	}
 }
@@ -107,6 +112,53 @@ func TestQueryFailureFactsSurviveWithoutErrorForDegradedProviderResults(t *testi
 	}
 	if _, exists := event["error"]; exists {
 		t.Fatalf("degraded provider line invented an error: %#v", event)
+	}
+}
+
+// A timed-out query's line carries the numbers its row reads the timeout
+// by: the settling wait, how late after it the query began, what it was
+// given, what it used and how much of that was alarmd's own - a query begun
+// past its deadline too, whose budget is below zero. A line without a timing carries none of them rather
+// than zeros.
+func TestATimedOutQueryLogsItsBudgetBesideItsDetail(t *testing.T) {
+	var output bytes.Buffer
+	facts := QueryFailureFacts{Stage: "provider", Category: "provider_transport", Code: "QUERY_TIMEOUT", Detail: "transport=timeout",
+		Timing: &QueryTiming{SettleMillis: 30_000, StartLateMillis: 11_000, BudgetMillis: 9_000, ElapsedMillis: 9_004, LocalMillis: 7_500}}
+	observer := newQueryFailureTestObserver(&output)
+	observer.Observe(context.Background(), Observation{Component: ComponentAccess, Stage: StageQueryCompleted, Result: ResultDegraded,
+		ReasonCode: "QUERY_TIMEOUT", QueryFailure: &facts, Trace: TraceFields{QueryGroupKey: "query-group-1"}})
+	var event map[string]any
+	if err := json.Unmarshal(output.Bytes(), &event); err != nil {
+		t.Fatalf("decode: %v; log=%s", err, output.String())
+	}
+	for field, want := range map[string]any{"failure_settle_ms": 30_000.0, "failure_start_late_ms": 11_000.0, "failure_budget_ms": 9_000.0,
+		"failure_elapsed_ms": 9_004.0, "failure_local_ms": 7_500.0} {
+		if event[field] != want {
+			t.Fatalf("event[%q]=%#v, want %#v; event=%#v", field, event[field], want, event)
+		}
+	}
+	output.Reset()
+	facts.Timing = &QueryTiming{SettleMillis: 30_000, StartLateMillis: 32_000, BudgetMillis: -2_000, ElapsedMillis: 0}
+	observer.Observe(context.Background(), Observation{Component: ComponentAccess, Stage: StageQueryCompleted, Result: ResultDegraded,
+		ReasonCode: "QUERY_TIMEOUT", QueryFailure: &facts, Trace: TraceFields{QueryGroupKey: "query-group-late"}})
+	event = nil
+	if err := json.Unmarshal(output.Bytes(), &event); err != nil {
+		t.Fatalf("decode: %v; log=%s", err, output.String())
+	}
+	for field, want := range map[string]any{"failure_settle_ms": 30_000.0, "failure_start_late_ms": 32_000.0, "failure_budget_ms": -2_000.0, "failure_elapsed_ms": 0.0} {
+		if event[field] != want {
+			t.Fatalf("begun past its deadline: event[%q]=%#v, want %#v; event=%#v", field, event[field], want, event)
+		}
+	}
+	output.Reset()
+	facts.Timing = nil
+	observer.Observe(context.Background(), Observation{Component: ComponentAccess, Stage: StageQueryCompleted, Result: ResultDegraded,
+		ReasonCode: "QUERY_TIMEOUT", QueryFailure: &facts, Trace: TraceFields{QueryGroupKey: "query-group-2"}})
+	if !strings.Contains(output.String(), "query-group-2") {
+		t.Fatalf("setup: the untimed failure's line was not written: %q", output.String())
+	}
+	if strings.Contains(output.String(), "failure_budget_ms") {
+		t.Fatalf("an untimed failure logged a budget: %s", output.String())
 	}
 }
 

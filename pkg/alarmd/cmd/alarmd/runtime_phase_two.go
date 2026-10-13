@@ -26,6 +26,8 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/controlplane"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/fleet"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/fleet/ui"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/lookback"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/metric"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/observability"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/openalerts"
@@ -33,7 +35,10 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/platformsettings"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/scheduler"
 	httpservice "github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/service/http"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/storecensus"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/strategy"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/viewstream"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/worker"
 )
 
 var errPhaseTwoWorkerBundleNotAssembled = errors.New(
@@ -80,7 +85,25 @@ type phaseTwoApplicationDependencies struct {
 		*observability.Logger,
 		*phaseTwoApplicationHealth,
 	) (*phaseTwoWorkerBundle, error)
-	newHTTP func(*metric.Recorder, observability.HealthSource, string) (httpRuntime, error)
+	newHTTP func(*metric.Recorder, observability.HealthSource, httpSurface) (httpRuntime, error)
+	// lifecycle opens the process's start/stop record; nil records nothing.
+	lifecycle func(config.Config) *lifecycleRecord
+}
+
+// httpSurface is what the listener needs from the configuration: where the
+// side listeners bind, whether the public surface is restricted, and where
+// the login page says the administrator key is kept (names only).
+type httpSurface struct {
+	Diagnostics    string
+	Internal       string
+	Restricted     bool
+	AdminKeySecret ui.AdminKeySecret
+}
+
+func httpSurfaceOf(cfg config.Config) httpSurface {
+	secret := cfg.CLI.AdminKeySecret
+	return httpSurface{Diagnostics: cfg.HTTP.DiagnosticsListen, Internal: cfg.HTTP.InternalListen, Restricted: cfg.PublicSurfaceRestrictionRequested(),
+		AdminKeySecret: ui.AdminKeySecret{Namespace: secret.Namespace, Name: secret.Name, Key: secret.Key}}
 }
 
 type runtimeModeDependencies struct {
@@ -90,10 +113,15 @@ type runtimeModeDependencies struct {
 
 func defaultPhaseTwoApplicationDependencies() phaseTwoApplicationDependencies {
 	return phaseTwoApplicationDependencies{
-		configureCPU: configurePhaseTwoCPU,
-		run:          runPhaseTwoApplication, openBundle: openProductionPhaseTwoBundle,
-		newHTTP: func(recorder *metric.Recorder, source observability.HealthSource, diagnosticsAddress string) (httpRuntime, error) {
-			return httpservice.NewWithHealth(recorder, source, httpservice.WithDiagnosticsAddress(diagnosticsAddress))
+		configureCPU: configurePhaseTwoCPU, lifecycle: newLifecycleRecord,
+		run: runPhaseTwoApplication, openBundle: openProductionPhaseTwoBundle,
+		newHTTP: func(recorder *metric.Recorder, source observability.HealthSource, surface httpSurface) (httpRuntime, error) {
+			options := []httpservice.Option{httpservice.WithDiagnosticsAddress(surface.Diagnostics), httpservice.WithInternalAddress(surface.Internal),
+				httpservice.WithAdminKeySecret(surface.AdminKeySecret)}
+			if surface.Restricted {
+				options = append(options, httpservice.WithRestrictedPublicSurface())
+			}
+			return httpservice.NewWithHealth(recorder, source, options...)
 		},
 	}
 }
@@ -112,9 +140,6 @@ func (a *phaseTwoApplication) HealthSnapshot() observability.HealthSnapshot {
 }
 
 func newPhaseTwoApplication(cfg config.Config) (*phaseTwoApplication, error) {
-	if cfg.Input.Mode != config.InputModeGoAccess {
-		return nil, fmt.Errorf("phase-two application requires input mode %q", config.InputModeGoAccess)
-	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate phase-two application configuration: %w", err)
 	}
@@ -150,7 +175,7 @@ func runPhaseTwoApplicationWithDependencies(
 	if err != nil {
 		return err
 	}
-	cpuSource := "runtime_default"
+	cpuSource := observability.CPUSourceRuntimeDefault
 	if dependencies.configureCPU != nil {
 		cpuSource, err = dependencies.configureCPU()
 		if err != nil {
@@ -191,20 +216,16 @@ func runPhaseTwoApplicationWithDependencies(
 		slog.Int64("go_memory_limit_bytes", profile.Capacity.GoMemoryLimitBytes),
 		slog.Int("go_gc_percent", profile.Capacity.GoGCPercent),
 		slog.String("memory_source", profile.MemorySource))
-	// The canonical encoder's rollout position is applied before anything can
-	// derive a digest, and it is logged, because a process that silently ran
-	// in a different position than the one asked for would produce digests
-	// nobody could account for afterwards. Validation has already rejected an
-	// unknown name, so the error here cannot fire; it is returned rather than
-	// dropped so that stays true if validation ever moves.
-	if _, err := contract.SetCanonicalMode(cfg.PhaseTwo.Canonical.SelectedMode()); err != nil {
-		return err
-	}
-	contract.SetCanonicalShadowStride(cfg.PhaseTwo.Canonical.Stride())
-	logger.Info("canonical_encoder", contract.CanonicalMode(), 0, 0,
-		slog.Uint64("shadow_sample_stride", cfg.PhaseTwo.Canonical.Stride()))
+	// A series delivery digest assembled from its shared parts that differed
+	// from the generic one: counted on canonical_encoding_records_shadow_total
+	// and said here at most once a minute. The generic digest was returned.
+	contract.SetRecordsDigestDivergenceReporter(func(divergence contract.RecordsDigestDivergence) {
+		logger.Warn("canonical_encoder", "records_digest_differed", divergence.Records, 0,
+			slog.String("domain", divergence.Domain), slog.String("served", divergence.Served),
+			slog.String("established", divergence.Established))
+	})
 
-	server, err := dependencies.newHTTP(recorder, application, cfg.HTTP.DiagnosticsListen)
+	server, err := dependencies.newHTTP(recorder, application, httpSurfaceOf(cfg))
 	if err != nil {
 		return err
 	}
@@ -214,20 +235,43 @@ func runPhaseTwoApplicationWithDependencies(
 	httpDone := make(chan error, 1)
 	go func() { httpDone <- server.Run(httpContext, cfg.HTTP.Listen, cfg.ShutdownTimeout.Duration()) }()
 
+	var lifecycle *lifecycleRecord
+	if dependencies.lifecycle != nil {
+		lifecycle = dependencies.lifecycle(cfg)
+	}
+	if lifecycle != nil {
+		lifecycle.failed = func(reason string) { recorder.ObserveDiagnosticRedisFailure("lifecycle", reason) }
+	}
+	defer lifecycle.close()
+	lifecycle.start()
 	bundle, err := dependencies.openBundle(runtimeContext, cfg, recorder, logger, application.health)
+	if err == nil && bundle != nil {
+		// Publish startup facts before making the evidence handler reachable.
+		bundle.runtimeConfig = &profile
+	}
 	if err == nil && bundle != nil && bundle.dependencies.FleetAPI != nil {
 		// The listener starts before this runtime does, so the API answers
 		// "not ready" until here rather than pretending to have no data.
+		server.SetPublicSurfaceRestricted(bundle.dependencies.PublicSurfaceRestricted)
 		server.SetAPI(bundle.dependencies.FleetAPI)
 	}
+	if err == nil && bundle != nil && bundle.dependencies.ControlStream != nil {
+		// The same for the control stream: a Worker that connects before
+		// this point is told the stream is not ready and tries again.
+		server.SetGRPC(bundle.dependencies.ControlStream)
+	}
+	if err == nil && bundle != nil {
+		bundle.liveness.logger = logger
+		server.SetLiveness(bundle.liveness)
+	}
 	if err != nil {
+		lifecycle.stop(lifecycleStopStartFailed, err, nil)
 		cancelRuntime()
 		cancelHTTP()
 		httpErr := waitRuntimeComponent(httpDone, time.Now().Add(cfg.ShutdownTimeout.Duration()))
 		return errors.Join(err, normalizeRuntimeShutdownError(httpErr, false))
 	}
 	bundleDone := make(chan error, 1)
-	bundle.runtimeConfig = &profile
 	go func() { bundleDone <- bundle.Run(runtimeContext) }()
 
 	var runErr, httpErr error
@@ -256,15 +300,25 @@ func runPhaseTwoApplicationWithDependencies(
 			markPhaseTwoFatal(runtimeContext, bundle, application.health, httpErr)
 		}
 	}
+	stopReason := lifecycleStopReason(ctx.Err() != nil, bundleStoppedEarly, httpStoppedEarly)
+	stopErr := errors.Join(runErr, httpErr)
 	cancelRuntime()
 	cancelHTTP()
-	deadline := time.Now().Add(cfg.ShutdownTimeout.Duration())
+	// The bundle drains its Slots within one shutdown timeout and releases
+	// its leases within another (phaseTwoWorkerBundle.Run).
+	bundleDeadline := time.Now().Add(2 * cfg.ShutdownTimeout.Duration())
+	httpDeadline := time.Now().Add(cfg.ShutdownTimeout.Duration())
 	if !bundleFinished {
-		runErr = waitRuntimeComponent(bundleDone, deadline)
+		runErr = waitRuntimeComponent(bundleDone, bundleDeadline)
 	}
 	if !httpFinished {
-		httpErr = waitRuntimeComponent(httpDone, deadline)
+		httpErr = waitRuntimeComponent(httpDone, httpDeadline)
 	}
+	// Written once the bundle has stopped, so the stop says how its Slots
+	// drained: a stop that cancelled Slots at the deadline is one whose
+	// events may be sent again by the next owner, and this record is the
+	// one reading of it that outlives the Pod.
+	lifecycle.stop(stopReason, stopErr, bundle.shutdownDrain())
 	result := errors.Join(
 		normalizeRuntimeShutdownError(runErr, bundleStoppedEarly),
 		normalizeRuntimeShutdownError(httpErr, httpStoppedEarly),
@@ -362,6 +416,13 @@ type phaseTwoOwnershipRuntime interface {
 		time.Time,
 		time.Duration,
 	) (phaseTwoQueryGroupRuntime, error)
+	// LoadOpened reads back what the Query Groups a round has just opened
+	// keep in the ownership store - their read holds - once their leases are
+	// held and before their Runners take a Slot, in one batched read for the
+	// round. Required: read before the lease, a hold could be a lease TTL
+	// old, and nothing read it again until the new owner's own write
+	// conflicted.
+	LoadOpened(context.Context, []execution.QueryGroupIdentity)
 	Close() error
 }
 
@@ -371,6 +432,13 @@ type phaseTwoOwnershipRuntime interface {
 // keeps apart from a plan that moves nothing.
 type phaseTwoRebalanceSource interface {
 	LastRebalance() *fleet.RebalanceFacts
+	// LastAssignmentScope is the same round's census of the content scope
+	// on the records it settled. On the same interface as the plan, so a
+	// runtime that plans reports both or is a compile error.
+	LastAssignmentScope() *fleet.AssignmentScopeFacts
+	// LastAssignmentSweep is the latest sweep of retired records, success or
+	// failure, for the same reason.
+	LastAssignmentSweep() *fleet.AssignmentSweepFacts
 }
 
 // rebalanceFleetFacts is the latest rebalance planning round on this
@@ -387,10 +455,90 @@ func (bundle *phaseTwoWorkerBundle) rebalanceFleetFacts() *fleet.RebalanceFacts 
 	return source.LastRebalance()
 }
 
+// assignmentScopeFleetFacts is the latest reconcile round's content-scope
+// census on this process, for the fleet snapshot; nil on a follower and on a
+// runtime that does not plan.
+func (bundle *phaseTwoWorkerBundle) assignmentScopeFleetFacts() *fleet.AssignmentScopeFacts {
+	if bundle == nil {
+		return nil
+	}
+	source, ok := bundle.dependencies.Ownership.(phaseTwoRebalanceSource)
+	if !ok {
+		return nil
+	}
+	return source.LastAssignmentScope()
+}
+
+// assignmentSweepFleetFacts is the latest sweep of retired Assignment records
+// on this process, for the fleet snapshot; nil on a follower.
+func (bundle *phaseTwoWorkerBundle) assignmentSweepFleetFacts() *fleet.AssignmentSweepFacts {
+	if bundle == nil {
+		return nil
+	}
+	source, ok := bundle.dependencies.Ownership.(phaseTwoRebalanceSource)
+	if !ok {
+		return nil
+	}
+	return source.LastAssignmentSweep()
+}
+
+// phaseTwoLeaderRoundSource is what an ownership runtime that runs the
+// control leader's reconcile rounds reports about them. Its own interface,
+// so a runtime that runs none -- every test fake among them -- needs no
+// stub.
+type phaseTwoLeaderRoundSource interface {
+	LastLeaderRound() *fleet.LeaderRoundFacts
+	LeaderRoundStats() metric.LeaderRoundStats
+}
+
+var _ phaseTwoLeaderRoundSource = (*productionPhaseTwoOwnership)(nil)
+
+// leaderRoundFleetFacts is the latest leader round on this process, for the
+// fleet snapshot; nil on a follower.
+func (bundle *phaseTwoWorkerBundle) leaderRoundFleetFacts() *fleet.LeaderRoundFacts {
+	if bundle == nil {
+		return nil
+	}
+	source, ok := bundle.dependencies.Ownership.(phaseTwoLeaderRoundSource)
+	if !ok {
+		return nil
+	}
+	return source.LastLeaderRound()
+}
+
+// leaderRoundStats is what the leader round collector scrapes; empty on a
+// runtime that runs no rounds.
+func (bundle *phaseTwoWorkerBundle) leaderRoundStats() metric.LeaderRoundStats {
+	if bundle == nil {
+		return metric.LeaderRoundStats{}
+	}
+	source, ok := bundle.dependencies.Ownership.(phaseTwoLeaderRoundSource)
+	if !ok {
+		return metric.LeaderRoundStats{}
+	}
+	return source.LeaderRoundStats()
+}
+
 type phaseTwoQueryGroupLifecycle struct {
 	runner phaseTwoQueryGroupRuntime
 	cancel context.CancelFunc
 	done   chan struct{}
+	// inflight counts this Query Group's Slots that are executing, and idle
+	// is closed when it falls back to zero; both under the bundle's lock. A
+	// Slot is counted in the same step that finds its lifecycle current, so
+	// once a lifecycle is detached no Slot can start on it, and a release
+	// that waits on idle waits for exactly the Slots already running.
+	inflight int
+	idle     chan struct{}
+}
+
+// declinedQueryGroup is a Query Group this replica will not run while the
+// execution of it that hung here has not returned (design 02 section 6.5).
+type declinedQueryGroup struct {
+	lifecycle *phaseTwoQueryGroupLifecycle
+	stage     string
+	deadline  time.Time
+	since     time.Time
 }
 
 type phaseTwoQueryGroupRuntime interface {
@@ -401,8 +549,31 @@ type phaseTwoQueryGroupRuntime interface {
 	// this Query Group is worth running again. It is read at the same point
 	// NextReadyAt is, because the two answers belong to the same moment.
 	DueBound() scheduler.RunnerDueBound
+	// NextDeadline is when the next Slot this Query Group would run stops
+	// being worth running; zero when nothing is known. It is required rather
+	// than optional: as an optional interface the production Runtime never
+	// implemented it, every production Query Group was queued with no
+	// deadline, and the deadline order shipped twice without ever having run.
+	// A method the compiler does not demand is a method one implementation
+	// silently lacks.
+	NextDeadline() time.Time
 	MaintainLease(context.Context, time.Duration, time.Duration) error
 	Release(context.Context) error
+	// DeclineHung claims the execution in flight as hung when it is past
+	// its own deadline by more than grace and has not begun to commit, and
+	// returns the stage it is stuck in (execution.SlotStages) and the
+	// deadline it overran; a claimed execution writes nothing more. The
+	// deadline is the execution's own, set as it runs - a normal Slot's
+	// query deadline, a recovery's from its arrival - and is the only one
+	// the watchdog judges by: the dispatcher's deadline is the frozen Slot's
+	// first attempt's, minutes gone for a replay. Required, like
+	// NextDeadline.
+	DeclineHung(now time.Time, grace time.Duration) (string, time.Time, bool)
+	// ExecutionDeadline is the deadline the execution in flight runs under,
+	// as DeclineHung judges it, without claiming anything; zero when none is
+	// in flight or it has none yet. The liveness probe reads it beside the
+	// dispatcher's deadline.
+	ExecutionDeadline() time.Time
 }
 
 type phaseTwoWorkerBundleDependencies struct {
@@ -417,13 +588,49 @@ type phaseTwoWorkerBundleDependencies struct {
 	// RefreshOpenAlerts reads the consumer's open alert publication into the
 	// process copy; run once at start and then on its own cadence.
 	RefreshOpenAlerts func(context.Context)
+	// RunOpenAlerts owns subscription/reconciliation for the current protocol.
+	RunOpenAlerts    func(context.Context) error
+	RunEffectiveTime func(context.Context)
+	// RunAbsentClose is the control leader's difference against the
+	// strategies that no longer exist. Same shape as RunEffectiveTime: one
+	// goroutine for the process, which decides per round whether it is the
+	// leader.
+	RunAbsentClose func(context.Context)
+	// RunTargetScopeClose decides the closes of alerts whose target left
+	// the strategy's scope, from what this replica's own admission step
+	// turned away. Every replica runs its own.
+	RunTargetScopeClose func(context.Context)
+	// Lookback is the late-data lookback on the query path, nil when this
+	// process does not run it. The bundle runs its rechecks and drops the
+	// samples of a Query Group the moment it stops owning it.
+	Lookback  *lookback.Engine
+	ReadHolds *productionReadHolds
 	// RefreshPlatformSettings reads the platform's dynamic configuration
 	// into the process copy and brings what evaluates by it up to date; run
 	// once at start and then once a minute.
 	RefreshPlatformSettings func(context.Context)
 	// PublishFleet writes this replica's contribution to them.
-	FleetAPI     http.Handler
+	FleetAPI http.Handler
+	// PublicSurfaceRestricted is whether the listener's public surface is
+	// restricted: asked for by the configuration and the CLI came up.
+	PublicSurfaceRestricted bool
+	// ControlStream serves decision-016's view stream over the HTTP
+	// listener (gRPC over h2c), and StreamIdentity is what this process
+	// writes into its registration for it. ViewStreamStats is the Leader's
+	// account of the stream for the metrics and the page. All absent for a
+	// runtime without the stream.
+	ControlStream   http.Handler
+	StreamIdentity  viewStreamIdentity
+	ViewStreamStats func() viewstream.Stats
+	// ViewClient is this Worker's side of the stream, run with the
+	// maintenance goroutines and read by nothing in execution.
+	ViewClient   *viewstream.Client
 	PublishFleet func(context.Context)
+	// MeasureStores takes a census of what the stores this process writes to
+	// hold, by key family (package storecensus), while it is the Control
+	// Leader, and forgets the last one when it is not: one census for the
+	// deployment, not one per replica.
+	MeasureStores func(ctx context.Context, leading bool)
 	// ApplyObservationWindows makes the windows opened through that API take
 	// effect on this replica. It runs on the reconcile tick rather than on a
 	// timer of its own, so opening a window is bounded by a cadence the
@@ -435,13 +642,35 @@ type phaseTwoWorkerBundleDependencies struct {
 	// the floor directly. It is recorded by the same command hook, so it needs
 	// no metric of its own. A nil probe disables the measurement.
 	ProbeControlRedis func(context.Context) error
+	// ActivationBlocked is the Control Leader's last cutover as far as the
+	// Query Groups it held back go; nil where there is no repository.
+	ActivationBlocked func() controlplane.ActivationBlockedReading
+	// ActivationSkipped is the timelines the Control Leader's activation
+	// read left out because they did not decode; nil leaves the row without
+	// them.
+	ActivationSkipped func() controlplane.SkippedTimelinesReading
 	CloseResources    func(context.Context) error
 	Now               func() time.Time
+
+	// ActivationHeader is the Control Leader's standing on a missing
+	// activation header; nil where there is no repository.
+	ActivationHeader func() controlplane.ActivationHeaderReading
 }
 
 type phaseTwoWorkerBundle struct {
 	runtimeConfig *observability.RuntimeConfigFacts
 	dependencies  phaseTwoWorkerBundleDependencies
+	// liveness is what the liveness probe judges; see phaseTwoLiveness.
+	liveness *phaseTwoLiveness
+	// workerPorts is what this runtime actually handed the coordinator.
+	//
+	// Kept so a test can read it. A port that may be nil is a port a production
+	// runtime can be missing while every fake has it, and the only sign is the
+	// capability quietly not happening -- which is how a deadline port went two
+	// releases implemented by every test double and by nothing that shipped.
+	// The check is a scan of the whole struct rather than of one field, so the
+	// next optional port is covered without anybody remembering to add it.
+	workerPorts worker.Ports
 	// applied and capacity feed the heartbeat's acknowledgement and load.
 	// Both are set at assembly and may be nil, in which case the heartbeat
 	// carries neither, which readers take as unknown.
@@ -452,6 +681,8 @@ type phaseTwoWorkerBundle struct {
 	mu             sync.RWMutex
 	queryGroups    []execution.QueryGroupIdentity
 	assigned       map[execution.QueryGroupIdentity]struct{}
+	// assignmentRead is set by the first Assignment applied; see updateReadiness.
+	assignmentRead bool
 	runners        map[execution.QueryGroupIdentity]*phaseTwoQueryGroupLifecycle
 	// scheduledRunners is the owned Runner set in Query Group order, rebuilt
 	// only after that set changes. The dispatcher reads it on every pass of its
@@ -476,6 +707,14 @@ type phaseTwoWorkerBundle struct {
 	controlSourceKind     observability.SourceKind
 	controlReason         observability.ReasonCode
 	lastControlRecoveryAt time.Time
+	// outputSinkReady is whether the output sink is open. A replica whose
+	// sink is not open registers as starting and reports not ready, for the
+	// same reason as one that has not read the control facts: it is up and
+	// answers, but must not be handed Query Groups whose decisions it cannot
+	// publish. Set by outputSinkChanged from the sink's own record; a bundle
+	// assembled without a lazy sink (the tests' fakes open theirs before the
+	// bundle exists) keeps the initial true.
+	outputSinkReady bool
 	// controlSource is the state of the control source refresh as this
 	// process reports it, read at scrape and at publish rather than on a
 	// transition. See runtime_phase_two_control_source.go.
@@ -493,10 +732,36 @@ type phaseTwoWorkerBundle struct {
 	maintenanceCtx context.Context
 	cancelMaintain context.CancelFunc
 	cancelControl  context.CancelFunc
-	maintenanceWG  sync.WaitGroup
-	inflightWG     sync.WaitGroup
+	// cancelViewClient stops this Worker's side of the view stream alone,
+	// under the maintenance context that Shutdown cancels with the rest.
+	cancelViewClient context.CancelFunc
+	maintenanceWG    sync.WaitGroup
+	inflightWG       sync.WaitGroup
+	// flightReleased carries the Query Groups whose flight, held by a
+	// supplement or maintenance, turned a Slot away, once the hold ends
+	// (scheduler.FlightCoordinator.OnTurnedAwayReleased): the dispatcher runs
+	// the Slot then instead of at its next turn.
+	flightReleased chan execution.QueryGroupIdentity
 	shutdownOnce   sync.Once
 	shutdownErr    error
+	drainOnce      sync.Once
+	drainErr       error
+	// shutdownDrainFacts is the stop's wait, for the lifecycle record and the
+	// tests; under mu.
+	shutdownDrainFacts *observability.SlotDrainFacts
+	slotsRunning       int
+	// declined is the Query Groups whose execution hung here past its
+	// deadline and grace; under mu. Each holds one execution slot until its
+	// execution returns, when it is lifted, so it never has more entries
+	// than the dispatcher has slots.
+	declined map[execution.QueryGroupIdentity]*declinedQueryGroup
+	// unreadableTimelines is the owned Query Groups whose last round that
+	// asked for a Slot met a Schedule timeline that does not decode; under mu.
+	// The registration names them so a leader reads them again
+	// (ownership.WorkerRegistration.UnreadableTimelines). An entry goes with
+	// the first later round of its Query Group that runs a Slot, and with its
+	// Runner, so the set is never larger than the owned set.
+	unreadableTimelines map[execution.QueryGroupIdentity]struct{}
 	// dependencyDegraded is set while a control or Ownership Store call fails
 	// transiently. dependencyFailureSeq counts those failures so a reconcile
 	// pass only clears the flag when no new failure happened during the pass.
@@ -525,12 +790,34 @@ type phaseTwoScheduledRunner struct {
 	// late from a clock that crossed the boundary between the prediction and the
 	// verdict -- two situations the count of violations alone reports the same.
 	predictedHeldFor time.Duration
+	// place is the place in the queue this dispatch was given: the deadline it
+	// was ordered by, its sequence among equals and the cohort its turn-aways
+	// count under. It travels with the dispatch and comes back with the
+	// result, so a Slot that returns unfinished is requeued in the place it
+	// had rather than a new one. Empty until the Runner is first queued.
+	place phaseTwoQueuePlace
+}
+
+// phaseTwoQueuePlace is one Slot's standing in the queue, given when the
+// Slot is first offered a place and kept for as long as that Slot is the one
+// the Runner is due for. A Slot that came back deferred -- for readiness,
+// admission or backoff -- is the same work with the same deadline, and
+// giving it a fresh sequence would move it behind everything queued while it
+// was out; reading no deadline for it would rank it behind every Slot that
+// has one, which is where the short cohort's five-second Slot went.
+type phaseTwoQueuePlace struct {
+	deadline time.Time
+	sequence uint64
+	cohort   string
 }
 
 type phaseTwoScheduledResult struct {
 	scheduled       phaseTwoScheduledRunner
 	attempted       bool
 	admissionDenied bool
+	// outcome is what the round's Runner returned; read for the words that
+	// say what the round met (noteTimelineReading).
+	outcome execution.SlotExecutionResult
 	// ran says the Runner was actually entered. A dispatch that found the
 	// context cancelled or the lifecycle replaced returns without running, and
 	// the bound such a return would carry belongs to the previous round.
@@ -549,20 +836,6 @@ type phaseTwoQueuedRunner struct {
 	deadline time.Time
 	sequence uint64
 	cohort   string
-}
-
-// phaseTwoDeadlineRunner is the Runner's answer to "by when": the production
-// Runner implements it; a Runner that does not is queued with no deadline
-// and ordered after every one that has.
-type phaseTwoDeadlineRunner interface {
-	NextDeadline() time.Time
-}
-
-func queuedRunnerDeadline(runner phaseTwoQueryGroupRuntime) time.Time {
-	if withDeadline, ok := runner.(phaseTwoDeadlineRunner); ok {
-		return withDeadline.NextDeadline()
-	}
-	return time.Time{}
 }
 
 // deadlineBefore orders two queued Runners by when their work expires:
@@ -618,6 +891,12 @@ type phaseTwoRunnerDispatcher struct {
 	lastQueued map[execution.QueryGroupIdentity]phaseTwoRunnerGeneration
 	queued     map[execution.QueryGroupIdentity]*phaseTwoQueryGroupLifecycle
 	active     map[execution.QueryGroupIdentity]*phaseTwoQueryGroupLifecycle
+	// turnedAway is each Query Group whose round a supplement or maintenance
+	// turned away from its flight, waiting for that hold to end; released
+	// each whose hold ended before its round's return was handled. Both are
+	// cleared at every generation, whose walk offers any round left.
+	turnedAway map[execution.QueryGroupIdentity]phaseTwoScheduledRunner
+	released   map[execution.QueryGroupIdentity]struct{}
 	normal     []phaseTwoQueuedRunner
 	delayed    []phaseTwoQueuedRunner
 	// queueSequence numbers queue entries in order of queueing; normalDirty
@@ -710,6 +989,20 @@ type phaseTwoRotationFacts struct {
 	generation uint64
 }
 
+// flightReleasedNotices is how many released holds wait for the dispatcher
+// at once. A notice that does not fit is dropped: the Slot it was for runs
+// at its next turn, one scheduler tick later, as it did before notices.
+const flightReleasedNotices = 256
+
+// noticeFlightReleased tells the dispatcher a Query Group's flight is free
+// again after it turned a Slot away. It never blocks.
+func (bundle *phaseTwoWorkerBundle) noticeFlightReleased(queryGroup execution.QueryGroupIdentity) {
+	select {
+	case bundle.flightReleased <- queryGroup:
+	default:
+	}
+}
+
 func newPhaseTwoWorkerBundle(dependencies phaseTwoWorkerBundleDependencies) (*phaseTwoWorkerBundle, error) {
 	if dependencies.Health == nil || dependencies.Control == nil || dependencies.Ownership == nil ||
 		dependencies.Observer == nil || dependencies.Now == nil {
@@ -718,13 +1011,19 @@ func newPhaseTwoWorkerBundle(dependencies phaseTwoWorkerBundleDependencies) (*ph
 	if err := dependencies.Config.Validate(); err != nil {
 		return nil, err
 	}
-	bundle := &phaseTwoWorkerBundle{dependencies: dependencies,
-		assigned: make(map[execution.QueryGroupIdentity]struct{}),
-		runners:  make(map[execution.QueryGroupIdentity]*phaseTwoQueryGroupLifecycle)}
+	bundle := &phaseTwoWorkerBundle{dependencies: dependencies, outputSinkReady: true,
+		flightReleased: make(chan execution.QueryGroupIdentity, flightReleasedNotices),
+		assigned:       make(map[execution.QueryGroupIdentity]struct{}),
+		runners:        make(map[execution.QueryGroupIdentity]*phaseTwoQueryGroupLifecycle),
+		liveness:       newPhaseTwoLiveness(dependencies.Now, dependencies.Recorder)}
 	if dependencies.Recorder != nil {
 		dependencies.Recorder.SetOwnedQueryGroups(0)
 		dependencies.Recorder.SetControlSourceSource(bundle.controlSourceStats)
+		dependencies.Recorder.SetLeaderRoundSource(bundle.leaderRoundStats)
 		dependencies.Recorder.SetCatalogCompositionSource(bundle.catalogComposition)
+		if dependencies.Lookback != nil {
+			dependencies.Recorder.SetLookbackSource(func() lookback.Stats { return productionLookbackStats(dependencies.Lookback, dependencies.ReadHolds) })
+		}
 	}
 	return bundle, nil
 }
@@ -746,7 +1045,7 @@ func (bundle *phaseTwoWorkerBundle) Start(ctx context.Context) error {
 		Component: observability.ComponentRuntime, Stage: observability.StageConfigLoaded,
 		Result: observability.ResultSuccess, RuntimeConfig: bundle.runtimeConfig,
 	})
-	if err := bundle.register(ctx, ownership.WorkerStarting); err != nil {
+	if err := bundle.registerAtStartup(ctx, ownership.WorkerStarting); err != nil {
 		return err
 	}
 	leader, err := bundle.tryAcquireControlLeader(ctx)
@@ -791,7 +1090,7 @@ func (bundle *phaseTwoWorkerBundle) Start(ctx context.Context) error {
 		return err
 	}
 	bundle.readPersistedSourceSuccess(ctx)
-	if err := bundle.register(ctx, ownership.WorkerReady); err != nil {
+	if err := bundle.registerAtStartup(ctx, ownership.WorkerReady); err != nil {
 		return err
 	}
 	if !controlFactsAvailable {
@@ -809,14 +1108,50 @@ func (bundle *phaseTwoWorkerBundle) Start(ctx context.Context) error {
 	bundle.mu.RUnlock()
 	if leader {
 		if err := bundle.dependencies.Ownership.PublishAssignments(ctx, queryGroups, bundle.dependencies.Now()); err != nil {
-			return fmt.Errorf("phase-two publish Assignment: %w", err)
+			if !errors.Is(err, ownership.ErrStaleFence) {
+				return bundle.startWithoutAssignment(ctx, fmt.Errorf("phase-two publish Assignment: %w", err))
+			}
+			bundle.markControlFollower(err)
 		}
 	}
 	assigned, err := bundle.dependencies.Ownership.AssignedQueryGroups(ctx, queryGroups)
 	if err != nil {
-		return fmt.Errorf("phase-two read Assignment: %w", err)
+		return bundle.startWithoutAssignment(ctx, fmt.Errorf("phase-two read Assignment: %w", err))
 	}
 	if err := bundle.applyAssignment(ctx, assigned); err != nil {
+		return err
+	}
+	bundle.startMaintenance()
+	bundle.updateReadiness()
+	return nil
+}
+
+// registerAtStartup is the reconcile tick's handling of a registration write,
+// applied at startup: a write that fails is the renewal loop's to retry, and
+// the replica carries on unregistered, which is how it is given no Query
+// Group meanwhile. Ending startup here turned a Redis failover that crossed a
+// rollout into a crash loop.
+func (bundle *phaseTwoWorkerBundle) registerAtStartup(ctx context.Context, readiness ownership.AssignmentReadiness) error {
+	err := bundle.register(ctx, readiness)
+	switch {
+	case err == nil:
+		return nil
+	case ctx.Err() != nil:
+		return ctx.Err()
+	case isPhaseTwoInvariantError(err):
+		return err
+	}
+	bundle.observeRegistrationRenewal(observability.ResultFailed, err)
+	bundle.markControlDependencyDegraded()
+	return nil
+}
+
+// startWithoutAssignment ends startup without an Assignment when the
+// Assignment could not be published or read, as the reconcile tick does: the
+// replica is not ready while it holds none, and the first tick publishes and
+// reads it again. Invariant violations still end startup.
+func (bundle *phaseTwoWorkerBundle) startWithoutAssignment(ctx context.Context, err error) error {
+	if err := bundle.scopeControlError(ctx, observability.ComponentOwnership, observability.StageAssignmentAcquired, err); err != nil {
 		return err
 	}
 	bundle.startMaintenance()
@@ -871,7 +1206,13 @@ func (bundle *phaseTwoWorkerBundle) Run(ctx context.Context) error {
 	defer scheduleTicker.Stop()
 	defer refreshTicker.Stop()
 	defer reconcileTicker.Stop()
-	schedulerCtx, cancelScheduler := context.WithCancel(ctx)
+	// Slots execute under a context of their own that the stop signal does
+	// not reach: a stop ends dispatch and leaves the Slots already running to
+	// finish within the drain deadline, which alone cancels them (design 02
+	// §6.6). The values of ctx are kept.
+	executionCtx, cancelExecution := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelExecution()
+	dispatchStop := make(chan struct{})
 	schedulerWake := make(chan struct{}, 1)
 	schedulerDone := make(chan error, 1)
 	ticksDone := make(chan struct{})
@@ -881,7 +1222,7 @@ func (bundle *phaseTwoWorkerBundle) Run(ctx context.Context) error {
 		defer close(ticksDone)
 		for {
 			select {
-			case <-schedulerCtx.Done():
+			case <-dispatchStop:
 				return
 			case <-scheduleTicker.C:
 				select {
@@ -892,18 +1233,22 @@ func (bundle *phaseTwoWorkerBundle) Run(ctx context.Context) error {
 		}
 	}()
 	go func() {
-		schedulerDone <- bundle.runScheduler(schedulerCtx, schedulerWake, false)
+		schedulerDone <- bundle.runScheduler(executionCtx, schedulerWake, dispatchStop, false)
 	}()
 
 	var runErr error
 	schedulerRunning := true
+	bundle.liveness.start(livenessLoopControl, controlLoopStallBound)
 	for runErr == nil {
 		select {
 		case <-ctx.Done():
 			runErr = ctx.Err()
 		case <-refreshTicker.C:
+			began := bundle.liveness.clock()
 			runErr = bundle.refreshAndReconcile(ctx, true)
+			bundle.liveness.turned(livenessLoopControl, began)
 		case <-reconcileTicker.C:
+			began := bundle.liveness.clock()
 			bundle.probeControlRedis(ctx)
 			// Applied before the reconcile rather than after it: a failure here
 			// must not decide whether the pipeline reconciles, and the applier
@@ -912,6 +1257,7 @@ func (bundle *phaseTwoWorkerBundle) Run(ctx context.Context) error {
 				bundle.dependencies.ApplyObservationWindows(ctx)
 			}
 			runErr = bundle.refreshAndReconcile(ctx, false)
+			bundle.liveness.turned(livenessLoopControl, began)
 		case schedulerErr := <-schedulerDone:
 			schedulerRunning = false
 			if schedulerErr == nil {
@@ -920,32 +1266,65 @@ func (bundle *phaseTwoWorkerBundle) Run(ctx context.Context) error {
 			runErr = schedulerErr
 		}
 	}
-	cancelScheduler()
+	// The drain deadline (design 02 §6.6) runs from here. DRAINING is
+	// registered first, so the leader stops placing work here while the last
+	// Slots finish. The releases that follow get a shutdown timeout of their
+	// own: a drain that used its whole deadline must not leave every lease to
+	// expire by TTL, which would hold each Query Group's next owner out for
+	// the rest of it.
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), bundle.dependencies.Config.ShutdownTimeout.Duration())
+	defer cancelDrain()
+	drainErr := bundle.beginDraining(drainCtx)
+	close(dispatchStop)
 	<-ticksDone
 	if schedulerRunning {
-		schedulerErr := <-schedulerDone
+		schedulerErr := bundle.drainSlots(drainCtx, schedulerDone, cancelExecution)
 		if schedulerErr != nil && !errors.Is(schedulerErr, context.Canceled) {
 			runErr = errors.Join(runErr, schedulerErr)
 		}
 	}
+	cancelExecution()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), bundle.dependencies.Config.ShutdownTimeout.Duration())
 	defer cancel()
-	shutdownErr := bundle.Shutdown(shutdownCtx)
+	shutdownErr := errors.Join(drainErr, bundle.Shutdown(shutdownCtx))
 	if errors.Is(runErr, context.Canceled) && ctx.Err() != nil {
 		runErr = nil
 	}
 	return errors.Join(runErr, shutdownErr)
 }
 
+// oneShotTargetsUnqueued says no target of a one-shot run is waiting in a
+// queue or running: what is left will not run in this generation.
+func (dispatcher *phaseTwoRunnerDispatcher) oneShotTargetsUnqueued() bool {
+	for queryGroup, lifecycle := range dispatcher.oneShotTargets {
+		if dispatcher.queued[queryGroup] == lifecycle || dispatcher.active[queryGroup] == lifecycle {
+			return false
+		}
+	}
+	return true
+}
+
+// oneShotGenerationLimit bounds the ticks a one-shot run issues itself: a
+// target still not dispatched after this many is one the dispatcher never
+// reaches, which the run reports rather than waits on.
+const oneShotGenerationLimit = 16
+
 func (bundle *phaseTwoWorkerBundle) runScheduledOnce(ctx context.Context) error {
 	wake := make(chan struct{}, 1)
 	wake <- struct{}{}
-	return bundle.runScheduler(ctx, wake, true)
+	return bundle.runScheduler(ctx, wake, nil, true)
 }
 
+// runScheduler runs the dispatcher until ctx ends or stop is closed. Slots
+// execute under ctx. A closed stop ends dispatch without touching ctx: no
+// Slot starts after it, the Slots already running go on under ctx, and the
+// call returns context.Canceled once they have all returned. That is how a
+// stop lets the commit boundaries in flight finish (design 02 §6.6); a nil
+// stop is never closed.
 func (bundle *phaseTwoWorkerBundle) runScheduler(
 	ctx context.Context,
 	wake <-chan struct{},
+	stop <-chan struct{},
 	oneShot bool,
 ) error {
 	bundle.mu.Lock()
@@ -962,7 +1341,7 @@ func (bundle *phaseTwoWorkerBundle) runScheduler(
 	dispatcher := newPhaseTwoRunnerDispatcher(bundle, oneShot)
 	dispatcher.start(ctx)
 	defer dispatcher.stop()
-	return dispatcher.run(ctx, wake)
+	return dispatcher.run(ctx, wake, stop)
 }
 
 func newPhaseTwoRunnerDispatcher(
@@ -970,13 +1349,7 @@ func newPhaseTwoRunnerDispatcher(
 	oneShot bool,
 ) *phaseTwoRunnerDispatcher {
 	schedulerConfig := bundle.dependencies.Config.PhaseTwo.Scheduler
-	// The limit is derived from the container and validated positive, so the
-	// floor of one is reached only by a Config assembled field by field in a
-	// test. There is no unlimited fanout to fall back to.
-	fanout := max(schedulerConfig.ActiveExecutionLimit, 1)
-	if schedulerConfig.ReadyQueueCapacity > 0 && schedulerConfig.ReadyQueueCapacity < fanout {
-		fanout = schedulerConfig.ReadyQueueCapacity
-	}
+	fanout := phaseTwoDispatcherFanout(schedulerConfig)
 	// A fresh dispatcher starts with no bounds. Entries carried over from a
 	// previous one would be answers about a schedule nobody has looked at since,
 	// and starting empty reproduces exactly what the first tick does today.
@@ -988,6 +1361,8 @@ func newPhaseTwoRunnerDispatcher(
 		lastQueued:    make(map[execution.QueryGroupIdentity]phaseTwoRunnerGeneration),
 		queued:        make(map[execution.QueryGroupIdentity]*phaseTwoQueryGroupLifecycle),
 		active:        make(map[execution.QueryGroupIdentity]*phaseTwoQueryGroupLifecycle),
+		turnedAway:    make(map[execution.QueryGroupIdentity]phaseTwoScheduledRunner),
+		released:      make(map[execution.QueryGroupIdentity]struct{}),
 		preferDelayed: true, oneShot: oneShot,
 	}
 }
@@ -1091,11 +1466,14 @@ func (dispatcher *phaseTwoRunnerDispatcher) executeScheduled(ctx context.Context
 	}
 	func() {
 		defer dispatcher.changeExecuting(-1)
-		if ctx.Err() == nil && dispatcher.bundle.isCurrentScheduledRunner(scheduled) {
+		token := dispatcher.bundle.liveness.executionStarted(scheduled.place.deadline, scheduled.lifecycle.runner.ExecutionDeadline)
+		defer dispatcher.bundle.liveness.executionReturned(token)
+		if ctx.Err() == nil && dispatcher.bundle.enterScheduledRunner(scheduled) {
 			result.ran = true
 			func() {
+				defer dispatcher.bundle.exitScheduledRunner(scheduled.lifecycle)
 				defer startSlotTiming(runCtx, dispatcher.bundle.dependencies.Observer, observability.StageRunnerCompleted, time.Now)()
-				_, result.attempted, result.admissionDenied, result.err =
+				result.outcome, result.attempted, result.admissionDenied, result.err =
 					scheduled.lifecycle.runner.RunOneAdmitted(runCtx, func(execution.Operation) (func(), bool) {
 						// A positive F is an emergency guard; zero has no Runner gate.
 						// P/R belong only to actual Query admission in Access.
@@ -1117,10 +1495,16 @@ func (dispatcher *phaseTwoRunnerDispatcher) stop() {
 	dispatcher.workers.Wait()
 }
 
-func (dispatcher *phaseTwoRunnerDispatcher) run(ctx context.Context, wake <-chan struct{}) error {
+func (dispatcher *phaseTwoRunnerDispatcher) run(ctx context.Context, wake <-chan struct{}, stop <-chan struct{}) error {
 	var canceled error
 	ctxDone := ctx.Done()
+	liveness := dispatcher.bundle.liveness
+	if !dispatcher.oneShot {
+		liveness.setSlots(dispatcher.fanout)
+		liveness.start(livenessLoopDispatch, dispatchLoopStallBound)
+	}
 	for {
+		began := liveness.clock()
 		dispatcher.observeOccupancy(ctx)
 		if canceled != nil && len(dispatcher.active) == 0 {
 			return canceled
@@ -1128,6 +1512,19 @@ func (dispatcher *phaseTwoRunnerDispatcher) run(ctx context.Context, wake <-chan
 		if dispatcher.oneShot && dispatcher.generation > 0 && len(dispatcher.oneShotTargets) == 0 &&
 			len(dispatcher.active) == 0 {
 			return nil
+		}
+		if dispatcher.oneShot && dispatcher.generation > 0 && len(dispatcher.active) == 0 && len(dispatcher.normal) == 0 &&
+			dispatcher.walkGeneration == dispatcher.generation && dispatcher.walked >= dispatcher.walkSize &&
+			dispatcher.oneShotTargetsUnqueued() {
+			// Targets left neither queued nor running were turned away this
+			// generation, by a full queue that evicted them as it does in
+			// production, and production gives them their turn at the next
+			// tick: the one-shot run issues that tick itself.
+			if dispatcher.generation >= oneShotGenerationLimit {
+				return errors.New("phase-two one-shot dispatch: a target was never dispatched")
+			}
+			dispatcher.beginGeneration()
+			continue
 		}
 
 		// Consume completed work before admitting another normal item. This
@@ -1196,6 +1593,10 @@ func (dispatcher *phaseTwoRunnerDispatcher) run(ctx context.Context, wake <-chan
 			retryReady = retryTimer.C
 		}
 
+		// The turn is the work up to the wait; the wait itself is idle.
+		if !dispatcher.oneShot {
+			liveness.turned(livenessLoopDispatch, began)
+		}
 		select {
 		case dispatch <- scheduled:
 			dispatcher.markDispatched(scheduled, selectDelayed, delayedIndex, delayedDue)
@@ -1205,10 +1606,19 @@ func (dispatcher *phaseTwoRunnerDispatcher) run(ctx context.Context, wake <-chan
 			if canceled == nil {
 				dispatcher.beginGeneration()
 			}
+		case queryGroup := <-dispatcher.bundle.flightReleased:
+			if canceled == nil {
+				dispatcher.flightReleased(queryGroup)
+			}
 		case <-retryReady:
 		case <-ctxDone:
 			canceled = ctx.Err()
 			ctxDone = nil
+		case <-stop:
+			if canceled == nil {
+				canceled = context.Canceled
+			}
+			stop = nil
 		}
 		if retryTimer != nil && !retryTimer.Stop() {
 			select {
@@ -1228,6 +1638,8 @@ func (dispatcher *phaseTwoRunnerDispatcher) beginGeneration() {
 		dispatcher.auditCursor = ""
 	}
 	dispatcher.generation++
+	clear(dispatcher.turnedAway)
+	clear(dispatcher.released)
 	// One header comparison for the whole replica, once per tick. It is here
 	// rather than per Query Group because the header is global: a publication
 	// stamps it regardless of which Query Groups it touched, so one reading
@@ -1367,12 +1779,7 @@ func (dispatcher *phaseTwoRunnerDispatcher) fillQueues(runners []phaseTwoSchedul
 			scheduled.queuedAt = time.Now()
 		}
 		readyAt := scheduled.lifecycle.runner.NextReadyAt()
-		dispatcher.queueSequence++
-		queued := phaseTwoQueuedRunner{
-			scheduled: scheduled, readyAt: readyAt, deadline: queuedRunnerDeadline(scheduled.lifecycle.runner),
-			sequence: dispatcher.queueSequence,
-			cohort:   scheduler.ShortPeriodCohortForInterval(scheduled.lifecycle.runner.DueBound().IntervalSeconds),
-		}
+		queued := dispatcher.queueEntry(scheduled, readyAt)
 		recorder := dispatcher.bundle.dependencies.Recorder
 		// The recovery queue may not turn a Query Group away while it holds fewer
 		// entries than this Worker owns.
@@ -1495,6 +1902,9 @@ func (dispatcher *phaseTwoRunnerDispatcher) fillQueues(runners []phaseTwoSchedul
 				if latest < 0 || queued.deadline.IsZero() || !deadlineBefore(queued, dispatcher.normal[latest]) {
 					dispatcher.bundle.dependencies.TargetFlow.Record("queue_skipped", string(scheduled.queryGroup), observability.TargetFlowFacts{Decision: "normal_queue_full"})
 					recorder.RecordDispatchTurnaway("normal_queue_full", queued.cohort)
+					if latest >= 0 {
+						dispatcher.observeTurnaway("normal_queue_full", queued, dispatcher.normal[latest], readyQueueVerdict(queued, dispatcher.normal[latest]), len(dispatcher.normal), limits.ReadyQueueCapacity)
+					}
 					dispatcher.rotation.deferred++
 					dispatcher.rotation.deferredQueueFull++
 					dispatcher.dueIndex.MarkHeldBack(scheduled.queryGroup)
@@ -1503,14 +1913,12 @@ func (dispatcher *phaseTwoRunnerDispatcher) fillQueues(runners []phaseTwoSchedul
 				evicted := dispatcher.normal[latest]
 				dispatcher.bundle.dependencies.TargetFlow.Record("queue_skipped", string(evicted.scheduled.queryGroup), observability.TargetFlowFacts{Decision: "normal_queue_evicted"})
 				recorder.RecordDispatchTurnaway("normal_queue_evicted", evicted.cohort)
+				dispatcher.observeTurnaway("normal_queue_evicted", evicted, queued, "displaced", len(dispatcher.normal), limits.ReadyQueueCapacity)
 				dispatcher.rotation.deferred++
 				dispatcher.rotation.deferredQueueFull++
 				dispatcher.dueIndex.MarkHeldBack(evicted.scheduled.queryGroup)
 				if dispatcher.queued[evicted.scheduled.queryGroup] == evicted.scheduled.lifecycle {
 					delete(dispatcher.queued, evicted.scheduled.queryGroup)
-				}
-				if dispatcher.oneShot {
-					delete(dispatcher.lastQueued, evicted.scheduled.queryGroup)
 				}
 				dispatcher.normal[latest] = queued
 			} else {
@@ -1526,6 +1934,9 @@ func (dispatcher *phaseTwoRunnerDispatcher) fillQueues(runners []phaseTwoSchedul
 					// not a lack of room, and the walk moves on.
 					dispatcher.bundle.dependencies.TargetFlow.Record("queue_skipped", string(scheduled.queryGroup), observability.TargetFlowFacts{Decision: "delayed_queue_full", ReadyAtMS: diagnosticTimeMS(readyAt)})
 					recorder.RecordDispatchTurnaway("delayed_not_better", queued.cohort)
+					if latest >= 0 {
+						dispatcher.observeTurnaway("delayed_not_better", queued, dispatcher.delayed[latest], "ready_at_not_before", len(dispatcher.delayed), recoveryCapacity)
+					}
 					dispatcher.rotation.deferred++
 					dispatcher.rotation.deferredNotBetter++
 					dispatcher.dueIndex.MarkHeldBack(scheduled.queryGroup)
@@ -1535,12 +1946,10 @@ func (dispatcher *phaseTwoRunnerDispatcher) fillQueues(runners []phaseTwoSchedul
 				evicted := dispatcher.delayed[latest].scheduled
 				dispatcher.bundle.dependencies.TargetFlow.Record("queue_skipped", string(evicted.queryGroup), observability.TargetFlowFacts{Decision: "delayed_queue_evicted"})
 				recorder.RecordDispatchTurnaway("delayed_evicted", dispatcher.delayed[latest].cohort)
+				dispatcher.observeTurnaway("delayed_evicted", dispatcher.delayed[latest], queued, "ready_at_displaced", len(dispatcher.delayed), recoveryCapacity)
 				dispatcher.dueIndex.MarkHeldBack(evicted.queryGroup)
 				if dispatcher.queued[evicted.queryGroup] == evicted.lifecycle {
 					delete(dispatcher.queued, evicted.queryGroup)
-				}
-				if dispatcher.oneShot {
-					delete(dispatcher.lastQueued, evicted.queryGroup)
 				}
 				dispatcher.delayed[latest] = queued
 			} else {
@@ -1695,6 +2104,9 @@ func (dispatcher *phaseTwoRunnerDispatcher) handleResult(
 	if dispatcher.active[scheduled.queryGroup] == scheduled.lifecycle {
 		delete(dispatcher.active, scheduled.queryGroup)
 	}
+	if result.ran {
+		dispatcher.bundle.noteTimelineReading(scheduled.queryGroup, result.attempted, result.outcome)
+	}
 	dispatcher.recordDueBound(result)
 	if dispatcher.oneShotTargets[scheduled.queryGroup] == scheduled.lifecycle {
 		delete(dispatcher.oneShotTargets, scheduled.queryGroup)
@@ -1709,13 +2121,26 @@ func (dispatcher *phaseTwoRunnerDispatcher) handleResult(
 			return
 		}
 		if !result.attempted {
+			var outcome observability.Result = observability.ResultFailed
+			reason := observability.ReasonInternalUnknown
+			yielded := heldByYield(result.err)
+			switch yielded {
+			case scheduler.FlightHeldBySupplement:
+				outcome, reason = observability.ResultSkipped, observability.ReasonHeldBySupplement
+			case scheduler.FlightHeldByMaintenance:
+				outcome, reason = observability.ResultSkipped, observability.ReasonHeldByMaintenance
+			}
 			observeRuntime(ctx, dispatcher.bundle.dependencies.Observer, observability.Observation{
 				Component: observability.ComponentScheduler, Stage: observability.StageScheduleDue,
-				Result: observability.ResultFailed, ReasonCode: observability.ReasonInternalUnknown,
+				Result: outcome, ReasonCode: reason,
 				Direction: observability.DirectionInternal,
 				Trace:     observability.TraceFields{QueryGroupKey: string(scheduled.queryGroup)},
 				Err:       result.err,
 			})
+			if yielded != "" && requeue {
+				dispatcher.turnedAwayByHold(scheduled)
+				return
+			}
 		}
 	}
 	if result.admissionDenied {
@@ -1754,8 +2179,106 @@ func (dispatcher *phaseTwoRunnerDispatcher) handleResult(
 	if len(dispatcher.delayed) >= dispatcher.bundle.dependencies.Config.PhaseTwo.Scheduler.RecoveryQueueCapacity {
 		return
 	}
-	dispatcher.delayed = append(dispatcher.delayed, phaseTwoQueuedRunner{scheduled: scheduled, readyAt: readyAt})
+	// The same entry the walk would build, not a bare one. This used to write
+	// only the Runner and its readiness, so a deferred Slot re-entered the
+	// recovery queue with no deadline, no sequence and no cohort: the order
+	// ranked it behind every Slot with a deadline, and a ten-second Slot with
+	// five seconds left waited behind the minute's Slots with fifty-five.
+	dispatcher.delayed = append(dispatcher.delayed, dispatcher.queueEntry(scheduled, readyAt))
 	dispatcher.queued[scheduled.queryGroup] = scheduled.lifecycle
+}
+
+// heldByYield is what held the flight a round was turned away from, when
+// that is a supplement or maintenance -- a yield by design -- and empty
+// otherwise.
+func heldByYield(err error) string {
+	var inFlight *scheduler.SlotInFlightError
+	if !errors.As(err, &inFlight) {
+		return ""
+	}
+	switch inFlight.HeldBy {
+	case scheduler.FlightHeldBySupplement, scheduler.FlightHeldByMaintenance:
+		return inFlight.HeldBy
+	}
+	return ""
+}
+
+// turnedAwayByHold takes a round a supplement or maintenance turned away.
+// It is not queued again at once, as a deferred return is: its Runner still
+// says it is ready, and it would be turned away again for as long as the
+// hold lasts. It runs when the hold ends -- at once, if the end was heard
+// before this return -- or at its next turn.
+func (dispatcher *phaseTwoRunnerDispatcher) turnedAwayByHold(scheduled phaseTwoScheduledRunner) {
+	if _, ended := dispatcher.released[scheduled.queryGroup]; ended {
+		delete(dispatcher.released, scheduled.queryGroup)
+		dispatcher.queueNow(scheduled)
+		return
+	}
+	dispatcher.turnedAway[scheduled.queryGroup] = scheduled
+}
+
+// flightReleased takes the end of a hold that turned a round away: the round
+// is queued now, or, when its return has not been handled yet, the end is
+// kept for it.
+func (dispatcher *phaseTwoRunnerDispatcher) flightReleased(queryGroup execution.QueryGroupIdentity) {
+	scheduled, waiting := dispatcher.turnedAway[queryGroup]
+	if !waiting {
+		dispatcher.released[queryGroup] = struct{}{}
+		return
+	}
+	delete(dispatcher.turnedAway, queryGroup)
+	dispatcher.queueNow(scheduled)
+}
+
+// queueNow puts a round in the recovery queue ready now, unless its Runner
+// is no longer the current one, it is queued or running already, or the
+// queue is full; its next turn offers it then.
+func (dispatcher *phaseTwoRunnerDispatcher) queueNow(scheduled phaseTwoScheduledRunner) {
+	if !dispatcher.bundle.isCurrentScheduledRunner(scheduled) || dispatcher.queued[scheduled.queryGroup] != nil ||
+		dispatcher.active[scheduled.queryGroup] != nil ||
+		len(dispatcher.delayed) >= dispatcher.bundle.dependencies.Config.PhaseTwo.Scheduler.RecoveryQueueCapacity {
+		return
+	}
+	dispatcher.delayed = append(dispatcher.delayed, dispatcher.queueEntry(scheduled, dispatcher.bundle.schedulerNow()))
+	dispatcher.queued[scheduled.queryGroup] = scheduled.lifecycle
+}
+
+// queueEntry is the one way a Runner becomes a queue entry, from the walk
+// and from a deferred return alike.
+//
+// The deadline is read from the Runner every time: it holds the frozen
+// Slot's deadline until that Slot completes, so an unfinished Slot reads the
+// same value it was queued with and a completed one reads the next Slot's.
+// That is also how the two are told apart. A Runner whose deadline is the
+// one its place was given for is still due for that Slot and keeps its
+// sequence and cohort; one whose deadline moved is being queued for a new
+// Slot and is given the next sequence, as any first queueing is. A Runner
+// with no deadline either time keeps its place: it ranks after every dated
+// entry regardless, and the tie-break is all a new sequence would change.
+//
+// One consequence, stated so nobody reads the rule as stronger than it is:
+// the walk usually queues a Runner before it has frozen its next Slot, and
+// the deadline it reads then is the Runner's estimate from its due bound
+// (scheduler.Runner.NextDeadline), not the frozen value. The first deferred
+// return of that Slot reads the frozen deadline, which differs from the
+// estimate, so that return is given a new place. "The same Slot keeps its
+// sequence" therefore holds from the second deferral on; the first deferral
+// of a Slot queued on an estimate refreshes it once. Telling an estimate
+// from a frozen deadline would need the Runner to say which it gave, which
+// the interface does not carry; the deadline itself is right in both cases.
+func (dispatcher *phaseTwoRunnerDispatcher) queueEntry(scheduled phaseTwoScheduledRunner, readyAt time.Time) phaseTwoQueuedRunner {
+	deadline := scheduled.lifecycle.runner.NextDeadline()
+	if scheduled.place.sequence == 0 || !deadline.Equal(scheduled.place.deadline) {
+		dispatcher.queueSequence++
+		scheduled.place = phaseTwoQueuePlace{
+			deadline: deadline, sequence: dispatcher.queueSequence,
+			cohort: scheduler.ShortPeriodCohortForInterval(scheduled.lifecycle.runner.DueBound().IntervalSeconds),
+		}
+	}
+	return phaseTwoQueuedRunner{
+		scheduled: scheduled, readyAt: readyAt,
+		deadline: deadline, sequence: scheduled.place.sequence, cohort: scheduled.place.cohort,
+	}
 }
 
 // recordDueBound rewrites the index entry from the round that has just
@@ -1826,6 +2349,42 @@ func delayedBefore(left, right phaseTwoQueuedRunner) bool {
 		return left.scheduled.queryGroup < right.scheduled.queryGroup
 	}
 	return left.readyAt.Before(right.readyAt)
+}
+
+// readyQueueVerdict names which clause of deadlineBefore kept an arrival out
+// of a full ready queue, so a turned-away short-period Query Group says what
+// it lost to rather than only that it lost.
+func readyQueueVerdict(arrival, tail phaseTwoQueuedRunner) string {
+	switch {
+	case arrival.deadline.IsZero():
+		return "deadline_unknown"
+	case tail.deadline.IsZero() || tail.deadline.Before(arrival.deadline):
+		return "tail_earlier"
+	}
+	return "tail_equal"
+}
+
+// observeTurnaway writes the facts of one turnaway for a short-period cohort.
+// The counter is recorded for every cohort at the call site; this is the
+// explanation, and only the cohorts whose turnaways are a finding get one.
+// The observer is scoped by Query Group, so one Query Group turned away every
+// pass is rate limited on its own and cannot push out another's line.
+func (dispatcher *phaseTwoRunnerDispatcher) observeTurnaway(outcome string, turnedAway, kept phaseTwoQueuedRunner, verdict string, queueLength, queueCapacity int) {
+	if !observability.IsShortPeriodCohort(turnedAway.cohort) {
+		return
+	}
+	observeRuntime(context.Background(), dispatcher.bundle.dependencies.Observer, observability.Observation{
+		Component: observability.ComponentScheduler, Stage: observability.StageDispatchTurnaway,
+		Result: observability.ResultSuccess,
+		Trace:  observability.TraceFields{QueryGroupKey: string(turnedAway.scheduled.queryGroup)},
+		DispatchTurnaway: &observability.DispatchTurnawayFacts{
+			Outcome: outcome, Cohort: turnedAway.cohort, Verdict: verdict,
+			DeadlineUnixMilli: diagnosticTimeMS(turnedAway.deadline), ReadyAtUnixMilli: diagnosticTimeMS(turnedAway.readyAt),
+			KeptQueryGroup: string(kept.scheduled.queryGroup), KeptCohort: kept.cohort,
+			KeptDeadlineUnixMilli: diagnosticTimeMS(kept.deadline), KeptReadyAtUnixMilli: diagnosticTimeMS(kept.readyAt),
+			QueueLength: queueLength, QueueCapacity: queueCapacity,
+		},
+	})
 }
 
 func (dispatcher *phaseTwoRunnerDispatcher) dropStaleQueued(revision uint64) {
@@ -1927,6 +2486,70 @@ func (bundle *phaseTwoWorkerBundle) isCurrentScheduledRunner(scheduled phaseTwoS
 	return !bundle.draining && !bundle.closed && bundle.runners[scheduled.queryGroup] == scheduled.lifecycle
 }
 
+// enterScheduledRunner is isCurrentScheduledRunner for a Slot about to run:
+// the same answer, and when it is yes the Slot is counted on its lifecycle
+// under the same lock. A check followed by a separate count would leave a
+// window in which the Query Group is detached and released between the two,
+// and the Slot then runs on a lease its owner has already let go.
+func (bundle *phaseTwoWorkerBundle) enterScheduledRunner(scheduled phaseTwoScheduledRunner) bool {
+	bundle.mu.Lock()
+	defer bundle.mu.Unlock()
+	if bundle.draining || bundle.closed || bundle.runners[scheduled.queryGroup] != scheduled.lifecycle {
+		return false
+	}
+	lifecycle := scheduled.lifecycle
+	if lifecycle.inflight == 0 {
+		lifecycle.idle = make(chan struct{})
+	}
+	lifecycle.inflight++
+	bundle.slotsRunning++
+	return true
+}
+
+func (bundle *phaseTwoWorkerBundle) exitScheduledRunner(lifecycle *phaseTwoQueryGroupLifecycle) {
+	bundle.mu.Lock()
+	lifecycle.inflight--
+	bundle.slotsRunning--
+	var lifted execution.QueryGroupIdentity
+	var entry *declinedQueryGroup
+	if lifecycle.inflight == 0 {
+		close(lifecycle.idle)
+		lifecycle.idle = nil
+		// The hung execution has returned: the replica no longer has a
+		// reason to decline its Query Group.
+		for queryGroup, declined := range bundle.declined {
+			if declined.lifecycle == lifecycle {
+				lifted, entry = queryGroup, declined
+				delete(bundle.declined, queryGroup)
+				break
+			}
+		}
+	}
+	bundle.mu.Unlock()
+	if entry != nil {
+		bundle.recordHungExecution(lifted, entry, observability.ExecutionHungReturned, nil)
+	}
+}
+
+// slotsInFlight is how many Slots of a lifecycle are running, and the
+// channel closed when none is; nil when none is now.
+func (bundle *phaseTwoWorkerBundle) slotsInFlight(lifecycle *phaseTwoQueryGroupLifecycle) (int, <-chan struct{}) {
+	bundle.mu.RLock()
+	defer bundle.mu.RUnlock()
+	if lifecycle.inflight == 0 {
+		return 0, nil
+	}
+	return lifecycle.inflight, lifecycle.idle
+}
+
+// runningSlots is how many Slots are running in this process, detached
+// lifecycles included.
+func (bundle *phaseTwoWorkerBundle) runningSlots() int {
+	bundle.mu.RLock()
+	defer bundle.mu.RUnlock()
+	return bundle.slotsRunning
+}
+
 func (bundle *phaseTwoWorkerBundle) schedulerNow() time.Time {
 	if bundle.dependencies.Now != nil {
 		return bundle.dependencies.Now()
@@ -1942,17 +2565,21 @@ func (bundle *phaseTwoWorkerBundle) Shutdown(ctx context.Context) error {
 		return errors.New("phase-two worker shutdown context is required")
 	}
 	bundle.shutdownOnce.Do(func() {
-		bundle.mu.Lock()
-		bundle.draining = true
-		cancelMaintain := bundle.cancelMaintain
-		bundle.mu.Unlock()
-		bundle.dependencies.Health.Update(phaseTwoReadiness{State: observability.HealthDraining})
 		var result []error
-		result = append(result, bundle.register(ctx, ownership.WorkerDraining))
+		result = append(result, bundle.beginDraining(ctx))
+		bundle.mu.RLock()
+		cancelMaintain := bundle.cancelMaintain
+		bundle.mu.RUnlock()
 		if cancelMaintain != nil {
 			cancelMaintain()
 		}
-		result = append(result, waitPhaseTwoGroup(ctx, &bundle.inflightWG))
+		// The scheduler's group is waited for unless the stop's drain has
+		// already cancelled Slots that did not return: waiting again would
+		// spend the whole of this context on them and leave no time for the
+		// releases below, and every lease would expire by TTL instead.
+		if drain := bundle.shutdownDrain(); drain == nil || drain.Unreturned == 0 {
+			result = append(result, waitPhaseTwoGroup(ctx, &bundle.inflightWG))
+		}
 		bundle.mu.Lock()
 		runners := make([]*phaseTwoQueryGroupLifecycle, 0, len(bundle.runners))
 		queryGroups := make([]execution.QueryGroupIdentity, 0, len(bundle.runners))
@@ -1964,7 +2591,8 @@ func (bundle *phaseTwoWorkerBundle) Shutdown(ctx context.Context) error {
 		}
 		bundle.setOwnedQueryGroupsLocked()
 		bundle.mu.Unlock()
-		result = append(result, waitPhaseTwoGroup(ctx, &bundle.maintenanceWG))
+		maintenanceErr := waitPhaseTwoGroup(ctx, &bundle.maintenanceWG)
+		result = append(result, maintenanceErr)
 		for index, lifecycle := range runners {
 			releaseErr := lifecycle.runner.Release(ctx)
 			result = append(result, releaseErr)
@@ -1973,6 +2601,14 @@ func (bundle *phaseTwoWorkerBundle) Shutdown(ctx context.Context) error {
 				transitionResult = observability.ResultFailed
 			}
 			bundle.observeOwnership(ctx, observability.StageAssignmentLost, transitionResult, queryGroups[index], releaseErr)
+		}
+		// The Control Leader lease goes last among the leases, and only when
+		// every leader task has stopped: a wait that timed out may leave one
+		// still writing, and releasing then would let the next leader start
+		// while the old one writes - the overlap the lease exists to prevent.
+		// Left to expire, as it always was, in that case.
+		if releaser, ok := bundle.dependencies.Ownership.(phaseTwoControlLeaderReleaser); ok && maintenanceErr == nil {
+			result = append(result, releaser.ReleaseControlLeader(ctx))
 		}
 		if bundle.dependencies.CloseResources != nil {
 			result = append(result, bundle.dependencies.CloseResources(ctx))
@@ -1986,9 +2622,91 @@ func (bundle *phaseTwoWorkerBundle) Shutdown(ctx context.Context) error {
 		if bundle.shutdownErr != nil {
 			shutdownResult = observability.ResultFailed
 		}
-		bundle.observe(ctx, observability.ComponentRuntime, observability.Stage(observability.StageShutdown), shutdownResult, bundle.shutdownErr)
+		bundle.mu.RLock()
+		drain := bundle.shutdownDrainFacts
+		bundle.mu.RUnlock()
+		observeRuntime(ctx, bundle.dependencies.Observer, observability.Observation{
+			Component: observability.ComponentRuntime, Stage: observability.StageShutdown, Result: shutdownResult,
+			Direction: observability.DirectionInternal, Err: bundle.shutdownErr, SlotDrain: drain,
+		})
 	})
 	return bundle.shutdownErr
+}
+
+// beginDraining is the first step of every stop, once: the replica stops
+// being judged for liveness, refuses new Slots and new Assignments, reports
+// DRAINING and registers it, so the leader stops placing work here while the
+// Slots in flight finish.
+func (bundle *phaseTwoWorkerBundle) beginDraining(ctx context.Context) error {
+	bundle.drainOnce.Do(func() {
+		bundle.liveness.stopJudging()
+		bundle.mu.Lock()
+		bundle.draining = true
+		bundle.mu.Unlock()
+		bundle.dependencies.Health.Update(phaseTwoReadiness{State: observability.HealthDraining})
+		bundle.drainErr = bundle.register(ctx, ownership.WorkerDraining)
+	})
+	return bundle.drainErr
+}
+
+// drainSlots waits for the dispatcher, already told to stop, to return: it
+// returns once every Slot in flight has. Past the drain deadline the Slots
+// still running are cancelled, and the dispatcher is waited for again --
+// they return on cancellation. What happened is kept for the shutdown line
+// and the lifecycle record.
+func (bundle *phaseTwoWorkerBundle) drainSlots(
+	ctx context.Context,
+	schedulerDone <-chan error,
+	cancelExecution context.CancelFunc,
+) error {
+	began := time.Now()
+	drain := observability.SlotDrainFacts{Site: observability.SlotDrainSiteShutdown, Waited: bundle.runningSlots()}
+	var schedulerErr error
+	select {
+	case schedulerErr = <-schedulerDone:
+		drain.Outcome = observability.SlotDrainFinished
+		if drain.Waited == 0 {
+			drain.Outcome = observability.SlotDrainIdle
+		}
+	case <-ctx.Done():
+		drain.Outcome, drain.Cancelled = observability.SlotDrainDeadline, bundle.runningSlots()
+		cancelExecution()
+		// Bounded too: a Slot that honours its context returns within
+		// moments of the cancellation, and one that has not is in a call
+		// that does not watch it, whose own timeout would only spend what the
+		// releases after this need. The stop goes on without it.
+		select {
+		case schedulerErr = <-schedulerDone:
+		case <-time.After(drainCancelGrace):
+			drain.Outcome, drain.Unreturned = observability.SlotDrainDeadlineUnreturned, bundle.runningSlots()
+		}
+	}
+	drain.WaitMS = time.Since(began).Milliseconds()
+	bundle.mu.Lock()
+	bundle.shutdownDrainFacts = &drain
+	bundle.mu.Unlock()
+	return schedulerErr
+}
+
+// drainCancelGrace is how long a stop waits, after cancelling the Slots still
+// running at its drain deadline, for them to return. A Slot that honours its
+// context returns within milliseconds; one still running a second later is
+// blocked in a call that ignores it.
+const drainCancelGrace = time.Second
+
+// shutdownDrain is the stop's wait for its Slots; nil before a stop has run
+// one.
+func (bundle *phaseTwoWorkerBundle) shutdownDrain() *observability.SlotDrainFacts {
+	if bundle == nil {
+		return nil
+	}
+	bundle.mu.RLock()
+	defer bundle.mu.RUnlock()
+	if bundle.shutdownDrainFacts == nil {
+		return nil
+	}
+	drain := *bundle.shutdownDrainFacts
+	return &drain
 }
 
 func markPhaseTwoFatal(
@@ -2010,6 +2728,7 @@ func (bundle *phaseTwoWorkerBundle) register(ctx context.Context, readiness owne
 		bundle.mu.RLock()
 		draining := bundle.draining
 		factsSeen := bundle.controlFactsSeen
+		sinkReady := bundle.outputSinkReady
 		bundle.mu.RUnlock()
 		if draining {
 			return nil
@@ -2025,13 +2744,23 @@ func (bundle *phaseTwoWorkerBundle) register(ctx context.Context, readiness owne
 			// ready would be handed a share of Query Groups it cannot open.
 			readiness = ownership.WorkerStarting
 		}
+		if !sinkReady {
+			// The same half for the output sink: a replica that cannot
+			// publish must not be handed Query Groups to decide. The renewal
+			// loop registers it ready on the first renewal after the sink
+			// opens, within one renewal interval.
+			readiness = ownership.WorkerStarting
+		}
 	}
 	registration, err := phaseTwoWorkerRegistration(
 		bundle.dependencies.Config, readiness, bundle.dependencies.Now(), bundle.appliedFacts(), bundle.loadFacts(),
+		bundle.dependencies.StreamIdentity,
 	)
 	if err != nil {
 		return err
 	}
+	registration.Declined = bundle.declinedRegistration()
+	registration.UnreadableTimelines, registration.UnreadableTimelinesTotal = bundle.unreadableTimelinesRegistration()
 	if err := bundle.dependencies.Ownership.RegisterWorker(ctx, registration); err != nil {
 		return fmt.Errorf("phase-two register worker as %s: %w", readiness, err)
 	}
@@ -2064,6 +2793,11 @@ func (bundle *phaseTwoWorkerBundle) loadFacts() *ownership.WorkerLoad {
 		PermitsHeld:      capacity.PermitsHeld, PermitBudget: capacity.PermitBudget,
 		PermitSeconds: capacity.PermitSeconds, Waiting: capacity.Waiting,
 		MemoryUsedBytes: capacity.MemoryUsed, MemoryLimitBytes: capacity.MemoryLimit,
+		// The pool the Leader judges this replica's byte constraint against
+		// (decision-020 section 5.7): the same number the coordinator holds
+		// Slots under, so the Leader never re-derives it from the memory
+		// limit with a divisor of its own.
+		RetainedPoolBytes: bundle.dependencies.Config.PhaseTwo.Coordinator.MaxRetainedBytes,
 	}
 }
 
@@ -2073,6 +2807,7 @@ func phaseTwoWorkerRegistration(
 	at time.Time,
 	applied *ownership.AppliedControlFacts,
 	load *ownership.WorkerLoad,
+	stream viewStreamIdentity,
 ) (ownership.WorkerRegistration, error) {
 	capabilitiesDigest, err := phaseTwoCapabilitiesDigest(cfg)
 	if err != nil {
@@ -2084,6 +2819,12 @@ func phaseTwoWorkerRegistration(
 		CapabilitiesDigest: capabilitiesDigest,
 		ExpiresAt:          at.Add(cfg.PhaseTwo.Worker.RegistrationTTL.Duration()),
 		Applied:            applied, Load: load,
+		// The control contracts this binary takes part in. The leader
+		// starts a contract only when every ready worker declares it.
+		Capabilities: []string{ownership.CapabilityContentScope, ownership.CapabilityShardAware},
+		// Where this process serves the view stream and what a Worker must
+		// present to it (decision-016); empty for a process without one.
+		Endpoint: stream.Endpoint, StreamToken: stream.Token,
 	}
 	if err := registration.Validate(); err != nil {
 		return ownership.WorkerRegistration{}, err
@@ -2092,6 +2833,35 @@ func phaseTwoWorkerRegistration(
 }
 
 func (bundle *phaseTwoWorkerBundle) startMaintenance() {
+	if bundle.dependencies.RunOpenAlerts != nil {
+		bundle.maintenanceWG.Add(1)
+		go func() {
+			defer bundle.maintenanceWG.Done()
+			_ = bundle.dependencies.RunOpenAlerts(bundle.maintenanceCtx)
+		}()
+	}
+	if bundle.dependencies.RunAbsentClose != nil {
+		bundle.maintenanceWG.Add(1)
+		go func() { defer bundle.maintenanceWG.Done(); bundle.dependencies.RunAbsentClose(bundle.maintenanceCtx) }()
+	}
+	if bundle.dependencies.RunTargetScopeClose != nil {
+		bundle.maintenanceWG.Add(1)
+		go func() {
+			defer bundle.maintenanceWG.Done()
+			bundle.dependencies.RunTargetScopeClose(bundle.maintenanceCtx)
+		}()
+	}
+	if bundle.dependencies.RunEffectiveTime != nil {
+		bundle.maintenanceWG.Add(1)
+		go func() { defer bundle.maintenanceWG.Done(); bundle.dependencies.RunEffectiveTime(bundle.maintenanceCtx) }()
+	}
+	if bundle.dependencies.Lookback != nil {
+		bundle.maintenanceWG.Add(1)
+		go func() {
+			defer bundle.maintenanceWG.Done()
+			runLookback(bundle.maintenanceCtx, bundle.dependencies.Lookback)
+		}()
+	}
 	bundle.maintenanceWG.Add(1)
 	go bundle.maintainRegistration()
 	if bundle.dependencies.PublishFleet != nil {
@@ -2105,6 +2875,36 @@ func (bundle *phaseTwoWorkerBundle) startMaintenance() {
 	if bundle.dependencies.RefreshPlatformSettings != nil {
 		bundle.maintenanceWG.Add(1)
 		go bundle.refreshPlatformSettings()
+	}
+	if bundle.dependencies.MeasureStores != nil {
+		bundle.maintenanceWG.Add(1)
+		go bundle.measureStores()
+	}
+	if bundle.dependencies.ViewClient != nil {
+		var viewCtx context.Context
+		viewCtx, bundle.cancelViewClient = context.WithCancel(bundle.maintenanceCtx)
+		bundle.maintenanceWG.Add(1)
+		go bundle.runViewClient(viewCtx)
+	}
+}
+
+// measureStores takes a census of the stores once every storecensus.Interval,
+// on the Control Leader. The first is an interval after the start, not at
+// it: a starting process has rounds to catch up on first.
+func (bundle *phaseTwoWorkerBundle) measureStores() {
+	defer bundle.maintenanceWG.Done()
+	ticker := time.NewTicker(storecensus.Interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-bundle.maintenanceCtx.Done():
+			return
+		case <-ticker.C:
+			bundle.mu.RLock()
+			leading := bundle.controlLeader
+			bundle.mu.RUnlock()
+			bundle.dependencies.MeasureStores(bundle.maintenanceCtx, leading)
+		}
 	}
 }
 
@@ -2188,7 +2988,24 @@ func (bundle *phaseTwoWorkerBundle) tryAcquireControlLeader(ctx context.Context)
 		return leader, err
 	}
 	bundle.startControlMaintenance()
+	// A new term: publish the stored view before this round's refresh, so a
+	// Worker without a view does not wait for the whole refresh to get one.
+	if publisher, ok := bundle.dependencies.Ownership.(phaseTwoStoredViewPublisher); ok {
+		publisher.PublishStoredView(ctx)
+	}
 	return true, nil
+}
+
+// phaseTwoStoredViewPublisher publishes a new term's first view from stored
+// facts; optional, see productionPhaseTwoOwnership.PublishStoredView.
+type phaseTwoStoredViewPublisher interface {
+	PublishStoredView(context.Context)
+}
+
+// phaseTwoControlLeaderReleaser gives up the Control Leader lease at
+// shutdown; optional, see productionPhaseTwoOwnership.ReleaseControlLeader.
+type phaseTwoControlLeaderReleaser interface {
+	ReleaseControlLeader(context.Context) error
 }
 
 func (bundle *phaseTwoWorkerBundle) startControlMaintenance() {
@@ -2246,6 +3063,11 @@ func (bundle *phaseTwoWorkerBundle) maintainRegistration() {
 			return
 		case <-ticker.C:
 		}
+		if holds := bundle.dependencies.ReadHolds; holds != nil {
+			ctx, cancel := context.WithTimeout(bundle.maintenanceCtx, interval)
+			holds.renew(ctx)
+			cancel()
+		}
 		err := renewPhaseTwoWithinInterval(bundle.maintenanceCtx, interval, func(attemptCtx context.Context) error {
 			return bundle.register(attemptCtx, ownership.WorkerReady)
 		}, func(err error) {
@@ -2289,6 +3111,7 @@ func (bundle *phaseTwoWorkerBundle) applyAssignment(
 		return errPhaseTwoWorkerDraining
 	}
 	bundle.assigned = desired
+	bundle.assignmentRead = true
 	removed := make(map[execution.QueryGroupIdentity]*phaseTwoQueryGroupLifecycle)
 	for queryGroup, lifecycle := range bundle.runners {
 		if _, keep := desired[queryGroup]; keep {
@@ -2296,66 +3119,138 @@ func (bundle *phaseTwoWorkerBundle) applyAssignment(
 		}
 		bundle.removeRunnerLocked(queryGroup)
 		removed[queryGroup] = lifecycle
+		// The handover is counted here, under the lock that saw the bundle
+		// not draining, so Shutdown's wait on the group cannot begin before it.
+		bundle.maintenanceWG.Add(1)
 	}
 	bundle.setOwnedQueryGroupsLocked()
 	missing := make([]execution.QueryGroupIdentity, 0, len(desired))
 	for queryGroup := range desired {
-		if _, open := bundle.runners[queryGroup]; !open {
+		_, open := bundle.runners[queryGroup]
+		// A declined Query Group stays desired until a leader places it
+		// elsewhere; it is not opened here again while its execution hangs.
+		_, declined := bundle.declined[queryGroup]
+		if !open && !declined {
 			missing = append(missing, queryGroup)
 		}
 	}
 	bundle.mu.Unlock()
 
+	// One line for the whole change, however it returns: the per-Query Group
+	// successes below are counted and not written, and at a start they were
+	// about 2,100 lines a Pod.
+	var applied observability.AssignmentAppliedFacts
+	defer bundle.observeAssignmentApplied(ctx, &applied)
+
 	// Every error below is scoped to one Query Group. Store I/O failures mark
 	// the Worker degraded and are retried on the next reconcile; siblings and
 	// the Worker continue. Only invariant violations and cancellation return.
 	for queryGroup, lifecycle := range removed {
-		if err := bundle.stopQueryGroup(ctx, queryGroup, lifecycle); err != nil {
-			bundle.observeOwnership(ctx, observability.StageAssignmentLost, observability.ResultFailed, queryGroup, err)
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			// The lifecycle is already detached; the lease expires by TTL.
-			bundle.markControlDependencyDegraded()
-			continue
-		}
-		bundle.observeOwnership(ctx, observability.StageAssignmentLost, observability.ResultSuccess, queryGroup, nil)
+		applied.Note(string(queryGroup), true, false)
+		go bundle.handOverQueryGroup(queryGroup, lifecycle)
 	}
+	// Every missing Query Group is opened before any of their Runners starts,
+	// and what the opened ones keep in the ownership store is read in
+	// between, once for the round (LoadOpened): after their leases are held,
+	// so it is what the previous owner last wrote, and before their first
+	// Slot is classified. Read one at a time as each was opened, a slow store
+	// cost every one of them a timeout at the takeover with the most to
+	// catch up.
+	type openedQueryGroup struct {
+		queryGroup execution.QueryGroupIdentity
+		runner     phaseTwoQueryGroupRuntime
+	}
+	opened := make([]openedQueryGroup, 0, len(missing))
+	var stop error
 	for _, queryGroup := range missing {
 		bundle.observeOwnership(ctx, observability.StageTakeoverStarted, observability.ResultStarted, queryGroup, nil)
 		runner, err := bundle.dependencies.Ownership.OpenQueryGroup(
 			ctx, queryGroup, bundle.dependencies.Now(), bundle.dependencies.Config.PhaseTwo.Ownership.LeaseTTL.Duration(),
 		)
 		if err != nil {
+			applied.Note(string(queryGroup), false, true)
 			bundle.observeOwnership(ctx, observability.StageTakeoverCompleted, observability.ResultFailed, queryGroup, err)
 			if errors.Is(err, ownership.ErrLeaseBusy) || errors.Is(err, ownership.ErrNotDesired) ||
 				errors.Is(err, ownership.ErrStaleFence) {
 				continue
 			}
 			if ctx.Err() != nil {
-				return ctx.Err()
+				stop = ctx.Err()
+				break
 			}
 			if isPhaseTwoInvariantError(err) {
-				return fmt.Errorf("phase-two open Query Group %s: %w", queryGroup, err)
+				stop = fmt.Errorf("phase-two open Query Group %s: %w", queryGroup, err)
+				break
 			}
 			bundle.markControlDependencyDegraded()
 			continue
 		}
 		if runner == nil {
-			return newPhaseTwoInvariantError(fmt.Sprintf("phase-two open Query Group %s returned no runner", queryGroup))
+			stop = newPhaseTwoInvariantError(fmt.Sprintf("phase-two open Query Group %s returned no runner", queryGroup))
+			break
 		}
-		if !bundle.startQueryGroup(ctx, queryGroup, runner) {
-			if err := runner.Release(ctx); err != nil {
-				bundle.observeOwnership(ctx, observability.StageAssignmentLost, observability.ResultFailed, queryGroup, err)
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				bundle.markControlDependencyDegraded()
-			}
+		opened = append(opened, openedQueryGroup{queryGroup: queryGroup, runner: runner})
+	}
+	if stop != nil {
+		// What the round opened and will not start is released, as a start
+		// the bundle refuses is.
+		for _, entry := range opened {
+			_ = bundle.releaseUnstarted(ctx, entry.queryGroup, entry.runner)
+		}
+		return stop
+	}
+	queryGroups := make([]execution.QueryGroupIdentity, len(opened))
+	for index, entry := range opened {
+		queryGroups[index] = entry.queryGroup
+	}
+	bundle.dependencies.Ownership.LoadOpened(ctx, queryGroups)
+	canceled := false
+	for _, entry := range opened {
+		if bundle.startQueryGroup(ctx, entry.queryGroup, entry.runner) {
+			applied.Note(string(entry.queryGroup), false, false)
 			continue
 		}
+		if err := bundle.releaseUnstarted(ctx, entry.queryGroup, entry.runner); err != nil && ctx.Err() != nil {
+			canceled = true
+		}
+	}
+	if canceled {
+		return ctx.Err()
 	}
 	return nil
+}
+
+// releaseUnstarted releases a Query Group opened and never started. A
+// release that fails leaves the lease to expire by its TTL.
+func (bundle *phaseTwoWorkerBundle) releaseUnstarted(
+	ctx context.Context,
+	queryGroup execution.QueryGroupIdentity,
+	runner phaseTwoQueryGroupRuntime,
+) error {
+	err := runner.Release(ctx)
+	if err != nil {
+		bundle.observeOwnership(ctx, observability.StageAssignmentLost, observability.ResultFailed, queryGroup, err)
+		if ctx.Err() == nil {
+			bundle.markControlDependencyDegraded()
+		}
+	}
+	return err
+}
+
+// observeAssignmentApplied writes the one line an assignment change has, when
+// it moved anything: how many Query Groups were released, taken over and not
+// taken over, and the first few of each.
+func (bundle *phaseTwoWorkerBundle) observeAssignmentApplied(ctx context.Context, applied *observability.AssignmentAppliedFacts) {
+	if applied == nil || !applied.Changed() {
+		return
+	}
+	facts := *applied
+	observeRuntime(ctx, bundle.dependencies.Observer, observability.Observation{
+		Component: observability.ComponentOwnership, Stage: observability.StageAssignmentApplied,
+		Result: observability.ResultSuccess, Operation: observability.OperationTransition,
+		Direction: observability.DirectionInternal, AssignmentApplied: &facts,
+		Trace: observability.TraceFields{OwnerID: bundle.dependencies.Config.PhaseTwo.Worker.ID},
+	})
 }
 
 // markControlDependencyDegraded records one transient control or Ownership
@@ -2463,21 +3358,90 @@ func (bundle *phaseTwoWorkerBundle) startQueryGroup(
 	return true
 }
 
-func (bundle *phaseTwoWorkerBundle) stopQueryGroup(
-	ctx context.Context,
+// handOverQueryGroup lets go of a Query Group this Worker is no longer
+// desired for (design 02 §6.2 steps 2-3). Its lifecycle is already detached,
+// so no Slot starts on it. A Slot already running is waited for while the
+// lease keeps renewing: the store admits this holder until the grace the move
+// gave it ends, and caps the renewal there. The lease is released after the
+// Slot, so the commit boundary it is in lands under the lease it began under,
+// and the next owner does not send its events again.
+//
+// The wait ends with the Slot, or with the lease. Once renewal stops -- the
+// grace ran out, or the store refused the lease -- the Slot's later writes are
+// refused whatever happens, and waiting longer only keeps the next owner out.
+// A process that begins to stop meanwhile stops renewing every lease, and the
+// Slot is then waited for within the shutdown timeout, which is what the stop
+// gives its own Slots. It runs on its own goroutine under maintenanceWG, so
+// the control loop never waits on a Slot.
+func (bundle *phaseTwoWorkerBundle) handOverQueryGroup(
 	queryGroup execution.QueryGroupIdentity,
 	lifecycle *phaseTwoQueryGroupLifecycle,
-) error {
+) {
+	defer bundle.maintenanceWG.Done()
+	bound := bundle.dependencies.Config.ShutdownTimeout.Duration()
+	began := time.Now()
+	waited, idle := bundle.slotsInFlight(lifecycle)
+	outcome := observability.SlotDrainIdle
+	if idle != nil {
+		select {
+		case <-idle:
+		case <-lifecycle.done:
+		}
+		switch {
+		case channelClosed(idle):
+			outcome = observability.SlotDrainFinished
+		case bundle.maintenanceCtx != nil && bundle.maintenanceCtx.Err() != nil:
+			outcome = observability.SlotDrainStopped
+			select {
+			case <-idle:
+			case <-time.After(bound):
+			}
+		default:
+			outcome = observability.SlotDrainLeaseEnded
+		}
+	}
+	bundle.recordHandoverDrain(queryGroup, observability.SlotDrainFacts{
+		Site: observability.SlotDrainSiteHandover, Outcome: outcome, Waited: waited,
+		WaitMS: time.Since(began).Milliseconds(),
+	})
 	lifecycle.cancel()
+	// Bounded as a lost Query Group's stop is: a lease goroutine that did not
+	// end would otherwise hold this one for good. Past the bound the lease is
+	// released anyway; a renewal still in flight then finds its fence stale.
 	select {
 	case <-lifecycle.done:
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-time.After(bound):
 	}
-	if err := lifecycle.runner.Release(ctx); err != nil {
-		return fmt.Errorf("phase-two release Query Group %s: %w", queryGroup, err)
+	releaseCtx, cancel := context.WithTimeout(context.Background(), bound)
+	defer cancel()
+	if err := lifecycle.runner.Release(releaseCtx); err != nil {
+		bundle.observeOwnership(releaseCtx, observability.StageAssignmentLost, observability.ResultFailed, queryGroup,
+			fmt.Errorf("phase-two release Query Group %s: %w", queryGroup, err))
+		// The lease expires by its TTL.
+		bundle.markControlDependencyDegraded()
+		return
 	}
-	return nil
+	bundle.observeOwnership(releaseCtx, observability.StageAssignmentLost, observability.ResultSuccess, queryGroup, nil)
+}
+
+func channelClosed(signal <-chan struct{}) bool {
+	select {
+	case <-signal:
+		return true
+	default:
+		return false
+	}
+}
+
+// recordHandoverDrain counts one handover's wait and writes its line.
+func (bundle *phaseTwoWorkerBundle) recordHandoverDrain(queryGroup execution.QueryGroupIdentity, drain observability.SlotDrainFacts) {
+	bundle.dependencies.Recorder.RecordHandoverDrain(drain.Outcome, time.Duration(drain.WaitMS)*time.Millisecond)
+	observeRuntime(context.Background(), bundle.dependencies.Observer, observability.Observation{
+		Component: observability.ComponentOwnership, Stage: observability.StageHandoverDrained,
+		Result: observability.ResultSuccess, Operation: observability.OperationTransition,
+		Direction: observability.DirectionInternal, SlotDrain: &drain,
+		Trace: observability.TraceFields{QueryGroupKey: string(queryGroup), OwnerID: bundle.dependencies.Config.PhaseTwo.Worker.ID},
+	})
 }
 
 func (bundle *phaseTwoWorkerBundle) stopLostQueryGroup(
@@ -2499,7 +3463,7 @@ func (bundle *phaseTwoWorkerBundle) stopLostQueryGroup(
 		err = errors.Join(err, releaseErr)
 	}
 	bundle.updateReadiness()
-	bundle.observeOwnership(context.Background(), observability.StageAssignmentLost, observability.ResultFailed, queryGroup, err)
+	bundle.observeOwnership(context.Background(), observability.StageAssignmentLost, lostResult(err), queryGroup, err)
 }
 
 func (bundle *phaseTwoWorkerBundle) detachLostQueryGroup(
@@ -2516,7 +3480,20 @@ func (bundle *phaseTwoWorkerBundle) detachLostQueryGroup(
 		err = errors.Join(err, releaseErr)
 	}
 	bundle.updateReadiness()
-	bundle.observeOwnership(context.Background(), observability.StageAssignmentLost, observability.ResultFailed, queryGroup, err)
+	bundle.observeOwnership(context.Background(), observability.StageAssignmentLost, lostResult(err), queryGroup, err)
+}
+
+// lostResult is how a Query Group let go of outside a planned stop reads: a
+// failure, unless its lease ran out at a content switch - the holder was
+// still on the old content when the change fell due, and the next reconcile
+// takes the Query Group again on the new content. Its reason says so
+// either way (ownership.LeaseEndedAtContentSwitch).
+func lostResult(err error) observability.Result {
+	var switched *ownership.LeaseEndedAtContentSwitch
+	if errors.As(err, &switched) {
+		return observability.ResultSuccess
+	}
+	return observability.ResultFailed
 }
 
 func (bundle *phaseTwoWorkerBundle) detachQueryGroup(
@@ -2545,6 +3522,41 @@ func (bundle *phaseTwoWorkerBundle) ownedQueryGroups() []execution.QueryGroupIde
 	return owned
 }
 
+// ownedContentScope is the content the owned Query Group's Runner runs now,
+// as its lease's last acquire or renewal left it; empty for a Query Group
+// this process does not own or whose lease names no content.
+func (bundle *phaseTwoWorkerBundle) ownedContentScope(queryGroup execution.QueryGroupIdentity) string {
+	bundle.mu.RLock()
+	defer bundle.mu.RUnlock()
+	lifecycle, owned := bundle.runners[queryGroup]
+	if !owned {
+		return ""
+	}
+	runner, ok := lifecycle.runner.(maintenanceRunner)
+	if !ok {
+		return ""
+	}
+	contentScope, _, _ := runner.maintenanceLease()
+	return contentScope
+}
+
+// ownedLeases is the owned Query Groups with the timeline revision each
+// lease names, read from memory, for the cost roster. A Runner without a
+// lease to read is owned and not accepting.
+func (bundle *phaseTwoWorkerBundle) ownedLeases() []ownedLease {
+	bundle.mu.RLock()
+	defer bundle.mu.RUnlock()
+	owned := make([]ownedLease, 0, len(bundle.runners))
+	for queryGroup, lifecycle := range bundle.runners {
+		lease := ownedLease{queryGroup: queryGroup}
+		if runner, ok := lifecycle.runner.(maintenanceRunner); ok {
+			_, lease.revision, lease.accepting = runner.maintenanceLease()
+		}
+		owned = append(owned, lease)
+	}
+	return owned
+}
+
 // setRunnerLocked and removeRunnerLocked are the only ways the owned Runner
 // set changes. Both keep what is derived from that set - the owned count and
 // the dispatcher's ordered view - in step with it, which is why no caller
@@ -2559,7 +3571,12 @@ func (bundle *phaseTwoWorkerBundle) setRunnerLocked(
 
 func (bundle *phaseTwoWorkerBundle) removeRunnerLocked(queryGroup execution.QueryGroupIdentity) {
 	delete(bundle.runners, queryGroup)
+	// Not owned here any more: its timeline is its next owner's to report.
+	delete(bundle.unreadableTimelines, queryGroup)
 	bundle.setOwnedQueryGroupsLocked()
+	// A Query Group no longer owned is no longer rechecked. The lookback
+	// never takes the bundle's lock under its own, so this order is safe.
+	bundle.dependencies.Lookback.Forget(queryGroup)
 }
 
 // setOwnedQueryGroupsLocked follows every change to the owned Runner set, so
@@ -2574,24 +3591,43 @@ func (bundle *phaseTwoWorkerBundle) setOwnedQueryGroupsLocked() {
 
 func (bundle *phaseTwoWorkerBundle) updateReadiness() {
 	bundle.mu.RLock()
-	assignmentReady := !bundle.draining && !bundle.closed && len(bundle.runners) == len(bundle.assigned)
+	// A replica that has not yet read its Assignment holds none, which is not
+	// the same as having been assigned none: startup that could not read it
+	// waits for the tick that does, not ready meanwhile.
+	// A declined Query Group still assigned here counts as accounted for: it
+	// is let go on purpose and waits for a leader to place it elsewhere, and
+	// reporting the replica not ready for it would move all the others too.
+	assignmentReady := bundle.assignmentRead && !bundle.draining && !bundle.closed
 	if assignmentReady {
+		open := 0
 		for queryGroup := range bundle.assigned {
-			if _, open := bundle.runners[queryGroup]; !open {
+			if _, running := bundle.runners[queryGroup]; running {
+				open++
+				continue
+			}
+			if _, declined := bundle.declined[queryGroup]; !declined {
 				assignmentReady = false
 				break
 			}
 		}
+		assignmentReady = assignmentReady && open == len(bundle.runners)
 	}
 	controlDegraded := bundle.controlDegraded
 	controlReason := bundle.controlReason
 	factsSeen := bundle.controlFactsSeen
 	dependencyDegraded := bundle.dependencyDegraded
 	lastRecoveryAt := bundle.lastControlRecoveryAt
+	sinkReady := bundle.outputSinkReady
 	bundle.mu.RUnlock()
 	state := observability.HealthReady
 	var reasons []observability.ReasonCode
-	if !factsSeen {
+	if !sinkReady {
+		// Not ready, under the dependency's name: the replica is up and its
+		// diagnostics answer, and the rollout waits on it instead of
+		// terminating the replicas that can publish for one that cannot.
+		state = observability.HealthNotReady
+		reasons = []observability.ReasonCode{phaseTwoOutputSinkReason}
+	} else if !factsSeen {
 		// Not ready rather than degraded: degraded still answers the
 		// readiness probe as ready, and a rollout that took that answer would
 		// terminate the replica that does know the facts for one that does
@@ -2615,15 +3651,251 @@ func (bundle *phaseTwoWorkerBundle) updateReadiness() {
 	}
 	bundle.dependencies.Health.Update(phaseTwoReadiness{
 		State: state, Reasons: reasons, SnapshotReady: true, AssignmentReady: assignmentReady,
-		RuntimeStateReady: true, OutputSinkReady: true, LastRecoveryAt: lastRecoveryAt,
+		RuntimeStateReady: true, OutputSinkReady: sinkReady, LastRecoveryAt: lastRecoveryAt,
 	})
+}
+
+// phaseTwoOutputSinkReason is the readiness reason while the output sink is
+// not open. Kafka's own code, because that is the dependency that did not
+// answer; the endpoint list carries what it said.
+var phaseTwoOutputSinkReason = observability.ReasonCode(contract.ReasonKafkaUnavailable)
+
+// outputSinkChanged is told by the lazy output sink after every attempt. It
+// keeps the readiness fact and the worker registration in step with the sink:
+// not ready and starting while it is closed, ready on the first renewal after
+// it opens.
+func (bundle *phaseTwoWorkerBundle) outputSinkChanged(state outputSinkState) {
+	bundle.mu.Lock()
+	changed := bundle.outputSinkReady != state.Ready
+	bundle.outputSinkReady = state.Ready
+	bundle.mu.Unlock()
+	if !changed {
+		return
+	}
+	bundle.updateReadiness()
+	if !state.Ready && state.LastFailure != "" {
+		bundle.observe(context.Background(), observability.ComponentRuntime, observability.StageStartup,
+			observability.ResultDegraded, errors.New("output sink is not open: "+state.LastFailure))
+	}
+}
+
+// noteTimelineReading keeps the unreadable-timeline names in step with what
+// this replica's rounds meet. A round that asked for a Slot and met a
+// timeline that does not decode (SCHEDULE_UNREADABLE) names its Query Group;
+// a later round of it that ran a Slot - the source read the timeline to
+// freeze it - drops the name. A round that did not ask the source (not due,
+// backing off) or that the source refused for another reason, before or
+// beside the timeline, says nothing about the bytes and leaves the name as
+// it is: dropping it there would have the name come and go between
+// heartbeats while the timeline stayed unreadable. Only an owned Query
+// Group is named.
+func (bundle *phaseTwoWorkerBundle) noteTimelineReading(queryGroup execution.QueryGroupIdentity, attempted bool, outcome execution.SlotExecutionResult) {
+	if !attempted {
+		return
+	}
+	unreadable := outcome.ReasonCode == execution.ReasonCode(contract.ReasonScheduleUnreadable)
+	if !unreadable && outcome.SourceRetry {
+		return
+	}
+	bundle.mu.Lock()
+	_, named := bundle.unreadableTimelines[queryGroup]
+	_, owned := bundle.runners[queryGroup]
+	switch {
+	case unreadable && !named && owned:
+		if bundle.unreadableTimelines == nil {
+			bundle.unreadableTimelines = make(map[execution.QueryGroupIdentity]struct{})
+		}
+		bundle.unreadableTimelines[queryGroup] = struct{}{}
+	case !unreadable && named:
+		delete(bundle.unreadableTimelines, queryGroup)
+	}
+	bundle.mu.Unlock()
+	if unreadable && !named && owned {
+		bundle.dependencies.Recorder.RecordTimelineUnreadableReported()
+	}
+}
+
+// unreadableTimelinesRegistration is the names the registration carries -
+// the first ownership.MaxReportedUnreadableTimelines in Query Group order -
+// and how many there are in all.
+func (bundle *phaseTwoWorkerBundle) unreadableTimelinesRegistration() ([]string, int) {
+	bundle.mu.RLock()
+	defer bundle.mu.RUnlock()
+	if len(bundle.unreadableTimelines) == 0 {
+		return nil, 0
+	}
+	names := make([]string, 0, len(bundle.unreadableTimelines))
+	for queryGroup := range bundle.unreadableTimelines {
+		names = append(names, string(queryGroup))
+	}
+	sort.Strings(names)
+	total := len(names)
+	if total > ownership.MaxReportedUnreadableTimelines {
+		names = names[:ownership.MaxReportedUnreadableTimelines]
+	}
+	return names, total
 }
 
 // refreshAndReconcile runs one control tick. Dependency failures never stop
 // the Worker: they are scoped by scopeControlError, keep already-owned Query
 // Groups running and are retried on the next tick. Only invariant violations
 // and cancellation are returned to Run.
+// declineHungExecutions finds the executions still running past their own
+// deadline by executionPastDeadlineGrace without having begun to commit - an
+// execution that ignored its cancellation, which only a code bug produces -
+// and lets each one's Query Group go (design 02 section 6.5): the execution
+// is claimed so it writes nothing more, the lifecycle is detached so nothing
+// starts on it, its lease is released at once without waiting on it, and the
+// Query Group is declined - named on this replica's registration so a leader
+// places it elsewhere and never back here - until the hung execution
+// returns.
+//
+// The deadline is the one the execution runs under (DeclineHung): a normal
+// Slot's query deadline, a replay's, retry's or probe's derived from its own
+// arrival - never the frozen Slot's first-attempt deadline, which a replay of
+// a taken-over Slot is minutes past by design. Only the stages before the
+// commit are judged, where past its deadline an execution has only its
+// evaluation left, which the grace (the liveness probe's minute) covers. An
+// execution that has begun to write output is never declined: its State and
+// Progress writes run under their own bounded timeouts, and releasing the
+// lease between them would leave acknowledged output unapplied.
+func (bundle *phaseTwoWorkerBundle) declineHungExecutions(now time.Time) {
+	type hung struct {
+		queryGroup execution.QueryGroupIdentity
+		entry      *declinedQueryGroup
+	}
+	var found []hung
+	bundle.mu.Lock()
+	if bundle.draining || bundle.closed {
+		bundle.mu.Unlock()
+		return
+	}
+	for queryGroup, lifecycle := range bundle.runners {
+		if lifecycle.inflight == 0 {
+			continue
+		}
+		// An execution with no deadline of its own yet - in its source, or
+		// a recovery before access derived its deadline - is not judged: its
+		// reads are bounded by their clients.
+		stage, deadline, claimed := lifecycle.runner.DeclineHung(now, executionPastDeadlineGrace)
+		if !claimed {
+			continue
+		}
+		entry := &declinedQueryGroup{lifecycle: lifecycle, stage: stage, deadline: deadline, since: now}
+		bundle.removeRunnerLocked(queryGroup)
+		if bundle.declined == nil {
+			bundle.declined = make(map[execution.QueryGroupIdentity]*declinedQueryGroup)
+		}
+		bundle.declined[queryGroup] = entry
+		bundle.maintenanceWG.Add(1)
+		found = append(found, hung{queryGroup, entry})
+	}
+	bundle.mu.Unlock()
+	for _, hung := range found {
+		go bundle.declineQueryGroup(hung.queryGroup, hung.entry)
+	}
+}
+
+// declineQueryGroup lets go of a Query Group whose execution is hung here:
+// renewal stops, the lease is released without waiting on the Slot, and the
+// registration is written at once so the leader learns of the decline on its
+// next round rather than at the next renewal.
+func (bundle *phaseTwoWorkerBundle) declineQueryGroup(queryGroup execution.QueryGroupIdentity, entry *declinedQueryGroup) {
+	defer bundle.maintenanceWG.Done()
+	bound := bundle.dependencies.Config.ShutdownTimeout.Duration()
+	lifecycle := entry.lifecycle
+	lifecycle.cancel()
+	select {
+	case <-lifecycle.done:
+	case <-time.After(bound):
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), bound)
+	defer cancel()
+	releaseErr := lifecycle.runner.Release(ctx)
+	bundle.recordHungExecution(queryGroup, entry, observability.ExecutionHungDeclined, releaseErr)
+	if err := bundle.register(ctx, ownership.WorkerReady); err != nil {
+		bundle.markControlDependencyDegraded()
+	}
+	bundle.updateReadiness()
+}
+
+// recordHungExecution counts one hung execution's decline or return and
+// writes its line: which Query Group, the stage it is stuck in, how far past
+// its deadline, and on return how long it was hung.
+func (bundle *phaseTwoWorkerBundle) recordHungExecution(
+	queryGroup execution.QueryGroupIdentity,
+	entry *declinedQueryGroup,
+	outcome string,
+	err error,
+) {
+	now := bundle.dependencies.Now()
+	facts := observability.ExecutionHungFacts{Outcome: outcome, Stage: entry.stage,
+		DeadlineUnixMilli: entry.deadline.UnixMilli(), PastDeadlineMS: now.Sub(entry.deadline).Milliseconds()}
+	if outcome == observability.ExecutionHungReturned {
+		facts.HungMS = now.Sub(entry.since).Milliseconds()
+	}
+	bundle.dependencies.Recorder.RecordExecutionHung(outcome)
+	result := observability.Result(observability.ResultFailed)
+	if outcome == observability.ExecutionHungReturned {
+		result = observability.ResultSuccess
+	}
+	observeRuntime(context.Background(), bundle.dependencies.Observer, observability.Observation{
+		Component: observability.ComponentScheduler, Stage: observability.StageExecutionHung,
+		Result: result, Direction: observability.DirectionInternal, ExecutionHung: &facts, Err: err,
+		Trace: observability.TraceFields{QueryGroupKey: string(queryGroup), OwnerID: bundle.dependencies.Config.PhaseTwo.Worker.ID},
+	})
+}
+
+// phaseTwoDispatcherFanout is how many execution slots the dispatcher runs:
+// one goroutine each, taking Slots off the queue. The limit is derived from
+// the container and validated positive, so the floor of one is reached only
+// by a Config assembled field by field in a test. There is no unlimited
+// fanout to fall back to.
+func phaseTwoDispatcherFanout(schedulerConfig config.PhaseTwoSchedulerConfig) int {
+	fanout := max(schedulerConfig.ActiveExecutionLimit, 1)
+	if schedulerConfig.ReadyQueueCapacity > 0 && schedulerConfig.ReadyQueueCapacity < fanout {
+		fanout = schedulerConfig.ReadyQueueCapacity
+	}
+	return fanout
+}
+
+// declineFleetFacts is what this replica publishes of its declines, from
+// the same set its registration names (declinedRegistration), with the
+// execution slots the dispatcher runs: each decline holds one until its
+// hung execution returns. Nil while it declines none.
+func (bundle *phaseTwoWorkerBundle) declineFleetFacts() *fleet.DeclineFacts {
+	bundle.mu.RLock()
+	defer bundle.mu.RUnlock()
+	if len(bundle.declined) == 0 {
+		return nil
+	}
+	declined := make([]fleet.DeclinedQueryGroup, 0, len(bundle.declined))
+	for queryGroup, entry := range bundle.declined {
+		declined = append(declined, fleet.DeclinedQueryGroup{QueryGroup: string(queryGroup), Stage: entry.stage, Since: entry.since.UTC()})
+	}
+	sort.Slice(declined, func(left, right int) bool { return declined[left].QueryGroup < declined[right].QueryGroup })
+	return &fleet.DeclineFacts{Fanout: phaseTwoDispatcherFanout(bundle.dependencies.Config.PhaseTwo.Scheduler), Total: len(declined),
+		QueryGroups: declined[:min(len(declined), fleet.MaxDeclineSamples)]}
+}
+
+// declinedRegistration is the declined set as the registration names it,
+// in Query Group order.
+func (bundle *phaseTwoWorkerBundle) declinedRegistration() []ownership.DeclinedQueryGroup {
+	bundle.mu.RLock()
+	defer bundle.mu.RUnlock()
+	if len(bundle.declined) == 0 {
+		return nil
+	}
+	declined := make([]ownership.DeclinedQueryGroup, 0, len(bundle.declined))
+	for queryGroup, entry := range bundle.declined {
+		declined = append(declined, ownership.DeclinedQueryGroup{QueryGroup: string(queryGroup), Stage: entry.stage})
+	}
+	sort.Slice(declined, func(left, right int) bool { return declined[left].QueryGroup < declined[right].QueryGroup })
+	return declined
+}
+
 func (bundle *phaseTwoWorkerBundle) refreshAndReconcile(ctx context.Context, refresh bool) error {
+	bundle.declineHungExecutions(bundle.dependencies.Now())
 	failureSeq := bundle.controlDependencyFailureSeq()
 	var queryGroups []execution.QueryGroupIdentity
 	var err error
@@ -2879,9 +4151,12 @@ func (bundle *phaseTwoWorkerBundle) markControlFollower(err error) {
 // registration maintenance. Transient Ownership Store failures never reach
 // it; they are retried by maintainRegistration.
 func (bundle *phaseTwoWorkerBundle) markOwnershipUnsafe(err error) {
+	bundle.mu.RLock()
+	sinkReady := bundle.outputSinkReady
+	bundle.mu.RUnlock()
 	bundle.dependencies.Health.Update(phaseTwoReadiness{
 		State: observability.HealthNotReady, Reasons: []observability.ReasonCode{observability.ReasonInternalUnknown},
-		SnapshotReady: true, RuntimeStateReady: true, OutputSinkReady: true,
+		SnapshotReady: true, RuntimeStateReady: true, OutputSinkReady: sinkReady,
 	})
 	bundle.observe(context.Background(), observability.ComponentOwnership, observability.StageAssignmentLost, observability.ResultFailed, err)
 }
@@ -2924,10 +4199,7 @@ func (bundle *phaseTwoWorkerBundle) observeOwnership(
 	queryGroup execution.QueryGroupIdentity,
 	err error,
 ) {
-	reason := observability.ReasonNone
-	if err != nil {
-		reason = observability.ReasonInternalUnknown
-	}
+	reason := ownershipObservationReason(err)
 	observeRuntime(ctx, bundle.dependencies.Observer, observability.Observation{
 		Component: observability.ComponentOwnership, Stage: stage, Result: result,
 		Operation: observability.OperationTransition, Direction: observability.DirectionInternal,
@@ -2935,6 +4207,21 @@ func (bundle *phaseTwoWorkerBundle) observeOwnership(
 			QueryGroupKey: string(queryGroup), OwnerID: bundle.dependencies.Config.PhaseTwo.Worker.ID,
 		}, Err: err,
 	})
+}
+
+// ownershipObservationReason is the reason an ownership observation carries
+// for err: none for no error, the store's own refusal word for one of its
+// four refusals, internal_unknown for anything else. Every ownership site
+// used to say internal_unknown for all four, and which refusal a deployment
+// was seeing could only be read off the error text of a rate-limited log.
+func ownershipObservationReason(err error) observability.ReasonCode {
+	if err == nil {
+		return observability.ReasonNone
+	}
+	if reason, ok := ownership.RefusalReason(err); ok {
+		return observability.ReasonCode(reason)
+	}
+	return observability.ReasonInternalUnknown
 }
 
 func phaseTwoRuntimeObserver(observer observability.Observer) observability.Observer {
@@ -2987,7 +4274,6 @@ type phaseTwoReadiness struct {
 	AssignmentReady   bool
 	RuntimeStateReady bool
 	OutputSinkReady   bool
-	ResourceState     observability.ResourceState
 	LastRecoveryAt    time.Time
 }
 
@@ -3009,8 +4295,7 @@ func (h *phaseTwoApplicationHealth) Update(readiness phaseTwoReadiness) {
 		State: readiness.State, Reasons: append([]observability.ReasonCode(nil), readiness.Reasons...),
 		ConfigLoaded: true, SchemaReady: true, PhaseTwo: true, SnapshotReady: readiness.SnapshotReady,
 		AssignmentReady: readiness.AssignmentReady, RuntimeStateReady: readiness.RuntimeStateReady,
-		OutputSinkReady: readiness.OutputSinkReady, ResourceState: readiness.ResourceState,
-		LastRecoveryAt: readiness.LastRecoveryAt,
+		OutputSinkReady: readiness.OutputSinkReady, LastRecoveryAt: readiness.LastRecoveryAt,
 	})
 }
 
@@ -3018,13 +4303,7 @@ func (h *phaseTwoApplicationHealth) HealthSnapshot() observability.HealthSnapsho
 	if h == nil || h.tracker == nil {
 		return observability.NormalizeHealthSnapshot(observability.HealthSnapshot{PhaseTwo: true})
 	}
-	snapshot := h.tracker.HealthSnapshot()
-	// Kafka input claims and lag belong only to phase-one compatibility. Keep
-	// them structurally absent from the phase-two readiness source.
-	snapshot.AssignedClaims = 0
-	snapshot.ConsumerLagRecords = 0
-	snapshot.ConsumerLagKnown = false
-	return observability.NormalizeHealthSnapshot(snapshot)
+	return observability.NormalizeHealthSnapshot(h.tracker.HealthSnapshot())
 }
 
 func diagnosticTimeMS(t time.Time) int64 {
@@ -3063,6 +4342,14 @@ type httpRuntime interface {
 	// SetAPI installs the observability API once the runtime that produces the
 	// object facts is open. The listener starts before that runtime does.
 	SetAPI(http.Handler)
+	// SetGRPC installs the control stream the same way.
+	SetGRPC(http.Handler)
+	// SetLiveness installs what /healthz judges, once the loops it judges
+	// exist.
+	SetLiveness(httpservice.LivenessSource)
+	// SetPublicSurfaceRestricted settles the public surface once the CLI is
+	// built: restricted only when a session can be had.
+	SetPublicSurfaceRestricted(bool)
 }
 
 // waitRuntimeComponent waits for one component's shutdown to report, up to the

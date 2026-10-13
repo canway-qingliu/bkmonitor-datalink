@@ -18,9 +18,8 @@ import (
 )
 
 const (
-	snapshotSchemaVersion         = "alarmd-control-snapshot-v1"
-	activationSchemaVersion       = "alarmd-control-activation-v2"
-	legacyActivationSchemaVersion = "alarmd-control-activation-v1"
+	snapshotSchemaVersion   = "alarmd-control-snapshot-v1"
+	activationSchemaVersion = "alarmd-control-activation-v2"
 )
 
 var (
@@ -79,6 +78,27 @@ type SourceAuditState struct {
 type PlanActivationRecord struct {
 	Fact        execution.PlanActivationFact `json:"fact"`
 	Publication SnapshotPublicationRef       `json:"publication"`
+	// PreviousReadHold locates this Plan's lateness evidence after a query
+	// identity change. It is observational metadata, not activation identity.
+	PreviousReadHold *ReadHoldPredecessorRef `json:"previous_read_hold,omitempty"`
+}
+
+type ReadHoldPredecessorRef struct {
+	QueryGroup execution.QueryGroupIdentity `json:"query_group"`
+	ClosedAt   execution.EvaluationTime     `json:"closed_at"`
+	// PreviousSlot is the Plan's last legal Slot in the Segment it left and
+	// CompletionOffsetMillis its completion offset there, both from the
+	// closed schedule: the deadline the new group's first Slots must not read
+	// ahead of, known without reading the old group's timeline or content.
+	// Zero when that Segment held no Slot of the Plan.
+	PreviousSlot           execution.EvaluationTime `json:"previous_slot,omitempty"`
+	CompletionOffsetMillis int64                    `json:"completion_offset_ms,omitempty"`
+}
+
+// Equal compares by content; the fact carries a pointer, see
+// execution.ActivatedPlan.
+func (record PlanActivationRecord) Equal(other PlanActivationRecord) bool {
+	return record.Fact.Equal(other.Fact) && record.Publication == other.Publication
 }
 
 type DrainingQueryGroup struct {
@@ -97,6 +117,17 @@ type ActivationState struct {
 	Plans          []PlanActivationRecord  `json:"plans"`
 	Draining       []DrainingQueryGroup    `json:"draining,omitempty"`
 	ActiveQGSetRef ActiveQueryGroupSetRef  `json:"active_qg_set_ref"`
+	// BlockedCount and BlockedDigest account for the persisted set of Query
+	// Groups a cutover held back (see BlockedQueryGroup); the set itself is a
+	// key of its own. A reader that does not know them ignores them.
+	BlockedCount  int    `json:"blocked_count,omitempty"`
+	BlockedDigest string `json:"blocked_digest,omitempty"`
+	// SkippedTimelines is the Query Groups the read that gave a head body its
+	// records back left out, because their timelines did not decode. Never
+	// persisted: it is what this process could not read, not a fact of the
+	// activation. Their records are missing from Plans, which is not their
+	// removal (see Ensure).
+	SkippedTimelines []SkippedTimeline `json:"-"`
 }
 
 type ActivationExpectation struct {
@@ -110,30 +141,55 @@ type RedisCatalogRepository struct {
 	prefix          string
 	ttl             time.Duration
 	activationCache parsedActivationCache
-	objectCatalog   objectCatalogState
-	catalogIndex    catalogIndex
-	contentMemo     publishedContentMemo
-	objectCache     *objectReadCache
-	objectFlights   objectReadFlights
+	// lastGood is the activation last served under a known header, kept for
+	// RebuildActivationBody; see lastGoodActivation.
+	lastGood lastGoodActivation
+	rebuilds activationRebuildCounts
+	// timelineRepairs is every unreadable timeline this process was asked
+	// to look at, by what became of it; read at scrape time.
+	timelineRepairs timelineRepairCounts
+	// skippedTimelines is every timeline the activation read left out, by
+	// reason, and the ones its last read left out.
+	skippedTimelines skippedTimelineState
+	header           activationHeaderStanding
+	blocked          blockedCounts
+	objectCatalog    objectCatalogState
+	catalogIndex     catalogIndex
+	contentMemo      publishedContentMemo
+	// objectCache is read through objects(): an atomic pointer, so the
+	// cache can be configured, or configured again, while readers are
+	// running. See ConfigureObjectCache.
+	objectCache   atomic.Pointer[objectReadCache]
+	objectFlights objectReadFlights
+	// localView is what this Worker holds by content for the Query Groups it
+	// owns, sized from the bytes it read. See local_view.go.
+	localView localView
 	// manifestCache and latestPublication bound the two reads the per-Slot
 	// Segment freshness check makes. See segment_freshness_cache.go.
-	manifestCache              catalogManifestCache
-	manifestFlights            catalogManifestFlights
-	latestPublication          latestPublicationMemo
-	freshnessClock             func() time.Time
-	controlCache               *controlReadCache
-	controlReads               controlReadCounters
-	adoptMu                    sync.Mutex
-	legacyMigrationMaxScanKeys int
-	legacyMigrationTimeout     time.Duration
-	drainingRetireAfter        time.Duration
-	segmentRetention           execution.SlotRetention
+	manifestCache       catalogManifestCache
+	manifestFlights     catalogManifestFlights
+	latestPublication   latestPublicationMemo
+	freshnessClock      func() time.Time
+	controlCache        *controlReadCache
+	controlReads        controlReadCounters
+	activationBodyBytes atomic.Int64
+	written             writtenActivation
+	activeSets          activeSetCache
+	adoptMu             sync.Mutex
+	drainingRetireAfter time.Duration
+	segmentRetention    execution.SlotRetention
 	// contentCutoverVerified is set once this process has read every open
 	// Segment in one cutover and found each naming the content its manifest
 	// names; later cutovers then read only the Query Groups whose content
 	// changed. See content_cutover.go.
 	contentCutoverVerified atomic.Bool
-	observer               observability.Observer
+	// assignmentRecordKey names the Assignment record of a Query Group, on
+	// the same Redis the timelines are on, so a cutover writes each rewritten
+	// timeline's revision onto its record in the same script that writes the
+	// timeline (decision-016 batch 4). Nil writes none: a deployment without
+	// the ownership store beside the catalog carries no such word.
+	assignmentRecordKey func(execution.QueryGroupIdentity) string
+	observer            observability.Observer
 }
 
 // ConfigureDrainingTermination bounds how long a retired Query Group may stay
@@ -171,14 +227,6 @@ func NewRedisCatalogRepository(client redis.Cmdable, prefix string, ttl time.Dur
 			controlTimelineCacheDefaultMaxEntries, controlTimelineCacheDefaultMaxBytes)}, nil
 }
 
-func (repository *RedisCatalogRepository) ConfigureLegacyMigration(maxScanKeys int, timeout time.Duration) error {
-	if repository == nil || maxScanKeys <= 0 || timeout <= 0 {
-		return errors.New("alarmd controlplane: invalid legacy migration bounds")
-	}
-	repository.legacyMigrationMaxScanKeys, repository.legacyMigrationTimeout = maxScanKeys, timeout
-	return nil
-}
-
 func (repository *RedisCatalogRepository) Ping(ctx context.Context) error {
 	if repository == nil || repository.client == nil {
 		return errors.New("alarmd controlplane: Redis catalog repository is required")
@@ -190,11 +238,15 @@ func (repository *RedisCatalogRepository) Ping(ctx context.Context) error {
 // Activation header names, and of nothing else. The Snapshot and the Active
 // Set are content-addressed, so their presence is all the script needs to
 // know about them; the two small mappings are compared by value, and a header
-// that moved means another Activation owns the objects now. The reply carries
-// the Active Set's size for the renewal facts, so the caller never reads it
-// to learn that.
+// that moved means another Activation owns the objects now. A header that is
+// not there at all is told apart from one that moved (-2): nothing moves on
+// from it by itself, and the Control Leader writes it back from the body
+// (RebuildActivationHeader). The reply carries the Active Set's size for the
+// renewal facts, so the caller never reads it to learn that.
 const renewCurrentActivationObjectsScript = `
-if redis.call('GET', KEYS[1]) ~= ARGV[1] then return {0, 0} end
+local header = redis.call('GET', KEYS[1])
+if not header then return {-2, 0} end
+if header ~= ARGV[1] then return {0, 0} end
 if redis.call('EXISTS', KEYS[2]) == 0 or redis.call('GET', KEYS[3]) ~= ARGV[3] or
    redis.call('GET', KEYS[4]) ~= ARGV[4] or redis.call('EXISTS', KEYS[5]) == 0 then return {-1, 0} end
 redis.call('PEXPIRE', KEYS[2], ARGV[2])
@@ -220,7 +272,7 @@ func (repository *RedisCatalogRepository) RenewCurrentActivationObjects(ctx cont
 			Result: observability.Result(metricResult), ActiveQGSet: &observability.ActiveQGSetFacts{Operation: "renew", Result: metricResult,
 				QueryGroups: queryGroups, ObjectBytes: objectBytes, Duration: time.Since(started)}})
 	}()
-	state, err := repository.LoadActivation(ctx)
+	state, err := repository.LoadActivationHead(ctx)
 	if err != nil {
 		return err
 	}
@@ -228,7 +280,11 @@ func (repository *RedisCatalogRepository) RenewCurrentActivationObjects(ctx cont
 	if err != nil {
 		return err
 	}
-	if _, err := repository.LoadCatalogManifest(ctx, state.Current.SnapshotRevision); err != nil {
+	// Decoded once per revision and asked of the store on every round with
+	// an existence check: the whole manifest, most of a megabyte on a few
+	// thousand Query Groups, was read here on every refresh round only to be
+	// dropped.
+	if _, err := repository.retainedCatalogManifest(ctx, state.Current.SnapshotRevision); err != nil {
 		if errors.Is(err, ErrCatalogManifestUnavailable) {
 			return ErrSnapshotUnavailable
 		}
@@ -266,11 +322,20 @@ func (repository *RedisCatalogRepository) RenewCurrentActivationObjects(ctx cont
 			return err
 		}
 		repository.renewObjectCatalog(ctx, state.Current.SnapshotRevision)
+		// The renewal compared the header and found it: whatever this
+		// process last saw of a missing header is over. Without this a
+		// header another writer put back while a rebuild conflicted stayed
+		// "missing" on the fleet until the next activation asked.
+		repository.header.present()
 		metricResult = "success"
 		queryGroups, objectBytes = len(groups), int(activeBytes)
 		return nil
 	case 0:
+		repository.header.conflict(ActivationRenewalHeaderMoved)
 		return ErrActivationConflict
+	case -2:
+		repository.header.conflict(ActivationRenewalHeaderMissing)
+		return ErrActivationHeaderMissing
 	default:
 		return ErrSnapshotUnavailable
 	}
@@ -730,10 +795,28 @@ func (repository *RedisCatalogRepository) LoadLatestAudit(ctx context.Context) (
 	return audit, nil
 }
 
+// LoadActivation is the activation with its Plan records, which only the
+// Control Leader's activation and cutover need; every other reader wants
+// LoadActivationHead. A head body gets its records back from the open
+// Segments (materializeActivationPlans), once per header.
 func (repository *RedisCatalogRepository) LoadActivation(ctx context.Context) (ActivationState, error) {
-	entry, err := repository.loadParsedActivation(ctx)
+	if repository == nil || repository.client == nil {
+		return ActivationState{}, errors.New("alarmd controlplane: Redis catalog repository is required")
+	}
+	version, err := repository.readControlVersion(ctx)
+	if err != nil {
+		repository.clearActivationCaches()
+		return ActivationState{}, err
+	}
+	entry, err := repository.loadParsedActivationAt(ctx, version)
 	if err != nil {
 		return ActivationState{}, err
+	}
+	if entry.state.SchemaVersion == activationHeadSchemaVersion {
+		if state, ok := repository.written.lookup(entry.payload); ok {
+			return state, nil
+		}
+		return entry.materialized(ctx, repository, version)
 	}
 	return entry.cloneState(), nil
 }
@@ -760,6 +843,23 @@ func (repository *RedisCatalogRepository) LoadActivations(ctx context.Context, r
 	if repository == nil || repository.client == nil {
 		return execution.PlanActivationResult{}, errors.New("alarmd controlplane: Redis catalog repository is required")
 	}
+	// A request carrying the Worker's timeline revision hint is answered
+	// from the Query Group's own timeline (decision-016 batch 4b): the open
+	// Segment's activation records are the same records the activation
+	// state carries for that Query Group - the cutover writes both from one
+	// list in one script - and a closed Segment's Slot is historical either
+	// way. Answering from the timeline reads no activation header, which is
+	// the poll batch 4 removes; a hint the timeline does not bear falls back
+	// to the header path inside loadScheduleTimelineHinted.
+	if timelineRevisionHint(ctx) > 0 {
+		timeline, err := repository.loadScheduleTimelineHinted(ctx, request.Contract.Slot.QueryGroup)
+		if err == nil {
+			return activationsFromTimeline(request, timeline)
+		}
+		if !errors.Is(err, ErrScheduleUnavailable) {
+			return execution.PlanActivationResult{}, err
+		}
+	}
 	// One header probe covers both the activation and the Schedule timeline of
 	// this authorization; both were persisted under that same header.
 	version, err := repository.readControlVersion(ctx)
@@ -767,69 +867,38 @@ func (repository *RedisCatalogRepository) LoadActivations(ctx context.Context, r
 		repository.clearActivationCaches()
 		return execution.PlanActivationResult{}, err
 	}
-	entry, err := repository.loadParsedActivationAt(ctx, version)
+	// The activation must be there - a header without its body is the state
+	// the Control Leader rebuilds, and executing past it would hide it - but
+	// the answer comes from the Query Group's timeline, as on the hinted
+	// path: the open Segment carries the same records the body does for this
+	// Query Group, and a head body carries none (activation_head.go).
+	if _, err := repository.loadParsedActivationAt(ctx, version); err != nil {
+		return execution.PlanActivationResult{}, err
+	}
+	timeline, err := repository.loadScheduleTimelineAt(ctx, request.Contract.Slot.QueryGroup, version)
 	if err != nil {
 		return execution.PlanActivationResult{}, err
 	}
-	historical, err := repository.validateClosedHistoricalContract(ctx, request.Contract, entry.state.Current, version)
-	if err != nil {
-		return execution.PlanActivationResult{}, err
-	}
-	result := execution.PlanActivationResult{Contract: request.Contract, Facts: make([]execution.PlanActivationFact, 0, len(request.Plans))}
-	for _, plan := range request.Plans {
-		fact, found := entry.byPlan[plan]
-		if historical || !found {
-			fact = execution.PlanActivationFact{Plan: plan, Selection: execution.ActivationNone}
-		}
-		result.Facts = append(result.Facts, fact)
-	}
-	if err := result.Validate(request); err != nil {
-		return execution.PlanActivationResult{}, err
-	}
-	return result, nil
-}
-
-func (repository *RedisCatalogRepository) validateClosedHistoricalContract(
-	ctx context.Context,
-	contractRef execution.FrozenExecutionContractRef,
-	current SnapshotPublicationRef,
-	version controlVersion,
-) (bool, error) {
-	timeline, err := repository.loadScheduleTimelineAt(ctx, contractRef.Slot.QueryGroup, version)
-	if err != nil {
-		return false, err
-	}
-	for _, segment := range timeline.Segments {
-		schedule := segment.Schedule
-		if !schedule.Segment.Contains(contractRef.Slot.EvaluationTime) {
-			continue
-		}
-		if schedule.Segment.Start != contractRef.ScheduleSegmentStart ||
-			schedule.Segment.ScheduleRevision != contractRef.ScheduleRevision ||
-			schedule.Segment.Publication.SnapshotRevision != contractRef.SnapshotRevision ||
-			schedule.Segment.QueryRevision != contractRef.QueryRevision {
-			return false, errors.New("alarmd controlplane: activation request does not reference its persisted Schedule Segment")
-		}
-		// The current occurrence of a Query Group is its open Segment. It
-		// need not name the current publication: a Query Group whose content
-		// did not change keeps its Segment across publications, so naming
-		// an older publication is the normal case, not a historical one.
-		if schedule.Segment.End == nil {
-			return false, nil
-		}
-		return true, nil
-	}
-	return false, errors.New("alarmd controlplane: activation request has no persisted Schedule Segment")
+	return activationsFromTimeline(request, timeline)
 }
 
 func validateActivationState(state ActivationState) error {
-	if state.SchemaVersion != "" && state.SchemaVersion != activationSchemaVersion && state.SchemaVersion != legacyActivationSchemaVersion {
-		return errors.New("alarmd controlplane: unsupported activation schema")
+	switch state.SchemaVersion {
+	case "", activationSchemaVersion, activationHeadSchemaVersion:
+	default:
+		// The v1 body a development build wrote before the first release is
+		// among these: no release wrote one, and none is upgraded.
+		return fmt.Errorf("alarmd controlplane: unsupported activation schema %q", state.SchemaVersion)
 	}
-	if state.SchemaVersion == activationSchemaVersion {
+	if state.SchemaVersion == activationSchemaVersion || state.SchemaVersion == activationHeadSchemaVersion {
 		if err := state.ActiveQGSetRef.validate(); err != nil {
 			return err
 		}
+	}
+	// A head carries no records: they are on the open Segments (see
+	// activation_head.go). One that carries some is not a head.
+	if state.SchemaVersion == activationHeadSchemaVersion && len(state.Plans) > 0 {
+		return errors.New("alarmd controlplane: an activation head carries Plan records")
 	}
 	if state.RecordRevision == 0 || state.Current.validate() != nil {
 		return errors.New("alarmd controlplane: incomplete activation state")
@@ -840,12 +909,12 @@ func validateActivationState(state ActivationState) error {
 	if state.Pending != nil && *state.Pending == state.Current {
 		return errors.New("alarmd controlplane: pending snapshot must differ from current")
 	}
-	seen := make(map[execution.PlanIdentity]struct{}, len(state.Plans))
+	seen := make(map[execution.PlanKey]struct{}, len(state.Plans))
 	for _, record := range state.Plans {
-		if _, duplicate := seen[record.Fact.Plan]; duplicate {
+		if _, duplicate := seen[record.Fact.Key()]; duplicate {
 			return errors.New("alarmd controlplane: duplicate activation Plan")
 		}
-		seen[record.Fact.Plan] = struct{}{}
+		seen[record.Fact.Key()] = struct{}{}
 		if err := record.Fact.Plan.Validate(); err != nil || record.Publication.validate() != nil {
 			return errors.New("alarmd controlplane: invalid activation Plan record")
 		}
@@ -872,6 +941,19 @@ func validateActivationState(state ActivationState) error {
 		selected := record.Fact.Selected
 		if selected.Identity != record.Fact.Plan || selected.StateGeneration == "" || selected.StateApplyEpoch == 0 || selected.ScheduleRevision == "" || selected.RequiredFullSlots == 0 {
 			return errors.New("alarmd controlplane: incomplete activated Plan")
+		}
+		if err := selected.Carry.Validate(selected); err != nil {
+			return err
+		}
+		// The piece is repeated on the selection the way the identity is,
+		// and has to agree the same way.
+		if !execution.ShardsEqual(selected.Shard, record.Fact.Shard) {
+			return errors.New("alarmd controlplane: activated Plan names another piece than its record")
+		}
+		if record.Fact.Shard != nil {
+			if err := record.Fact.Shard.Validate(); err != nil || record.Fact.Shard.IsZero() {
+				return errors.New("alarmd controlplane: activation record carries an incomplete piece")
+			}
 		}
 	}
 	seenDraining := make(map[execution.QueryGroupIdentity]struct{}, len(state.Draining))
@@ -1012,4 +1094,34 @@ func (publisher *SnapshotPublisher) publishAudit(
 		return PublishedSnapshot{}, false, err
 	}
 	return snapshot, created, nil
+}
+
+// WithAssignmentRecordKey tells the repository where each Query Group's
+// Assignment record lives, so a cutover that rewrites a timeline writes the
+// timeline's new revision onto the record in the same script. The record's
+// word on the revision is what a holder's renewal brings back and what the
+// executable view previews; written anywhere but beside the timeline, the
+// two could be read apart. A record that does not exist is not created: a
+// Query Group placed later carries the revision on its placement.
+func (repository *RedisCatalogRepository) WithAssignmentRecordKey(key func(execution.QueryGroupIdentity) string) *RedisCatalogRepository {
+	if repository != nil {
+		repository.assignmentRecordKey = key
+	}
+	return repository
+}
+
+// TimelineRecordRevision is the revision the Query Group's Schedule timeline
+// record is at, read through the control cache like every other timeline
+// read; zero and no error when the Query Group has no timeline yet. It is
+// what a placement writes onto the Assignment record it creates, so the
+// record's word starts true rather than empty (decision-016 batch 4).
+func (repository *RedisCatalogRepository) TimelineRecordRevision(ctx context.Context, queryGroup execution.QueryGroupIdentity) (uint64, error) {
+	timeline, err := repository.loadScheduleTimeline(ctx, queryGroup)
+	if errors.Is(err, ErrScheduleUnavailable) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return timeline.RecordRevision, nil
 }

@@ -318,9 +318,6 @@ func TestSourceReconcilerPublishesStateCompatibilityChangeAndForcesWarming(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result, err := initialReconciler.Refresh(ctx, source, planner); err != nil || result.Status != controlplane.SourceRefreshPendingConfirmation {
-		t.Fatalf("initial pending = (%+v, %v)", result, err)
-	}
 	initial, err := initialReconciler.Refresh(ctx, source, planner)
 	if err != nil || initial.Status != controlplane.SourceRefreshPublished {
 		t.Fatalf("initial publish = (%+v, %v)", initial, err)
@@ -341,10 +338,6 @@ func TestSourceReconcilerPublishesStateCompatibilityChangeAndForcesWarming(t *te
 	changedReconciler, err := controlplane.NewSourceReconciler(repository, compiler, changedSemantics)
 	if err != nil {
 		t.Fatal(err)
-	}
-	pending, err := changedReconciler.Refresh(ctx, source, planner)
-	if err != nil || pending.Status != controlplane.SourceRefreshPendingConfirmation {
-		t.Fatalf("state compatibility change = (%+v, %v), want new candidate instead of UNCHANGED", pending, err)
 	}
 	changed, err := changedReconciler.Refresh(ctx, source, planner)
 	if err != nil || changed.Status != controlplane.SourceRefreshPublished || changed.Publication == initial.Publication {
@@ -500,7 +493,7 @@ func TestRedisCatalogRuntimeReplaysPreG4HistoricalSegmentAfterG4StateGenerationU
 		t.Fatalf("historical Freeze repeat = (%+v, %v), want %+v", repeated, err, historical)
 	}
 	activations, err := repository.LoadActivations(ctx, execution.PlanActivationRequest{
-		Contract: historical.Contract, Plans: []execution.PlanIdentity{historical.DuePlans[0].Identity},
+		Contract: historical.Contract, Plans: []execution.PlanKey{historical.DuePlans[0].Key()},
 	})
 	if err != nil || len(activations.Facts) != 1 || activations.Facts[0].Selection != execution.ActivationNone {
 		t.Fatalf("historical activation admission = (%+v, %v), want NONE without a new-generation Guard", activations, err)

@@ -26,11 +26,24 @@ func TargetScopeFromContract(source *contract.TargetScopeV2) *TargetScope {
 			for _, key := range condition.Keys {
 				keys[key] = struct{}{}
 			}
+			var pairs [][2]string
+			if len(condition.IdentityFields) > 0 {
+				pairs = append([][2]string(nil), condition.IdentityFields...)
+			}
 			converted.Conditions = append(converted.Conditions, TargetScopeCondition{
-				Field:  TargetScopeField(condition.Field),
-				Method: TargetScopeMethod(condition.Method),
-				Keys:   keys,
+				Field:          TargetScopeField(condition.Field),
+				Method:         TargetScopeMethod(condition.Method),
+				Keys:           keys,
+				IdentityFields: pairs,
 			})
+			if condition.Field == contract.TargetScopeDynamicGroup {
+				// The contract's keys are the group ids; the hosts are read
+				// per Slot (TargetScope.WithGroupMemberships), and until then
+				// no member is known.
+				dynamic := &converted.Conditions[len(converted.Conditions)-1]
+				dynamic.GroupIDs = append([]string(nil), condition.Keys...)
+				dynamic.Keys, dynamic.MembershipUnknown = map[string]struct{}{}, len(condition.Keys) > 0
+			}
 		}
 		scope.Groups = append(scope.Groups, converted)
 	}

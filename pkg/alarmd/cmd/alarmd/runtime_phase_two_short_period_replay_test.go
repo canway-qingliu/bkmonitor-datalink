@@ -137,6 +137,7 @@ func startShortPeriodFixture(t *testing.T) *shortPeriodFixture {
 	fixture.now = func() time.Time { return time.UnixMilli(fixture.clock.Load()) }
 
 	uqServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
 		fixture.uqCalls.Add(1)
 		var payload struct {
 			EndTime string `json:"end_time"`
@@ -190,7 +191,7 @@ func startShortPeriodFixture(t *testing.T) *shortPeriodFixture {
 		},
 		phaseTwoProductionExternalDependencies{
 			Now: fixture.now, HTTPClient: uqServer.Client(), AdditionalObserver: additionalObserver,
-			OpenEvents: func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) { return events, nil },
+			PrepareEvents: preparedEvents(func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) { return events, nil }),
 		},
 	)
 	if err != nil {
@@ -208,7 +209,7 @@ func startShortPeriodFixture(t *testing.T) *shortPeriodFixture {
 		t.Fatalf("Query Groups/runners = %v/%d, want one", bundle.queryGroups, len(bundle.runners))
 	}
 	fixture.queryGroup = bundle.queryGroups[0]
-	fixture.runner = bundle.runners[fixture.queryGroup].runner
+	fixture.runner = settledRunner(bundle, fixture.queryGroup)
 
 	production := bundle.dependencies.Ownership.(*productionPhaseTwoOwnership)
 	schedule, err := production.dependencies.Catalog.ReadInitialFrozenSchedule(ctx, fixture.queryGroup)

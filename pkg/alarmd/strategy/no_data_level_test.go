@@ -62,9 +62,9 @@ func TestNoDataDetectionDoesNotMoveThePlanFingerprints(t *testing.T) {
 			"this would re-key every Plan's runtime state in the deployment",
 			with.PlanRef().StateCompatibilityHash, without.PlanRef().StateCompatibilityHash)
 	}
-	if len(with.Levels()) != len(without.Levels()) {
+	if with.Levels().Len() != without.Levels().Len() {
 		t.Fatalf("Levels() = %d with no-data and %d without; the no-data level is not a declared level",
-			len(with.Levels()), len(without.Levels()))
+			with.Levels().Len(), without.Levels().Len())
 	}
 }
 
@@ -205,15 +205,20 @@ func TestNoDataLevelThatCannotCompileWithholdsTheWholePlan(t *testing.T) {
 	}
 	if compiled, ok := result.Plan(); ok {
 		t.Fatalf("Compile() produced a Plan with %d levels and no-data level %v; want the Plan withheld",
-			len(compiled.Levels()), compiled.NoDataLevel())
+			compiled.Levels().Len(), compiled.NoDataLevel())
 	}
 	terminal := result.PlanTerminal()
 	if terminal == nil {
 		t.Fatal("Compile() withheld the Plan without saying why")
 	}
-	if terminal.ReasonCode != contract.ReasonNoDataConfigInvalid {
-		t.Fatalf("plan terminal reason = %q, want %q: the setting is enabled and produces no decision",
-			terminal.ReasonCode, contract.ReasonNoDataConfigInvalid)
+	// Its own code, not the config layer's. Both are this setting failing a
+	// check, but they leave the strategy in opposite states - that one
+	// suspends absence detection and leaves the thresholds detecting, this one
+	// refuses the whole definition - and everything downstream is keyed by the
+	// code alone.
+	if terminal.ReasonCode != contract.ReasonNoDataPlanUncompilable {
+		t.Fatalf("plan terminal reason = %q, want %q: the setting is enabled, produces no decision, and refuses the whole definition",
+			terminal.ReasonCode, contract.ReasonNoDataPlanUncompilable)
 	}
 	if !strings.HasPrefix(terminal.FieldPath, "no_data.") {
 		t.Fatalf("plan terminal path = %q, want it to name the no_data section", terminal.FieldPath)

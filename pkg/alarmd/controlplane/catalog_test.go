@@ -1,6 +1,7 @@
 package controlplane_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -88,6 +89,16 @@ func assertCompilesWithEvaluationCore(t *testing.T, plan contract.EvaluationPlan
 
 func compileWithEvaluationCore(t *testing.T, plan contract.EvaluationPlanV2, dataset contract.DatasetContractV2) *strategy.CompiledPlan {
 	t.Helper()
+	result := evaluationCoreResult(t, plan, dataset)
+	compiled, ok := result.Plan()
+	if !ok {
+		t.Fatalf("Evaluation Core rejected plan: terminal=%#v levels=%#v", result.PlanTerminal(), result.LevelTerminals())
+	}
+	return compiled
+}
+
+func evaluationCoreResult(t *testing.T, plan contract.EvaluationPlanV2, dataset contract.DatasetContractV2) strategy.CompileResult {
+	t.Helper()
 	compiler, err := strategy.NewCompiler(strategy.NewDefaultAlgorithmCompilerRegistry(), strategy.Limits{
 		MaxPlanBytes: 64 << 10, MaxLevelsPerPlan: 16, MaxAlgorithmsPerLevel: 8, MaxGroupsPerAlgorithm: 16,
 		MaxConditionsPerAlgorithm: 64, MaxASTNodesPerLevel: 256, MaxTriggerWindowSize: 4096,
@@ -105,11 +116,7 @@ func compileWithEvaluationCore(t *testing.T, plan contract.EvaluationPlanV2, dat
 	if err != nil {
 		t.Fatal(err)
 	}
-	compiled, ok := result.Plan()
-	if !ok {
-		t.Fatalf("Evaluation Core rejected plan: terminal=%#v levels=%#v", result.PlanTerminal(), result.LevelTerminals())
-	}
-	return compiled
+	return result
 }
 
 func TestBuildCatalogRejectsMissingRealTenantFact(t *testing.T) {
@@ -147,26 +154,95 @@ func TestCatalogRevisionIsIndependentFromSourceTraversalOrder(t *testing.T) {
 	}
 }
 
-func TestG1DoesNotSilentlyDropUnsupportedLegacySemantics(t *testing.T) {
-	base := `{"id":1,"bk_biz_id":2,"update_time":1,%s"items":[{"id":1,"query_md5":"q","expression":"a","query_configs":[{"agg_interval":60}],"algorithms":[{"level":1,"type":"Threshold","config":[[{"method":"gt","threshold":1}]]}]}],"detects":[{"level":1,"trigger_config":{"count":1,"check_window":1%s}}]}`
+// A strategy in a priority group is compiled as the standalone strategy it
+// is. The arbitration between the group's strategies is the platform alert
+// pipeline's, so nothing of it reaches the Plan: the Plan is the one the same
+// strategy compiles to without the two fields, save for the verbatim strategy
+// document the output carries, and the only trace is a record naming it.
+func TestPriorityGroupStrategyRunsStandaloneAndIsNamed(t *testing.T) {
+	base := `{"id":1,"bk_biz_id":2,"update_time":1,%s"items":[{"id":1,"query_md5":"q","expression":"a","query_configs":[{"agg_interval":60}],"algorithms":[{"level":1,"type":"Threshold","config":[[{"method":"gt","threshold":1}]]}]}],"detects":[{"level":1,"trigger_config":{"count":1,"check_window":1}}]}`
 	identity := controlplane.SourceIdentity{TenantID: "tenant-a", BusinessID: "2", SpaceScope: "bkcc__2"}
-	for _, test := range []struct{ name, prefix, trigger string }{
-		{name: "priority semantics", prefix: `"priority":1,"priority_group_key":"group",`, trigger: ""},
-		{name: "non-default uptime", prefix: "", trigger: `,"uptime":{"time_ranges":[{"start":"09:00","end":"18:00"}]}`},
+	build := func(t *testing.T, prefix string) controlplane.Catalog {
+		t.Helper()
+		document := json.RawMessage(fmt.Sprintf(base, prefix))
+		catalog, err := controlplane.BuildCatalog(context.Background(), controlplane.BuildRequest{Strategies: []controlplane.SourceStrategy{{SourceID: "1", Document: document, Identity: identity}}, Planner: &recordingPlanner{facts: queryFacts(t)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(catalog.QueryGroups) != 1 || len(catalog.QueryGroups[0].Plans) != 1 {
+			t.Fatalf("strategy did not become a Plan: %#v", catalog.Dispositions)
+		}
+		return catalog
+	}
+	ignoredRecords := func(catalog controlplane.Catalog) []controlplane.ObjectDisposition {
+		var records []controlplane.ObjectDisposition
+		for _, disposition := range catalog.Dispositions {
+			if disposition.Reason == controlplane.ReasonPriorityIgnored {
+				records = append(records, disposition)
+			}
+		}
+		return records
+	}
+	standalone := build(t, "")
+	for _, test := range []struct {
+		name, prefix string
+		named        bool
+	}{
+		{name: "priority in a group", prefix: `"priority":100,"priority_group_key":"PGK:group",`, named: true},
+		// Zero is a priority there: it never claims a dimension, and a higher
+		// strategy of its group still keeps it from detecting one.
+		{name: "zero priority in a group", prefix: `"priority":0,"priority_group_key":"0123456789abcdef",`, named: true},
+		{name: "group without a priority", prefix: `"priority":null,"priority_group_key":"0123456789abcdef",`},
+		{name: "priority without a group", prefix: `"priority":1,"priority_group_key":"",`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			document := json.RawMessage(fmt.Sprintf(base, test.prefix, test.trigger))
-			catalog, err := controlplane.BuildCatalog(context.Background(), controlplane.BuildRequest{Strategies: []controlplane.SourceStrategy{{SourceID: "1", Document: document, Identity: identity}}, Planner: &recordingPlanner{facts: queryFacts(t)}})
-			if err != nil {
-				t.Fatal(err)
+			catalog := build(t, test.prefix)
+			records := ignoredRecords(catalog)
+			if !test.named {
+				if len(records) != 0 {
+					t.Fatalf("a strategy the platform does not arbitrate was named: %#v", records)
+				}
+				return
 			}
-			if len(catalog.QueryGroups) != 0 || len(catalog.Dispositions) != 1 {
-				t.Fatalf("unsupported semantics were silently accepted: %#v", catalog)
+			want := controlplane.ObjectDisposition{SourceID: "1", Scope: "PLAN", Disposition: controlplane.DispositionConfigNoted, Reason: controlplane.ReasonPriorityIgnored}
+			if len(records) != 1 || records[0] != want {
+				t.Fatalf("records=%#v, want one %#v", records, want)
 			}
-			if test.name == "non-default uptime" && catalog.Dispositions[0].Scope != "PLAN" {
-				t.Fatalf("uptime scope=%s", catalog.Dispositions[0].Scope)
+			accepted := 0
+			for _, disposition := range catalog.Dispositions {
+				if disposition.Disposition == controlplane.DispositionAccepted {
+					accepted++
+				}
+			}
+			if accepted != 1 {
+				t.Fatalf("dispositions=%#v, want the Plan accepted", catalog.Dispositions)
+			}
+			got, alone := catalog.QueryGroups[0], standalone.QueryGroups[0]
+			if got.Identity != alone.Identity {
+				t.Fatalf("Query Group identity moved with the priority fields: %s != %s", got.Identity, alone.Identity)
+			}
+			gotPlan, alonePlan := got.Plans[0].Plan, alone.Plans[0].Plan
+			if gotPlan.LegacyOutput == nil || !bytes.Contains(gotPlan.LegacyOutput.Strategy, []byte(`"priority_group_key"`)) {
+				t.Fatalf("the output lost the strategy document as written: %#v", gotPlan.LegacyOutput)
+			}
+			gotPlan.LegacyOutput, alonePlan.LegacyOutput = nil, nil
+			gotBytes, _ := json.Marshal(gotPlan)
+			aloneBytes, _ := json.Marshal(alonePlan)
+			if !bytes.Equal(gotBytes, aloneBytes) {
+				t.Fatalf("priority reached the Plan:\n%s\n%s", gotBytes, aloneBytes)
 			}
 		})
+	}
+	if records := ignoredRecords(standalone); len(records) != 0 {
+		t.Fatalf("a strategy without priority was named: %#v", records)
+	}
+	// The zero is a reading: no strategy here is arbitrated by priority.
+	key := controlplane.WithheldKey{Disposition: controlplane.DispositionConfigNoted, Reason: controlplane.ReasonPriorityIgnored}
+	if count, reported := controlplane.ComposeCatalog(standalone).Withheld[key]; !reported || count != 0 {
+		t.Fatalf("PRIORITY_IGNORED reported=%v count=%d, want a zero that is published", reported, count)
+	}
+	if count := controlplane.ComposeCatalog(build(t, `"priority":1,"priority_group_key":"PGK:group",`)).Withheld[key]; count != 1 {
+		t.Fatalf("PRIORITY_IGNORED count=%d, want the one named Plan", count)
 	}
 }
 
@@ -271,36 +347,215 @@ func TestLegacyLevelPriorityDistinguishesMissingFromExplicitZero(t *testing.T) {
 	}
 }
 
-func TestLegacyRecoveryPresenceMatchesPythonContract(t *testing.T) {
+// legacyRecoveryCatalog builds one strategy from its detects, with a
+// threshold algorithm at each of the given levels.
+func legacyRecoveryCatalog(t *testing.T, detects string, levels ...int) controlplane.Catalog {
+	t.Helper()
 	identity := controlplane.SourceIdentity{TenantID: "tenant-a", BusinessID: "2", SpaceScope: "bkcc__2"}
-	build := func(t *testing.T, recovery string) controlplane.Catalog {
-		t.Helper()
-		document := json.RawMessage(fmt.Sprintf(`{"id":11,"bk_biz_id":2,"update_time":1,"items":[{"id":1,"query_md5":"q","expression":"a","unit":"percent","query_configs":[{"agg_interval":60}],"algorithms":[{"level":1,"type":"Threshold","config":[{"method":"gt","threshold":80}]}]}],"detects":[{"level":1,"trigger_config":{"count":1,"check_window":1}%s}]}`, recovery))
-		catalog, err := controlplane.BuildCatalog(context.Background(), controlplane.BuildRequest{Strategies: []controlplane.SourceStrategy{{SourceID: "11", Document: document, Identity: identity}}, Planner: &recordingPlanner{facts: queryFacts(t)}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return catalog
+	algorithms := make([]string, 0, len(levels))
+	for _, level := range levels {
+		algorithms = append(algorithms, fmt.Sprintf(`{"level":%d,"type":"Threshold","config":[{"method":"gt","threshold":80}]}`, level))
 	}
-
-	disabled := build(t, `,"recovery_config":{}`)
-	if len(disabled.QueryGroups) != 1 {
-		t.Fatalf("empty recovery config should disable recovery: %#v", disabled)
-	}
-	var disabledConfig struct {
-		Enabled            bool   `json:"enabled"`
-		ConsecutiveWindows uint32 `json:"consecutive_windows"`
-	}
-	if err := json.Unmarshal(disabled.QueryGroups[0].Plans[0].Plan.StrategyIR.Levels[0].RecoveryPlan.Config, &disabledConfig); err != nil {
+	document := json.RawMessage(fmt.Sprintf(`{"id":11,"bk_biz_id":2,"update_time":1,"items":[{"id":1,"query_md5":"q","expression":"a","unit":"percent","query_configs":[{"agg_interval":60}],"algorithms":[%s]}],"detects":[%s]}`,
+		strings.Join(algorithms, ","), detects))
+	catalog, err := controlplane.BuildCatalog(context.Background(), controlplane.BuildRequest{Strategies: []controlplane.SourceStrategy{{SourceID: "11", Document: document, Identity: identity}}, Planner: &recordingPlanner{facts: queryFacts(t)}})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if disabledConfig.Enabled || disabledConfig.ConsecutiveWindows != 0 {
-		t.Fatalf("disabled recovery=%+v", disabledConfig)
-	}
+	return catalog
+}
 
-	invalid := build(t, `,"recovery_config":{"check_window":0}`)
-	if len(invalid.QueryGroups) != 0 || len(invalid.Dispositions) != 1 || invalid.Dispositions[0].Reason != "RECOVERY_CONFIG_INVALID" {
-		t.Fatalf("non-empty zero recovery was silently disabled: %#v", invalid)
+type legacyRecoveryReading struct {
+	Enabled            bool   `json:"enabled"`
+	ConsecutiveWindows uint32 `json:"consecutive_windows"`
+}
+
+func legacyRecoveryOf(t *testing.T, catalog controlplane.Catalog) map[uint32]legacyRecoveryReading {
+	t.Helper()
+	if len(catalog.QueryGroups) != 1 {
+		t.Fatalf("not compiled: %+v", catalog.Dispositions)
+	}
+	readings := map[uint32]legacyRecoveryReading{}
+	for _, level := range catalog.QueryGroups[0].Plans[0].Plan.StrategyIR.Levels {
+		var reading legacyRecoveryReading
+		if err := json.Unmarshal(level.RecoveryPlan.Config, &reading); err != nil {
+			t.Fatal(err)
+		}
+		readings[level.Definition.LevelID] = reading
+	}
+	return readings
+}
+
+func notedReasons(catalog controlplane.Catalog) map[uint32]string {
+	reasons := map[uint32]string{}
+	for _, disposition := range catalog.Dispositions {
+		if disposition.Disposition == controlplane.DispositionConfigNoted && disposition.Scope == "LEVEL" {
+			reasons[disposition.LevelID] = disposition.Reason
+		}
+	}
+	return reasons
+}
+
+// A level's recovery is read the way the backend reads it, and every level
+// recovers. get_recovery_configs reads int(detect["recovery_config"]
+// ["check_window"]) for every detect (strategy.py:379-392); the recovery
+// checker catches the KeyError, TypeError and ValueError that raises and
+// takes its default of 5 windows (recover.py:53, :253-267). So an empty, null
+// or missing recovery_config, one without check_window, a list, and a
+// check_window that int() cannot read all recover after 5 windows, noted as
+// defaulted; a quoted number and a fraction are read as int() reads them.
+// The trigger never reads the recovery, so every one of these levels
+// detects.
+//
+// A check_window of 0 or below is the exception, and stays refused as
+// RECOVERY_CONFIG_INVALID: the backend recovers at once there
+// (recover.py:467-506), and what this build should do is a rule difference
+// awaiting product (trigger review of 2026-10-09, section 6). Pinned so the
+// rule does not change by accident.
+func TestARecoveryIsReadAsTheBackendReadsItAndEveryLevelRecovers(t *testing.T) {
+	const defaulted, refused = "RECOVERY_CONFIG_DEFAULTED", "RECOVERY_CONFIG_INVALID"
+	for _, test := range []struct {
+		recovery string
+		windows  uint32
+		noted    string
+	}{
+		{`,"recovery_config":{}`, 5, defaulted},
+		{`,"recovery_config":null`, 5, defaulted},
+		{``, 5, defaulted},
+		{`,"recovery_config":{"status_setter":"recovery"}`, 5, defaulted},
+		{`,"recovery_config":[]`, 5, defaulted},
+		{`,"recovery_config":{"check_window":null}`, 5, defaulted},
+		{`,"recovery_config":{"check_window":"many"}`, 5, defaulted},
+		{`,"recovery_config":{"check_window":"3"}`, 3, ""},
+		{`,"recovery_config":{"check_window":" 3 "}`, 3, ""},
+		{`,"recovery_config":{"check_window":3.7}`, 3, ""},
+		{`,"recovery_config":{"check_window":2}`, 2, ""},
+		{`,"recovery_config":{"check_window":true}`, 1, ""},
+		{`,"recovery_config":{"check_window":0}`, 0, refused},
+		{`,"recovery_config":{"check_window":-2}`, 0, refused},
+	} {
+		t.Run(test.recovery, func(t *testing.T) {
+			catalog := legacyRecoveryCatalog(t, `{"level":1,"trigger_config":{"count":1,"check_window":1}`+test.recovery+`}`, 1)
+			if test.noted == refused {
+				if len(catalog.QueryGroups) != 0 || len(catalog.Dispositions) != 1 || catalog.Dispositions[0].Reason != refused || catalog.Dispositions[0].Detail == "" {
+					t.Fatalf("dispositions = %+v, want the level refused as %s with the window named", catalog.Dispositions, refused)
+				}
+				return
+			}
+			got := legacyRecoveryOf(t, catalog)[1]
+			if !got.Enabled || got.ConsecutiveWindows != test.windows {
+				t.Fatalf("recovery = %+v, want enabled with %d windows", got, test.windows)
+			}
+			if reason := notedReasons(catalog)[1]; reason != test.noted {
+				t.Fatalf("noted %q, want %q", reason, test.noted)
+			}
+		})
+	}
+}
+
+// One detect whose recovery the backend cannot read makes get_recovery_configs
+// raise for the whole strategy, and the checker takes the default for every
+// level, the readable ones included (recover.py:253-267): level 1's 3 windows
+// are read as 5 because level 2's recovery is empty.
+func TestOneUnreadableRecoveryDefaultsEveryLevelOfTheStrategy(t *testing.T) {
+	catalog := legacyRecoveryCatalog(t,
+		`{"level":1,"trigger_config":{"count":1,"check_window":1},"recovery_config":{"check_window":3}},`+
+			`{"level":2,"trigger_config":{"count":1,"check_window":1},"recovery_config":{}}`, 1, 2)
+	got := legacyRecoveryOf(t, catalog)
+	for _, level := range []uint32{1, 2} {
+		if got[level] != (legacyRecoveryReading{Enabled: true, ConsecutiveWindows: 5}) {
+			t.Fatalf("level %d recovery = %+v, want the default 5 windows", level, got[level])
+		}
+		if reason := notedReasons(catalog)[level]; reason != "RECOVERY_CONFIG_DEFAULTED" {
+			t.Fatalf("level %d noted %q, want RECOVERY_CONFIG_DEFAULTED", level, reason)
+		}
+	}
+	// And with both readable, each keeps its own.
+	readable := legacyRecoveryOf(t, legacyRecoveryCatalog(t,
+		`{"level":1,"trigger_config":{"count":1,"check_window":1},"recovery_config":{"check_window":3}},`+
+			`{"level":2,"trigger_config":{"count":1,"check_window":1},"recovery_config":{"check_window":2}}`, 1, 2))
+	if readable[1].ConsecutiveWindows != 3 || readable[2].ConsecutiveWindows != 2 {
+		t.Fatalf("readable recoveries = %+v, want 3 and 2", readable)
+	}
+}
+
+// The trigger's numbers are read with int() as the backend reads them
+// (strategy.py:369-370): a quoted number, one with spaces, a fraction
+// truncated toward zero and a boolean. A value int() cannot read stops the
+// whole strategy there - get_trigger_configs raises for the map, and the
+// trigger stage reads it for the strategy (processor.py:667, checker.py:46) -
+// so every level is refused by name, the unreadable detect's level and value
+// in the detail; before, it failed the whole strategy's decode. A readable
+// count below one refuses only its own level: an older difference, the
+// backend runs it, registered as awaiting product.
+func TestTheTriggersNumbersAreReadAsTheBackendReadsThem(t *testing.T) {
+	for _, test := range []struct {
+		trigger       string
+		count, window uint32
+		refused       bool
+	}{
+		{`{"count":"1","check_window":"2"}`, 1, 2, false},
+		{`{"count":" 3 ","check_window":5}`, 3, 5, false},
+		{`{"count":2.8,"check_window":4.9}`, 2, 4, false},
+		{`{"count":true,"check_window":"2"}`, 1, 2, false},
+		{`{"count":"many","check_window":2}`, 0, 0, true},
+		{`{"count":1,"check_window":null}`, 0, 0, true},
+		{`{"count":-1,"check_window":2}`, 0, 0, true},
+		{`{"count":"","check_window":2}`, 0, 0, true},
+	} {
+		t.Run(test.trigger, func(t *testing.T) {
+			catalog := legacyRecoveryCatalog(t,
+				`{"level":1,"trigger_config":`+test.trigger+`,"recovery_config":{"check_window":1}},`+
+					`{"level":2,"trigger_config":{"count":1,"check_window":1},"recovery_config":{"check_window":1}}`, 1, 2)
+			_, unreadable := pythonIntForTest(test.trigger)
+			if test.refused && unreadable {
+				if len(catalog.QueryGroups) != 0 || len(catalog.Dispositions) != 2 {
+					t.Fatalf("dispositions = %+v, want both levels refused", catalog.Dispositions)
+				}
+				for _, disposition := range catalog.Dispositions {
+					if disposition.Reason != "TRIGGER_CONFIG_MISSING" || !strings.Contains(disposition.Detail, "level 1's trigger_config.") {
+						t.Fatalf("dispositions = %+v, want every level refused naming level 1's unreadable value", catalog.Dispositions)
+					}
+				}
+				return
+			}
+			if len(catalog.QueryGroups) != 1 {
+				t.Fatalf("the strategy did not compile: %+v", catalog.Dispositions)
+			}
+			levels := catalog.QueryGroups[0].Plans[0].Plan.StrategyIR.Levels
+			var level1 *contract.LevelIRV2
+			for index := range levels {
+				if levels[index].Definition.LevelID == 1 {
+					level1 = &levels[index]
+				}
+			}
+			if test.refused {
+				if level1 != nil || len(levels) != 1 {
+					t.Fatalf("levels = %+v, want level 1 refused and level 2 detecting", levels)
+				}
+				found := false
+				for _, disposition := range catalog.Dispositions {
+					found = found || (disposition.LevelID == 1 && disposition.Reason == "TRIGGER_CONFIG_MISSING" && disposition.Detail != "")
+				}
+				if !found {
+					t.Fatalf("dispositions = %+v, want level 1 refused as TRIGGER_CONFIG_MISSING with the value named", catalog.Dispositions)
+				}
+				return
+			}
+			if level1 == nil {
+				t.Fatalf("level 1 not compiled: %+v", catalog.Dispositions)
+			}
+			var trigger struct {
+				RequiredAnomalies uint32 `json:"required_anomalies"`
+				WindowSize        uint32 `json:"window_size"`
+			}
+			if err := json.Unmarshal(level1.TriggerPlan.Config, &trigger); err != nil {
+				t.Fatal(err)
+			}
+			if trigger.RequiredAnomalies != test.count || trigger.WindowSize != test.window {
+				t.Fatalf("trigger = %+v, want %d of %d", trigger, test.count, test.window)
+			}
+		})
 	}
 }
 
@@ -388,7 +643,7 @@ func TestBuildCatalogRejectsMultipleItemsWithoutSilentlySelectingFirst(t *testin
 	}
 }
 
-func TestBuildCatalogAbsentSourceGetsOneGraceCycleBeforeRemoval(t *testing.T) {
+func TestBuildCatalogAbsentSourceKeepsExecutingThroughTheGracePeriod(t *testing.T) {
 	payload, err := os.ReadFile("testdata/two_threshold_strategies.json")
 	if err != nil {
 		t.Fatal(err)
@@ -413,48 +668,75 @@ func TestBuildCatalogAbsentSourceGetsOneGraceCycleBeforeRemoval(t *testing.T) {
 		Publication: controlplane.SnapshotPublicationRef{SnapshotRevision: previous.SnapshotRevision, PublicationEpoch: 1},
 		QueryGroups: previous.QueryGroups,
 	}
-	pendingRemoval := controlplane.ObjectDisposition{SourceID: "1002", Scope: "STRATEGY",
+	// The grace is a period, not a round: without a statement that it holds
+	// the last good document, the writer of the active set has been seen to
+	// lose entries for minutes with the strategies unchanged (these rounds
+	// carry no statement, WriterHoldsLastGood false). A strategy absent from it keeps executing
+	// under PENDING_REMOVAL, stamped with when it was first found absent,
+	// until it has been absent for the whole period; only then is it REMOVED.
+	t0 := time.Unix(1_700_000_000, 0)
+	within := t0.Add(controlplane.AbsenceGracePeriod - time.Minute)
+	expired := t0.Add(controlplane.AbsenceGracePeriod)
+	pendingAt := func(since time.Time) controlplane.ObjectDisposition {
+		return controlplane.ObjectDisposition{SourceID: "1002", Scope: "STRATEGY",
+			Disposition: controlplane.DispositionPendingRemoval, Reason: "REMOVED_FROM_ACTIVE_SET", AbsentSince: since.Unix()}
+	}
+	removedAt := func(since time.Time) controlplane.ObjectDisposition {
+		return controlplane.ObjectDisposition{SourceID: "1002", Scope: "STRATEGY",
+			Disposition: controlplane.DispositionRemoved, Reason: "ABSENT_FROM_ACTIVE_SET", AbsentSince: since.Unix()}
+	}
+	// A PENDING_REMOVAL written by a build before the grace was a period
+	// carries no moment.
+	pendingUnstamped := controlplane.ObjectDisposition{SourceID: "1002", Scope: "STRATEGY",
 		Disposition: controlplane.DispositionPendingRemoval, Reason: "REMOVED_FROM_ACTIVE_SET"}
-	removed := controlplane.ObjectDisposition{SourceID: "1002", Scope: "STRATEGY",
-		Disposition: controlplane.DispositionRemoved, Reason: "ABSENT_FROM_ACTIVE_SET"}
 	sourceIncomplete := controlplane.ObjectDisposition{SourceID: "1002", Scope: "STRATEGY",
 		Disposition: controlplane.DispositionSourceIncomplete, Reason: "SOURCE_READ_INCOMPLETE"}
+	withPrevious := func(extra ...controlplane.ObjectDisposition) []controlplane.ObjectDisposition {
+		return append(append([]controlplane.ObjectDisposition(nil), previous.Dispositions...), extra...)
+	}
 	for _, test := range []struct {
 		name         string
 		strategies   []controlplane.SourceStrategy
 		previous     []controlplane.ObjectDisposition
+		now          time.Time
 		wantPlans    []string
 		wantStrategy *controlplane.ObjectDisposition
 	}{
 		{
-			name: "absent once is retained with PENDING_REMOVAL", strategies: onlyFirst,
-			previous: previous.Dispositions, wantPlans: []string{"1001", "1002"}, wantStrategy: &pendingRemoval,
+			name: "first found absent is retained with PENDING_REMOVAL stamped now", strategies: onlyFirst,
+			previous: previous.Dispositions, now: t0, wantPlans: []string{"1001", "1002"}, wantStrategy: ptr(pendingAt(t0)),
 		},
 		{
-			name: "absent without any audit history is retained with PENDING_REMOVAL", strategies: onlyFirst,
-			previous: nil, wantPlans: []string{"1001", "1002"}, wantStrategy: &pendingRemoval,
+			name: "absent without any audit history is retained with PENDING_REMOVAL stamped now", strategies: onlyFirst,
+			previous: nil, now: t0, wantPlans: []string{"1001", "1002"}, wantStrategy: ptr(pendingAt(t0)),
 		},
 		{
-			name: "absent twice leaves the Catalog with REMOVED", strategies: onlyFirst,
-			previous:  append(append([]controlplane.ObjectDisposition(nil), previous.Dispositions...), pendingRemoval),
-			wantPlans: []string{"1001"}, wantStrategy: &removed,
+			name: "still absent inside the grace keeps executing under the same stamp", strategies: onlyFirst,
+			previous: withPrevious(pendingAt(t0)), now: within, wantPlans: []string{"1001", "1002"}, wantStrategy: ptr(pendingAt(t0)),
 		},
 		{
-			name: "present again after PENDING_REMOVAL is accepted without a removal fact", strategies: both,
-			previous:  append(append([]controlplane.ObjectDisposition(nil), previous.Dispositions...), pendingRemoval),
-			wantPlans: []string{"1001", "1002"},
+			name: "absent for the whole grace leaves the Catalog with REMOVED", strategies: onlyFirst,
+			previous: withPrevious(pendingAt(t0)), now: expired, wantPlans: []string{"1001"}, wantStrategy: ptr(removedAt(t0)),
+		},
+		{
+			name: "a grace stamped by an older build restarts from now rather than expiring", strategies: onlyFirst,
+			previous: withPrevious(pendingUnstamped), now: expired, wantPlans: []string{"1001", "1002"}, wantStrategy: ptr(pendingAt(expired)),
+		},
+		{
+			name: "present again inside the grace is accepted without a removal fact", strategies: both,
+			previous: withPrevious(pendingAt(t0)), now: within, wantPlans: []string{"1001", "1002"},
 		},
 		{
 			name:       "SOURCE_INCOMPLETE still retains even after PENDING_REMOVAL",
 			strategies: []controlplane.SourceStrategy{both[0], {SourceID: "1002", Identity: identity, SourceDisposition: &sourceIncomplete}},
-			previous:   append(append([]controlplane.ObjectDisposition(nil), previous.Dispositions...), pendingRemoval),
-			wantPlans:  []string{"1001", "1002"}, wantStrategy: &sourceIncomplete,
+			previous:   withPrevious(pendingAt(t0)), now: expired,
+			wantPlans: []string{"1001", "1002"}, wantStrategy: &sourceIncomplete,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			catalog, err := controlplane.BuildCatalog(context.Background(), controlplane.BuildRequest{
 				Strategies: test.strategies, Planner: &recordingPlanner{facts: queryFacts(t)},
-				LastGood: lastGood, PreviousDispositions: test.previous,
+				LastGood: lastGood, PreviousDispositions: test.previous, Now: test.now,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -479,7 +761,215 @@ func TestBuildCatalogAbsentSourceGetsOneGraceCycleBeforeRemoval(t *testing.T) {
 			}
 		})
 	}
+	// The two answers the grace separates: with the period gone the strategy
+	// absent for nine minutes would already have left. Pinned here so the
+	// constant cannot be shortened to a round without this case saying so.
+	if controlplane.AbsenceGracePeriod < 2*time.Minute {
+		t.Fatalf("AbsenceGracePeriod = %s: a grace shorter than the observed flutter is the one-round grace back", controlplane.AbsenceGracePeriod)
+	}
 }
+
+// Under the writer's statement that it holds the last good document, a
+// strategy leaves the active set only when it is gone: the round that finds
+// it absent removes its Plan, with no grace and so no moment to carry. One
+// already serving a grace from a round without the statement is removed
+// too, and keeps the moment its grace began.
+func TestBuildCatalogRemovesAnAbsenceAtOnceUnderTheWritersStatement(t *testing.T) {
+	payload, err := os.ReadFile("testdata/two_threshold_strategies.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var documents []json.RawMessage
+	if err := json.Unmarshal(payload, &documents); err != nil {
+		t.Fatal(err)
+	}
+	identity := controlplane.SourceIdentity{TenantID: "tenant-a", BusinessID: "2", SpaceScope: "bkcc__2"}
+	both := []controlplane.SourceStrategy{
+		{SourceID: "1001", Document: documents[0], Identity: identity},
+		{SourceID: "1002", Document: documents[1], Identity: identity},
+	}
+	previous, err := controlplane.BuildCatalog(context.Background(), controlplane.BuildRequest{
+		Strategies: both, Planner: &recordingPlanner{facts: queryFacts(t)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastGood := &controlplane.PublishedSnapshot{
+		Publication: controlplane.SnapshotPublicationRef{SnapshotRevision: previous.SnapshotRevision, PublicationEpoch: 1},
+		QueryGroups: previous.QueryGroups,
+	}
+	t0 := time.Unix(1_700_000_000, 0)
+	graced := controlplane.ObjectDisposition{SourceID: "1002", Scope: "STRATEGY",
+		Disposition: controlplane.DispositionPendingRemoval, Reason: "REMOVED_FROM_ACTIVE_SET", AbsentSince: t0.Unix()}
+	for _, test := range []struct {
+		name         string
+		strategies   []controlplane.SourceStrategy
+		previous     []controlplane.ObjectDisposition
+		wantPlans    []string
+		wantStrategy *controlplane.ObjectDisposition
+	}{
+		{
+			name: "first found absent leaves at once", strategies: both[:1], previous: previous.Dispositions,
+			wantPlans: []string{"1001"}, wantStrategy: &controlplane.ObjectDisposition{SourceID: "1002", Scope: "STRATEGY",
+				Disposition: controlplane.DispositionRemoved, Reason: "ABSENT_FROM_ACTIVE_SET"},
+		},
+		{
+			name: "one serving a grace leaves at once with the moment it began", strategies: both[:1],
+			previous:  append(append([]controlplane.ObjectDisposition(nil), previous.Dispositions...), graced),
+			wantPlans: []string{"1001"}, wantStrategy: &controlplane.ObjectDisposition{SourceID: "1002", Scope: "STRATEGY",
+				Disposition: controlplane.DispositionRemoved, Reason: "ABSENT_FROM_ACTIVE_SET", AbsentSince: t0.Unix()},
+		},
+		{
+			name: "listed is accepted", strategies: both, previous: previous.Dispositions, wantPlans: []string{"1001", "1002"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			catalog, err := controlplane.BuildCatalog(context.Background(), controlplane.BuildRequest{
+				Strategies: test.strategies, Planner: &recordingPlanner{facts: queryFacts(t)},
+				LastGood: lastGood, PreviousDispositions: test.previous, Now: t0.Add(time.Minute), WriterHoldsLastGood: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := catalogStrategyIDs(catalog); !reflect.DeepEqual(got, test.wantPlans) {
+				t.Fatalf("catalog plans=%v, want %v", got, test.wantPlans)
+			}
+			var strategyDispositions []controlplane.ObjectDisposition
+			for _, disposition := range catalog.Dispositions {
+				if disposition.Scope == "STRATEGY" {
+					strategyDispositions = append(strategyDispositions, disposition)
+				}
+			}
+			switch {
+			case test.wantStrategy == nil && len(strategyDispositions) != 0:
+				t.Fatalf("strategy dispositions=%#v, want none", strategyDispositions)
+			case test.wantStrategy != nil && (len(strategyDispositions) != 1 || strategyDispositions[0] != *test.wantStrategy):
+				t.Fatalf("strategy dispositions=%#v, want %#v", strategyDispositions, *test.wantStrategy)
+			}
+		})
+	}
+}
+
+// An active set read whole and empty is a statement like any other list:
+// every strategy in it is absent. It is not held: under the writer's
+// statement every strategy leaves at once, and without it every strategy
+// serves the removal grace and then leaves, as a strategy absent from a
+// list that only shrank does. A missing key never gets here - the source
+// refuses it as active_set_missing before a Catalog is built. A hold an
+// earlier build wrote for an empty list starts the grace where it began,
+// and a deployment that never had a strategy stays empty.
+func TestBuildCatalogEmptyActiveSetIsAStatement(t *testing.T) {
+	payload, err := os.ReadFile("testdata/two_threshold_strategies.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var documents []json.RawMessage
+	if err := json.Unmarshal(payload, &documents); err != nil {
+		t.Fatal(err)
+	}
+	identity := controlplane.SourceIdentity{TenantID: "tenant-a", BusinessID: "2", SpaceScope: "bkcc__2"}
+	both := []controlplane.SourceStrategy{
+		{SourceID: "1001", Document: documents[0], Identity: identity},
+		{SourceID: "1002", Document: documents[1], Identity: identity},
+	}
+	previous, err := controlplane.BuildCatalog(context.Background(), controlplane.BuildRequest{
+		Strategies: both, Planner: &recordingPlanner{facts: queryFacts(t)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastGood := &controlplane.PublishedSnapshot{
+		Publication: controlplane.SnapshotPublicationRef{SnapshotRevision: previous.SnapshotRevision, PublicationEpoch: 1},
+		QueryGroups: previous.QueryGroups,
+	}
+	t0 := time.Unix(1_700_000_000, 0)
+	graced := func(sourceID string, since time.Time) controlplane.ObjectDisposition {
+		return controlplane.ObjectDisposition{SourceID: sourceID, Scope: "STRATEGY",
+			Disposition: controlplane.DispositionPendingRemoval, Reason: "REMOVED_FROM_ACTIVE_SET", AbsentSince: since.Unix()}
+	}
+	removed := func(sourceID string, since int64) controlplane.ObjectDisposition {
+		return controlplane.ObjectDisposition{SourceID: sourceID, Scope: "STRATEGY",
+			Disposition: controlplane.DispositionRemoved, Reason: "ABSENT_FROM_ACTIVE_SET", AbsentSince: since}
+	}
+	// What a build before this one wrote for an empty list. The retired word
+	// is spelled in two pieces: the removed-word scan looks for a source that
+	// still uses it, and this is a record of one that did.
+	heldByAnEarlierBuild := func(sourceID string, since time.Time) controlplane.ObjectDisposition {
+		held := graced(sourceID, since)
+		held.Reason = "ACTIVE_SET_" + "EMPTY"
+		return held
+	}
+	withPrevious := func(extra ...controlplane.ObjectDisposition) []controlplane.ObjectDisposition {
+		return append(append([]controlplane.ObjectDisposition(nil), previous.Dispositions...), extra...)
+	}
+	empty := []controlplane.SourceStrategy{}
+	for _, test := range []struct {
+		name         string
+		strategies   []controlplane.SourceStrategy
+		lastGood     *controlplane.PublishedSnapshot
+		previous     []controlplane.ObjectDisposition
+		now          time.Time
+		statement    bool
+		wantPlans    []string
+		wantStrategy []controlplane.ObjectDisposition
+	}{
+		{
+			name: "under the writer's statement every strategy leaves at once", strategies: empty, statement: true,
+			lastGood: lastGood, previous: previous.Dispositions, now: t0,
+			wantPlans: []string{}, wantStrategy: []controlplane.ObjectDisposition{removed("1001", 0), removed("1002", 0)},
+		},
+		{
+			name: "without a statement first found empty serves the grace, stamped now", strategies: empty,
+			lastGood: lastGood, previous: previous.Dispositions, now: t0,
+			wantPlans: []string{"1001", "1002"}, wantStrategy: []controlplane.ObjectDisposition{graced("1001", t0), graced("1002", t0)},
+		},
+		{
+			name: "without a statement empty for the whole grace leaves", strategies: empty,
+			lastGood: lastGood, previous: withPrevious(graced("1001", t0), graced("1002", t0)),
+			now:       t0.Add(controlplane.AbsenceGracePeriod),
+			wantPlans: []string{}, wantStrategy: []controlplane.ObjectDisposition{removed("1001", t0.Unix()), removed("1002", t0.Unix())},
+		},
+		{
+			name: "a hold an earlier build wrote starts the grace where it began", strategies: empty,
+			lastGood: lastGood, previous: withPrevious(heldByAnEarlierBuild("1001", t0), heldByAnEarlierBuild("1002", t0)),
+			now:       t0.Add(10 * controlplane.AbsenceGracePeriod),
+			wantPlans: []string{}, wantStrategy: []controlplane.ObjectDisposition{removed("1001", t0.Unix()), removed("1002", t0.Unix())},
+		},
+		{
+			name: "listed again inside the grace, nothing is pending", strategies: both,
+			lastGood: lastGood, previous: withPrevious(graced("1001", t0), graced("1002", t0)),
+			now: t0.Add(time.Minute), wantPlans: []string{"1001", "1002"},
+		},
+		{
+			name: "a deployment that never ran a strategy stays empty", strategies: empty,
+			now: t0, wantPlans: []string{},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			catalog, err := controlplane.BuildCatalog(context.Background(), controlplane.BuildRequest{
+				Strategies: test.strategies, Planner: &recordingPlanner{facts: queryFacts(t)},
+				LastGood: test.lastGood, PreviousDispositions: test.previous, Now: test.now, WriterHoldsLastGood: test.statement,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := catalogStrategyIDs(catalog); !reflect.DeepEqual(got, test.wantPlans) {
+				t.Fatalf("catalog plans=%v, want %v", got, test.wantPlans)
+			}
+			var strategyDispositions []controlplane.ObjectDisposition
+			for _, disposition := range catalog.Dispositions {
+				if disposition.Scope == "STRATEGY" {
+					strategyDispositions = append(strategyDispositions, disposition)
+				}
+			}
+			if !reflect.DeepEqual(strategyDispositions, test.wantStrategy) {
+				t.Fatalf("strategy dispositions=%#v, want %#v", strategyDispositions, test.wantStrategy)
+			}
+		})
+	}
+}
+
+func ptr[T any](value T) *T { return &value }
 
 func catalogStrategyIDs(catalog controlplane.Catalog) []string {
 	ids := make([]string, 0)
@@ -613,4 +1103,17 @@ func TestBuildCatalogDoesNotRetainALastGoodPlanWhoseRevisionNoLongerDerives(t *t
 		len(named) != 1 || named[0].Reason != "LAST_GOOD_FACTS_INVALID" {
 		t.Fatalf("with facts the rules refuse: plans %v, stale %d, dispositions %+v; want LAST_GOOD_FACTS_INVALID", got, catalog.RetainedStaleRevisions, named)
 	}
+}
+
+// pythonIntForTest says whether a trigger object written in a test case has a
+// count or check_window the backend's int() cannot read: the cases name it in
+// their own text, so the test decides which refusal to expect without
+// calling the reader under test.
+func pythonIntForTest(trigger string) (string, bool) {
+	for _, unreadable := range []string{`"many"`, `null`, `""`} {
+		if strings.Contains(trigger, unreadable) {
+			return unreadable, true
+		}
+	}
+	return "", false
 }

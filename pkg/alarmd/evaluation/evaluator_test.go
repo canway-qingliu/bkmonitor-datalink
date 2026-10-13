@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/contract"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/detect"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/internal/racedetector"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/observability"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/strategy"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/trigger"
@@ -37,7 +40,7 @@ func TestEvaluatorProducesValidatedProvisionalAbnormalWithoutMutatingViews(t *te
 func TestEvaluatorUsesHistoryForNormalThenRecovery(t *testing.T) {
 	history := []execution.StateHistoryPoint{{RecordID: strings.Repeat("a", 64), SourceTime: 40, Levels: []execution.StateLevelFact{{LevelID: 5, DetectFingerprint: "", Result: execution.LevelFactAnomalous}}}}
 	req := requestFixture(t, json.RawMessage(`10`), history)
-	history[0].Levels[0].DetectFingerprint = req.Header.DuePlans[0].CompiledPlan.Levels()[0].Fingerprints().Detect
+	history[0].Levels[0].DetectFingerprint = req.Header.DuePlans[0].CompiledPlan.Levels().At(0).Fingerprints().Detect
 	req.State.Items[0].History = history
 	result, err := newEvaluator(t).Evaluate(context.Background(), req)
 	if err != nil {
@@ -79,21 +82,26 @@ func TestEvaluatorRejectsRecordLimitBeforeCopyingPrimaryView(t *testing.T) {
 		}
 	}
 	evaluator := newEvaluator(t)
-	allocation := testing.Benchmark(func(b *testing.B) {
-		for index := 0; index < b.N; index++ {
-			_, err := evaluator.Evaluate(context.Background(), req)
-			if err == nil || !strings.Contains(err.Error(), "record budget exceeded") {
-				b.Fatalf("error=%v", err)
-			}
+	// Keep the byte bound that catches copying before rejection, without a
+	// benchmark's time-based calibration in the ordinary regression suite.
+	const runs = 100
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for index := 0; index < runs; index++ {
+		_, err := evaluator.Evaluate(context.Background(), req)
+		if err == nil || !strings.Contains(err.Error(), "record budget exceeded") {
+			t.Fatalf("error=%v", err)
 		}
-	})
-	if allocation.AllocedBytesPerOp() > 64<<10 {
-		t.Fatalf("oversized PRIMARY was copied before rejection: %d bytes/op", allocation.AllocedBytesPerOp())
+	}
+	runtime.ReadMemStats(&after)
+	if bytesPerOp := (after.TotalAlloc - before.TotalAlloc) / runs; !racedetector.Enabled && bytesPerOp > 64<<10 {
+		t.Fatalf("oversized PRIMARY was copied before rejection: %d bytes/op", bytesPerOp)
 	}
 }
 
-// This measures one supported 500-record series, not the process heap or the
-// maximum combination of levels and history. The input is built outside timing.
+// Keep the supported 500-record shape and its folded state mutation. Capacity
+// measurement belongs in the opt-in profile, not a calibrated loop in this test.
 func TestEvaluatorRetainsSupportedRecordLimit(t *testing.T) {
 	records := make([]contract.CanonicalRecordV2, 500)
 	for i := range records {
@@ -106,18 +114,13 @@ func TestEvaluatorRetainsSupportedRecordLimit(t *testing.T) {
 	evaluator := newEvaluator(t)
 	evaluator.limits.MaxRecords = 500
 	evaluator.limits.Trigger.MaxEvidenceBytesPerEvent = 64 << 10
-	allocation := testing.Benchmark(func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			result, err := evaluator.Evaluate(context.Background(), req)
-			if err != nil {
-				b.Fatal(err)
-			}
-			if len(result.Plans) != 1 || len(result.Plans[0].LevelOutcomes) != 500 || len(result.Plans[0].StateResults) != 1 || len(result.Plans[0].StateResults[0].Events) != 500 {
-				b.Fatal("supported series lost records or exceeded one folded state mutation")
-			}
-		}
-	})
-	t.Logf("500 records, one level, 4 KiB dimensions: %d bytes/op (total allocations, not live heap)", allocation.AllocedBytesPerOp())
+	result, err := evaluator.Evaluate(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Plans) != 1 || len(result.Plans[0].LevelOutcomes) != 500 || len(result.Plans[0].StateResults) != 1 || len(result.Plans[0].StateResults[0].Events) != 500 {
+		t.Fatal("supported series lost records or exceeded one folded state mutation")
+	}
 }
 
 func TestEvaluatorFoldsSameSeriesRecordsInSourceOrder(t *testing.T) {
@@ -138,6 +141,17 @@ func TestEvaluatorFoldsSameSeriesRecordsInSourceOrder(t *testing.T) {
 	if len(result.LevelOutcomes) != 2 || result.LevelOutcomes[0].Record.SourceTime != 180 || result.LevelOutcomes[1].Record.SourceTime != 240 {
 		t.Fatalf("outcomes are not source ordered: %+v", result.LevelOutcomes)
 	}
+	// The second record is what this case is about: it sees the first one's
+	// provisional history and the 2-of-2 trigger fires on it.
+	//
+	// The first stays UNKNOWN, and under decision-022 that is now a statement
+	// about evidence rather than about completeness. Its window is two wide and
+	// needs two anomalies; it holds one observed position, which is anomalous,
+	// and one hole. Had the hole been anomalous the window would have fired, so
+	// the window has not answered and the recovery walk counts nothing from it.
+	// An earlier draft of this comment claimed RECOVERY here, from a walk that
+	// judged windows on their observed positions alone and would have read this
+	// one as a miss on the strength of its hole.
 	if result.LevelOutcomes[0].Outcome != execution.LevelOutcomeUnknown || result.LevelOutcomes[1].Outcome != execution.LevelOutcomeAbnormal {
 		t.Fatalf("N-of-M did not observe provisional history: %+v", result.LevelOutcomes)
 	}
@@ -185,8 +199,18 @@ func TestEvaluatorBoundsPersistedHistoryAcrossOneSeriesBatch(t *testing.T) {
 		t.Fatalf("Evaluate()=%v", err)
 	}
 	result := evaluated.Plans[0]
-	if len(result.StateResults) != 1 || len(result.StateResults[0].Mutation.AffectedRecords) != 3 || len(result.StateResults[0].Mutation.Points) != 2 {
-		t.Fatalf("history was not bounded independently from affected records: %+v", result.StateResults)
+	if len(result.StateResults) != 1 || len(result.StateResults[0].Mutation.AffectedRecords) != 3 {
+		t.Fatalf("the batch's affected records were not all carried: %+v", result.StateResults)
+	}
+	// The bound holds over the record the write leaves behind, not over the
+	// points the round evaluated: three records were evaluated and all three
+	// travel as the addition, and the retention of two decides what survives.
+	if record := recordLeftBehind(t, result.StateResults[0].Mutation); len(record) != 2 {
+		t.Fatalf("history was not bounded independently from affected records: %+v", record)
+	}
+	if points := len(result.StateResults[0].Mutation.Points); points != 3 {
+		t.Fatalf("the addition carries %d points, want the batch's three: truncating at the producer is "+
+			"what moves the bound away from the record it bounds", points)
 	}
 }
 
@@ -236,7 +260,7 @@ func TestEvaluatorConvergesGappedLevelWhenLiveWindowIsFull(t *testing.T) {
 	series := strings.Repeat("c", 64)
 	point := func(plan *strategy.CompiledPlan, id string, sourceTime int64) execution.StateHistoryPoint {
 		return execution.StateHistoryPoint{RecordID: strings.Repeat(id, 64), SourceTime: sourceTime,
-			Levels: []execution.StateLevelFact{{LevelID: 5, DetectFingerprint: plan.Levels()[0].Fingerprints().Detect, Result: execution.LevelFactNormal}}}
+			Levels: []execution.StateLevelFact{{LevelID: 5, DetectFingerprint: plan.Levels().At(0).Fingerprints().Detect, Result: execution.LevelFactNormal}}}
 	}
 	tests := []struct {
 		name       string
@@ -270,8 +294,8 @@ func TestEvaluatorConvergesGappedLevelWhenLiveWindowIsFull(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			plan := compiledWindow(t, test.window, test.window)
-			if plan.Levels()[0].RequiredDetectHistoryPoints() != test.window {
-				t.Fatalf("required detect history points = %d, want %d", plan.Levels()[0].RequiredDetectHistoryPoints(), test.window)
+			if plan.Levels().At(0).RequiredDetectHistoryPoints() != test.window {
+				t.Fatalf("required detect history points = %d, want %d", plan.Levels().At(0).RequiredDetectHistoryPoints(), test.window)
 			}
 			history := test.history(plan)
 			request := requestFixtureForPlan(t, plan, []contract.CanonicalRecordV2{{RecordID: strings.Repeat("f", 64), SourceTime: 300, BusinessID: "2",
@@ -298,8 +322,16 @@ func TestEvaluatorConvergesGappedLevelWhenLiveWindowIsFull(t *testing.T) {
 					evaluated.Disposition != execution.PlanDecided || level.HistoryCompleteness != execution.HistoryFull || level.GapReasonCode != "" {
 					t.Fatalf("GAPPED Level with a FULL live window did not converge: outcome=%+v level=%+v disposition=%s", outcome, level, evaluated.Disposition)
 				}
-			} else if outcome.Outcome != execution.LevelOutcomeUnknown || outcome.ReasonCode != test.wantReason ||
+			} else if outcome.Outcome != execution.LevelOutcomeRecovery ||
 				level.HistoryCompleteness != execution.HistoryGapped || level.GapReasonCode != test.wantReason {
+				// The Level does not converge: the loaded window has a hole, so
+				// it stays GAPPED and keeps its reason, and that is what this
+				// case is about. The business outcome is a separate question
+				// and since decision-022 has a separate answer - the two
+				// positions the recovery walk reads are both observed and
+				// neither is anomalous, so the alert closes while the Level
+				// stays guarded. Before, the guard answered both questions and
+				// this outcome was UNKNOWN.
 				t.Fatalf("GAPPED Level with an incomplete live window changed: outcome=%+v level=%+v", outcome, level)
 			}
 			if err := result.Validate(request); err != nil {
@@ -309,25 +341,95 @@ func TestEvaluatorConvergesGappedLevelWhenLiveWindowIsFull(t *testing.T) {
 	}
 }
 
-func TestEvaluatorDoesNotClearLoadedGappedWithoutEvidence(t *testing.T) {
-	req := requestFixture(t, json.RawMessage(`10`), nil)
-	req.State.Items[0].Status = execution.StateFoundGapped
-	req.State.Items[0].Levels[0].HistoryCompleteness = execution.HistoryGapped
-	req.State.Items[0].Levels[0].GapReasonCode = execution.ReasonCode(contract.ReasonGapSkipped)
-	result, err := newEvaluator(t).Evaluate(context.Background(), req)
-	if err != nil {
-		t.Fatalf("Evaluate()=%v", err)
-	}
-	plan := result.Plans[0]
-	if plan.LevelOutcomes[0].Outcome != execution.LevelOutcomeUnknown || plan.LevelOutcomes[0].ReasonCode != execution.ReasonCode(contract.ReasonGapSkipped) ||
-		len(plan.StateResults) != 1 || plan.StateResults[0].Mutation.Levels[0].HistoryCompleteness != execution.HistoryGapped ||
-		plan.StateResults[0].Mutation.Levels[0].GapReasonCode != execution.ReasonCode(contract.ReasonGapSkipped) || len(plan.StateResults[0].Events) != 0 {
-		t.Fatalf("GAPPED was cleared without evidence: %+v", plan)
-	}
+// unevidencedRecoveryFixture is one observed, non-anomalous record in a Level
+// whose window is five wide and whose threshold is two. Four of the window's
+// five positions are holes, and four holes can hide the two anomalies the
+// window needed to fire, so the window never answers and the recovery walk
+// counts nothing from it.
+//
+// Tests that pin what a guard does need this shape rather than the default
+// fixture. The default Level has a window of one and a threshold of one, so its
+// single record is an entire window, fully observed - complete recovery
+// evidence, which since decision-022 section 9.1 leaves the guard and produces
+// a RECOVERY. That is correct behaviour and it stops those tests from reaching
+// the mechanism they were written for.
+func unevidencedRecoveryFixture(t testing.TB) execution.EvaluationRequest {
+	t.Helper()
+	return requestFixtureForPlan(t, compiledWindow(t, 5, 2), []contract.CanonicalRecordV2{{
+		RecordID: strings.Repeat("b", 64), SourceTime: 400,
+		DimensionIdentity: contract.DimensionIdentityV2{Digest: strings.Repeat("c", 64)},
+		Values:            map[string]json.RawMessage{"value": json.RawMessage(`10`)},
+		Dimensions:        map[string]json.RawMessage{},
+	}}, nil)
 }
 
+// A loaded GAPPED Level and one observed record. Whether that record closes an
+// open alert is decided by the evidence, not by the guard: decision-022 section
+// 9.1 replaced "a guard forbids RECOVERY" with "a guard forbids an unevidenced
+// RECOVERY". Both branches are here because one alone proves nothing - the
+// refusing branch on its own passes just as well when nothing can ever recover,
+// which is what this file asserted before and what a hole in any window would
+// have made permanent.
+//
+// The two branches differ only in the shape of the Level, and that difference
+// is the whole answer. At window 1 and threshold 1 the single observed record
+// is an entire window, fully observed and not anomalous, so the evidence the
+// recovery plan asks for is complete. At window 5 and threshold 2 the same
+// record leaves four holes in its window, and four holes can hide the two
+// anomalies the window needed to fire, so the window has not answered and the
+// walk has nothing to count.
+//
+// Neither branch clears the guard. Closing what is open and calling the Level
+// fine are different claims, and only the second one needs a full window.
+func TestEvaluatorClearsALoadedGapForAnEvidencedRecoveryOnly(t *testing.T) {
+	loadGapped := func(req *execution.EvaluationRequest) {
+		req.State.Items[0].Status = execution.StateFoundGapped
+		req.State.Items[0].Levels[0].HistoryCompleteness = execution.HistoryGapped
+		req.State.Items[0].Levels[0].GapReasonCode = execution.ReasonCode(contract.ReasonGapSkipped)
+	}
+
+	t.Run("evidence complete", func(t *testing.T) {
+		req := requestFixture(t, json.RawMessage(`10`), nil)
+		loadGapped(&req)
+		result, err := newEvaluator(t).Evaluate(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Evaluate()=%v", err)
+		}
+		plan := result.Plans[0]
+		level := plan.StateResults[0].Mutation.Levels[0]
+		if plan.LevelOutcomes[0].Outcome != execution.LevelOutcomeRecovery ||
+			level.HistoryCompleteness != execution.HistoryGapped ||
+			level.GapReasonCode != execution.ReasonCode(contract.ReasonGapSkipped) {
+			t.Fatalf("a fully observed window did not close what was open, or cleared the guard doing it: %+v", plan)
+		}
+	})
+
+	t.Run("evidence incomplete", func(t *testing.T) {
+		req := unevidencedRecoveryFixture(t)
+		loadGapped(&req)
+		result, err := newEvaluator(t).Evaluate(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Evaluate()=%v", err)
+		}
+		plan := result.Plans[0]
+		level := plan.StateResults[0].Mutation.Levels[0]
+		if plan.LevelOutcomes[0].Outcome != execution.LevelOutcomeUnknown ||
+			plan.LevelOutcomes[0].ReasonCode != execution.ReasonCode(contract.ReasonGapSkipped) ||
+			len(plan.StateResults) != 1 || level.HistoryCompleteness != execution.HistoryGapped ||
+			level.GapReasonCode != execution.ReasonCode(contract.ReasonGapSkipped) ||
+			len(plan.StateResults[0].Events) != 0 {
+			t.Fatalf("GAPPED was cleared without evidence: %+v", plan)
+		}
+	})
+}
+
+// The reason word has to survive the round on both the outcome and the State,
+// so the outcome has to be UNKNOWN for there to be a word in transit at all.
+// That needs a Level whose recovery cannot be evidenced: with the default
+// Level the single record is a whole observed window and the round recovers,
+// which is correct and carries no reason word.
 func TestEvaluatorPreservesLoadedPlanGapReasonInUnknownOutcomeAndState(t *testing.T) {
-	req := requestFixture(t, json.RawMessage(`10`), nil)
+	req := unevidencedRecoveryFixture(t)
 	due := req.Header.DuePlans[0]
 	applyVersion, err := execution.BuildApplyVersion(req.Header.Contract, due.StateApplyEpoch)
 	if err != nil {
@@ -426,41 +528,88 @@ func TestEvaluatorAdvancesLoadedPlanGapAfterFullStateMutation(t *testing.T) {
 	}
 }
 
+// stateViewFromMutation is the record a following round would load after this
+// mutation landed. The history is the merge the store performs, not the points
+// the mutation names: a fixture that fed the addition back as the whole record
+// would shrink the window by one round each time and quietly stop reproducing
+// whatever it was built to reproduce.
 func stateViewFromMutation(mutation execution.StateMutation, status execution.StateLoadStatus) execution.RuntimeStateView {
 	levels := make([]execution.RuntimeLevelStateView, len(mutation.Levels))
 	for i, level := range mutation.Levels {
 		levels[i] = execution.RuntimeLevelStateView{LevelID: level.LevelID, LevelStateCompatibility: level.LevelStateCompatibility, HistoryCompleteness: level.HistoryCompleteness, GapReasonCode: level.GapReasonCode, WarmupRequirementRef: level.WarmupRequirementRef, LastProcessedEventTime: level.LastProcessedEventTime}
 	}
-	return execution.RuntimeStateView{Identity: mutation.Identity, Status: status, BlobRevision: mutation.ExpectedBlobRevision + 1, VersionComparison: execution.ApplyVersionPersistedOlder, History: append([]execution.StateHistoryPoint(nil), mutation.Points...), Levels: levels, SeriesGuard: mutation.SeriesGuard}
+	history, err := execution.MergedHistory(mutation.BaseHistory, mutation.Points, mutation.RetentionPoints)
+	if err != nil {
+		panic(err)
+	}
+	return execution.RuntimeStateView{Identity: mutation.Identity, Status: status, BlobRevision: mutation.ExpectedBlobRevision + 1, VersionComparison: execution.ApplyVersionPersistedOlder, History: history, Levels: levels, SeriesGuard: mutation.SeriesGuard}
 }
 
-func TestEvaluatorWarmingAndGappedNeverEmitNormalOrRecovery(t *testing.T) {
+// NORMAL is still forbidden under either guard, and that half is untouched: an
+// incomplete window cannot say a Level is fine, whatever it can say about an
+// alert that is already open.
+//
+// RECOVERY is no longer forbidden outright, only unevidenced RECOVERY
+// (decision-022 section 9.1), so it is asserted against the evidence instead of
+// against the guard. Both recovery branches are here on purpose: the refusing
+// one alone would pass in a build where recovery never happens at all, which is
+// exactly the state this change exists to leave.
+func TestEvaluatorWarmingAndGappedNeverEmitNormalAndGateRecoveryOnEvidence(t *testing.T) {
+	loadGuard := func(req *execution.EvaluationRequest, completeness execution.HistoryCompleteness) {
+		req.State.Items[0].Levels[0].HistoryCompleteness = completeness
+		if completeness == execution.HistoryWarming {
+			req.State.Items[0].Status = execution.StateFoundWarming
+			req.State.Items[0].Levels[0].GapReasonCode = execution.ReasonCode(contract.ReasonHistoryWarming)
+		} else {
+			req.State.Items[0].Status = execution.StateFoundGapped
+			req.State.Items[0].Levels[0].GapReasonCode = execution.ReasonCode(contract.ReasonHistoryGapped)
+		}
+	}
+
 	for _, completeness := range []execution.HistoryCompleteness{execution.HistoryWarming, execution.HistoryGapped} {
-		t.Run(string(completeness), func(t *testing.T) {
+		t.Run(string(completeness)+"/never normal", func(t *testing.T) {
 			req := requestFixture(t, json.RawMessage(`10`), nil)
-			req.State.Items[0].Levels[0].HistoryCompleteness = completeness
-			if completeness == execution.HistoryWarming {
-				req.State.Items[0].Status = execution.StateFoundWarming
-				req.State.Items[0].Levels[0].GapReasonCode = execution.ReasonCode(contract.ReasonHistoryWarming)
-			} else {
-				req.State.Items[0].Status = execution.StateFoundGapped
-				req.State.Items[0].Levels[0].GapReasonCode = execution.ReasonCode(contract.ReasonHistoryGapped)
-			}
+			loadGuard(&req, completeness)
 			evaluated, err := newEvaluator(t).Evaluate(context.Background(), req)
 			if err != nil {
 				t.Fatalf("Evaluate()=%v", err)
 			}
 			result := evaluated.Plans[0]
-			out := result.LevelOutcomes[0]
-			if out.Outcome == execution.LevelOutcomeNormal || out.Outcome == execution.LevelOutcomeRecovery || len(result.StateResults) != 1 || len(result.StateResults[0].Mutation.Points) != 1 {
+			if result.LevelOutcomes[0].Outcome == execution.LevelOutcomeNormal ||
+				len(result.StateResults) != 1 || len(result.StateResults[0].Mutation.Points) != 1 {
 				t.Fatalf("unsafe result=%+v", result)
+			}
+		})
+
+		t.Run(string(completeness)+"/recovery needs evidence", func(t *testing.T) {
+			req := unevidencedRecoveryFixture(t)
+			loadGuard(&req, completeness)
+			evaluated, err := newEvaluator(t).Evaluate(context.Background(), req)
+			if err != nil {
+				t.Fatalf("Evaluate()=%v", err)
+			}
+			if out := evaluated.Plans[0].LevelOutcomes[0].Outcome; out == execution.LevelOutcomeRecovery {
+				t.Fatalf("a window that never answered still claimed a recovery: %+v", evaluated.Plans[0])
+			}
+		})
+
+		t.Run(string(completeness)+"/recovery on evidence", func(t *testing.T) {
+			req := requestFixture(t, json.RawMessage(`10`), nil)
+			loadGuard(&req, completeness)
+			evaluated, err := newEvaluator(t).Evaluate(context.Background(), req)
+			if err != nil {
+				t.Fatalf("Evaluate()=%v", err)
+			}
+			if out := evaluated.Plans[0].LevelOutcomes[0].Outcome; out != execution.LevelOutcomeRecovery {
+				t.Fatalf("a fully observed window under a guard gave %s, want RECOVERY: the guard is still "+
+					"holding open alerts open", out)
 			}
 		})
 	}
 }
 
-func newEvaluator(t *testing.T) *Evaluator {
-	d, err := detect.NewEvaluator(detect.NewDefaultRegistry(), nil)
+func newEvaluator(t testing.TB) *Evaluator {
+	d, err := detect.NewEvaluator(detect.NewDefaultRegistry())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -471,11 +620,11 @@ func newEvaluator(t *testing.T) *Evaluator {
 	return e
 }
 
-func requestFixture(t *testing.T, value json.RawMessage, history []execution.StateHistoryPoint) execution.EvaluationRequest {
+func requestFixture(t testing.TB, value json.RawMessage, history []execution.StateHistoryPoint) execution.EvaluationRequest {
 	return requestFixtureForPlan(t, compiled(t), []contract.CanonicalRecordV2{{RecordID: strings.Repeat("b", 64), SourceTime: 100, BusinessID: "2", DimensionIdentity: contract.DimensionIdentityV2{Digest: strings.Repeat("c", 64)}, Values: map[string]json.RawMessage{"value": value}, Dimensions: map[string]json.RawMessage{}, ReceivedTime: 100}}, history)
 }
 
-func requestFixtureForPlan(t *testing.T, plan *strategy.CompiledPlan, records []contract.CanonicalRecordV2, history []execution.StateHistoryPoint) execution.EvaluationRequest {
+func requestFixtureForPlan(t testing.TB, plan *strategy.CompiledPlan, records []contract.CanonicalRecordV2, history []execution.StateHistoryPoint) execution.EvaluationRequest {
 	id := execution.PlanIdentity{TenantID: "tenant", BusinessID: "2", StrategyID: "7"}
 	due := execution.DuePlan{Identity: id, CompiledPlan: plan, StateGeneration: "state-v1", StateApplyEpoch: 1, ScheduleRevision: "plan-schedule", CompletionDeadlineUnixMilli: 200000}
 	consumer := execution.ConsumerRef{Plan: id, LevelID: 5, HasLevel: true}
@@ -496,7 +645,7 @@ func requestFixtureForPlan(t *testing.T, plan *strategy.CompiledPlan, records []
 	provider := strategy.NewStaticScheduleProvider(strategy.TimezoneResolverFunc(func(context.Context, string, string, string) (*time.Location, error) {
 		return time.UTC, nil
 	}))
-	facts, err := provider.Resolve(context.Background(), []strategy.EffectiveTimeRequest{{TenantID: "tenant", BusinessID: "2", EvaluationTime: 100, Requirement: plan.Levels()[0].EffectiveTimeRequirement()}})
+	facts, err := provider.Resolve(context.Background(), []strategy.EffectiveTimeRequest{{TenantID: "tenant", BusinessID: "2", EvaluationTime: 100, Requirement: plan.Levels().At(0).EffectiveTimeRequirement()}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -508,22 +657,28 @@ func requestFixtureForPlan(t *testing.T, plan *strategy.CompiledPlan, records []
 	return execution.EvaluationRequest{Header: execution.InternalExecutionHeader{ExecutionID: "execution", Contract: contractRef, DuePlans: []execution.DuePlan{due}, Requirements: []execution.DataRequirement{requirement}, EffectiveTimeFacts: []execution.BoundEffectiveTimeFact{{Consumer: consumer, SeriesIdentity: series, Fact: facts[0]}}, RequiredPhysicalQueries: []execution.PlannedPhysicalQueryRef{{Digest: "physical", QueryRevision: "query"}}, DeadlineUnixMilli: 200000}, Inputs: []execution.SeriesEvaluationInputRequest{{Contract: contractRef, Consumer: consumer, SeriesIdentity: series, RequirementIDs: []execution.RequirementID{"main"}, Inputs: []execution.NamedInputBinding{binding}}}, State: execution.StatePreflightResult{Items: []execution.RuntimeStateView{stateView}}, Gaps: execution.GapLoadResult{Items: []execution.GapGuardSnapshot{{Identity: execution.PlanGapIdentity{Plan: id, StateGeneration: "state-v1"}, Status: execution.GapMissing}}}}
 }
 
-func compiled(t *testing.T) *strategy.CompiledPlan {
+func compiled(t testing.TB) *strategy.CompiledPlan {
 	return compiledWindow(t, 1, 1)
 }
 
-func compiledWindow(t *testing.T, windowSize, requiredAnomalies uint32) *strategy.CompiledPlan {
+func compiledWindow(t testing.TB, windowSize, requiredAnomalies uint32) *strategy.CompiledPlan {
 	return compiledWindowWithUptime(t, windowSize, requiredAnomalies, false)
 }
 
-func compiledWindowWithUptime(t *testing.T, windowSize, requiredAnomalies uint32, uptime bool) *strategy.CompiledPlan {
+func compiledWindowWithUptime(t testing.TB, windowSize, requiredAnomalies uint32, uptime bool) *strategy.CompiledPlan {
 	return compiledWindowWithNoData(t, windowSize, requiredAnomalies, nil, uptime)
 }
 
 // compiledWindowWithNoData is the same fixture plan with no-data detection
 // optionally on, so a test can have a Plan that carries a no-data level without
 // changing anything else about it.
-func compiledWindowWithNoData(t *testing.T, windowSize, requiredAnomalies uint32, noData *contract.NoDataConfigV1, uptime bool) *strategy.CompiledPlan {
+func compiledWindowWithNoData(t testing.TB, windowSize, requiredAnomalies uint32, noData *contract.NoDataConfigV1, uptime bool) *strategy.CompiledPlan {
+	return compiledWindowEdited(t, windowSize, requiredAnomalies, noData, uptime, nil)
+}
+
+// compiledWindowEdited is the fixture plan with an edit applied to the frozen
+// Plan before it is compiled, for a test about one field of it.
+func compiledWindowEdited(t testing.TB, windowSize, requiredAnomalies uint32, noData *contract.NoDataConfigV1, uptime bool, edit func(*contract.EvaluationPlanV2)) *strategy.CompiledPlan {
 	c, err := strategy.NewCompiler(strategy.NewDefaultAlgorithmCompilerRegistry(), strategy.Limits{MaxPlanBytes: 1 << 20, MaxLevelsPerPlan: 16, MaxAlgorithmsPerLevel: 8, MaxGroupsPerAlgorithm: 16, MaxConditionsPerAlgorithm: 64, MaxASTNodesPerLevel: 256, MaxTriggerWindowSize: 16, MaxRecoveryConsecutiveWindows: 16, MaxRequiredHistoryPoints: 32, MaxTriggerComputeCost: 1 << 20, MaxCompiledPlanBytes: 1 << 20, MaxCacheEntries: 16, MaxCacheBytes: 1 << 20, NegativeCacheTTL: time.Minute, BudgetRevision: "test"})
 	if err != nil {
 		t.Fatal(err)
@@ -542,6 +697,9 @@ func compiledWindowWithNoData(t *testing.T, windowSize, requiredAnomalies uint32
 	triggerConfig := json.RawMessage(triggerPayload)
 	level := contract.LevelIRV2{Definition: contract.LevelDefinitionV2{LevelID: 5, Priority: 1}, Connector: contract.LevelConnectorAND, DetectPlan: contract.DetectPlanV2{Algorithms: []contract.AlgorithmIRV2{{Type: "Threshold", Version: 1, Config: json.RawMessage(`{"value_field":"value","data_unit":"percent","threshold_unit_prefix":"","precision":{"decimal_places":6,"rounding":"HALF_EVEN"},"groups":[{"conditions":[{"operator":"GTE","threshold_decimal":"50"}]}]}`)}}}, TriggerPlan: contract.TypedPlanV1{Type: "N_OF_M", Version: 1, Config: triggerConfig}, RecoveryPlan: contract.TypedPlanV1{Type: "CONTINUOUS_TRIGGER_MISS", Version: 1, Config: json.RawMessage(`{"enabled":true,"consecutive_windows":1}`)}}
 	p := contract.EvaluationPlanV2{PlanID: "7", StrategyRef: ref, InputProjection: projection, NoData: noData, StrategyIR: contract.StrategyIRV2{Schema: contract.Schema{Name: contract.StrategyIRSchemaV2, Major: 2}, StrategyRef: ref, InputProjection: projection, ExecutionSemantics: contract.ExecutionSemanticsV2{EvaluationScope: contract.EvaluationScopeSeries, QueryWindow: 300, AggregationInterval: 60, EvaluationInterval: 60, LatenessTolerance: 120}, Levels: []contract.LevelIRV2{level}}}
+	if edit != nil {
+		edit(&p)
+	}
 	r, err := c.Compile(context.Background(), strategy.CompileRequest{Plan: p, DatasetContract: contract.DatasetContractV2{SchemaDigest: strings.Repeat("1", 64), NormalizationDigest: strings.Repeat("2", 64), IdentityFields: []string{"host"}, SourceTimeField: "time", ReceivedTimeField: "received_time"}, StateSemantics: strategy.StateSemantics{StateSchemaVersion: "s", CodecSemanticsVersion: "c", IdentitySchemaDigest: strings.Repeat("3", 64), SourceTimeSemanticsVersion: "t", HistoryCellSemanticsVersion: "h"}})
 	if err != nil {
 		t.Fatal(err)
@@ -566,7 +724,23 @@ func planGapMarkerFixture(
 	lastRevision execution.PlanScheduleRevision,
 ) execution.EvaluationRequest {
 	t.Helper()
-	request := requestFixture(t, json.RawMessage(`10`), nil)
+	return planGapMarkerFixtureOn(t, requestFixture(t, json.RawMessage(`10`), nil), scope, reason, required, observed, lastRevision)
+}
+
+// planGapMarkerFixtureOn is the same over a caller-supplied request, for cases
+// that need a Level whose recovery cannot be evidenced. A guard reason is only
+// observable on an outcome that carries one, and the default Level's single
+// record is a whole observed window, which since decision-022 recovers and
+// carries no reason at all.
+func planGapMarkerFixtureOn(
+	t *testing.T,
+	request execution.EvaluationRequest,
+	scope execution.GapScope,
+	reason string,
+	required, observed uint32,
+	lastRevision execution.PlanScheduleRevision,
+) execution.EvaluationRequest {
+	t.Helper()
 	due := request.Header.DuePlans[0]
 	version, err := execution.BuildApplyVersion(request.Header.Contract, due.StateApplyEpoch)
 	if err != nil {
@@ -613,7 +787,7 @@ func TestEvaluatorRecoversPlanGapUnderEveryReasonAndScope(t *testing.T) {
 			{name: "level", scope: execution.GapScope{LevelID: 5, HasLevel: true}},
 		} {
 			t.Run(reason+"/"+scope.name, func(t *testing.T) {
-				request := planGapMarkerFixture(t, scope.scope, reason, 1, 0, "")
+				request := planGapMarkerFixtureOn(t, unevidencedRecoveryFixture(t), scope.scope, reason, 1, 0, "")
 				result, err := newEvaluator(t).Evaluate(context.Background(), request)
 				if err != nil {
 					t.Fatalf("Evaluate() error = %v", err)
@@ -703,5 +877,289 @@ func TestEvaluatorKeepsPlanGapWithoutDurableState(t *testing.T) {
 		if len(result.Plans[0].StateResults) != 0 || len(result.Plans[0].GuardAfterState) != 0 {
 			t.Fatalf("revision %q cleared a gap without durable state: %+v", revision, result.Plans[0])
 		}
+	}
+}
+
+// proposeRoundGuard does for a test what the worker does after Evaluate: when
+// the round's inputs are incomplete by the one definition the fold reads, the
+// Plan's result carries the gap marker that fold names, so the contract sees
+// the guard that will cover the outcome. Evaluate itself never proposes it --
+// the worker owns the marker -- so a test that validates an evaluation with an
+// incomplete input has to stand in for the worker or it validates a shape
+// production never produces.
+func proposeRoundGuard(t *testing.T, request execution.EvaluationRequest, result *execution.EvaluationResult) {
+	t.Helper()
+	due := request.Header.DuePlans[0]
+	var bindings []execution.NamedInputBinding
+	for _, input := range request.Inputs {
+		bindings = append(bindings, input.Inputs...)
+	}
+	reasons := execution.RoundGapScopeReasons(bindings, due.Identity)
+	if len(reasons) == 0 {
+		return
+	}
+	identity := execution.PlanGapIdentity{Plan: due.Identity, StateGeneration: due.StateGeneration}
+	marker, _ := request.Gaps.Find(identity)
+	version, err := execution.BuildApplyVersion(request.Header.Contract, due.StateApplyEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var required uint32
+	for _, level := range due.CompiledPlan.Levels().All() {
+		if points := level.RequiredDetectHistoryPoints(); points > required {
+			required = points
+		}
+	}
+	scopes := make([]execution.GapScope, 0, len(reasons))
+	for scope := range reasons {
+		scopes = append(scopes, scope)
+	}
+	sort.Slice(scopes, func(i, j int) bool {
+		if scopes[i].HasLevel != scopes[j].HasLevel {
+			return !scopes[i].HasLevel
+		}
+		return scopes[i].LevelID < scopes[j].LevelID
+	})
+	mutations := make([]execution.GapScopeMutation, 0, len(scopes))
+	for _, scope := range scopes {
+		mutations = append(mutations, execution.GapScopeMutation{Scope: scope, Kind: execution.GapOpen,
+			ReasonCode: reasons[scope], RequiredFullSlots: required})
+	}
+	mutation, err := execution.BuildPlanGapMutation(execution.PlanGapMutation{
+		Identity: identity, ExpectedMarkerRevision: marker.MarkerRevision,
+		ApplyVersion: version, ScheduleRevision: due.ScheduleRevision, Scopes: mutations,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result.Plans[0].GuardBeforeEvents = []execution.PlanGapMutation{mutation}
+	result.Plans[0].GuardAfterState = nil
+}
+
+// A Level outside its effective hours still advances its history, and the
+// history it advances may not be full yet: the trigger returns before it says
+// anything about the window, so the completeness comes from the summary
+// alone, and the reason has to come with it. It did not: the mutation carried
+// WARMING with no reason, the state contract refused it, and every Slot of a
+// strategy outside its hours failed from the first one whose window was not
+// yet full - on a new state generation, every such strategy at once, until a
+// query-free finalization covered it with a gap guard. This is the shape of
+// one strategy on a live deployment on the acceptance release: business
+// hours only, no calendar, evaluated in the evening on a window the new
+// generation had not filled.
+func TestAnInactiveLevelOnAWarmingWindowCarriesTheWarmingReason(t *testing.T) {
+	req := requestFixtureForPlan(t, compiledWindowWithUptime(t, 3, 2, true), []contract.CanonicalRecordV2{{RecordID: strings.Repeat("b", 64), SourceTime: 100, BusinessID: "2", DimensionIdentity: contract.DimensionIdentityV2{Digest: strings.Repeat("c", 64)}, Values: map[string]json.RawMessage{"value": json.RawMessage(`80`)}, Dimensions: map[string]json.RawMessage{}, ReceivedTime: 100}}, nil)
+	if got := req.Header.EffectiveTimeFacts[0].Fact.Status(); got != strategy.EffectiveTimeInactive {
+		t.Fatalf("fixture status=%s, want INACTIVE", got)
+	}
+	// No history under this generation yet: the window of three is warming.
+	req.State.Items[0].Status = execution.StateMissingWarming
+	req.State.Items[0].BlobRevision = 0
+	req.State.Items[0].Levels = nil
+	evaluated, err := newEvaluator(t).Evaluate(context.Background(), req)
+	if err != nil {
+		t.Fatalf("an inactive Level on a warming window failed to evaluate: %v", err)
+	}
+	if err := evaluated.Validate(req); err != nil {
+		t.Fatalf("the contract refused what the evaluator produced: %v", err)
+	}
+	plan := evaluated.Plans[0]
+	if len(plan.LevelOutcomes) != 1 || plan.LevelOutcomes[0].Outcome != execution.LevelOutcomeUnknown || plan.LevelOutcomes[0].ReasonCode != execution.ReasonCode(contract.ReasonEffectiveTimeInactive) {
+		t.Fatalf("outcomes = %+v, want one UNKNOWN with EFFECTIVE_TIME_INACTIVE", plan.LevelOutcomes)
+	}
+	if len(plan.StateResults) != 1 || len(plan.StateResults[0].Mutation.Levels) != 1 {
+		t.Fatalf("state results = %+v, want the one advancing mutation", plan.StateResults)
+	}
+	level := plan.StateResults[0].Mutation.Levels[0]
+	if level.HistoryCompleteness != execution.HistoryWarming || level.GapReasonCode != execution.ReasonCode(contract.ReasonHistoryWarming) {
+		t.Fatalf("mutation Level = %+v, want WARMING with HISTORY_WARMING: a warming window without its reason is what the contract refuses", level)
+	}
+	if len(plan.StateResults[0].Events) != 0 {
+		t.Fatalf("an inactive Level emitted events: %+v", plan.StateResults[0].Events)
+	}
+}
+
+// A window's guard reason is the reason the verdict reported for that window
+// was held with. On the round a guard converges, the live window decides and
+// nothing is held -- but the reason stayed in the evaluator's per-Level map
+// and rode out on the window anyway, so the window said "not guarded" and
+// named a guard in the same breath. The coverage reader refuses that pair
+// (WINDOW_GUARD_REASON_UNGUARDED) and drops the whole run's coverage for it:
+// on a running deployment it fired twenty to thirty times per ten minutes,
+// each one a run that reported no coverage at all.
+//
+// The fixture is the one round where both are true: the loaded history forms
+// the required full window at the last processed record, so the guard
+// converges, and the new record sits one step past a hole, so the live
+// window is still short and a window fact is emitted.
+func TestAConvergingGuardLeavesNoReasonOnAnUnguardedWindow(t *testing.T) {
+	plan := compiledWindow(t, 3, 2)
+	series := strings.Repeat("c", 64)
+	point := func(id string, sourceTime int64) execution.StateHistoryPoint {
+		return execution.StateHistoryPoint{RecordID: strings.Repeat(id, 64), SourceTime: sourceTime,
+			Levels: []execution.StateLevelFact{{LevelID: 5, DetectFingerprint: plan.Levels().At(0).Fingerprints().Detect, Result: execution.LevelFactNormal}}}
+	}
+	history := []execution.StateHistoryPoint{point("a", 120), point("b", 180), point("d", 240)}
+	request := requestFixtureForPlan(t, plan, []contract.CanonicalRecordV2{{RecordID: strings.Repeat("f", 64), SourceTime: 360, BusinessID: "2",
+		DimensionIdentity: contract.DimensionIdentityV2{Digest: series}, Values: map[string]json.RawMessage{"value": json.RawMessage(`10`)},
+		Dimensions: map[string]json.RawMessage{}, ReceivedTime: 360}}, history)
+	request.State.Items[0].Status = execution.StateFoundWarming
+	request.State.Items[0].Levels[0].HistoryCompleteness = execution.HistoryWarming
+	request.State.Items[0].Levels[0].GapReasonCode = execution.ReasonCode(contract.ReasonHistoryWarming)
+	request.State.Items[0].Levels[0].LastProcessedEventTime = history[len(history)-1].SourceTime
+
+	result, err := newEvaluator(t).Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate()=%v", err)
+	}
+	coverage := result.Plans[0].HistoryCoverage
+	windows := coverage.Windows
+	if len(windows) == 0 {
+		t.Fatalf("no window was summarised: this case needs a short window on the converging round (coverage=%+v)", coverage)
+	}
+	// The round this test is about: the guard has converged, so no window
+	// reports a held verdict. Without that the pair below cannot happen and
+	// the fixture is not exercising the case.
+	held := 0
+	for _, window := range windows {
+		if window.Guarded {
+			held++
+		}
+	}
+	if held != 0 {
+		t.Fatalf("%d of %d windows still report a held verdict: the guard did not converge, so this fixture does not reach the case", held, len(windows))
+	}
+	for _, window := range windows {
+		if window.GuardReason != "" {
+			t.Fatalf("an unguarded window names the guard %q: the reader refuses the pair and the run reports no coverage at all", window.GuardReason)
+		}
+	}
+}
+
+// gappedGuardRequest is a series whose Level is held by a durable guard over
+// a gapped history - points at 120 and 240, none at 180 - evaluated at 300,
+// where the window of three still has the hole.
+func gappedGuardRequest(t *testing.T, outOfHours bool) execution.EvaluationRequest {
+	t.Helper()
+	plan := compiledWindowWithUptime(t, 3, 2, outOfHours)
+	point := func(id string, sourceTime int64) execution.StateHistoryPoint {
+		return execution.StateHistoryPoint{RecordID: strings.Repeat(id, 64), SourceTime: sourceTime,
+			Levels: []execution.StateLevelFact{{LevelID: 5, DetectFingerprint: plan.Levels().At(0).Fingerprints().Detect, Result: execution.LevelFactNormal}}}
+	}
+	history := []execution.StateHistoryPoint{point("a", 120), point("b", 240)}
+	request := requestFixtureForPlan(t, plan, []contract.CanonicalRecordV2{{RecordID: strings.Repeat("f", 64), SourceTime: 300, BusinessID: "2",
+		DimensionIdentity: contract.DimensionIdentityV2{Digest: strings.Repeat("c", 64)}, Values: map[string]json.RawMessage{"value": json.RawMessage(`80`)},
+		Dimensions: map[string]json.RawMessage{}, ReceivedTime: 300}}, history)
+	request.State.Items[0].Status = execution.StateFoundGapped
+	request.State.Items[0].Levels[0].HistoryCompleteness = execution.HistoryGapped
+	request.State.Items[0].Levels[0].GapReasonCode = execution.ReasonCode(contract.ReasonHistoryGapped)
+	request.State.Items[0].Levels[0].LastProcessedEventTime = 240
+	return request
+}
+
+// A Level its effective time suppressed was not evaluated because it was out
+// of its hours, and that is what its outcome says, even while a guard over its
+// gapped history stands. The outcome used to take the guard's reason, so an
+// out-of-hours round read HISTORY_GAPPED whenever its history happened to be
+// gapped, and a window of nothing but out-of-hours rounds read as data that
+// did not arrive. The history's own completeness is untouched: the Level
+// state keeps GAPPED under the guard's reason.
+func TestASuppressedLevelUnderAGuardSaysItWasOutOfItsHours(t *testing.T) {
+	request := gappedGuardRequest(t, true)
+	if got := request.Header.EffectiveTimeFacts[0].Fact.Status(); got != strategy.EffectiveTimeInactive {
+		t.Fatalf("fixture status=%s, want INACTIVE", got)
+	}
+	evaluated, err := newEvaluator(t).Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate()=%v", err)
+	}
+	if err := evaluated.Validate(request); err != nil {
+		t.Fatalf("the contract refused an out-of-hours outcome under a guard: %v", err)
+	}
+	plan := evaluated.Plans[0]
+	if len(plan.LevelOutcomes) != 1 || plan.LevelOutcomes[0].Outcome != execution.LevelOutcomeUnknown ||
+		plan.LevelOutcomes[0].ReasonCode != execution.ReasonCode(contract.ReasonEffectiveTimeInactive) || plan.LevelOutcomes[0].GuardTail {
+		t.Fatalf("outcomes = %+v, want one UNKNOWN for EFFECTIVE_TIME_INACTIVE that is no guard's tail", plan.LevelOutcomes)
+	}
+	if len(plan.StateResults) != 1 || len(plan.StateResults[0].Events) != 0 {
+		t.Fatalf("state results = %+v, want the one advancing mutation and no event", plan.StateResults)
+	}
+	level := plan.StateResults[0].Mutation.Levels[0]
+	if level.HistoryCompleteness != execution.HistoryGapped || level.GapReasonCode != execution.ReasonCode(contract.ReasonHistoryGapped) {
+		t.Fatalf("mutation Level = %+v, want the history still GAPPED under its guard's reason", level)
+	}
+	_, attribution, err := execution.DeriveCompletionAttribution(execution.InternalExecution{Inputs: request.Inputs[0].Inputs}, evaluated)
+	if err != nil || attribution.Reason != execution.ReasonCode(contract.ReasonEffectiveTimeInactive) {
+		t.Fatalf("the round is attributed to %+v (%v), want EFFECTIVE_TIME_INACTIVE", attribution, err)
+	}
+}
+
+// The same guard on a round inside the Level's hours: the Level was evaluated
+// and its gapped history is why it decided nothing, so the outcome keeps the
+// guard's reason.
+func TestAGuardedLevelInsideItsHoursStillSaysItsHistoryIsGapped(t *testing.T) {
+	request := gappedGuardRequest(t, false)
+	evaluated, err := newEvaluator(t).Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate()=%v", err)
+	}
+	if err := evaluated.Validate(request); err != nil {
+		t.Fatalf("the contract refused: %v", err)
+	}
+	outcome := evaluated.Plans[0].LevelOutcomes[0]
+	if outcome.Outcome != execution.LevelOutcomeUnknown || outcome.ReasonCode != execution.ReasonCode(contract.ReasonHistoryGapped) {
+		t.Fatalf("outcome = %+v, want UNKNOWN for HISTORY_GAPPED", outcome)
+	}
+}
+
+// The exception is the effective time's alone: an outcome that claims it
+// inside the Level's hours, or on inputs not whole enough for its history to
+// advance, still has to carry the guard's reason.
+func TestOnlyASuppressedLevelOnWholeInputsMayLeaveItsGuardsReason(t *testing.T) {
+	inHours := gappedGuardRequest(t, false)
+	evaluated, err := newEvaluator(t).Evaluate(context.Background(), inHours)
+	if err != nil {
+		t.Fatalf("Evaluate()=%v", err)
+	}
+	evaluated.Plans[0].LevelOutcomes[0].ReasonCode = execution.ReasonCode(contract.ReasonEffectiveTimeInactive)
+	if err := evaluated.Validate(inHours); err == nil || !strings.Contains(err.Error(), "active guard reason") {
+		t.Fatalf("an outcome inside its hours claimed to be out of them: %v", err)
+	}
+
+	outOfHours := gappedGuardRequest(t, true)
+	outOfHours.Inputs[0].Inputs[0].DataState = execution.DataStateEmpty
+	evaluated, err = newEvaluator(t).Evaluate(context.Background(), outOfHours)
+	if err != nil {
+		t.Fatalf("Evaluate()=%v", err)
+	}
+	off, guards := execution.ReasonCode(contract.ReasonEffectiveTimeInactive), evaluated.Plans[0].LevelOutcomes[0].ReasonCode
+	evaluated.Plans[0].LevelOutcomes[0].ReasonCode = off
+	if evaluated.Plans[0].ReasonCode == guards {
+		evaluated.Plans[0].ReasonCode = off
+	}
+	if evaluated.ReasonCode == guards {
+		evaluated.ReasonCode = off
+	}
+	if err := evaluated.Validate(outOfHours); err == nil || !strings.Contains(err.Error(), "active guard reason") {
+		t.Fatalf("an out-of-hours outcome on inputs that carry no data left its guard's reason: %v", err)
+	}
+}
+
+// Out of its hours on inputs that carry no data, a guarded Level keeps the
+// guard's reason: its history cannot advance on them, so the round is the
+// guard's like any other UNKNOWN, and the contract accepts nothing else.
+func TestASuppressedLevelOnInputsWithoutDataKeepsItsGuardsReason(t *testing.T) {
+	request := gappedGuardRequest(t, true)
+	request.Inputs[0].Inputs[0].DataState = execution.DataStateEmpty
+	evaluated, err := newEvaluator(t).Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate()=%v", err)
+	}
+	if err := evaluated.Validate(request); err != nil {
+		t.Fatalf("the contract refused: %v", err)
+	}
+	if outcome := evaluated.Plans[0].LevelOutcomes[0]; outcome.Outcome != execution.LevelOutcomeUnknown ||
+		outcome.ReasonCode != execution.ReasonCode(contract.ReasonHistoryGapped) {
+		t.Fatalf("outcome = %+v, want UNKNOWN for the guard's HISTORY_GAPPED", outcome)
 	}
 }

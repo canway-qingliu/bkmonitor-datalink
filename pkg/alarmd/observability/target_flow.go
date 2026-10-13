@@ -335,6 +335,12 @@ func (f *TargetFlow) Observe(ctx context.Context, o Observation) {
 	if f == nil {
 		return
 	}
+	// A supplement is not a run of the object: it came with no flow, and its
+	// records filed under the supplemented Slot read as runs with no run id
+	// that decided "incomplete".
+	if o.Operation == OperationSupplement {
+		return
+	}
 	if o.Stage == StageStatePreflight || o.Stage == StageStateApplied {
 		if ctx != nil {
 			if v, ok := ctx.Value(targetFlowContextKey{}).(*targetFlowContext); ok && v.flow == f && (o.Trace.QueryGroupKey == "" || o.Trace.QueryGroupKey == v.queryGroup) {
@@ -366,6 +372,17 @@ func (f *TargetFlow) Observe(ctx context.Context, o Observation) {
 	}
 	switch o.Stage {
 	case StageAssignmentAcquired, StageAssignmentLost, StageTakeoverStarted, StageTakeoverCompleted, StageScheduleDue, StageSlotStarted, StageSlotCompleted, StageQueryCompleted, StageProgressCommitted, StageRunnerCompleted, StageSlotSourceCompleted, StageSlotReadinessArrival:
+	case StageEventACKed:
+		// Only the failures. A successful ACK per Slot is the volume of the
+		// completion line again for a fact the completion already carries;
+		// a failed one is the only observation whose words say why the
+		// round's events did not go -- and a window opened on an object whose
+		// every round ends OUTPUT_ACK_UNKNOWN had no record of them, so the
+		// sentence that told a refusing client from a silent broker was
+		// readable nowhere on the page.
+		if o.Err == nil && o.Result != ResultFailed {
+			return
+		}
 	case StageResourceHard:
 		// Only a capacity rejection names the Query Group it stopped; process
 		// level resource stops carry no Slot coordinates and stay in the
@@ -588,7 +605,7 @@ func failureText(err error) string {
 
 func targetFlowCritical(stage string, facts TargetFlowFacts) bool {
 	switch stage {
-	case string(StageQueryCompleted), string(StageProgressCommitted), string(StageSlotCompleted), string(StageRunnerCompleted), string(StageSlotSourceCompleted), string(StageResourceHard), "execution_outcome", "runner_return", "expired_range_returned":
+	case string(StageQueryCompleted), string(StageProgressCommitted), string(StageSlotCompleted), string(StageRunnerCompleted), string(StageSlotSourceCompleted), string(StageResourceHard), string(StageEventACKed), "execution_outcome", "runner_return", "expired_range_returned":
 		return true
 	case "runner_decision":
 		return facts.ExecutionOutcomeKnown || facts.Completed

@@ -665,15 +665,13 @@ func TestPhaseTwoCatalogRetentionAdmissionUsesTheCandidatesOwnScheduleOffset(t *
 	if err != nil || len(admitted.QueryGroups) != 1 {
 		t.Fatalf("admission(default) = (%+v, %v), want the Plan kept", admitted.QueryGroups, err)
 	}
-	// The retention is derived from the longest cadence the deployment
-	// supports, so shortening the configured floor no longer shortens it;
-	// the way to need more retention than there is, is a Plan evaluated less
-	// often than that bound. The property under test is unchanged: the
-	// candidate's own schedule offset decides whether it fits -- only the
-	// consequence moved, from refusing the Catalog to withholding the Plan.
+	// The candidate's own schedule offset decides whether it fits. The only
+	// Plan that does not is one whose frozen Slot would need its content kept
+	// past the state store's own ceiling; everything short of that is given
+	// the retention it needs.
 	beyond := controlplane.Catalog{QueryGroups: []controlplane.QueryGroup{{Plans: []controlplane.FrozenPlan{{
 		ScheduleSpec: execution.ScheduleSpec{
-			EvaluationIntervalSeconds: int64(phaseTwoMaxSupportedEvaluationInterval/time.Second) + 60, Timezone: "UTC"},
+			EvaluationIntervalSeconds: int64(phaseTwoObjectRetentionLimit(cfg)/time.Second) + 60, Timezone: "UTC"},
 	}}}}}
 	admitted, err = phaseTwoCatalogRetentionAdmission(cfg)(beyond)
 	if err != nil {
@@ -788,54 +786,10 @@ func (catalog *fakeFrozenCatalog) FreezeSlotContract(
 var _ access.FrozenPlanSource = (*productionFrozenExecution)(nil)
 var _ execution.QueryFreeFinalizationSource = (*productionFrozenExecution)(nil)
 
-func TestProductionPhaseTwoControlConfirmsColdStartBeforeInitialActivation(t *testing.T) {
-	publication := controlplane.SnapshotPublicationRef{SnapshotRevision: "snapshot-1", PublicationEpoch: 1}
-	reconciler := &fakeSourceReconciler{results: []controlplane.SourceRefreshResult{
-		{Status: controlplane.SourceRefreshPendingConfirmation, Observation: "observation-1"},
-		{Status: controlplane.SourceRefreshPublished, Observation: "observation-1", Publication: publication},
-	}}
-	repository := &fakeProductionCatalogRepository{activationErr: controlplane.ErrActivationUnavailable,
-		snapshot: controlplane.PublishedSnapshot{Publication: publication,
-			QueryGroups: []controlplane.QueryGroup{{Identity: "query-group-1"}}}}
-	activator := &fakeInitialScheduleActivator{state: controlplane.ActivationState{
-		RecordRevision: 1, Current: publication,
-	}}
-	waits := 0
-	var observations []observability.Observation
-	control, err := newProductionPhaseTwoControl(productionPhaseTwoControlDependencies{
-		Source: fakeStrategySource{}, Planner: fakePrimaryQueryCompiler{}, Reconciler: reconciler,
-		Activator: activator, Repository: repository, Schedules: &fakeScheduleProjection{},
-		Progress: &fakeProductionProgressReader{}, RefreshInterval: time.Second,
-		Observer: observability.ObserverFunc(func(_ context.Context, observation observability.Observation) {
-			observations = append(observations, observation)
-		}),
-		Wait: func(context.Context, time.Duration) error { waits++; return nil },
-	})
-	if err != nil {
-		t.Fatalf("newProductionPhaseTwoControl() error = %v", err)
-	}
-	result, err := control.InitialRefresh(context.Background())
-	if err != nil || result.Status != phaseTwoControlHealthy ||
-		!reflect.DeepEqual(result.QueryGroups, []execution.QueryGroupIdentity{"query-group-1"}) {
-		t.Fatalf("InitialRefresh() = %#v, %v", result, err)
-	}
-	if reconciler.calls != 2 || waits != 1 || activator.calls != 1 || activator.publication != publication {
-		t.Fatalf("cold-start calls refresh/wait/activate=%d/%d/%d publication=%+v",
-			reconciler.calls, waits, activator.calls, activator.publication)
-	}
-	pending := sourceRefreshObservations(observations, observability.SourceRefreshPending)
-	if len(pending) != 1 || pending[0].SourceRefresh.ObservationID != "observation-1" ||
-		pending[0].SourceRefresh.SnapshotRevision != "" || pending[0].SourceRefresh.PublicationEpoch != 0 ||
-		pending[0].SourceRefresh.CountsKnown {
-		t.Fatalf("cold-start pending observation = %#v", pending)
-	}
-	published := sourceRefreshObservations(observations, observability.SourceRefreshPublished)
-	if len(published) != 1 || published[0].SourceRefresh.SnapshotRevision != string(publication.SnapshotRevision) ||
-		published[0].SourceRefresh.PublicationEpoch != publication.PublicationEpoch {
-		t.Fatalf("cold-start published observation = %#v", published)
-	}
-}
-
+// A follower tick loads the active set and, first, steps the reconciler's
+// catalog memory down: a process on this path is not the Leader, and what
+// it published in an earlier term is not its to answer strategy lookups
+// from.
 func TestProductionPhaseTwoControlLoadsAllActiveQueryGroups(t *testing.T) {
 	publication := controlplane.SnapshotPublicationRef{SnapshotRevision: "snapshot-1", PublicationEpoch: 1}
 	repository := &fakeProductionCatalogRepository{
@@ -844,11 +798,11 @@ func TestProductionPhaseTwoControlLoadsAllActiveQueryGroups(t *testing.T) {
 			{Identity: "query-group-2"}, {Identity: "query-group-1"},
 		}},
 	}
+	reconciler := &fakeSourceReconciler{}
 	control, err := newProductionPhaseTwoControl(productionPhaseTwoControlDependencies{
-		Source: fakeStrategySource{}, Planner: fakePrimaryQueryCompiler{}, Reconciler: &fakeSourceReconciler{},
+		Source: fakeStrategySource{}, Planner: fakePrimaryQueryCompiler{}, Reconciler: reconciler,
 		Activator: &fakeInitialScheduleActivator{}, Repository: repository, Schedules: &fakeScheduleProjection{},
-		Progress: &fakeProductionProgressReader{}, RefreshInterval: time.Second,
-		Wait: func(context.Context, time.Duration) error { return nil },
+		Progress: &fakeProductionProgressReader{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -857,6 +811,9 @@ func TestProductionPhaseTwoControlLoadsAllActiveQueryGroups(t *testing.T) {
 	if err != nil || result.Status != phaseTwoControlHealthy ||
 		!reflect.DeepEqual(result.QueryGroups, []execution.QueryGroupIdentity{"query-group-1", "query-group-2"}) {
 		t.Fatalf("LoadActive() = %#v, %v", result, err)
+	}
+	if reconciler.stepDowns != 1 || reconciler.calls != 0 {
+		t.Fatalf("a follower tick stepped the reconciler down %d times and refreshed %d times, want 1 and 0", reconciler.stepDowns, reconciler.calls)
 	}
 }
 
@@ -888,7 +845,6 @@ func TestProductionPhaseTwoControlDrainsRetiredQueryGroupBeforeRemovingIt(t *tes
 		Observer: observability.ObserverFunc(func(_ context.Context, observation observability.Observation) {
 			observations = append(observations, observation)
 		}),
-		RefreshInterval: time.Second, Wait: func(context.Context, time.Duration) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -942,7 +898,6 @@ func TestProductionPhaseTwoControlRemovesRetiredZeroSlotQueryGroupWithoutProgres
 		Progress: &fakeProductionProgressReader{byGroup: map[execution.QueryGroupIdentity]execution.ProgressLoadResult{
 			retired: {Status: execution.ProgressMissing},
 		}},
-		RefreshInterval: time.Second, Wait: func(context.Context, time.Duration) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1023,7 +978,6 @@ func TestProductionPhaseTwoControlRetiresUndrainedQueryGroupPastTerminationWindo
 				Observer: observability.ObserverFunc(func(_ context.Context, observation observability.Observation) {
 					observations = append(observations, observation)
 				}),
-				RefreshInterval: time.Second, Wait: func(context.Context, time.Duration) error { return nil },
 				Now: func() time.Time { return test.now }, MaxReplayAge: test.maxReplayAge,
 			})
 			if err != nil {
@@ -1054,7 +1008,6 @@ func TestProductionPhaseTwoControlRetiresUndrainedQueryGroupPastTerminationWindo
 		Source: fakeStrategySource{}, Planner: fakePrimaryQueryCompiler{}, Reconciler: &fakeSourceReconciler{},
 		Activator: &fakeInitialScheduleActivator{}, Repository: &fakeProductionCatalogRepository{},
 		Schedules: &fakeScheduleProjection{}, Progress: &fakeProductionProgressReader{},
-		RefreshInterval: time.Second, Wait: func(context.Context, time.Duration) error { return nil },
 		MaxReplayAge: -time.Second,
 	}); err == nil {
 		t.Fatal("negative replay age was accepted")
@@ -1089,7 +1042,6 @@ func TestProductionPhaseTwoControlIsolatesInvalidDrainingQueryGroup(t *testing.T
 		Observer: observability.ObserverFunc(func(_ context.Context, observation observability.Observation) {
 			observations = append(observations, observation)
 		}),
-		RefreshInterval: time.Second, Wait: func(context.Context, time.Duration) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1105,71 +1057,6 @@ func TestProductionPhaseTwoControlIsolatesInvalidDrainingQueryGroup(t *testing.T
 	if observations[1].DrainingQG == nil || observations[1].DrainingQG.Total != 1 ||
 		observations[1].DrainingQG.Undrained != 0 || observations[1].DrainingQG.Isolated != 1 {
 		t.Fatalf("draining aggregate observation=%#v", observations)
-	}
-}
-
-func TestProductionPhaseTwoControlKeepsCurrentActivationWhileCandidateIsPending(t *testing.T) {
-	publication := controlplane.SnapshotPublicationRef{SnapshotRevision: "snapshot-current", PublicationEpoch: 2}
-	reconciler := &fakeSourceReconciler{results: []controlplane.SourceRefreshResult{
-		{Status: controlplane.SourceRefreshPendingConfirmation, Observation: "observation-next"},
-		{Status: controlplane.SourceRefreshPendingConfirmation, Observation: "observation-next-changed"},
-	}}
-	renewErr := errors.New("renew pending current objects")
-	repository := &fakeProductionCatalogRepository{activation: controlplane.ActivationState{
-		RecordRevision: 1, Current: publication,
-	}, snapshot: controlplane.PublishedSnapshot{Publication: publication,
-		QueryGroups: []controlplane.QueryGroup{{Identity: "query-group-1"}}}, renewErrs: []error{renewErr, nil}}
-	activator := &fakeInitialScheduleActivator{}
-	var observations []observability.Observation
-	control, err := newProductionPhaseTwoControl(productionPhaseTwoControlDependencies{
-		Source: fakeStrategySource{}, Planner: fakePrimaryQueryCompiler{}, Reconciler: reconciler,
-		Activator: activator, Repository: repository, Schedules: &fakeScheduleProjection{},
-		Progress: &fakeProductionProgressReader{}, RefreshInterval: time.Second,
-		Observer: observability.ObserverFunc(func(_ context.Context, observation observability.Observation) {
-			observations = append(observations, observation)
-		}),
-		Wait: func(context.Context, time.Duration) error { return errors.New("unexpected wait") },
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := control.Refresh(context.Background())
-	if err != nil || result.Status != phaseTwoControlDegradedLastGood ||
-		result.ReasonCode != observability.ReasonCode(contract.ReasonRedisUnavailable) ||
-		!errors.Is(result.Cause, renewErr) ||
-		!reflect.DeepEqual(result.QueryGroups, []execution.QueryGroupIdentity{"query-group-1"}) {
-		t.Fatalf("Refresh() = %#v, %v", result, err)
-	}
-	if activator.calls != 0 {
-		t.Fatalf("pending candidate changed current activation, calls = %d", activator.calls)
-	}
-	recovered, err := control.Refresh(context.Background())
-	if err != nil || recovered.Status != phaseTwoControlHealthy ||
-		!reflect.DeepEqual(recovered.QueryGroups, []execution.QueryGroupIdentity{"query-group-1"}) {
-		t.Fatalf("recovered Refresh() = %#v, %v", recovered, err)
-	}
-	if repository.renewCalls != 2 {
-		t.Fatalf("pending refresh renew calls=%d, want 2", repository.renewCalls)
-	}
-	// The active set of a legacy activation is read from the publication's
-	// content description, never from the snapshot body.
-	if repository.contentLoads != 2 {
-		t.Fatalf("pending legacy refresh content reads=%d, want only the two execution reads", repository.contentLoads)
-	}
-	pending := sourceRefreshObservations(observations, observability.SourceRefreshPending)
-	// A pending round reports the size of the active set. It used to report a
-	// change as well, differenced from the activation state against itself, which
-	// could only ever come out as added=0/retired=0 and was read as a measurement.
-	if len(pending) != 2 || pending[0].SourceRefresh.ObservationID != "observation-next" ||
-		pending[1].SourceRefresh.ObservationID != "observation-next-changed" ||
-		!pending[0].SourceRefresh.ActiveQueryGroupsKnown || !pending[1].SourceRefresh.ActiveQueryGroupsKnown ||
-		pending[0].SourceRefresh.CountsKnown || pending[1].SourceRefresh.CountsKnown {
-		t.Fatalf("pending source refresh observations=%#v", pending)
-	}
-	renewal := observationsWithoutDrainingFacts(observations)
-	if len(renewal) != 2 || renewal[0].Stage != observability.StageActiveQGSet ||
-		renewal[0].Result != observability.ResultDegraded || renewal[1].Result != observability.ResultRecovered {
-		t.Fatalf("pending renewal observations=%#v", renewal)
 	}
 }
 
@@ -1191,7 +1078,6 @@ func TestProductionPhaseTwoControlKeepsHealthyQueryGroupsAcrossPublicationConfli
 		Progress: &fakeProductionProgressReader{}, Observer: observability.ObserverFunc(func(_ context.Context, observation observability.Observation) {
 			observations = append(observations, observation)
 		}),
-		RefreshInterval: time.Second, Wait: func(context.Context, time.Duration) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1246,11 +1132,10 @@ func TestProductionPhaseTwoControlReportsUnchangedRefreshWithoutChangingActiveSe
 	control, err := newProductionPhaseTwoControl(productionPhaseTwoControlDependencies{
 		Source: fakeStrategySource{}, Planner: fakePrimaryQueryCompiler{}, Reconciler: reconciler,
 		Activator: activator, Repository: repository, Schedules: &fakeScheduleProjection{},
-		Progress: &fakeProductionProgressReader{}, RefreshInterval: time.Second,
+		Progress: &fakeProductionProgressReader{},
 		Observer: observability.ObserverFunc(func(_ context.Context, observation observability.Observation) {
 			observations = append(observations, observation)
 		}),
-		Wait: func(context.Context, time.Duration) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1279,63 +1164,23 @@ func TestProductionPhaseTwoControlReportsUnchangedRefreshWithoutChangingActiveSe
 	}
 }
 
-func TestProductionPhaseTwoControlLegacyUnchangedRefreshAddsNoDiagnosticSnapshotRead(t *testing.T) {
-	publication := controlplane.SnapshotPublicationRef{SnapshotRevision: "snapshot-current", PublicationEpoch: 2}
-	activation := controlplane.ActivationState{RecordRevision: 2, Current: publication}
-	repository := &fakeProductionCatalogRepository{
-		activation: activation,
-		snapshot: controlplane.PublishedSnapshot{Publication: publication,
-			QueryGroups: []controlplane.QueryGroup{{Identity: "query-group-1"}}},
-	}
-	var observations []observability.Observation
-	control, err := newProductionPhaseTwoControl(productionPhaseTwoControlDependencies{
-		Source: fakeStrategySource{}, Planner: fakePrimaryQueryCompiler{},
-		Reconciler: &fakeSourceReconciler{results: []controlplane.SourceRefreshResult{
-			{Status: controlplane.SourceRefreshUnchanged, Observation: "observation-current", Publication: publication},
-			{Status: controlplane.SourceRefreshUnchanged, Observation: "observation-current", Publication: publication},
-		}},
-		Activator: &fakeInitialScheduleActivator{state: activation}, Repository: repository,
-		Schedules: &fakeScheduleProjection{}, Progress: &fakeProductionProgressReader{},
-		Observer: observability.ObserverFunc(func(_ context.Context, observation observability.Observation) {
-			observations = append(observations, observation)
-		}),
-		RefreshInterval: time.Second, Wait: func(context.Context, time.Duration) error { return nil },
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for index := 0; index < 2; index++ {
-		result, refreshErr := control.Refresh(context.Background())
-		if refreshErr != nil {
-			t.Fatalf("legacy Refresh(%d)=(%#v,%v)", index, result, refreshErr)
-		}
-	}
-	unchanged := sourceRefreshObservations(observations, observability.SourceRefreshUnchanged)
-	if len(unchanged) != 2 || !unchanged[0].SourceRefresh.CountsKnown ||
-		unchanged[0].SourceRefresh.OldQueryGroups != 1 || unchanged[0].SourceRefresh.NewQueryGroups != 1 {
-		t.Fatalf("legacy unchanged source observations=%#v", unchanged)
-	}
-	if repository.contentLoads != 2 {
-		t.Fatalf("unchanged legacy refresh content reads=%d, want only the two execution reads", repository.contentLoads)
-	}
-}
-
 func TestProductionPhaseTwoControlSourceRefreshFactsUseExactChangedSetsAndKeepReadFailureDiagnostic(t *testing.T) {
 	previousPublication := controlplane.SnapshotPublicationRef{SnapshotRevision: "snapshot-1", PublicationEpoch: 1}
 	currentPublication := controlplane.SnapshotPublicationRef{SnapshotRevision: "snapshot-2", PublicationEpoch: 2}
 	currentRef := controlplane.ActiveQueryGroupSetRef{
 		SchemaVersion: "alarmd-active-qg-set-v1", Digest: strings.Repeat("b", 64), QGCount: 2,
 	}
+	previousRef := controlplane.ActiveQueryGroupSetRef{
+		SchemaVersion: "alarmd-active-qg-set-v1", Digest: strings.Repeat("a", 64), QGCount: 2,
+	}
 	repository := &fakeProductionCatalogRepository{
-		activeGroups: []execution.QueryGroupIdentity{"query-group-b", "query-group-c"},
-		snapshots: map[controlplane.SnapshotPublicationRef]controlplane.PublishedSnapshot{
-			previousPublication: {Publication: previousPublication, QueryGroups: []controlplane.QueryGroup{
-				{Identity: "query-group-a"}, {Identity: "query-group-b"},
-			}},
+		activeSets: map[string][]execution.QueryGroupIdentity{
+			previousRef.Digest: {"query-group-a", "query-group-b"},
+			currentRef.Digest:  {"query-group-b", "query-group-c"},
 		},
 	}
 	runtime := &productionPhaseTwoControl{dependencies: productionPhaseTwoControlDependencies{Repository: repository}}
-	previous := controlplane.ActivationState{RecordRevision: 1, Current: previousPublication}
+	previous := controlplane.ActivationState{RecordRevision: 1, Current: previousPublication, ActiveQGSetRef: previousRef}
 	current := controlplane.ActivationState{RecordRevision: 2, Current: currentPublication, ActiveQGSetRef: currentRef}
 
 	refresh := controlplane.SourceRefreshResult{
@@ -1397,7 +1242,6 @@ func TestProductionPhaseTwoControlObservesPublishedBeforeActivationFailure(t *te
 		Observer: observability.ObserverFunc(func(_ context.Context, observation observability.Observation) {
 			observations = append(observations, observation)
 		}),
-		RefreshInterval: time.Second, Wait: func(context.Context, time.Duration) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1451,7 +1295,6 @@ func TestProductionPhaseTwoControlObservesUnchangedBeforeActiveSetFailure(t *tes
 		Observer: observability.ObserverFunc(func(_ context.Context, observation observability.Observation) {
 			observations = append(observations, observation)
 		}),
-		RefreshInterval: time.Second, Wait: func(context.Context, time.Duration) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1504,8 +1347,7 @@ func TestProductionPhaseTwoControlKeepsLastGoodAcrossFailedRefreshAndRecovery(t 
 	control, err := newProductionPhaseTwoControl(productionPhaseTwoControlDependencies{
 		Source: fakeStrategySource{}, Planner: fakePrimaryQueryCompiler{}, Reconciler: reconciler,
 		Activator: activator, Repository: repository, Schedules: &fakeScheduleProjection{},
-		Progress:        &fakeProductionProgressReader{},
-		RefreshInterval: time.Second, Wait: func(context.Context, time.Duration) error { return nil },
+		Progress: &fakeProductionProgressReader{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1550,7 +1392,6 @@ func TestProductionPhaseTwoControlObservesRenewFailureAsOneRecoverableEpisode(t 
 		Observer: observability.ObserverFunc(func(_ context.Context, observation observability.Observation) {
 			observations = append(observations, observation)
 		}),
-		RefreshInterval: time.Second, Wait: func(context.Context, time.Duration) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1618,10 +1459,9 @@ func TestProductionPhaseTwoControlPreservesPrimaryRefreshClassificationWithoutLa
 					activation: controlplane.ActivationState{RecordRevision: 2, Current: publication},
 					snapshot: controlplane.PublishedSnapshot{Publication: publication,
 						QueryGroups: []controlplane.QueryGroup{{Identity: "query-group-healthy"}}},
-					snapshotErr: test.snapshotErr,
+					snapshotErr: test.snapshotErr, activeSetErr: test.snapshotErr,
 				},
 				Schedules: &fakeScheduleProjection{}, Progress: &fakeProductionProgressReader{},
-				RefreshInterval: time.Second, Wait: func(context.Context, time.Duration) error { return nil },
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -1668,8 +1508,7 @@ func TestProductionPhaseTwoControlKeepsLastGoodAcrossFailedCutoverAndRecovery(t 
 		Observer: observability.ObserverFunc(func(_ context.Context, observation observability.Observation) {
 			observations = append(observations, observation)
 		}),
-		Progress:        &fakeProductionProgressReader{},
-		RefreshInterval: time.Second, Wait: func(context.Context, time.Duration) error { return nil },
+		Progress: &fakeProductionProgressReader{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1725,10 +1564,13 @@ func TestProductionPhaseTwoControlKeepsLastGoodAcrossFailedCutoverAndRecovery(t 
 }
 
 type fakeSourceReconciler struct {
-	results []controlplane.SourceRefreshResult
-	errs    []error
-	calls   int
+	results   []controlplane.SourceRefreshResult
+	errs      []error
+	calls     int
+	stepDowns int
 }
+
+func (reconciler *fakeSourceReconciler) StepDown() { reconciler.stepDowns++ }
 
 func (reconciler *fakeSourceReconciler) Refresh(
 	context.Context,
@@ -1755,6 +1597,7 @@ type fakeProductionCatalogRepository struct {
 	contentLoads   int
 	snapshots      map[controlplane.SnapshotPublicationRef]controlplane.PublishedSnapshot
 	activeGroups   []execution.QueryGroupIdentity
+	activeSets     map[string][]execution.QueryGroupIdentity
 	activeSetErr   error
 	activeSetLoads int
 	renewErr       error
@@ -1765,6 +1608,12 @@ type fakeProductionCatalogRepository struct {
 	versionErr     error
 	successMarks   []time.Time
 	successMarkErr error
+
+	// headerRebuilds is how many times the leader asked for the activation
+	// header to be written back, and headerRebuild what each answer was.
+	headerRebuilds   int
+	headerRebuild    controlplane.ActivationHeaderRebuildOutcome
+	headerRebuildErr error
 }
 
 func (repository *fakeProductionCatalogRepository) MarkSourceRefreshSuccess(_ context.Context, at time.Time) error {
@@ -1779,6 +1628,14 @@ func (repository *fakeProductionCatalogRepository) LoadSourceRefreshSuccess(cont
 	return repository.successMarks[len(repository.successMarks)-1], true, nil
 }
 
+func (repository *fakeProductionCatalogRepository) RebuildActivationHeader(context.Context) (controlplane.ActivationHeaderRebuildOutcome, error) {
+	repository.headerRebuilds++
+	if repository.headerRebuild == "" && repository.headerRebuildErr == nil {
+		return controlplane.ActivationHeaderRebuildNotNeeded, nil
+	}
+	return repository.headerRebuild, repository.headerRebuildErr
+}
+
 func (repository *fakeProductionCatalogRepository) RenewCurrentActivationObjects(context.Context) error {
 	repository.renewCalls++
 	if repository.renewCalls <= len(repository.renewErrs) {
@@ -1787,11 +1644,29 @@ func (repository *fakeProductionCatalogRepository) RenewCurrentActivationObjects
 	return repository.renewErr
 }
 
+// LoadActiveQueryGroupSet is activeGroups when a test sets it. Unset, it is
+// the Query Groups the activation was cut over to, which is what a cutover
+// writes the set as: those of the activation's current publication, or of
+// the one publication the fake holds when the activation is the activator's.
 func (repository *fakeProductionCatalogRepository) LoadActiveQueryGroupSet(
-	context.Context,
-	controlplane.ActiveQueryGroupSetRef,
+	_ context.Context,
+	ref controlplane.ActiveQueryGroupSetRef,
 ) ([]execution.QueryGroupIdentity, error) {
 	repository.activeSetLoads++
+	if groups, ok := repository.activeSets[ref.Digest]; ok && repository.activeSetErr == nil {
+		return append([]execution.QueryGroupIdentity{}, groups...), nil
+	}
+	if repository.activeGroups == nil && repository.activeSetErr == nil {
+		snapshot, ok := repository.snapshots[repository.activation.Current]
+		if !ok {
+			snapshot = repository.snapshot
+		}
+		groups := make([]execution.QueryGroupIdentity, 0, len(snapshot.QueryGroups))
+		for _, group := range snapshot.QueryGroups {
+			groups = append(groups, group.Identity)
+		}
+		return groups, nil
+	}
 	return append([]execution.QueryGroupIdentity{}, repository.activeGroups...), repository.activeSetErr
 }
 
@@ -1808,7 +1683,7 @@ func sourceRefreshObservations(
 	return matches
 }
 
-func (repository *fakeProductionCatalogRepository) LoadActivation(
+func (repository *fakeProductionCatalogRepository) LoadActivationHead(
 	context.Context,
 ) (controlplane.ActivationState, error) {
 	return repository.activation, repository.activationErr
@@ -2017,11 +1892,11 @@ func TestProductionPhaseTwoActivationChecksExactPersistedStateEpoch(t *testing.T
 				ScheduleRevision: "plan-schedule-1", RequiredFullSlots: 2}}},
 	}}
 	activation := productionPhaseTwoActivation{source: source}
-	active, err := activation.IsPlanActive(context.Background(), contractRef, plan, 7)
+	active, err := activation.IsPlanActive(context.Background(), contractRef, execution.PlanKey{PlanIdentity: plan}, 7)
 	if err != nil || !active {
 		t.Fatalf("IsPlanActive(exact epoch) = %v, %v", active, err)
 	}
-	active, err = activation.IsPlanActive(context.Background(), contractRef, plan, 8)
+	active, err = activation.IsPlanActive(context.Background(), contractRef, execution.PlanKey{PlanIdentity: plan}, 8)
 	if err != nil || active {
 		t.Fatalf("IsPlanActive(stale epoch) = %v, %v", active, err)
 	}
@@ -2045,13 +1920,15 @@ func TestProductionPhaseTwoOwnershipUsesAssignmentAndLeaseBeforeRunner(t *testin
 		t.Fatal(err)
 	}
 	var observations []observability.Observation
+	cooldowns := &countingCooldownStore{}
 	production, err := newProductionPhaseTwoOwnership(productionPhaseTwoOwnershipDependencies{
-		Store: store, WorkerID: "worker-1", Catalog: unavailableSlotCatalog{},
+		QueryCooldowns: cooldowns,
+		Store:          store, WorkerID: "worker-1", Catalog: unavailableSlotCatalog{},
 		Progress: unavailableScheduleProgress{}, Executor: rejectingSlotExecutor{}, Now: func() time.Time { return now },
 		ControlLeaderTTL: time.Minute, Observer: observability.ObserverFunc(func(_ context.Context, observation observability.Observation) {
 			observations = append(observations, observation)
 		}), Reconcile: reconciler, Flights: flights, RecoveryLimits: limits, PostRecoveryTerminalDelay: time.Minute, QueryDeadlineReserve: 5 * time.Second,
-		SnapshotRetention: time.Hour, PublicationDelayAllowance: time.Minute, SettlingWait: 30 * time.Second, LeaseTTL: 30 * time.Second, ReconcileInterval: 5 * time.Second,
+		SnapshotRetention: time.Hour, PublicationDelayAllowance: time.Minute, SettlingWait: 30 * time.Second, LeaseTTL: 30 * time.Second, ReconcileInterval: 5 * time.Second, ContentScopes: noContentScopes,
 	})
 	if err != nil {
 		t.Fatalf("newProductionPhaseTwoOwnership() error = %v", err)
@@ -2096,6 +1973,13 @@ func TestProductionPhaseTwoOwnershipUsesAssignmentAndLeaseBeforeRunner(t *testin
 	if !hasObservedStage(observations, observability.StageLeaseRenewed) {
 		t.Fatalf("ownership observations = %+v, want lease_renewed", observations)
 	}
+	// The Query Group's pool record is read on its first round, so a Query
+	// Group that was in the pool before a restart or a change of owner is
+	// still in it.
+	_, _, _ = runner.RunOne(context.Background())
+	if cooldowns.loads != 1 {
+		t.Fatalf("pool record read %d times on the first round, want once", cooldowns.loads)
+	}
 	store.checkErr = ownership.ErrStaleFence
 	if _, attempted, err := runner.RunOne(context.Background()); !errors.Is(err, ownership.ErrStaleFence) || attempted {
 		t.Fatalf("RunOne(stale fence) attempted=%v error=%v", attempted, err)
@@ -2138,7 +2022,7 @@ func TestProductionPhaseTwoOwnershipFollowerReadsAssignmentWithoutPublishing(t *
 		Progress: unavailableScheduleProgress{}, Executor: rejectingSlotExecutor{}, Now: func() time.Time { return now },
 		ControlLeaderTTL: time.Minute, Observer: observability.NopObserver{}, Reconcile: reconciler,
 		Flights: flights, RecoveryLimits: limits, PostRecoveryTerminalDelay: time.Minute, QueryDeadlineReserve: 5 * time.Second,
-		SnapshotRetention: time.Hour, PublicationDelayAllowance: time.Minute, SettlingWait: 30 * time.Second, LeaseTTL: 30 * time.Second, ReconcileInterval: 5 * time.Second,
+		SnapshotRetention: time.Hour, PublicationDelayAllowance: time.Minute, SettlingWait: 30 * time.Second, LeaseTTL: 30 * time.Second, ReconcileInterval: 5 * time.Second, ContentScopes: noContentScopes,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2178,7 +2062,7 @@ func TestProductionSlotObservationsBracketRealExecutionWithFrozenProvenance(t *t
 				Contract: contractRef,
 				DuePlanTargets: execution.FrozenDuePlanTargets{
 					DuePlanSetDigest: contractRef.DuePlanSetDigest,
-					Plans:            []execution.PlanIdentity{{TenantID: "tenant", BusinessID: "2", StrategyID: "7"}},
+					Plans:            []execution.PlanKey{{PlanIdentity: execution.PlanIdentity{TenantID: "tenant", BusinessID: "2", StrategyID: "7"}}},
 				},
 				EarliestQueryDeadlineUnixMilli: 121_000,
 				RecoveryUntilUnixMilli:         721_000,
@@ -2331,9 +2215,24 @@ func TestObservedProductionSlotExecutorDoesNotReportReadinessDeferralAsFailure(t
 		t.Fatalf("Execute() error=%v, want wrapped readiness error", err)
 	}
 	if len(observations) != 2 || observations[1].Stage != observability.StageSlotCompleted ||
-		observations[1].Result != observability.ResultRetrying ||
-		observations[1].ReasonCode != observability.ReasonNone || observations[1].Err != nil {
+		observations[1].Result != observability.ResultRetrying || observations[1].Err != nil {
 		t.Fatalf("readiness observations=%+v, want non-failure retrying completion", observations)
+	}
+	// A deferral is the normal pacing of a Slot, and it has to say so on the
+	// completion line as the query line does. It used to carry no reason,
+	// which on a retrying result normalizes to reason_not_reported: on a live
+	// deployment that was every Query Group's most frequent slot_completed
+	// line, and the reason label of the stage counter with it, reading as a
+	// site that failed to report.
+	completed := observability.NormalizeObservation(observations[1])
+	if completed.ReasonCode != observability.ReasonCode(contract.ReasonQueryNotReady) {
+		t.Fatalf("deferral reason=%q, want %s as the query stage says it", completed.ReasonCode, contract.ReasonQueryNotReady)
+	}
+	if completed.ReasonCode == observability.ReasonNotReported || completed.ReasonCode == observability.ReasonInternalUnknown || completed.ReasonCode == observability.ReasonOther {
+		t.Fatalf("deferral normalizes to %q: the line reads as a fault", completed.ReasonCode)
+	}
+	if metricReason := observability.NormalizeMetricReason(observability.ComponentScheduler, observations[1].ReasonCode, observations[1].Result); metricReason == observability.ReasonNotReported {
+		t.Fatalf("deferral metric reason=%q, want a named class", metricReason)
 	}
 }
 
@@ -2357,8 +2256,12 @@ func productionRequest(fact execution.FrozenSlotContractFact, operation executio
 }
 
 type fakePhaseTwoOwnershipStore struct {
-	mu                     sync.Mutex
-	now                    time.Time
+	mu  sync.Mutex
+	now time.Time
+	// sweepErr, when set, is what SweepAssignments fails with after
+	// recording the keep set; sweep is what it reports when it does not.
+	sweepErr               error
+	sweep                  ownership.AssignmentSweep
 	worker                 ownership.WorkerRegistration
 	assignment             ownership.AssignmentRecord
 	checkErr               error
@@ -2375,6 +2278,11 @@ type fakePhaseTwoOwnershipStore struct {
 	renewCalls       int
 	renewLeaderErr   func() error
 	renewLeaderCalls int
+	// decisions is every Assignment decision published, in order, so a test
+	// can read what a publication was conditioned on and what it carried.
+	decisions []ownership.AssignmentDecision
+	// sweeps is the keep set of every Assignment sweep asked of the store.
+	sweeps []map[execution.QueryGroupIdentity]struct{}
 }
 
 func (store *fakePhaseTwoOwnershipStore) renewCount() int {
@@ -2396,10 +2304,27 @@ func (store *fakePhaseTwoOwnershipStore) RegisterWorker(_ context.Context, worke
 	return nil
 }
 
-func (store *fakePhaseTwoOwnershipStore) ListReadyWorkers(context.Context, time.Time) ([]ownership.WorkerRegistration, error) {
+func (store *fakePhaseTwoOwnershipStore) ListReadyWorkers(
+	context.Context, time.Time,
+) ([]ownership.WorkerRegistration, ownership.ControlReadStats, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	return []ownership.WorkerRegistration{store.worker}, nil
+	return []ownership.WorkerRegistration{store.worker}, ownership.ControlReadStats{Keys: 1, RoundTrips: 1}, nil
+}
+
+func (store *fakePhaseTwoOwnershipStore) ReadAssignments(
+	_ context.Context,
+	queryGroups []execution.QueryGroupIdentity,
+) (map[execution.QueryGroupIdentity]ownership.AssignmentRecord, ownership.ControlReadStats, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	found := make(map[execution.QueryGroupIdentity]ownership.AssignmentRecord, len(queryGroups))
+	for _, queryGroup := range queryGroups {
+		if store.assignment.QueryGroup == queryGroup {
+			found[queryGroup] = store.assignment
+		}
+	}
+	return found, ownership.ControlReadStats{Keys: len(queryGroups), RoundTrips: 1}, nil
 }
 
 func (store *fakePhaseTwoOwnershipStore) ReadAssignment(context.Context, execution.QueryGroupIdentity) (ownership.AssignmentRecord, error) {
@@ -2419,10 +2344,12 @@ func (store *fakePhaseTwoOwnershipStore) PublishAssignment(
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	store.publishAssignmentCalls++
+	store.decisions = append(store.decisions, decision)
 	store.assignment = ownership.AssignmentRecord{
 		QueryGroup: decision.QueryGroup, DesiredWorkerID: decision.DesiredWorkerID,
 		AssignmentGeneration: 1, RecordRevision: 1, ControlEpoch: authority.Fence.OwnerEpoch,
 		PlacementReason: decision.PlacementReason, AssignedAt: decision.DecidedAt,
+		ContentScope: decision.ContentScope,
 	}
 	return store.assignment, nil
 }
@@ -2478,6 +2405,16 @@ func (store *fakePhaseTwoOwnershipStore) Acquire(
 	}, Deadline: at.Add(ttl)}, nil
 }
 
+func (store *fakePhaseTwoOwnershipStore) RenewDeclaring(
+	ctx context.Context,
+	fence execution.OwnerFence,
+	_ string,
+	at time.Time,
+	ttl time.Duration,
+) (ownership.Lease, error) {
+	return store.Renew(ctx, fence, at, ttl)
+}
+
 func (store *fakePhaseTwoOwnershipStore) Renew(
 	_ context.Context,
 	fence execution.OwnerFence,
@@ -2501,7 +2438,7 @@ func (store *fakePhaseTwoOwnershipStore) Renew(
 	return ownership.Lease{Fence: fence, Deadline: at.Add(ttl)}, nil
 }
 
-func (store *fakePhaseTwoOwnershipStore) CheckFence(context.Context, execution.OwnerFence, time.Time) error {
+func (store *fakePhaseTwoOwnershipStore) CheckFence(context.Context, execution.OwnerFence) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	return store.checkErr
@@ -2510,7 +2447,6 @@ func (store *fakePhaseTwoOwnershipStore) CheckFence(context.Context, execution.O
 func (store *fakePhaseTwoOwnershipStore) CheckFenceWithAssignment(
 	context.Context,
 	execution.OwnerFence,
-	time.Time,
 ) (ownership.AssignmentRecord, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -2552,6 +2488,10 @@ func (unavailableSlotCatalog) ReadSuccessorFrozenSchedule(context.Context, execu
 
 func (unavailableSlotCatalog) NextSlotAfter(context.Context, execution.QueryGroupIdentity, execution.EvaluationTime) (execution.EvaluationTime, error) {
 	return 0, errors.New("unexpected schedule read")
+}
+
+func (unavailableSlotCatalog) ReadSegmentRepair(context.Context, execution.QueryGroupIdentity, execution.EvaluationTime) (execution.SegmentRepair, bool, error) {
+	return execution.SegmentRepair{}, false, errors.New("unexpected schedule read")
 }
 
 func (unavailableSlotCatalog) FreezeSlotContract(context.Context, execution.FreezeSlotContractRequest) (execution.FrozenSlotContractFact, error) {
@@ -2674,7 +2614,7 @@ func newRenewalTestFixture(t *testing.T) renewalTestFixture {
 			observations = append(observations, observation)
 			mu.Unlock()
 		}), Reconcile: reconciler, Flights: flights, RecoveryLimits: limits, PostRecoveryTerminalDelay: time.Minute,
-		QueryDeadlineReserve: 5 * time.Second, SnapshotRetention: time.Hour, PublicationDelayAllowance: time.Minute, SettlingWait: 30 * time.Second, LeaseTTL: 30 * time.Second, ReconcileInterval: 5 * time.Second,
+		QueryDeadlineReserve: 5 * time.Second, SnapshotRetention: time.Hour, PublicationDelayAllowance: time.Minute, SettlingWait: 30 * time.Second, LeaseTTL: 30 * time.Second, ReconcileInterval: 5 * time.Second, ContentScopes: noContentScopes,
 	})
 	if err != nil {
 		t.Fatalf("newProductionPhaseTwoOwnership() error = %v", err)
@@ -2730,6 +2670,16 @@ func TestProductionMaintainLeaseRetriesTransientRenewFailureInsideTTL(t *testing
 	waitPhaseTwoCondition(t, 3*time.Second, "lease renewal recovery", func() bool {
 		return countLeaseRenewalObservations(fixture.observations(), observability.ResultSuccess, observability.ReasonNone) > 0
 	})
+	// Every renewal line names the lease it is about: the Query Group and
+	// the owner renewing it, failed and renewed alike.
+	for _, observation := range fixture.observations() {
+		if observation.Stage != observability.StageLeaseRenewed {
+			continue
+		}
+		if observation.Trace.QueryGroupKey != "query-group-1" || observation.Trace.OwnerID == "" || observation.Trace.OwnerEpoch == 0 {
+			t.Fatalf("lease renewal %s names %+v, want the Query Group and its owner", observation.Result, observation.Trace)
+		}
+	}
 	select {
 	case err := <-leaseDone:
 		t.Fatalf("MaintainLease() returned %v after the store recovered", err)
@@ -2812,6 +2762,16 @@ func TestProductionMaintainControlLeaderRetriesTransientRenewFailureInsideTTL(t 
 	waitPhaseTwoCondition(t, 3*time.Second, "control leader renewal recovery", func() bool {
 		return countLeaseRenewalObservations(fixture.observations(), observability.ResultSuccess, observability.ReasonNone) > 0
 	})
+	// The control leader's renewal lines name its lease too: the leader key
+	// and the owner renewing it.
+	for _, observation := range fixture.observations() {
+		if observation.Stage != observability.StageLeaseRenewed {
+			continue
+		}
+		if observation.Trace.QueryGroupKey == "" || observation.Trace.OwnerID == "" || observation.Trace.OwnerEpoch == 0 {
+			t.Fatalf("control leader renewal %s names %+v, want the leader key and its owner", observation.Result, observation.Trace)
+		}
+	}
 
 	failure.set(transient)
 	fixture.clock.Advance(2 * time.Minute)
@@ -2903,7 +2863,6 @@ func TestProductionPhaseTwoControlReportsEveryRoundAndPersistsSuccess(t *testing
 		Progress: &fakeProductionProgressReader{}, Observer: observability.ObserverFunc(func(_ context.Context, observation observability.Observation) {
 			observations = append(observations, observation)
 		}),
-		RefreshInterval: time.Second, Wait: func(context.Context, time.Duration) error { return nil },
 		Now: func() time.Time { return now },
 	})
 	if err != nil {
@@ -2964,5 +2923,98 @@ func TestProductionPhaseTwoControlReportsEveryRoundAndPersistsSuccess(t *testing
 	}
 	if !reported {
 		t.Fatal("the failed mark write was not reported")
+	}
+}
+
+// countingCooldownStore holds no records and counts the reads.
+type countingCooldownStore struct{ loads int }
+
+func (store *countingCooldownStore) LoadQueryCooldown(context.Context, execution.QueryGroupIdentity) (scheduler.QueryCooldownRecord, bool, error) {
+	store.loads++
+	return scheduler.QueryCooldownRecord{}, false, nil
+}
+
+func (*countingCooldownStore) SaveQueryCooldown(context.Context, execution.OwnerFence, scheduler.QueryCooldownRecord) error {
+	return nil
+}
+
+// Every query-free finalization names why no query ran, because the
+// completion word does not: SNAPSHOT_UNAVAILABLE is a Slot that came after
+// its recovery bound, a Snapshot that is corrupt, or one that could not be
+// read until the bound passed. Each branch of the resolver, and each one's
+// finalization is valid.
+func TestEveryQueryFreeFinalizationNamesWhyNoQueryRan(t *testing.T) {
+	plan := execution.PlanIdentity{TenantID: "tenant-a", BusinessID: "2", StrategyID: "101"}
+	spec := execution.ScheduleSpec{EvaluationIntervalSeconds: 60, Alignment: 0, Timezone: "UTC"}
+	planRevision, err := execution.DerivePlanScheduleRevision(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schedulePlan := execution.FrozenPlanSchedule{Identity: plan, ScheduleRevision: planRevision, Spec: spec}
+	scheduleRevision, err := execution.DeriveQueryGroupScheduleRevision([]execution.FrozenPlanSchedule{schedulePlan})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contractRef := execution.FrozenExecutionContractRef{
+		Slot:             execution.SlotIdentity{QueryGroup: "query-group-1", EvaluationTime: 120},
+		SnapshotRevision: "snapshot-1", QueryRevision: "query-1", ScheduleRevision: scheduleRevision,
+		ScheduleSegmentStart: 60, DuePlanSetDigest: "due-1",
+	}
+	catalog := &fakeFrozenCatalog{
+		schedule: execution.FrozenQueryGroupSchedule{Segment: execution.ScheduleSegmentFact{
+			Publication: execution.SnapshotPublicationRef{SnapshotRevision: "snapshot-1", PublicationEpoch: 1},
+			QueryGroup:  "query-group-1", QueryRevision: "query-1", ScheduleRevision: scheduleRevision, Start: 60,
+		}, Plans: []execution.FrozenPlanSchedule{schedulePlan}},
+		fact: execution.FrozenSlotContractFact{Contract: contractRef, DuePlans: []execution.DuePlan{{
+			Identity: plan, ScheduleRevision: planRevision, ScheduleSpec: spec, CompletionDeadlineUnixMilli: 180_000,
+		}}, Requirements: []execution.DataRequirement{{Consumers: []execution.DataRequirementConsumer{{
+			Consumer: execution.ConsumerRef{Plan: plan}, ConsumerDeadlineUnixMilli: 180_000, DownstreamExecutionReserveMilliSec: 5_000,
+		}}}}},
+	}
+	repository := &fakeProductionCatalogRepository{snapshot: controlplane.PublishedSnapshot{
+		Publication: controlplane.SnapshotPublicationRef{SnapshotRevision: "snapshot-1", PublicationEpoch: 1},
+		QueryGroups: []controlplane.QueryGroup{{Identity: "query-group-1", QueryPlan: execution.QueryPlanFacts{QueryRevision: "query-1"}}},
+	}}
+	// The clock answers each read with the next instant: before the bound,
+	// then at it, so a resolve that outlasts the bound can be reached. A
+	// request whose replay has not expired reads the clock once before the
+	// resolve and once after it.
+	var instants []int64
+	resolver, err := newProductionFrozenExecution(catalog, repository, func() time.Time {
+		at := instants[0]
+		if len(instants) > 1 {
+			instants = instants[1:]
+		}
+		return time.UnixMilli(at)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := productionRequest(catalog.fact, execution.OperationNormal)
+	before, bound := request.RecoveryUntilUnixMilli-1, request.RecoveryUntilUnixMilli
+	for _, test := range []struct {
+		name     string
+		expired  bool
+		readErr  error
+		instants []int64
+		mode     execution.FinalizationMode
+		cause    execution.CompletionCause
+	}{
+		{"past the replay's reach", true, nil, []int64{before}, execution.FinalizationGapSkipped, execution.CauseExpiredReplay},
+		{"after the bound, nothing resolved", false, nil, []int64{bound}, execution.FinalizationSnapshotUnavailable, execution.CauseExpiredReplay},
+		{"resolved, but the bound passed meanwhile", false, nil, []int64{before, bound}, execution.FinalizationSnapshotUnavailable, execution.CauseExpiredReplay},
+		{"a corrupt Snapshot, on a live Slot", false, &controlplane.PersistedSnapshotCorruptError{Err: errors.New("bad bytes")}, []int64{before}, execution.FinalizationSnapshotUnavailable, execution.CauseSnapshotCorrupt},
+		{"a Snapshot unreadable until the bound", false, controlplane.ErrSnapshotUnavailable, []int64{before, bound}, execution.FinalizationSnapshotUnavailable, execution.CauseSnapshotUnavailablePastBound},
+		{"another resolve failure until the bound", false, errors.New("store refused"), []int64{before, bound}, execution.FinalizationSnapshotUnavailable, execution.CauseResolveFailedPastBound},
+	} {
+		instants, catalog.readErr = test.instants, test.readErr
+		request.ReplayExpired = test.expired
+		finalization, err := resolver.ResolveFinalization(context.Background(), request)
+		if err != nil || finalization.Mode != test.mode || finalization.Cause != test.cause {
+			t.Fatalf("%s: %+v, %v; want %s under %s", test.name, finalization, err, test.mode, test.cause)
+		}
+		if err := finalization.Validate(request); err != nil {
+			t.Fatalf("%s: the finalization is not valid: %v", test.name, err)
+		}
 	}
 }

@@ -103,17 +103,6 @@ func restoredWithoutEvidence(anomaly Anomaly) bool {
 	return false
 }
 
-// UnattributedCount returns how many carry no evidence either way.
-func UnattributedCount(anomalies []Anomaly) int {
-	unknown := 0
-	for _, anomaly := range anomalies {
-		if anomaly.Attribution == AttributionUnknown {
-			unknown++
-		}
-	}
-	return unknown
-}
-
 // Attribute fills in the attribution on every anomaly in the list.
 //
 // It runs over the rows rather than being computed in the tracker so that the
@@ -138,6 +127,9 @@ func Attribute(anomalies []Anomaly, at time.Time) {
 // as the backend's or the strategy's.
 func attribute(anomaly *Anomaly, at time.Time) {
 	schedule := scheduleOf(*anomaly, at)
+	// The failure in the one shape every failure is read in, before the
+	// check: the fold on it is one of the group keys below.
+	anomaly.Blocked = blockedOf(*anomaly, schedule)
 	check, under, unclassified := checkOf(*anomaly, schedule)
 	finding := Finding{Owner: OwnerNobody, Schedule: schedule, Result: resultOf(*anomaly)}
 	if under {
@@ -148,18 +140,4 @@ func attribute(anomaly *Anomaly, at time.Time) {
 	// counts cannot disagree about which of these was actually decided.
 	anomaly.Unclassified = unclassified
 	anomaly.Attribution = attributionOf(*anomaly)
-	// And the failure in the one shape every failure is read in, from the
-	// same evidence and the same code the check was decided on.
-	anomaly.Blocked = blockedOf(*anomaly, schedule)
-}
-
-// OursCount returns how many of these count against the deployment.
-func OursCount(anomalies []Anomaly) int {
-	ours := 0
-	for _, anomaly := range anomalies {
-		if anomaly.Attribution == AttributionOurs {
-			ours++
-		}
-	}
-	return ours
 }

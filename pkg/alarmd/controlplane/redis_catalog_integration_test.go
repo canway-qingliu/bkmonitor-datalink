@@ -6,8 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
-	"os/exec"
 	"reflect"
 	"sort"
 	"strconv"
@@ -22,6 +20,7 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/contract"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/controlplane"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/internal/redistest"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/observability"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/progress"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/strategy"
@@ -45,31 +44,6 @@ func (*scanCountingHook) BeforeProcessPipeline(ctx context.Context, _ []redis.Cm
 }
 
 func (*scanCountingHook) AfterProcessPipeline(context.Context, []redis.Cmder) error { return nil }
-
-type snapshotReadCountingHook struct {
-	mget atomic.Int64
-	get  atomic.Int64
-}
-
-func (hook *snapshotReadCountingHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
-	switch strings.ToLower(cmd.Name()) {
-	case "mget":
-		hook.mget.Add(1)
-	case "get":
-		hook.get.Add(1)
-	}
-	return ctx, nil
-}
-
-func (*snapshotReadCountingHook) AfterProcess(context.Context, redis.Cmder) error { return nil }
-
-func (*snapshotReadCountingHook) BeforeProcessPipeline(ctx context.Context, _ []redis.Cmder) (context.Context, error) {
-	return ctx, nil
-}
-
-func (*snapshotReadCountingHook) AfterProcessPipeline(context.Context, []redis.Cmder) error {
-	return nil
-}
 
 type serialActivationCASHook struct {
 	evals      atomic.Int64
@@ -533,9 +507,6 @@ func TestSourceReconcilerReturnsPublicationConflictWinner(t *testing.T) {
 		t.Fatal(err)
 	}
 	planner := &recordingPlanner{facts: queryFacts(t)}
-	if result, err := reconciler.Refresh(ctx, source, planner); err != nil || result.Status != controlplane.SourceRefreshPendingConfirmation {
-		t.Fatalf("initial pending=(%#v, %v)", result, err)
-	}
 	initial, err := reconciler.Refresh(ctx, source, planner)
 	if err != nil || initial.Status != controlplane.SourceRefreshPublished {
 		t.Fatalf("initial publication=(%#v, %v)", initial, err)
@@ -543,9 +514,6 @@ func TestSourceReconcilerReturnsPublicationConflictWinner(t *testing.T) {
 	changed := strings.Replace(string(document), `"threshold":80`, `"threshold":82`, 1)
 	if err := client.Set(ctx, "bkmonitor.cache.strategy_1001", changed, 0).Err(); err != nil {
 		t.Fatal(err)
-	}
-	if result, err := reconciler.Refresh(ctx, source, planner); err != nil || result.Status != controlplane.SourceRefreshPendingConfirmation {
-		t.Fatalf("changed pending=(%#v, %v)", result, err)
 	}
 	raceArmed = true
 	result, err := reconciler.Refresh(ctx, source, planner)
@@ -575,30 +543,24 @@ func TestSourceReconcilerPublishesNewOccurrenceWhenHistoricalContentReturns(t *t
 		t.Fatal(err)
 	}
 	planner := &recordingPlanner{facts: queryFacts(t)}
-	publish := func(wantPending bool) controlplane.SourceRefreshResult {
+	publish := func() controlplane.SourceRefreshResult {
 		t.Helper()
-		if wantPending {
-			pending, err := reconciler.Refresh(ctx, source, planner)
-			if err != nil || pending.Status != controlplane.SourceRefreshPendingConfirmation {
-				t.Fatalf("pending refresh=(%#v,%v)", pending, err)
-			}
-		}
 		result, err := reconciler.Refresh(ctx, source, planner)
 		if err != nil || result.Status != controlplane.SourceRefreshPublished {
 			t.Fatalf("published refresh=(%#v,%v)", result, err)
 		}
 		return result
 	}
-	first := publish(true)
+	first := publish()
 	changed := strings.Replace(string(document), `"threshold":80`, `"threshold":81`, 1)
 	if err := client.Set(ctx, "bkmonitor.cache.strategy_1001", changed, 0).Err(); err != nil {
 		t.Fatal(err)
 	}
-	second := publish(true)
+	second := publish()
 	if err := client.Set(ctx, "bkmonitor.cache.strategy_1001", string(document), 0).Err(); err != nil {
 		t.Fatal(err)
 	}
-	republished := publish(true)
+	republished := publish()
 	if republished.Publication.SnapshotRevision != first.Publication.SnapshotRevision ||
 		republished.Publication.PublicationEpoch <= second.Publication.PublicationEpoch {
 		t.Fatalf("Source A-B-A publications=%#v/%#v/%#v", first.Publication, second.Publication, republished.Publication)
@@ -654,7 +616,11 @@ func TestLegacyRedisSourceCompilesAndPublishesSharedQueryGroup(t *testing.T) {
 	}
 }
 
-func TestSourceReconcilerConfirmsChangeAcrossIndependentRefreshAndRestart(t *testing.T) {
+// Each refresh decides on its own read, and a restarted reconciler needs no
+// memory of an earlier one: the first round publishes what it read, a change
+// is published by the first round that reads it - in a new process too -
+// and a round that finds the source as published publishes nothing new.
+func TestSourceReconcilerPublishesEachChangeAcrossRefreshAndRestart(t *testing.T) {
 	client := newControlplaneRedis(t)
 	ctx := context.Background()
 	documents := realThresholdDocuments(t)
@@ -681,37 +647,26 @@ func TestSourceReconcilerConfirmsChangeAcrossIndependentRefreshAndRestart(t *tes
 		t.Fatal(err)
 	}
 	first, err := reconciler.Refresh(ctx, source, planner)
-	if err != nil || first.Status != controlplane.SourceRefreshPendingConfirmation {
+	if err != nil || first.Status != controlplane.SourceRefreshPublished || first.Publication.PublicationEpoch == 0 {
 		t.Fatalf("first refresh=(%#v, %v)", first, err)
-	}
-	if _, err := repository.LoadLatestPublication(ctx); !errors.Is(err, controlplane.ErrSnapshotUnavailable) {
-		t.Fatalf("unconfirmed candidate was published: %v", err)
 	}
 	changed := strings.Replace(string(documents[1]), `"threshold":90`, `"threshold":91`, 1)
 	if err := client.Set(ctx, "bkmonitor.cache.strategy_1002", changed, 0).Err(); err != nil {
 		t.Fatal(err)
 	}
 
-	// Recreate the reconciler: confirmation must come from the persisted prior
-	// independent refresh, not process memory or a second read in one call.
 	restarted, err := controlplane.NewSourceReconciler(repository, compiler, stateSemantics)
 	if err != nil {
 		t.Fatal(err)
 	}
 	second, err := restarted.Refresh(ctx, source, planner)
-	if err != nil || second.Status != controlplane.SourceRefreshPendingConfirmation {
-		t.Fatalf("second refresh=(%#v, %v)", second, err)
-	}
-	if _, err := repository.LoadLatestPublication(ctx); !errors.Is(err, controlplane.ErrSnapshotUnavailable) {
-		t.Fatalf("changed second candidate was published: %v", err)
+	if err != nil || second.Status != controlplane.SourceRefreshPublished ||
+		second.Publication.PublicationEpoch <= first.Publication.PublicationEpoch || second.Latest != first.Publication {
+		t.Fatalf("second refresh=(%#v, %v), want the change published after %+v", second, err, first.Publication)
 	}
 	third, err := restarted.Refresh(ctx, source, planner)
-	if err != nil || third.Status != controlplane.SourceRefreshPublished || third.Publication.PublicationEpoch == 0 {
-		t.Fatalf("third refresh=(%#v, %v)", third, err)
-	}
-	fourth, err := restarted.Refresh(ctx, source, planner)
-	if err != nil || fourth.Status != controlplane.SourceRefreshUnchanged || fourth.Publication != third.Publication {
-		t.Fatalf("unchanged refresh=(%#v, %v), published=%#v", fourth, err, third)
+	if err != nil || third.Status != controlplane.SourceRefreshUnchanged || third.Publication != second.Publication {
+		t.Fatalf("unchanged refresh=(%#v, %v), published=%#v", third, err, second)
 	}
 }
 
@@ -740,9 +695,6 @@ func TestSourceReconcilerPublishesOnlyRuntimeExecutablePlans(t *testing.T) {
 	reconciler, err := controlplane.NewSourceReconciler(repository, compiler, stateSemantics)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if result, err := reconciler.Refresh(ctx, source, planner); err != nil || result.Status != controlplane.SourceRefreshPendingConfirmation {
-		t.Fatalf("initial pending=(%#v, %v)", result, err)
 	}
 	published, err := reconciler.Refresh(ctx, source, planner)
 	if err != nil || published.Status != controlplane.SourceRefreshPublished {
@@ -806,9 +758,6 @@ func TestSourceReconcilerRuntimeCompilerKeepsOnlyInvalidLastGood(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result, err := reconciler.Refresh(ctx, source, planner); err != nil || result.Status != controlplane.SourceRefreshPendingConfirmation {
-		t.Fatalf("initial pending=(%#v, %v)", result, err)
-	}
 	initial, err := reconciler.Refresh(ctx, source, planner)
 	if err != nil || initial.Status != controlplane.SourceRefreshPublished {
 		t.Fatalf("initial publish=(%#v, %v)", initial, err)
@@ -827,9 +776,6 @@ func TestSourceReconcilerRuntimeCompilerKeepsOnlyInvalidLastGood(t *testing.T) {
 		if err := client.Set(ctx, "bkmonitor.cache.strategy_"+id, string(changed[index]), 0).Err(); err != nil {
 			t.Fatal(err)
 		}
-	}
-	if result, err := reconciler.Refresh(ctx, source, planner); err != nil || result.Status != controlplane.SourceRefreshPendingConfirmation {
-		t.Fatalf("changed pending=(%#v, %v)", result, err)
 	}
 	published, err := reconciler.Refresh(ctx, source, planner)
 	if err != nil || published.Status != controlplane.SourceRefreshPublished {
@@ -875,9 +821,6 @@ func TestSourceReconcilerMergesInvalidLevelLastGoodWithoutUnsupportedLevel(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result, err := reconciler.Refresh(ctx, source, planner); err != nil || result.Status != controlplane.SourceRefreshPendingConfirmation {
-		t.Fatalf("initial pending=(%#v, %v)", result, err)
-	}
 	initial, err := reconciler.Refresh(ctx, source, planner)
 	if err != nil || initial.Status != controlplane.SourceRefreshPublished {
 		t.Fatalf("initial publish=(%#v, %v)", initial, err)
@@ -904,9 +847,6 @@ func TestSourceReconcilerMergesInvalidLevelLastGoodWithoutUnsupportedLevel(t *te
 	}
 	if err := client.Set(ctx, "bkmonitor.cache.strategy_1001", string(changedDocument), 0).Err(); err != nil {
 		t.Fatal(err)
-	}
-	if result, err := reconciler.Refresh(ctx, source, planner); err != nil || result.Status != controlplane.SourceRefreshPendingConfirmation {
-		t.Fatalf("changed pending=(%#v, %v)", result, err)
 	}
 	published, err := reconciler.Refresh(ctx, source, planner)
 	if err != nil || published.Status != controlplane.SourceRefreshPublished {
@@ -992,9 +932,6 @@ func TestSourceReconcilerExcludesMergedPlanWhenAuthoritativeRecompileFails(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result, err := reconciler.Refresh(ctx, source, planner); err != nil || result.Status != controlplane.SourceRefreshPendingConfirmation {
-		t.Fatalf("initial pending=(%#v, %v)", result, err)
-	}
 	initial, err := reconciler.Refresh(ctx, source, planner)
 	if err != nil || initial.Status != controlplane.SourceRefreshPublished {
 		t.Fatalf("initial publish=(%#v, %v)", initial, err)
@@ -1008,9 +945,6 @@ func TestSourceReconcilerExcludesMergedPlanWhenAuthoritativeRecompileFails(t *te
 	changedDocument = withThresholdForLevel(t, changedDocument, 2, 82)
 	if err := client.Set(ctx, "bkmonitor.cache.strategy_1001", string(changedDocument), 0).Err(); err != nil {
 		t.Fatal(err)
-	}
-	if result, err := reconciler.Refresh(ctx, source, planner); err != nil || result.Status != controlplane.SourceRefreshPendingConfirmation {
-		t.Fatalf("changed pending=(%#v, %v)", result, err)
 	}
 	published, err := reconciler.Refresh(ctx, source, planner)
 	if err != nil || published.Status != controlplane.SourceRefreshPublished {
@@ -1062,9 +996,6 @@ func TestSourceReconcilerRetainsLastGoodForMissingAndInvalidObjectWhileHealthySi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result, err := reconciler.Refresh(ctx, source, planner); err != nil || result.Status != controlplane.SourceRefreshPendingConfirmation {
-		t.Fatalf("initial pending=(%#v, %v)", result, err)
-	}
 	initial, err := reconciler.Refresh(ctx, source, planner)
 	if err != nil || initial.Status != controlplane.SourceRefreshPublished {
 		t.Fatalf("initial publish=(%#v, %v)", initial, err)
@@ -1094,9 +1025,6 @@ func TestSourceReconcilerRetainsLastGoodForMissingAndInvalidObjectWhileHealthySi
 	if err := client.Set(ctx, "bkmonitor.cache.strategy_1002", changedSibling, 0).Err(); err != nil {
 		t.Fatal(err)
 	}
-	if result, err := reconciler.Refresh(ctx, source, planner); err != nil || result.Status != controlplane.SourceRefreshPendingConfirmation {
-		t.Fatalf("identity missing pending=(%#v, %v)", result, err)
-	}
 	reconciler, err = controlplane.NewSourceReconciler(repository, compiler, stateSemantics)
 	if err != nil {
 		t.Fatal(err)
@@ -1123,9 +1051,6 @@ func TestSourceReconcilerRetainsLastGoodForMissingAndInvalidObjectWhileHealthySi
 	if err := client.Set(ctx, "bkmonitor.cache.strategy_1002", changedSibling, 0).Err(); err != nil {
 		t.Fatal(err)
 	}
-	if result, err := reconciler.Refresh(ctx, source, planner); err != nil || result.Status != controlplane.SourceRefreshPendingConfirmation {
-		t.Fatalf("missing pending=(%#v, %v)", result, err)
-	}
 	missing, err := reconciler.Refresh(ctx, source, planner)
 	if err != nil || missing.Status != controlplane.SourceRefreshPublished {
 		t.Fatalf("missing publish=(%#v, %v)", missing, err)
@@ -1147,9 +1072,6 @@ func TestSourceReconcilerRetainsLastGoodForMissingAndInvalidObjectWhileHealthySi
 	changedSibling = strings.Replace(string(documents[1]), `"threshold":90`, `"threshold":93`, 1)
 	if err := client.Set(ctx, "bkmonitor.cache.strategy_1002", changedSibling, 0).Err(); err != nil {
 		t.Fatal(err)
-	}
-	if result, err := reconciler.Refresh(ctx, source, planner); err != nil || result.Status != controlplane.SourceRefreshPendingConfirmation {
-		t.Fatalf("invalid pending=(%#v, %v)", result, err)
 	}
 	invalid, err := reconciler.Refresh(ctx, source, planner)
 	if err != nil || invalid.Status != controlplane.SourceRefreshPublished {
@@ -1255,13 +1177,22 @@ func TestRedisCatalogRepositoryActivationCASAndProjection(t *testing.T) {
 		ScheduleRevision: catalog.QueryGroups[0].ScheduleRevision, ScheduleSegmentStart: 60, DuePlanSetDigest: "due-plans-v1",
 	}
 	missingPlan := execution.PlanIdentity{TenantID: "tenant-a", BusinessID: "2", StrategyID: "9999"}
-	activations, err := repository.LoadActivations(context.Background(), execution.PlanActivationRequest{Contract: contract, Plans: []execution.PlanIdentity{plan.Identity, missingPlan}})
-	if err != nil || len(activations.Facts) != 2 || activations.Facts[0] != fact || activations.Facts[1].Selection != execution.ActivationNone {
+	activations, err := repository.LoadActivations(context.Background(), execution.PlanActivationRequest{Contract: contract, Plans: []execution.PlanKey{{PlanIdentity: plan.Identity}, {PlanIdentity: missingPlan}}})
+	if err != nil || len(activations.Facts) != 2 || !activations.Facts[0].Equal(fact) || activations.Facts[1].Selection != execution.ActivationNone {
 		t.Fatalf("activation projection=(%#v, %v)", activations, err)
 	}
 
-	// Each authorization must reread live bytes, even if record_revision is unchanged.
+	// A caller changing the facts it was given changes nothing the next
+	// authorization reads.
 	activations.Facts[0].Selected.StateGeneration = "caller-mutation"
+	again, err := repository.LoadActivations(context.Background(), execution.PlanActivationRequest{Contract: contract, Plans: []execution.PlanKey{{PlanIdentity: plan.Identity}}})
+	if err != nil || len(again.Facts) != 1 || !again.Facts[0].Equal(fact) {
+		t.Fatal("second authorization saw the caller's mutation", err)
+	}
+	// The answer is the Query Group's open Segment, which is what executes
+	// (N15): a body rewritten beside it, header unchanged, with records the
+	// Segment does not carry, does not become the answer. The body must still
+	// be there - one that is gone is the state the leader rebuilds.
 	state.Plans[0].Fact.Selected.StateApplyEpoch++
 	payload, err := json.Marshal(state)
 	if err != nil {
@@ -1270,9 +1201,15 @@ func TestRedisCatalogRepositoryActivationCASAndProjection(t *testing.T) {
 	if err := client.Set(context.Background(), "alarmd:control:test:activation", payload, 0).Err(); err != nil {
 		t.Fatal(err)
 	}
-	again, err := repository.LoadActivations(context.Background(), execution.PlanActivationRequest{Contract: contract, Plans: []execution.PlanIdentity{plan.Identity}})
-	if err != nil || len(again.Facts) != 1 || again.Facts[0] != state.Plans[0].Fact {
-		t.Fatal("second authorization missed current facts or caller isolation", err)
+	again, err = repository.LoadActivations(context.Background(), execution.PlanActivationRequest{Contract: contract, Plans: []execution.PlanKey{{PlanIdentity: plan.Identity}}})
+	if err != nil || len(again.Facts) != 1 || !again.Facts[0].Equal(fact) {
+		t.Fatalf("authorization answered %+v (%v), want the open Segment's record %+v", again.Facts, err, fact)
+	}
+	if err := client.Del(context.Background(), "alarmd:control:test:activation").Err(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.LoadActivations(context.Background(), execution.PlanActivationRequest{Contract: contract, Plans: []execution.PlanKey{{PlanIdentity: plan.Identity}}}); !errors.Is(err, controlplane.ErrActivationBodyMissing) {
+		t.Fatalf("authorization without the body = %v, want ErrActivationBodyMissing", err)
 	}
 }
 
@@ -1751,17 +1688,6 @@ func TestScheduleActivationReconcilerClassifiesInjectedDependencyIOByStage(t *te
 			wantStage:   controlplane.ActivationFailureStageScheduleCutover,
 			publication: func(f activationFailureFixture) controlplane.SnapshotPublicationRef { return f.candidate },
 		},
-		{
-			name: "legacy persist eval", command: "eval",
-			wantStage:   controlplane.ActivationFailureStagePersist,
-			publication: func(f activationFailureFixture) controlplane.SnapshotPublicationRef { return f.current },
-			prepare: func(t *testing.T, f activationFailureFixture) {
-				legacy := f.activeState
-				legacy.SchemaVersion = "alarmd-control-activation-v1"
-				legacy.ActiveQGSetRef = controlplane.ActiveQueryGroupSetRef{}
-				writeLegacyActivation(t, context.Background(), f.client, f.prefix, legacy)
-			},
-		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1852,74 +1778,6 @@ func TestInitialScheduleActivatorPersistsOneNonAlignedBoundaryAcrossRestart(t *t
 	}
 }
 
-func TestScheduleActivationReconcilerUpgradesLegacySamePublicationToActiveQGSetRef(t *testing.T) {
-	ctx := context.Background()
-	client := newControlplaneRedis(t)
-	prefix := "alarmd:control:legacy-active-qg-upgrade"
-	repository, err := controlplane.NewRedisCatalogRepository(client, prefix, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	catalog := catalogWithSchedule(t, validCatalog(t, 80), 60, 0)
-	snapshot, _, err := repository.PublishCatalog(ctx, catalog)
-	if err != nil {
-		t.Fatal(err)
-	}
-	compiler, semantics := runtimePlanCompiler(t)
-	initial, err := controlplane.NewInitialScheduleActivator(repository, compiler, semantics, func() time.Time { return time.Unix(83, 0) })
-	if err != nil {
-		t.Fatal(err)
-	}
-	state, err := initial.Ensure(ctx, snapshot.Publication)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Reproduce the deployed v1 shape without changing Current, Plans or Schedule.
-	legacy := state
-	legacy.SchemaVersion = "alarmd-control-activation-v1"
-	legacy.ActiveQGSetRef = controlplane.ActiveQueryGroupSetRef{}
-	payload, err := json.Marshal(legacy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := client.Set(ctx, prefix+":activation", payload, 0).Err(); err != nil {
-		t.Fatal(err)
-	}
-	scanHook := &scanCountingHook{}
-	client.AddHook(scanHook)
-
-	reconciler, err := controlplane.NewScheduleActivationReconciler(repository, compiler, semantics, func() time.Time {
-		t.Fatal("same-publication upgrade must not allocate a cutover boundary")
-		return time.Time{}
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	upgraded, err := reconciler.Ensure(ctx, snapshot.Publication)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := scanHook.count.Load(); got != 0 {
-		t.Fatalf("same-publication upgrade SCAN calls=%d, want 0", got)
-	}
-	if upgraded.SchemaVersion != "alarmd-control-activation-v2" || upgraded.RecordRevision != legacy.RecordRevision+1 || upgraded.Current != legacy.Current || upgraded.Pending != legacy.Pending || !reflect.DeepEqual(upgraded.Plans, legacy.Plans) || !reflect.DeepEqual(upgraded.Draining, legacy.Draining) {
-		t.Fatalf("invalid upgraded activation: %#v", upgraded)
-	}
-	groups, err := repository.LoadActiveQueryGroupSet(ctx, upgraded.ActiveQGSetRef)
-	if err != nil || !reflect.DeepEqual(groups, []execution.QueryGroupIdentity{catalog.QueryGroups[0].Identity}) {
-		t.Fatalf("active set=(%#v,%v)", groups, err)
-	}
-	runtime, err := controlplane.NewRedisCatalogRuntime(repository, compiler, semantics, 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	schedule, err := runtime.ReadInitialFrozenSchedule(ctx, catalog.QueryGroups[0].Identity)
-	if err != nil || schedule.Segment.Start != 83 {
-		t.Fatalf("schedule changed=(%#v,%v)", schedule, err)
-	}
-}
-
 func TestScheduleActivationReconcilerDoesNotFallbackWhenV2ActiveSetInvalid(t *testing.T) {
 	for _, test := range []struct {
 		name      string
@@ -1979,388 +1837,6 @@ func TestScheduleActivationReconcilerDoesNotFallbackWhenV2ActiveSetInvalid(t *te
 	}
 }
 
-func TestScheduleActivationReconcilerMigratesLegacyAfterOldSnapshotExpiresAndQGIsDeleted(t *testing.T) {
-	ctx := context.Background()
-	client := newControlplaneRedis(t)
-	prefix := "alarmd:control:legacy-expired-qg-deleted"
-	repository, err := controlplane.NewRedisCatalogRepository(client, prefix, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var migrationObservations []observability.Observation
-	repository.ConfigureObserver(observability.ObserverFunc(func(_ context.Context, observation observability.Observation) {
-		if observation.LegacyMigration != nil {
-			migrationObservations = append(migrationObservations, observation)
-		}
-	}))
-	if err := repository.ConfigureLegacyMigration(50000, 30*time.Second); err != nil {
-		t.Fatal(err)
-	}
-	oldCatalog := catalogWithSchedule(t, validCatalog(t, 80), 60, 0)
-	oldSnapshot, _, err := repository.PublishCatalog(ctx, oldCatalog)
-	if err != nil {
-		t.Fatal(err)
-	}
-	compiler, semantics := runtimePlanCompiler(t)
-	initial, _ := controlplane.NewInitialScheduleActivator(repository, compiler, semantics, func() time.Time { return time.Unix(83, 0) })
-	oldState, err := initial.Ensure(ctx, oldSnapshot.Publication)
-	if err != nil {
-		t.Fatal(err)
-	}
-	legacy := oldState
-	legacy.SchemaVersion = "alarmd-control-activation-v1"
-	legacy.ActiveQGSetRef = controlplane.ActiveQueryGroupSetRef{}
-	legacyPayload, _ := json.Marshal(legacy)
-	if err := client.Set(ctx, prefix+":activation", legacyPayload, 0).Err(); err != nil {
-		t.Fatal(err)
-	}
-	emptyCatalog := controlplane.Catalog{QueryGroups: []controlplane.QueryGroup{}}
-	emptyCatalog.SnapshotRevision = execution.SnapshotRevision(mustDigest(t, "alarmd-strategy-snapshot-v1", emptyCatalog.QueryGroups))
-	emptySnapshot, _, err := repository.PublishCatalog(ctx, emptyCatalog)
-	if err != nil {
-		t.Fatal(err)
-	}
-	activationBefore, _ := client.Get(ctx, prefix+":activation").Bytes()
-	scheduleKey := prefix + ":schedule_timeline:" + string(oldCatalog.QueryGroups[0].Identity)
-	scheduleBefore, _ := client.Get(ctx, scheduleKey).Bytes()
-	canceledCtx, cancel := context.WithCancel(ctx)
-	cancel()
-	canceledReconciler, _ := controlplane.NewScheduleActivationReconciler(repository, compiler, semantics, func() time.Time { return time.Unix(180, 0) })
-	if _, err := canceledReconciler.Ensure(canceledCtx, emptySnapshot.Publication); !errors.Is(err, context.Canceled) {
-		t.Fatalf("parent context cancellation error=%v", err)
-	}
-	activationAfterCancel, _ := client.Get(ctx, prefix+":activation").Bytes()
-	scheduleAfterCancel, _ := client.Get(ctx, scheduleKey).Bytes()
-	if !bytes.Equal(activationBefore, activationAfterCancel) || !bytes.Equal(scheduleBefore, scheduleAfterCancel) {
-		t.Fatal("parent context cancellation changed Activation or Schedule")
-	}
-	// A legacy activation whose body expired is upgraded through the catalog
-	// manifest that every publication since the object catalog carries, so no
-	// timeline scan runs and neither the scan timeout nor its key limit is
-	// reached; the scan stays the path for a publication without a manifest.
-	reconciler, _ := controlplane.NewScheduleActivationReconciler(repository, compiler, semantics, func() time.Time { return time.Unix(180, 0) })
-	state, err := reconciler.Ensure(ctx, emptySnapshot.Publication)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if state.Current != emptySnapshot.Publication || state.SchemaVersion != "alarmd-control-activation-v2" || len(state.Plans) != 0 {
-		t.Fatalf("migration state=%#v", state)
-	}
-	groups, err := repository.LoadActiveQueryGroupSet(ctx, state.ActiveQGSetRef)
-	if err != nil || len(groups) != 0 {
-		t.Fatalf("active set=(%#v,%v)", groups, err)
-	}
-	if len(migrationObservations) != 0 {
-		t.Fatalf("legacy migration scanned timelines although the manifest was present: %#v", migrationObservations)
-	}
-}
-
-func TestScheduleActivationReconcilerLegacyMigrationRejectsUnprovableCoverage(t *testing.T) {
-	type mutation func(*testing.T, context.Context, *redis.Client, string, controlplane.ActivationState, []string)
-	tests := []struct {
-		name   string
-		mutate mutation
-	}{
-		{name: "activation plan missing open segment", mutate: func(t *testing.T, ctx context.Context, client *redis.Client, _ string, _ controlplane.ActivationState, scheduleKeys []string) {
-			if err := client.Del(ctx, scheduleKeys[1]).Err(); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{name: "same plan covered by two open segments", mutate: func(t *testing.T, ctx context.Context, client *redis.Client, _ string, _ controlplane.ActivationState, scheduleKeys []string) {
-			first := readJSONObject(t, ctx, client, scheduleKeys[0])
-			second := readJSONObject(t, ctx, client, scheduleKeys[1])
-			firstOpen := lastScheduleSegment(t, first)
-			secondOpen := lastScheduleSegment(t, second)
-			secondOpen["schedule"] = cloneJSONValue(t, firstOpen["schedule"])
-			secondOpen["plans"] = cloneJSONValue(t, firstOpen["plans"])
-			schedule := secondOpen["schedule"].(map[string]any)
-			segment := schedule["Segment"].(map[string]any)
-			segment["QueryGroup"] = second["query_group"]
-			writeJSONObject(t, ctx, client, scheduleKeys[1], second)
-		}},
-		{name: "orphan open segment", mutate: func(t *testing.T, ctx context.Context, client *redis.Client, prefix string, state controlplane.ActivationState, _ []string) {
-			state.Plans = append([]controlplane.PlanActivationRecord(nil), state.Plans[:1]...)
-			writeLegacyActivation(t, ctx, client, prefix, state)
-		}},
-		{name: "wrong publication", mutate: func(t *testing.T, ctx context.Context, client *redis.Client, _ string, _ controlplane.ActivationState, scheduleKeys []string) {
-			timeline := readJSONObject(t, ctx, client, scheduleKeys[0])
-			open := lastScheduleSegment(t, timeline)
-			schedule := open["schedule"].(map[string]any)
-			segment := schedule["Segment"].(map[string]any)
-			publication := segment["Publication"].(map[string]any)
-			publication["PublicationEpoch"] = publication["PublicationEpoch"].(float64) + 1
-			writeJSONObject(t, ctx, client, scheduleKeys[0], timeline)
-		}},
-		{name: "query group plan conflict", mutate: func(t *testing.T, ctx context.Context, client *redis.Client, _ string, _ controlplane.ActivationState, scheduleKeys []string) {
-			timeline := readJSONObject(t, ctx, client, scheduleKeys[0])
-			timeline["query_group"] = "conflicting-query-group"
-			writeJSONObject(t, ctx, client, scheduleKeys[0], timeline)
-		}},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			ctx := context.Background()
-			client := newControlplaneRedis(t)
-			prefix := "alarmd:control:legacy-negative:" + strings.ReplaceAll(test.name, " ", "-")
-			repository, err := controlplane.NewRedisCatalogRepository(client, prefix, time.Hour)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := repository.ConfigureLegacyMigration(50000, 30*time.Second); err != nil {
-				t.Fatal(err)
-			}
-			catalog := twoQueryGroupCatalog(t)
-			snapshot, _, err := repository.PublishCatalog(ctx, catalog)
-			if err != nil {
-				t.Fatal(err)
-			}
-			compiler, semantics := runtimePlanCompiler(t)
-			initial, _ := controlplane.NewInitialScheduleActivator(repository, compiler, semantics, func() time.Time { return time.Unix(83, 0) })
-			state, err := initial.Ensure(ctx, snapshot.Publication)
-			if err != nil {
-				t.Fatal(err)
-			}
-			state.SchemaVersion = "alarmd-control-activation-v1"
-			state.ActiveQGSetRef = controlplane.ActiveQueryGroupSetRef{}
-			writeLegacyActivation(t, ctx, client, prefix, state)
-			scheduleKeys := make([]string, 0, len(catalog.QueryGroups))
-			for _, group := range catalog.QueryGroups {
-				scheduleKeys = append(scheduleKeys, prefix+":schedule_timeline:"+string(group.Identity))
-			}
-			sort.Strings(scheduleKeys)
-			test.mutate(t, ctx, client, prefix, state, scheduleKeys)
-
-			activationBefore := readRedisValue(t, ctx, client, prefix+":activation")
-			headerBefore := readRedisValue(t, ctx, client, prefix+":activation_header")
-			schedulesBefore := readRedisValues(t, ctx, client, scheduleKeys)
-			activeSetsBefore, err := client.Keys(ctx, prefix+":active_qg_set:*").Result()
-			if err != nil {
-				t.Fatal(err)
-			}
-			sort.Strings(activeSetsBefore)
-			emptyCatalog := controlplane.Catalog{QueryGroups: []controlplane.QueryGroup{}}
-			emptyCatalog.SnapshotRevision = execution.SnapshotRevision(mustDigest(t, "alarmd-strategy-snapshot-v1", emptyCatalog.QueryGroups))
-			emptySnapshot, _, err := repository.PublishCatalog(ctx, emptyCatalog)
-			if err != nil {
-				t.Fatal(err)
-			}
-			clockCalls := 0
-			reconciler, _ := controlplane.NewScheduleActivationReconciler(repository, compiler, semantics, func() time.Time {
-				clockCalls++
-				return time.Unix(180, 0)
-			})
-			if _, err := reconciler.Ensure(ctx, emptySnapshot.Publication); err == nil {
-				t.Fatal("unprovable legacy coverage must fail closed")
-			}
-			if clockCalls != 0 {
-				t.Fatalf("cutover/business side-effect clock calls=%d, want 0", clockCalls)
-			}
-			if after := readRedisValue(t, ctx, client, prefix+":activation"); !bytes.Equal(activationBefore, after) {
-				t.Fatal("failed migration changed Activation")
-			}
-			if after := readRedisValue(t, ctx, client, prefix+":activation_header"); !bytes.Equal(headerBefore, after) {
-				t.Fatal("failed migration changed Activation header")
-			}
-			if after := readRedisValues(t, ctx, client, scheduleKeys); !reflect.DeepEqual(schedulesBefore, after) {
-				t.Fatal("failed migration changed Schedule timelines")
-			}
-			activeSetsAfter, err := client.Keys(ctx, prefix+":active_qg_set:*").Result()
-			if err != nil {
-				t.Fatal(err)
-			}
-			sort.Strings(activeSetsAfter)
-			if !reflect.DeepEqual(activeSetsBefore, activeSetsAfter) {
-				t.Fatalf("failed migration created a v2 Active Set: before=%v after=%v", activeSetsBefore, activeSetsAfter)
-			}
-		})
-	}
-}
-
-func TestScheduleActivationReconcilerLegacyMigrationResumesAfterObjectWriteBeforeCAS(t *testing.T) {
-	ctx := context.Background()
-	client := newControlplaneRedis(t)
-	prefix := "alarmd:control:legacy-migration-resume"
-	repository, err := controlplane.NewRedisCatalogRepository(client, prefix, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.ConfigureLegacyMigration(50000, 30*time.Second); err != nil {
-		t.Fatal(err)
-	}
-	catalog := twoQueryGroupCatalog(t)
-	snapshot, _, err := repository.PublishCatalog(ctx, catalog)
-	if err != nil {
-		t.Fatal(err)
-	}
-	compiler, semantics := runtimePlanCompiler(t)
-	initial, _ := controlplane.NewInitialScheduleActivator(repository, compiler, semantics, func() time.Time { return time.Unix(83, 0) })
-	state, err := initial.Ensure(ctx, snapshot.Publication)
-	if err != nil {
-		t.Fatal(err)
-	}
-	activeSetKey := prefix + ":active_qg_set:" + state.ActiveQGSetRef.Digest
-	state.SchemaVersion = "alarmd-control-activation-v1"
-	state.ActiveQGSetRef = controlplane.ActiveQueryGroupSetRef{}
-	writeLegacyActivation(t, ctx, client, prefix, state)
-	if err := client.Del(ctx, activeSetKey).Err(); err != nil {
-		t.Fatal(err)
-	}
-	scheduleKeys := scheduleTimelineKeys(prefix, catalog)
-	activationBefore := readRedisValue(t, ctx, client, prefix+":activation")
-	schedulesBefore := readRedisValues(t, ctx, client, scheduleKeys)
-	crashErr := errors.New("simulated crash before Activation CAS")
-	client.AddHook(&beforeEvalHook{run: func() error { return crashErr }})
-	crashing, _ := controlplane.NewScheduleActivationReconciler(repository, compiler, semantics, func() time.Time {
-		t.Fatal("same-publication migration must not allocate a cutover boundary")
-		return time.Time{}
-	})
-	if _, err := crashing.Ensure(ctx, snapshot.Publication); !errors.Is(err, crashErr) {
-		t.Fatalf("interrupted migration error=%v, want %v", err, crashErr)
-	}
-	if after := readRedisValue(t, ctx, client, prefix+":activation"); !bytes.Equal(activationBefore, after) {
-		t.Fatal("interrupted migration changed Activation")
-	}
-	if after := readRedisValues(t, ctx, client, scheduleKeys); !reflect.DeepEqual(schedulesBefore, after) {
-		t.Fatal("interrupted migration changed Schedule timelines")
-	}
-	if exists, err := client.Exists(ctx, activeSetKey).Result(); err != nil || exists != 1 {
-		t.Fatalf("pre-CAS Active Set exists=(%d,%v), want orphan available for retry", exists, err)
-	}
-
-	retryClient := redis.NewClient(&redis.Options{Addr: client.Options().Addr})
-	t.Cleanup(func() { _ = retryClient.Close() })
-	retryRepository, err := controlplane.NewRedisCatalogRepository(retryClient, prefix, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := retryRepository.ConfigureLegacyMigration(50000, 30*time.Second); err != nil {
-		t.Fatal(err)
-	}
-	retry, _ := controlplane.NewScheduleActivationReconciler(retryRepository, compiler, semantics, func() time.Time {
-		t.Fatal("retry migration must not allocate a cutover boundary")
-		return time.Time{}
-	})
-	winner, err := retry.Ensure(ctx, snapshot.Publication)
-	if err != nil {
-		t.Fatal(err)
-	}
-	repeated, err := retry.Ensure(ctx, snapshot.Publication)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(winner, repeated) || winner.RecordRevision != state.RecordRevision+1 || winner.SchemaVersion != "alarmd-control-activation-v2" {
-		t.Fatalf("migration retry/repeat states=(%#v,%#v)", winner, repeated)
-	}
-	groups, err := retryRepository.LoadActiveQueryGroupSet(ctx, winner.ActiveQGSetRef)
-	if err != nil || len(groups) != len(catalog.QueryGroups) || winner.ActiveQGSetRef.QGCount != uint64(len(catalog.QueryGroups)) {
-		t.Fatalf("winner Active Set groups=%#v ref=%#v err=%v", groups, winner.ActiveQGSetRef, err)
-	}
-	if after := readRedisValues(t, ctx, retryClient, scheduleKeys); !reflect.DeepEqual(schedulesBefore, after) {
-		t.Fatal("retry/repeat migration changed Schedule timelines")
-	}
-}
-
-func TestScheduleActivationReconcilerConcurrentLegacyMigrationReadsSingleWinner(t *testing.T) {
-	ctx := context.Background()
-	client := newControlplaneRedis(t)
-	prefix := "alarmd:control:legacy-migration-race"
-	repository, err := controlplane.NewRedisCatalogRepository(client, prefix, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.ConfigureLegacyMigration(50000, 30*time.Second); err != nil {
-		t.Fatal(err)
-	}
-	catalog := twoQueryGroupCatalog(t)
-	snapshot, _, err := repository.PublishCatalog(ctx, catalog)
-	if err != nil {
-		t.Fatal(err)
-	}
-	compiler, semantics := runtimePlanCompiler(t)
-	initial, _ := controlplane.NewInitialScheduleActivator(repository, compiler, semantics, func() time.Time { return time.Unix(83, 0) })
-	state, err := initial.Ensure(ctx, snapshot.Publication)
-	if err != nil {
-		t.Fatal(err)
-	}
-	activeSetKey := prefix + ":active_qg_set:" + state.ActiveQGSetRef.Digest
-	state.SchemaVersion = "alarmd-control-activation-v1"
-	state.ActiveQGSetRef = controlplane.ActiveQueryGroupSetRef{}
-	writeLegacyActivation(t, ctx, client, prefix, state)
-	if err := client.Del(ctx, activeSetKey).Err(); err != nil {
-		t.Fatal(err)
-	}
-	scheduleKeys := scheduleTimelineKeys(prefix, catalog)
-	schedulesBefore := readRedisValues(t, ctx, client, scheduleKeys)
-	auxiliary := redis.NewClient(&redis.Options{Addr: client.Options().Addr})
-	t.Cleanup(func() { _ = auxiliary.Close() })
-	casHook := &serialActivationCASHook{firstDone: make(chan struct{}), afterFirst: func() error {
-		return auxiliary.PExpire(ctx, activeSetKey, 2*time.Second).Err()
-	}}
-	client.AddHook(casHook)
-	first, _ := controlplane.NewScheduleActivationReconciler(repository, compiler, semantics, func() time.Time {
-		t.Fatal("legacy migration must not allocate a cutover boundary")
-		return time.Time{}
-	})
-	second, _ := controlplane.NewScheduleActivationReconciler(repository, compiler, semantics, func() time.Time {
-		t.Fatal("legacy migration must not allocate a cutover boundary")
-		return time.Time{}
-	})
-	type migrationResult struct {
-		state controlplane.ActivationState
-		err   error
-	}
-	results := make(chan migrationResult, 2)
-	go func() {
-		result, runErr := first.Ensure(ctx, snapshot.Publication)
-		results <- migrationResult{state: result, err: runErr}
-	}()
-	go func() {
-		result, runErr := second.Ensure(ctx, snapshot.Publication)
-		results <- migrationResult{state: result, err: runErr}
-	}()
-	one, two := <-results, <-results
-	if one.err != nil || two.err != nil || !reflect.DeepEqual(one.state, two.state) {
-		t.Fatalf("concurrent legacy migration states=(%#v,%#v) errors=(%v,%v)", one.state, two.state, one.err, two.err)
-	}
-	if one.state.RecordRevision != state.RecordRevision+1 || one.state.SchemaVersion != "alarmd-control-activation-v2" || one.state.ActiveQGSetRef.Digest == "" || one.state.ActiveQGSetRef.QGCount != uint64(len(catalog.QueryGroups)) {
-		t.Fatalf("invalid migration winner=%#v", one.state)
-	}
-	if got := casHook.evals.Load(); got != 2 {
-		t.Fatalf("legacy migration CAS attempts=%d, want 2", got)
-	}
-	if ttl, err := auxiliary.PTTL(ctx, activeSetKey).Result(); err != nil || ttl <= 0 || ttl > 2*time.Second {
-		t.Fatalf("CAS loser renewed/deleted winner object TTL=(%s,%v), want unchanged short TTL", ttl, err)
-	}
-	if after := readRedisValues(t, ctx, client, scheduleKeys); !reflect.DeepEqual(schedulesBefore, after) {
-		t.Fatal("concurrent migration changed Schedule timelines")
-	}
-	groups, err := repository.LoadActiveQueryGroupSet(ctx, one.state.ActiveQGSetRef)
-	if err != nil || len(groups) != len(catalog.QueryGroups) {
-		t.Fatalf("winner Active Set groups=%#v err=%v", groups, err)
-	}
-}
-
-func scheduleTimelineKeys(prefix string, catalog controlplane.Catalog) []string {
-	keys := make([]string, 0, len(catalog.QueryGroups))
-	for _, group := range catalog.QueryGroups {
-		keys = append(keys, prefix+":schedule_timeline:"+string(group.Identity))
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-func writeLegacyActivation(t *testing.T, ctx context.Context, client *redis.Client, prefix string, state controlplane.ActivationState) {
-	t.Helper()
-	payload, err := json.Marshal(state)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := client.Set(ctx, prefix+":activation", payload, 0).Err(); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func readJSONObject(t *testing.T, ctx context.Context, client *redis.Client, key string) map[string]any {
 	t.Helper()
 	payload := readRedisValue(t, ctx, client, key)
@@ -2382,32 +1858,6 @@ func writeJSONObject(t *testing.T, ctx context.Context, client *redis.Client, ke
 	}
 }
 
-func cloneJSONValue(t *testing.T, value any) any {
-	t.Helper()
-	payload, err := json.Marshal(value)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var cloned any
-	if err := json.Unmarshal(payload, &cloned); err != nil {
-		t.Fatal(err)
-	}
-	return cloned
-}
-
-func lastScheduleSegment(t *testing.T, timeline map[string]any) map[string]any {
-	t.Helper()
-	segments, ok := timeline["segments"].([]any)
-	if !ok || len(segments) == 0 {
-		t.Fatal("persisted Schedule has no segments")
-	}
-	segment, ok := segments[len(segments)-1].(map[string]any)
-	if !ok {
-		t.Fatal("persisted Schedule segment is not an object")
-	}
-	return segment
-}
-
 func readRedisValue(t *testing.T, ctx context.Context, client *redis.Client, key string) []byte {
 	t.Helper()
 	payload, err := client.Get(ctx, key).Bytes()
@@ -2415,15 +1865,6 @@ func readRedisValue(t *testing.T, ctx context.Context, client *redis.Client, key
 		t.Fatal(err)
 	}
 	return payload
-}
-
-func readRedisValues(t *testing.T, ctx context.Context, client *redis.Client, keys []string) map[string][]byte {
-	t.Helper()
-	values := make(map[string][]byte, len(keys))
-	for _, key := range keys {
-		values[key] = readRedisValue(t, ctx, client, key)
-	}
-	return values
 }
 
 func TestInitialScheduleActivatorPersistsEveryPublishedQueryGroup(t *testing.T) {
@@ -2687,7 +2128,7 @@ func TestScheduleActivationReconcilerCutsBackToHistoricalSnapshotOnNewOccurrence
 	}
 	activations, err := repository.LoadActivations(ctx, execution.PlanActivationRequest{
 		Contract: fact.Contract,
-		Plans:    []execution.PlanIdentity{fact.DuePlans[0].Identity},
+		Plans:    []execution.PlanKey{fact.DuePlans[0].Key()},
 	})
 	if err != nil || len(activations.Facts) != 1 || activations.Facts[0].Selection != execution.ActivationNone {
 		t.Fatalf("A@e1 historical activation=(%#v, %v), want NONE while A@e3 is current", activations, err)
@@ -3065,20 +2506,25 @@ func TestScheduleActivationReconcilerProjectsQueryIdentityChangeAsIndependentNew
 	}
 }
 
-// TestSourceReconcilerRemovesAbsentStrategyAfterOnePublishedGraceCycle drives
-// the real source reconciler against the legacy Redis strategy source. It
-// proves that the removal grace memory survives the UNCHANGED refresh path:
-// the audit published there carries PENDING_REMOVAL while the snapshot still
-// holds the Plan, and the next refresh drops the Plan with REMOVED.
-func TestSourceReconcilerRemovesAbsentStrategyAfterOnePublishedGraceCycle(t *testing.T) {
+// TestSourceReconcilerRemovesAbsentStrategyAfterTheGracePeriod drives the
+// real source reconciler against the legacy Redis strategy source. It proves
+// that the removal grace memory survives the candidate confirmation and the
+// UNCHANGED refresh path: the audit published there carries PENDING_REMOVAL
+// stamped with when the strategy was first found absent while the snapshot
+// still holds the Plan, every refresh inside the grace period keeps both,
+// and the first refresh past the period drops the Plan with REMOVED. A
+// strategy back inside the period - the shape of an upstream list that
+// loses entries for minutes at a time - is accepted with no removal fact
+// and its Plan never left.
+func TestSourceReconcilerRemovesAbsentStrategyAfterTheGracePeriod(t *testing.T) {
 	for _, test := range []struct {
-		name            string
-		separateGroup   bool
-		returnsInCycle3 bool
+		name          string
+		separateGroup bool
+		returns       bool
 	}{
 		{name: "removed Plan leaves its shared Query Group without draining"},
 		{name: "removed Plan retires its own Query Group into draining", separateGroup: true},
-		{name: "strategy returning after PENDING_REMOVAL is accepted without a removal fact", returnsInCycle3: true},
+		{name: "strategy returning inside the grace is accepted without a removal fact", returns: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -3113,21 +2559,24 @@ func TestSourceReconcilerRemovesAbsentStrategyAfterOnePublishedGraceCycle(t *tes
 			if err != nil {
 				t.Fatal(err)
 			}
+			// The source reconciler's clock, which the removal grace is
+			// measured on; the activator's own clock is separate below.
+			sourceNow := time.Unix(1_700_000_000, 0)
+			if err := reconciler.ConfigureClock(func() time.Time { return sourceNow }); err != nil {
+				t.Fatal(err)
+			}
 			at := time.Unix(60, 0)
 			activator, err := controlplane.NewScheduleActivationReconciler(repository, compiler, semantics, func() time.Time { return at })
 			if err != nil {
 				t.Fatal(err)
 			}
-			// settle runs one source cycle: a changed candidate needs the second
-			// identical observation before it publishes.
+			// settle runs one source cycle: one refresh, which publishes what
+			// it read.
 			settle := func() controlplane.SourceRefreshResult {
 				t.Helper()
 				result, err := reconciler.Refresh(ctx, source, planner)
-				if err == nil && result.Status == controlplane.SourceRefreshPendingConfirmation {
-					result, err = reconciler.Refresh(ctx, source, planner)
-				}
-				if err != nil || result.Status == controlplane.SourceRefreshPendingConfirmation {
-					t.Fatalf("source refresh did not settle: (%+v, %v)", result, err)
+				if err != nil {
+					t.Fatalf("source refresh: (%+v, %v)", result, err)
 				}
 				return result
 			}
@@ -3168,10 +2617,11 @@ func TestSourceReconcilerRemovesAbsentStrategyAfterOnePublishedGraceCycle(t *tes
 				sort.Strings(ids)
 				return ids
 			}
+			absentSince := sourceNow.Unix()
 			pendingRemoval := []controlplane.ObjectDisposition{{SourceID: "1002", Scope: "STRATEGY",
-				Disposition: controlplane.DispositionPendingRemoval, Reason: "REMOVED_FROM_ACTIVE_SET"}}
+				Disposition: controlplane.DispositionPendingRemoval, Reason: "REMOVED_FROM_ACTIVE_SET", AbsentSince: absentSince}}
 			removed := []controlplane.ObjectDisposition{{SourceID: "1002", Scope: "STRATEGY",
-				Disposition: controlplane.DispositionRemoved, Reason: "ABSENT_FROM_ACTIVE_SET"}}
+				Disposition: controlplane.DispositionRemoved, Reason: "ABSENT_FROM_ACTIVE_SET", AbsentSince: absentSince}}
 
 			// Cycle 1: both strategies are observed, published and activated.
 			first := settle()
@@ -3202,7 +2652,8 @@ func TestSourceReconcilerRemovesAbsentStrategyAfterOnePublishedGraceCycle(t *tes
 			}
 
 			// Cycle 2: strategy 1002 disappears upstream. The snapshot is unchanged
-			// because the Plan is retained, but the audit records the grace fact.
+			// because the Plan is retained, but the audit records the grace fact
+			// stamped with this moment.
 			setStrategyIDs(`[1001]`)
 			second := settle()
 			if second.Status != controlplane.SourceRefreshUnchanged || second.Publication != first.Publication {
@@ -3219,9 +2670,24 @@ func TestSourceReconcilerRemovesAbsentStrategyAfterOnePublishedGraceCycle(t *tes
 				t.Fatalf("cycle 2 activation=(%+v,%v), want unchanged", state, err)
 			}
 
-			if test.returnsInCycle3 {
-				// Cycle 3: the strategy is observed again before its grace cycle
-				// expired. It is accepted normally and the grace fact disappears.
+			// Every refresh inside the grace keeps the Plan and the same stamp:
+			// the audit does not move, so the refresh is UNCHANGED.
+			sourceNow = sourceNow.Add(controlplane.AbsenceGracePeriod - 2*time.Minute)
+			inside := settle()
+			if inside.Status != controlplane.SourceRefreshUnchanged || inside.Publication != first.Publication {
+				t.Fatalf("refresh inside the grace = %+v, want UNCHANGED at %+v", inside, first.Publication)
+			}
+			if plans, _ := publishedPlans(inside.Publication); !reflect.DeepEqual(plans, []string{"1001", "1002"}) {
+				t.Fatalf("snapshot plans inside the grace=%v, want the retained Plan", plans)
+			}
+			if dispositions := strategyDispositions("1002"); !reflect.DeepEqual(dispositions, pendingRemoval) {
+				t.Fatalf("strategy dispositions inside the grace=%+v, want the same %+v", dispositions, pendingRemoval)
+			}
+
+			if test.returns {
+				// Cycle 3: the strategy is observed again before the grace
+				// expired. It is accepted normally and the grace fact disappears;
+				// its Plan never left, so nothing is re-acquired.
 				setStrategyIDs(`[1001,1002]`)
 				third := settle()
 				if third.Status != controlplane.SourceRefreshUnchanged || third.Publication != first.Publication {
@@ -3236,8 +2702,10 @@ func TestSourceReconcilerRemovesAbsentStrategyAfterOnePublishedGraceCycle(t *tes
 				return
 			}
 
-			// Cycle 3: still absent, the grace cycle is spent. The Plan leaves the
-			// snapshot, the audit records REMOVED and activation follows.
+			// Cycle 3: still absent past the grace period. The Plan leaves the
+			// snapshot, the audit records REMOVED with the moment the absence
+			// began, and activation follows.
+			sourceNow = sourceNow.Add(2 * time.Minute)
 			third := settle()
 			if third.Status != controlplane.SourceRefreshPublished || third.Publication == first.Publication {
 				t.Fatalf("cycle 3 = %+v, want a new PUBLISHED snapshot", third)
@@ -3275,6 +2743,108 @@ func TestSourceReconcilerRemovesAbsentStrategyAfterOnePublishedGraceCycle(t *tes
 				t.Fatalf("cycle 4 strategy dispositions=%+v, want none", dispositions)
 			}
 		})
+	}
+}
+
+// An absence that arrives in the same round as a change to the snapshot is
+// published by that round with the moment the absence began, and the round
+// after it, a refresh interval later, stamps the same moment: the grace's
+// memory is the published audit, so an unchanged source makes an unchanged
+// audit and the round is UNCHANGED rather than a publication that only moved
+// a stamp.
+func TestSourceReconcilerKeepsAGraceStampAcrossRounds(t *testing.T) {
+	ctx := context.Background()
+	client := newControlplaneRedis(t)
+	documents := realThresholdDocuments(t)
+	setStrategyIDs := func(ids string) {
+		t.Helper()
+		if err := client.Set(ctx, "bkmonitor.cache.strategy_ids", ids, 0).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setDocument := func(id string, document json.RawMessage) {
+		t.Helper()
+		if err := client.Set(ctx, "bkmonitor.cache.strategy_"+id, string(document), 0).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setStrategyIDs(`[1001,1002]`)
+	setDocument("1001", documents[0])
+	setDocument("1002", documents[1])
+	source := newRedisStrategySource(t, client)
+	planner, err := controlplane.NewLegacyPrimaryQueryCompiler("uq-primary-v1", "UTC", testLegacyQueryRuntimeFacts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := controlplane.NewRedisCatalogRepository(client, "alarmd:control:grace-candidate", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiler, semantics := runtimePlanCompiler(t)
+	reconciler, err := controlplane.NewSourceReconciler(repository, compiler, semantics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceNow := time.Unix(1_700_000_000, 0)
+	if err := reconciler.ConfigureClock(func() time.Time { return sourceNow }); err != nil {
+		t.Fatal(err)
+	}
+	refresh := func() controlplane.SourceRefreshResult {
+		t.Helper()
+		result, err := reconciler.Refresh(ctx, source, planner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	// Cycle 1: both published.
+	first := refresh()
+	if first.Status != controlplane.SourceRefreshPublished {
+		t.Fatalf("cycle 1 = %+v, want PUBLISHED", first)
+	}
+	// Cycle 2: 1001 changes and 1002 disappears in the same round, so the
+	// snapshot moves and the round publishes it.
+	setDocument("1001", withResultTable(t, documents[0], "system.mem"))
+	setStrategyIDs(`[1001]`)
+	absentAt := sourceNow
+	changed := refresh()
+	if changed.Status != controlplane.SourceRefreshPublished || changed.Publication == first.Publication {
+		t.Fatalf("cycle 2 = %+v, want a new PUBLISHED snapshot", changed)
+	}
+	// One refresh interval later the next round stamps the same moment.
+	sourceNow = sourceNow.Add(time.Minute)
+	confirmed := refresh()
+	if confirmed.Status != controlplane.SourceRefreshUnchanged || confirmed.Publication != changed.Publication {
+		t.Fatalf("the round after cycle 2 = %+v, want UNCHANGED at %+v; a grace stamp that moved would make every round a publication", confirmed, changed.Publication)
+	}
+	audit, err := repository.LoadLatestAudit(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var graced []controlplane.ObjectDisposition
+	for _, disposition := range audit.Dispositions {
+		if disposition.Scope == "STRATEGY" && disposition.SourceID == "1002" {
+			graced = append(graced, disposition)
+		}
+	}
+	want := []controlplane.ObjectDisposition{{SourceID: "1002", Scope: "STRATEGY",
+		Disposition: controlplane.DispositionPendingRemoval, Reason: "REMOVED_FROM_ACTIVE_SET", AbsentSince: absentAt.Unix()}}
+	if !reflect.DeepEqual(graced, want) {
+		t.Fatalf("published grace fact = %+v, want %+v stamped when the absence was first seen", graced, want)
+	}
+	snapshot, err := loadPublishedSnapshot(ctx, repository, confirmed.Publication)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]string, 0)
+	for _, group := range snapshot.QueryGroups {
+		for _, plan := range group.Plans {
+			ids = append(ids, plan.Identity.StrategyID)
+		}
+	}
+	sort.Strings(ids)
+	if !reflect.DeepEqual(ids, []string{"1001", "1002"}) {
+		t.Fatalf("published plans = %v, want the changed 1001 and the retained 1002", ids)
 	}
 }
 
@@ -4028,42 +3598,36 @@ func TestRedisCatalogRuntimeCutoverUsesOneHalfOpenTimelineAndNewGrid(t *testing.
 		t.Fatal(err)
 	}
 
-	newCatalog := catalogWithSchedule(t, oldCatalog, 120, 30)
+	// Same interval, new alignment: a grid of 30+60k from the boundary on.
+	newCatalog := catalogWithSchedule(t, oldCatalog, 60, 30)
 	newSnapshot, _, err := repository.PublishCatalog(context.Background(), newCatalog)
 	if err != nil {
 		t.Fatal(err)
 	}
 	boundary := execution.EvaluationTime(180)
-	oldClosed := frozenSchedule(t, oldSnapshot.Publication, oldCatalog.QueryGroups[0], 60, &boundary)
-	newOpen := frozenSchedule(t, newSnapshot.Publication, newCatalog.QueryGroups[0], boundary, nil)
-	newActivation := activationState(t, 2, newSnapshot, newOpen, nil)
-	cutover := execution.ScheduleCutoverFact{OldSegment: oldClosed.Segment, NewSegment: newOpen.Segment}
-	if err := repository.CompareAndSetScheduleCutover(context.Background(), controlplane.ActivationExpectation{
-		RecordRevision: oldActivation.RecordRevision, Current: oldActivation.Current,
-	}, newActivation, []execution.ScheduleCutoverFact{cutover}); err != nil {
-		t.Fatal(err)
-	}
+	cutOverAt(t, repository, newSnapshot, boundary)
+	queryGroup := oldCatalog.QueryGroups[0].Identity
 
 	compiler, stateSemantics := runtimePlanCompiler(t)
 	runtime, err := controlplane.NewRedisCatalogRuntime(repository, compiler, stateSemantics, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldLoaded, err := runtime.ReadFrozenSchedule(context.Background(), oldClosed.Segment.QueryGroup, 120)
+	oldLoaded, err := runtime.ReadFrozenSchedule(context.Background(), queryGroup, 120)
 	if err != nil || oldLoaded.Segment.End == nil || *oldLoaded.Segment.End != boundary {
 		t.Fatalf("old schedule=(%#v, %v)", oldLoaded, err)
 	}
-	newLoaded, err := runtime.ReadFrozenSchedule(context.Background(), newOpen.Segment.QueryGroup, boundary)
+	newLoaded, err := runtime.ReadFrozenSchedule(context.Background(), queryGroup, boundary)
 	if err != nil || newLoaded.Segment.Start != boundary {
 		t.Fatalf("new schedule=(%#v, %v)", newLoaded, err)
 	}
 	first, ok := newLoaded.FirstSlot()
-	if !ok || first != 270 {
-		t.Fatalf("new first Slot=(%d, %t), want 270", first, ok)
+	if !ok || first != 210 {
+		t.Fatalf("new first Slot=(%d, %t), want 210", first, ok)
 	}
-	next, err := runtime.NextSlotAfter(context.Background(), oldClosed.Segment.QueryGroup, 120)
-	if err != nil || next != 270 {
-		t.Fatalf("next across cutover=(%d, %v), want 270", next, err)
+	next, err := runtime.NextSlotAfter(context.Background(), queryGroup, 120)
+	if err != nil || next != 210 {
+		t.Fatalf("next across cutover=(%d, %v), want 210", next, err)
 	}
 }
 
@@ -4092,50 +3656,19 @@ func TestRedisCatalogRepositoryRejectsInitialActivationWithoutScheduleForEveryPl
 	}
 }
 
-func TestRedisCatalogRepositoryRejectsCutoverChangingPlanOutsideAffectedQueryGroup(t *testing.T) {
-	client := newControlplaneRedis(t)
-	repository, err := controlplane.NewRedisCatalogRepository(client, "alarmd:control:cutover-coverage", time.Hour)
+// cutOverAt runs the cutover to snapshot the way production does, through
+// the reconciler a control-plane Leader runs, at boundary.
+func cutOverAt(t *testing.T, repository *controlplane.RedisCatalogRepository, snapshot controlplane.PublishedSnapshot, boundary execution.EvaluationTime) {
+	t.Helper()
+	progress := &activationProgressReader{byGroup: map[execution.QueryGroupIdentity]execution.ProgressLoadResult{}}
+	compiler, semantics := runtimePlanCompiler(t)
+	reconciler, err := controlplane.NewScheduleActivationReconcilerWithProgress(repository, compiler, semantics, progress,
+		func() time.Time { return time.Unix(int64(boundary), 0) })
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldCatalog := twoQueryGroupCatalog(t)
-	oldSnapshot, _, err := repository.PublishCatalog(context.Background(), oldCatalog)
-	if err != nil {
+	if _, err := reconciler.Ensure(context.Background(), snapshot.Publication); err != nil {
 		t.Fatal(err)
-	}
-	oldSchedules := []execution.FrozenQueryGroupSchedule{
-		frozenSchedule(t, oldSnapshot.Publication, oldCatalog.QueryGroups[0], 60, nil),
-		frozenSchedule(t, oldSnapshot.Publication, oldCatalog.QueryGroups[1], 60, nil),
-	}
-	oldActivation := activationState(t, 1, oldSnapshot, oldSchedules[0], nil, oldSchedules[1:]...)
-	initial := []execution.InitialScheduleActivationFact{{Segment: oldSchedules[0].Segment}, {Segment: oldSchedules[1].Segment}}
-	if err := repository.CompareAndSetInitialScheduleActivation(context.Background(), controlplane.ActivationExpectation{}, oldActivation, initial); err != nil {
-		t.Fatal(err)
-	}
-
-	newCatalog := catalogWithSchedule(t, oldCatalog, 120, 30)
-	newSnapshot, _, err := repository.PublishCatalog(context.Background(), newCatalog)
-	if err != nil {
-		t.Fatal(err)
-	}
-	boundary := execution.EvaluationTime(180)
-	oldClosed := frozenSchedule(t, oldSnapshot.Publication, oldCatalog.QueryGroups[0], 60, &boundary)
-	newOpen := frozenSchedule(t, newSnapshot.Publication, newCatalog.QueryGroups[0], boundary, nil)
-	newGroupActivation := activationState(t, 2, newSnapshot, newOpen, nil)
-	newActivation := oldActivation
-	newActivation.RecordRevision = 2
-	newActivation.Pending = &newSnapshot.Publication
-	newGroupActivation.Plans[0].Fact.Selection = execution.ActivationPending
-	newActivation.Plans[0] = newGroupActivation.Plans[0]
-	// This valid-looking mutation belongs to the other Query Group and must not
-	// be smuggled into the same CAS without its own persisted Segment fact.
-	newActivation.Plans[1].Fact.Selected.StateApplyEpoch++
-
-	err = repository.CompareAndSetScheduleCutover(context.Background(), controlplane.ActivationExpectation{
-		RecordRevision: oldActivation.RecordRevision, Current: oldActivation.Current,
-	}, newActivation, []execution.ScheduleCutoverFact{{OldSegment: oldClosed.Segment, NewSegment: newOpen.Segment}})
-	if err == nil || !strings.Contains(err.Error(), "outside affected Query Groups") {
-		t.Fatalf("unrelated activation mutation error=%v", err)
 	}
 }
 
@@ -4719,52 +4252,8 @@ func assertNoAuditDisposition(
 
 func newControlplaneRedis(t *testing.T) *redis.Client {
 	t.Helper()
-	executable, err := exec.LookPath("redis-server")
-	if err != nil {
-		t.Skip("redis-server is not installed")
-	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	address := listener.Addr().String()
-	if err := listener.Close(); err != nil {
-		t.Fatal(err)
-	}
-	_, portText, err := net.SplitHostPort(address)
-	if err != nil {
-		t.Fatal(err)
-	}
-	command := exec.Command(executable, "--bind", "127.0.0.1", "--port", portText,
-		"--save", "", "--appendonly", "no", "--dir", t.TempDir(), "--daemonize", "no", "--loglevel", "warning")
-	var output bytes.Buffer
-	command.Stdout, command.Stderr = &output, &output
-	if err := command.Start(); err != nil {
-		t.Fatal(err)
-	}
-	client := redis.NewClient(&redis.Options{Addr: address, DialTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second})
-	t.Cleanup(func() {
-		_ = client.Close()
-		if command.ProcessState == nil || !command.ProcessState.Exited() {
-			_ = command.Process.Kill()
-			_ = command.Wait()
-		}
-	})
-	// The wait is generous on purpose. Three seconds encoded an assumption about
-	// machine load rather than about redis: under `go test ./...` dozens of
-	// packages start their own server at the same moment, and a window that is
-	// ample on an idle machine is not on a loaded one - which turned a whole-tree
-	// "all green" into a function of load rather than of the code. A healthy
-	// server answers Ping in milliseconds, so a longer budget costs the normal
-	// path nothing; it only matters when the server genuinely cannot start, and
-	// that case is meant to be read from the server's own output.
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		if client.Ping(context.Background()).Err() == nil {
-			return client
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("redis-server did not become ready: %s", output.String())
-	return nil
+	server := redistest.Start(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr, DialTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second})
+	t.Cleanup(func() { _ = client.Close() })
+	return client
 }

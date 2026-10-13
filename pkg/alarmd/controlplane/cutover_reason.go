@@ -54,10 +54,6 @@ const (
 	// moved by something other than this path -- including a previous cutover
 	// of this path that wrote Segments and did not land its activation.
 	CutoverReasonOpenDigestMismatch = "open_digest_mismatch"
-	// CutoverReasonLegacyRevisionMismatch is a Segment from before Segments
-	// named their content, whose query or schedule revision disagrees with the
-	// group it is being compared against.
-	CutoverReasonLegacyRevisionMismatch = "legacy_revision_mismatch"
 	// CutoverReasonSegmentContentMismatch is the publication's own names
 	// disagreeing with the content it hands the cutter: the manifest says this
 	// Query Group's object is one digest and the group that came back from the
@@ -76,6 +72,12 @@ const (
 	// CutoverReasonDigestMismatch is a stored object that does not hash to the
 	// digest it is named by, or is not the object that digest should name.
 	CutoverReasonDigestMismatch = "digest_mismatch"
+	// CutoverReasonObjectNewer is a stored object of a contract version this
+	// build does not read yet: the leader that published it is newer than
+	// this replica. It lasts as long as the rollout and clears by itself
+	// when this replica is replaced; reading it as a digest mismatch made a
+	// version bump look like every object breaking at once.
+	CutoverReasonObjectNewer = "object_newer"
 	// CutoverReasonConflict is the compare-and-set losing: another writer moved
 	// the activation or a timeline first. This one is expected occasionally and
 	// resolves by itself on the next round.
@@ -102,9 +104,9 @@ const (
 var CutoverReasons = []string{
 	CutoverReasonActivationRecordMissing,
 	CutoverReasonTimelineMissing, CutoverReasonOpenSegmentClosed,
-	CutoverReasonOpenDigestMismatch, CutoverReasonLegacyRevisionMismatch,
+	CutoverReasonOpenDigestMismatch,
 	CutoverReasonSegmentContentMismatch, CutoverReasonSegmentConflict,
-	CutoverReasonDigestMismatch, CutoverReasonConflict, CutoverReasonUnavailable,
+	CutoverReasonDigestMismatch, CutoverReasonObjectNewer, CutoverReasonConflict, CutoverReasonUnavailable,
 	CutoverReasonInvalidRequest, CutoverReasonIO, CutoverReasonOther,
 }
 
@@ -168,6 +170,8 @@ func cutoverFailureReason(err error) string {
 		return CutoverReasonSegmentConflict
 	case errors.Is(err, ErrActivationConflict):
 		return CutoverReasonConflict
+	case errors.Is(err, ErrCatalogObjectContractNewer):
+		return CutoverReasonObjectNewer
 	case errors.Is(err, ErrCatalogObjectCorrupt):
 		return CutoverReasonDigestMismatch
 	case errors.Is(err, ErrCatalogObjectUnavailable),

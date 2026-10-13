@@ -6,13 +6,42 @@ package observability
 // worker contract codes, capacity budgets); anything outside the grammar
 // collapses to OTHER. Detail is an optional bounded provider detail such as
 // "http_status=503" or "transport=connection_refused".
-type QueryFailureFacts struct{ Stage, Category, Code, Detail string }
+type QueryFailureFacts struct {
+	Stage, Category, Code, Detail string
+	// Timing is a failed provider query read against its budget; nil where
+	// the attempt did not measure it. See QueryTiming.
+	Timing *QueryTiming
+}
+
+// QueryTiming splits a Slot query's budget - from its Slot's evaluation
+// time, or a recovery's arrival, to its query deadline - at the moment its
+// window could be read and the moment its request went out: the settling
+// wait the Plan puts first by design, the part lost after it before the
+// query began, what was left to the deadline then, and what the request
+// used, of which local is what alarmd spent on what had arrived of the
+// answer - the rest was waiting on the backend. The first three add up to
+// the whole budget. It is what tells a timeout apart: a backend that did not
+// answer in time uses its whole budget having begun on time, little of it
+// local; alarmd's own delivery that did not keep up spends most of it local;
+// a query begun late had little left; a budget short to begin with is small
+// in all three added together. See execution.AttemptTiming.
+type QueryTiming struct {
+	SettleMillis    int64 `json:"settle_ms"`
+	StartLateMillis int64 `json:"start_late_ms"`
+	BudgetMillis    int64 `json:"budget_ms"`
+	ElapsedMillis   int64 `json:"elapsed_ms"`
+	LocalMillis     int64 `json:"local_ms"`
+}
 
 const (
 	QueryFailureStageExecute        = "execute"
 	QueryFailureStageStreamComplete = "stream_complete"
 	QueryFailureStageProvider       = "provider"
 	QueryFailureStageOther          = "other"
+	// QueryFailureStageOutput is the write of the round's events, after the
+	// evaluation: a failure there is the sink's, and the row reads it by the
+	// error's own words rather than by a query failure's detail grammar.
+	QueryFailureStageOutput = "output"
 
 	QueryFailureCategorySourceBackend      = "source_backend"
 	QueryFailureCategorySeriesIdentity     = "series_identity"
@@ -28,6 +57,8 @@ const (
 	// the result contract rejected.
 	QueryFailureCategoryEvaluation = "evaluation"
 	QueryFailureCategoryOther      = "other"
+	// QueryFailureCategoryOutput is a failure writing the round's events.
+	QueryFailureCategoryOutput = "output"
 
 	QueryFailureCodeOther = "OTHER"
 
@@ -41,11 +72,13 @@ const (
 var (
 	QueryFailureStages = []string{
 		QueryFailureStageExecute, QueryFailureStageStreamComplete, QueryFailureStageProvider, QueryFailureStageOther,
+		QueryFailureStageOutput,
 	}
 	QueryFailureCategories = []string{
 		QueryFailureCategorySourceBackend, QueryFailureCategorySeriesIdentity, QueryFailureCategoryBudget,
 		QueryFailureCategoryCompletionContract, QueryFailureCategoryNamedInput, QueryFailureCategoryProviderTransport,
 		QueryFailureCategoryAdmission, QueryFailureCategoryEvaluation, QueryFailureCategoryOther,
+		QueryFailureCategoryOutput,
 	}
 )
 
@@ -66,6 +99,33 @@ func ValidQueryFailureCode(code string) bool {
 		}
 	}
 	return true
+}
+
+// CapacityBudgetFailureCode is the failure code a rejection by one budget
+// carries.
+//
+// It exists because the budget's own value is a metric label -- lower case,
+// chosen to read well beside other labels -- and the failure code grammar is
+// upper case. The budget was being passed straight through as the code, so
+// every budget rejection published a code no reader could parse: fleet
+// normalised it away and the page was left with the free text, which is rate
+// limited and gone first. The two spellings are the same fact, and this is the
+// one place that says so.
+func CapacityBudgetFailureCode(budget CapacityBudget) string {
+	switch NormalizeCapacityBudget(budget) {
+	case CapacityBudgetSeries:
+		return "BUDGET_SERIES"
+	case CapacityBudgetRetainedBytes:
+		return "BUDGET_RETAINED_BYTES"
+	case CapacityBudgetStateMutations:
+		return "BUDGET_STATE_MUTATIONS"
+	case CapacityBudgetEvents:
+		return "BUDGET_EVENTS"
+	case CapacityBudgetGapMutations:
+		return "BUDGET_GAP_MUTATIONS"
+	default:
+		return "BUDGET_OTHER"
+	}
 }
 
 // NormalizeQueryFailureCode returns code when it matches the grammar and OTHER
@@ -104,13 +164,15 @@ func normalizeQueryFailure(component Component, stage Stage, input *QueryFailure
 		f.Stage = QueryFailureStageOther
 	}
 	switch f.Category {
-	case QueryFailureCategoryBudget:
-		if budget := NormalizeCapacityBudget(CapacityBudget(f.Code)); budget != "" && budget != CapacityBudgetOther {
-			f.Code = string(budget)
-		} else {
-			f.Code = NormalizeQueryFailureCode(f.Code)
-		}
-	case QueryFailureCategorySourceBackend, QueryFailureCategorySeriesIdentity, QueryFailureCategoryCompletionContract,
+	// Budget goes through the same grammar as every other category. It used to
+	// have an exemption: a code that spelled a known budget was kept as it was,
+	// which is how every budget rejection came to publish a lower-case label as
+	// its code without anything noticing. The exemption was what made it
+	// invisible -- OTHER on that path would have said at once that the code was
+	// not a code. Publishers map the budget to its code themselves now, with
+	// CapacityBudgetFailureCode.
+	case QueryFailureCategoryBudget, QueryFailureCategorySourceBackend, QueryFailureCategorySeriesIdentity,
+		QueryFailureCategoryCompletionContract,
 		QueryFailureCategoryNamedInput, QueryFailureCategoryProviderTransport, QueryFailureCategoryAdmission,
 		QueryFailureCategoryEvaluation:
 		f.Code = NormalizeQueryFailureCode(f.Code)

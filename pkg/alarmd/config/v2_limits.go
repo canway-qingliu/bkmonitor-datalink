@@ -11,29 +11,17 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/contract"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/linkdoutput"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/state"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/strategy"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/trigger"
 )
 
 const defaultOutputMaxMessageBytes = 512 << 10
-
-type ReaderLimitsConfig struct {
-	MaxEnvelopeBytes     int `yaml:"max_envelope_bytes"`
-	MaxRecordsPerMessage int `yaml:"max_records_per_message"`
-	MaxPlansPerMessage   int `yaml:"max_plans_per_message"`
-	MaxLevelsPerPlan     int `yaml:"max_levels_per_plan"`
-	MaxSelectorBytes     int `yaml:"max_selector_bytes"`
-	MaxRecordBytes       int `yaml:"max_record_bytes"`
-	MaxPlanSetBytes      int `yaml:"max_plan_set_bytes"`
-	MaxContractDepth     int `yaml:"max_contract_depth"`
-	MaxStringBytes       int `yaml:"max_string_bytes"`
-	MaxValidationIssues  int `yaml:"max_validation_issues"`
-}
 
 type CompilerLimitsConfig struct {
 	MaxPlanBytes              int      `yaml:"max_plan_bytes"`
@@ -83,7 +71,6 @@ type StoreLimitsConfig struct {
 }
 
 type LimitsConfig struct {
-	Reader   ReaderLimitsConfig   `yaml:"reader"`
 	Compiler CompilerLimitsConfig `yaml:"compiler"`
 	Detect   DetectLimitsConfig   `yaml:"detect"`
 	Trigger  TriggerLimitsConfig  `yaml:"trigger"`
@@ -93,11 +80,6 @@ type LimitsConfig struct {
 
 func defaultLimits() LimitsConfig {
 	return LimitsConfig{
-		Reader: ReaderLimitsConfig{
-			MaxEnvelopeBytes: 512 << 10, MaxRecordsPerMessage: 500, MaxPlansPerMessage: 16, MaxLevelsPerPlan: 8,
-			MaxSelectorBytes: 64 << 10, MaxRecordBytes: 128 << 10, MaxPlanSetBytes: 256 << 10,
-			MaxContractDepth: 32, MaxStringBytes: 64 << 10, MaxValidationIssues: 256,
-		},
 		Compiler: CompilerLimitsConfig{
 			MaxPlanBytes: 256 << 10, MaxLevelsPerPlan: 8, MaxAlgorithmsPerLevel: 8,
 			MaxGroupsPerAlgorithm: 16, MaxConditionsPerAlgorithm: 32, MaxASTNodesPerLevel: 512,
@@ -133,16 +115,6 @@ func defaultLimits() LimitsConfig {
 	}
 }
 
-func (c Config) ReaderLimits() contract.ReaderLimitsV2 {
-	v := c.Limits.Reader
-	return contract.ReaderLimitsV2{
-		MaxEnvelopeBytes: v.MaxEnvelopeBytes, MaxRecordsPerMessage: v.MaxRecordsPerMessage,
-		MaxPlansPerMessage: v.MaxPlansPerMessage, MaxLevelsPerPlan: v.MaxLevelsPerPlan,
-		MaxSelectorBytes: v.MaxSelectorBytes, MaxRecordBytes: v.MaxRecordBytes, MaxPlanSetBytes: v.MaxPlanSetBytes,
-		MaxContractDepth: v.MaxContractDepth, MaxStringBytes: v.MaxStringBytes, MaxValidationIssues: v.MaxValidationIssues,
-	}
-}
-
 func (c Config) CompilerLimits() strategy.Limits {
 	v := c.Limits.Compiler
 	return strategy.Limits{
@@ -152,6 +124,7 @@ func (c Config) CompilerLimits() strategy.Limits {
 		MaxTriggerWindowSize:          c.Limits.Trigger.MaxTriggerWindowSize,
 		MaxRecoveryConsecutiveWindows: c.Limits.Trigger.MaxRecoveryConsecutiveWindows,
 		MaxRequiredHistoryPoints:      v.MaxRequiredHistoryPoints,
+		MaxRetainedPointsByLevels:     c.retainedPointCeilings(),
 		MaxTriggerComputeCost:         c.Limits.Trigger.MaxComputeCost,
 		MaxCompiledPlanBytes:          v.MaxCompiledPlanBytes,
 		MaxCacheEntries:               v.MaxCacheEntries, MaxCacheBytes: v.MaxCacheBytes,
@@ -169,26 +142,7 @@ func (c Config) TriggerLimits() trigger.EvaluationLimitsV2 {
 	}
 }
 
-func (c Config) CodecLimits() state.CodecLimits {
-	v := c.Limits.Codec
-	return state.CodecLimits{MaxLevels: v.MaxLevels, MaxPoints: v.MaxPoints, MaxEncodedBytes: v.MaxEncodedBytes}
-}
-
-func (c Config) StoreLimits() state.StoreLimits {
-	v := c.Limits.Store
-	return state.StoreLimits{
-		MaxKeysPerBatch: v.MaxKeysPerBatch, MaxKeyBytesPerBatch: v.MaxKeyBytesPerBatch,
-		MaxLoadedBytes: v.MaxLoadedBytes, MaxWrittenBytes: v.MaxWrittenBytes,
-	}
-}
-
 func (c LimitsConfig) validate() error {
-	r := c.Reader
-	if r.MaxEnvelopeBytes <= 0 || r.MaxRecordsPerMessage <= 0 || r.MaxPlansPerMessage <= 0 || r.MaxLevelsPerPlan <= 0 ||
-		r.MaxSelectorBytes <= 0 || r.MaxRecordBytes <= 0 || r.MaxPlanSetBytes <= 0 || r.MaxContractDepth <= 0 ||
-		r.MaxStringBytes <= 0 || r.MaxValidationIssues <= 0 {
-		return errors.New("limits.reader budgets must be positive")
-	}
 	compiler := c.Compiler
 	if compiler.MaxPlanBytes <= 0 || compiler.MaxLevelsPerPlan <= 0 || compiler.MaxAlgorithmsPerLevel <= 0 ||
 		compiler.MaxGroupsPerAlgorithm <= 0 || compiler.MaxConditionsPerAlgorithm <= 0 || compiler.MaxASTNodesPerLevel <= 0 ||
@@ -215,14 +169,16 @@ func (c LimitsConfig) validate() error {
 	if store.MaxKeysPerBatch <= 0 || store.MaxKeyBytesPerBatch <= 0 || store.MaxLoadedBytes <= 0 || store.MaxWrittenBytes <= 0 {
 		return errors.New("limits.store budgets must be positive")
 	}
-	if r.MaxSelectorBytes > r.MaxEnvelopeBytes || r.MaxRecordBytes > r.MaxEnvelopeBytes || r.MaxPlanSetBytes > r.MaxEnvelopeBytes ||
-		compiler.MaxPlanBytes > r.MaxPlanSetBytes {
-		return errors.New("reader and compiler byte budgets are inconsistent")
-	}
-	if r.MaxPlansPerMessage > int(detectLimits.MaxPlans) || r.MaxLevelsPerPlan > compiler.MaxLevelsPerPlan ||
-		compiler.MaxLevelsPerPlan > int(triggerLimits.MaxLevels) ||
+	if compiler.MaxLevelsPerPlan > int(triggerLimits.MaxLevels) ||
 		compiler.MaxLevelsPerPlan > int(triggerLimits.MaxLevelResultsPerEvent) || compiler.MaxLevelsPerPlan > codec.MaxLevels {
 		return errors.New("plan and level budgets are inconsistent")
+	}
+	if compiler.MaxLevelsPerPlan > linkdoutput.MaxEvaluations {
+		// Every decided level of a Plan is one evaluation on the standard
+		// output, and the consumer refuses a message carrying more than its
+		// bound. The relation lives here, where the budget is set, rather
+		// than as a refusal met one alert at a time.
+		return fmt.Errorf("limits.compiler.max_levels_per_plan %d exceeds the %d evaluations the standard output carries", compiler.MaxLevelsPerPlan, linkdoutput.MaxEvaluations)
 	}
 	if compiler.MaxRequiredHistoryPoints > triggerLimits.MaxRequiredHistoryPoints ||
 		compiler.MaxRequiredHistoryPoints > uint32(codec.MaxPoints) {
@@ -235,4 +191,43 @@ func (c LimitsConfig) validate() error {
 		return errors.New("state store cannot admit one maximum encoded window")
 	}
 	return nil
+}
+
+// retainedPointCeilings is how many retained points fit one stored Runtime
+// State record, by how many Levels share it.
+//
+// Derived from the representation the store writes rather than stated beside
+// it. Under the JSON envelope the configured max_required_history_points of
+// 4096 was unreachable - the record ran out at roughly 2100 points for one
+// Level and 1400 for two - so the number in the file described a limit that
+// could not be reached and the real one was written nowhere: a Plan configured
+// between them compiled, activated, and then had every state write refused per
+// series with nothing to say why.
+//
+// It follows the framed record now that the store writes one, which is the
+// case this was built to handle. The ceilings rise by more than an order of
+// magnitude and the configured limit becomes the binding one again: 4096
+// points is reachable at every Level count, so a Plan is bounded by what it
+// asked for rather than by the shape of the value it is stored in. That is
+// the intended end state, not a reason to leave the derivation behind - a
+// ceiling that has stopped binding is exactly a ceiling nobody notices has
+// moved, and the next representation or the next configured limit puts it
+// back in play with nothing else to revisit.
+func (c Config) retainedPointCeilings() []uint32 {
+	levels := c.Limits.Compiler.MaxLevelsPerPlan
+	if levels <= 0 {
+		return nil
+	}
+	// One past MaxLevelsPerPlan: a Plan that detects no-data compiles a Level
+	// for it beside the ones the strategy declares, and that Level's facts are
+	// written on the same points as the rest.
+	ceilings := make([]uint32, levels+2)
+	for count := 1; count < len(ceilings); count++ {
+		points, err := state.MaxPackedFramePoints(count, c.Limits.Codec.MaxEncodedBytes)
+		if err != nil || points <= 0 {
+			continue
+		}
+		ceilings[count] = uint32(points)
+	}
+	return ceilings
 }

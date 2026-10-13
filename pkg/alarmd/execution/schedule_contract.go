@@ -73,8 +73,15 @@ func (spec ScheduleSpec) nextAtOrAfter(at EvaluationTime) (EvaluationTime, bool)
 	return EvaluationTime(int64(at) + increment), true
 }
 
-func (spec ScheduleSpec) completionDeadlineUnixMilli(at EvaluationTime) (int64, bool) {
-	return spec.CompletionDeadlineUnixMilli(at)
+// HeldCompletionDeadlineUnixMilli is the completion deadline of the Slot at
+// at read readHoldMillis later than its schedule says: the deadline a frozen
+// contract with that read hold carries.
+func (spec ScheduleSpec) HeldCompletionDeadlineUnixMilli(at EvaluationTime, readHoldMillis int64) (int64, bool) {
+	deadline, ok := spec.CompletionDeadlineUnixMilli(at)
+	if !ok || readHoldMillis < 0 || readHoldMillis > MaxReadHoldMillis || deadline > math.MaxInt64-readHoldMillis {
+		return 0, false
+	}
+	return deadline + readHoldMillis, true
 }
 
 // MinimumSettlingWaitSeconds is the shortest wait this product has ever
@@ -183,6 +190,16 @@ type FrozenPlanSchedule struct {
 	Identity         PlanIdentity
 	ScheduleRevision PlanScheduleRevision
 	Spec             ScheduleSpec
+	// Shard is the piece of a split strategy this entry schedules, nil for a
+	// Plan that is not split. Persisted inside the Schedule timeline, so a
+	// pointer omitted when nil: no timeline of an unsplit Plan changes bytes.
+	Shard *ShardRef `json:",omitempty"`
+}
+
+// Key is this entry's Plan key: the strategy and the piece. Activation
+// records are matched to Schedule entries by it across every Query Group.
+func (schedule FrozenPlanSchedule) Key() PlanKey {
+	return PlanKeyOf(schedule.Identity, ShardOf(schedule.Shard))
 }
 
 func (schedule FrozenPlanSchedule) Validate() error {
@@ -202,7 +219,14 @@ func (schedule FrozenPlanSchedule) Validate() error {
 type FrozenPlanScheduleRef struct {
 	Identity         PlanIdentity
 	ScheduleRevision PlanScheduleRevision
+	// Shard is the piece this ref schedules, nil for a Plan that is not
+	// split. The ref is in the due-Plan-set digest domain, so it is omitted
+	// when nil and no digest of an unsplit Plan moves.
+	Shard *ShardRef `json:",omitempty"`
 }
+
+// Key is this ref's Plan key: the strategy and the piece.
+func (ref FrozenPlanScheduleRef) Key() PlanKey { return PlanKeyOf(ref.Identity, ShardOf(ref.Shard)) }
 
 func (ref FrozenPlanScheduleRef) Validate() error {
 	if err := ref.Identity.Validate(); err != nil {
@@ -425,7 +449,7 @@ func (schedule FrozenQueryGroupSchedule) DuePlanRefs(at EvaluationTime) []Frozen
 	due := make([]FrozenPlanScheduleRef, 0, len(schedule.Plans))
 	for _, plan := range schedule.Plans {
 		if plan.Spec.IsAligned(at) {
-			due = append(due, FrozenPlanScheduleRef{Identity: plan.Identity, ScheduleRevision: plan.ScheduleRevision})
+			due = append(due, FrozenPlanScheduleRef{Identity: plan.Identity, ScheduleRevision: plan.ScheduleRevision, Shard: plan.Shard})
 		}
 	}
 	sort.Slice(due, func(left, right int) bool {
@@ -474,35 +498,6 @@ func (fact InitialScheduleActivationFact) Validate(schedule FrozenQueryGroupSche
 	return nil
 }
 
-// ScheduleCutoverFact atomically closes OldSegment and opens NewSegment at one
-// boundary. It records immutable facts and does not introduce a state machine.
-type ScheduleCutoverFact struct {
-	OldSegment ScheduleSegmentFact
-	NewSegment ScheduleSegmentFact
-}
-
-func (fact ScheduleCutoverFact) Validate(oldSchedule, newSchedule FrozenQueryGroupSchedule) error {
-	if err := oldSchedule.Validate(); err != nil {
-		return err
-	}
-	if err := newSchedule.Validate(); err != nil {
-		return err
-	}
-	if !sameScheduleSegment(fact.OldSegment, oldSchedule.Segment) ||
-		!sameScheduleSegment(fact.NewSegment, newSchedule.Segment) {
-		return errors.New("alarmd execution: cutover Segments do not match frozen schedules")
-	}
-	if fact.OldSegment.QueryGroup != fact.NewSegment.QueryGroup || fact.OldSegment.End == nil ||
-		*fact.OldSegment.End != fact.NewSegment.Start || fact.NewSegment.End != nil {
-		return errors.New("alarmd execution: cutover requires adjacent half-open Segments on one Query Group timeline")
-	}
-	if fact.NewSegment.Publication.PublicationEpoch <= fact.OldSegment.Publication.PublicationEpoch ||
-		fact.NewSegment.Publication.SnapshotRevision == fact.OldSegment.Publication.SnapshotRevision {
-		return errors.New("alarmd execution: cutover publication must advance content and epoch")
-	}
-	return nil
-}
-
 // FreezeSlotContractRequest is the exact Scheduler-to-Catalog request. It has
 // no latest selector, local time, ownership, assignment or execution identity.
 type FreezeSlotContractRequest struct {
@@ -511,12 +506,19 @@ type FreezeSlotContractRequest struct {
 	ScheduleSegmentStart EvaluationTime
 	EvaluationTime       EvaluationTime
 	DuePlans             []FrozenPlanScheduleRef
+	// ReadHoldMillis is the Slot's read hold (FrozenExecutionContractRef):
+	// the Query Group's current one for a Slot frozen for the first time,
+	// and the contract's own for every later freeze of it.
+	ReadHoldMillis int64
 }
 
 func (request FreezeSlotContractRequest) Validate() error {
 	if request.QueryGroup == "" || request.ScheduleRevision == "" || request.ScheduleSegmentStart <= 0 ||
 		request.EvaluationTime < request.ScheduleSegmentStart || len(request.DuePlans) == 0 {
 		return errors.New("alarmd execution: complete frozen Slot request is required")
+	}
+	if request.ReadHoldMillis < 0 || request.ReadHoldMillis > MaxReadHoldMillis {
+		return errors.New("alarmd execution: frozen Slot request read hold is out of range")
 	}
 	seen := make(map[PlanIdentity]struct{}, len(request.DuePlans))
 	for _, due := range request.DuePlans {
@@ -544,6 +546,40 @@ func (fact FrozenSlotContractFact) DeriveDuePlanSetDigest() (DuePlanSetDigest, e
 }
 
 func (fact FrozenSlotContractFact) Validate(request FreezeSlotContractRequest) error {
+	if err := fact.validateAgainst(request); err != nil {
+		return err
+	}
+	digest, err := fact.DeriveDuePlanSetDigest()
+	if err != nil {
+		return err
+	}
+	if digest != fact.Contract.DuePlanSetDigest {
+		return errors.New("alarmd execution: frozen due Plan digest cannot be independently reproduced")
+	}
+	return nil
+}
+
+// SealFrozenSlotContractFact is how the freeze that builds a fact finishes
+// it: the due Plan set digest derived here, once, from the fact's own due
+// Plans and requirements, and every other rule Validate holds a fact to. The
+// freeze used to derive the digest, then validate the fact, which derived it
+// again from the same slices a line later -- the whole of the due Plans'
+// canonical encoding twice per Slot, for a comparison that could not fail.
+// Validate stays what a fact arriving from anywhere else is held to.
+func SealFrozenSlotContractFact(fact FrozenSlotContractFact, request FreezeSlotContractRequest) (FrozenSlotContractFact, error) {
+	digest, err := fact.DeriveDuePlanSetDigest()
+	if err != nil {
+		return FrozenSlotContractFact{}, err
+	}
+	fact.Contract.DuePlanSetDigest = digest
+	if err := fact.validateAgainst(request); err != nil {
+		return FrozenSlotContractFact{}, err
+	}
+	return fact, nil
+}
+
+// validateAgainst is every rule Validate holds a fact to but the digest.
+func (fact FrozenSlotContractFact) validateAgainst(request FreezeSlotContractRequest) error {
 	if err := request.Validate(); err != nil {
 		return err
 	}
@@ -553,7 +589,8 @@ func (fact FrozenSlotContractFact) Validate(request FreezeSlotContractRequest) e
 	if fact.Contract.Slot.QueryGroup != request.QueryGroup ||
 		fact.Contract.ScheduleRevision != request.ScheduleRevision ||
 		fact.Contract.ScheduleSegmentStart != request.ScheduleSegmentStart ||
-		fact.Contract.Slot.EvaluationTime != request.EvaluationTime {
+		fact.Contract.Slot.EvaluationTime != request.EvaluationTime ||
+		fact.Contract.ReadHoldMillis != request.ReadHoldMillis {
 		return errors.New("alarmd execution: frozen Slot contract differs from requested Segment or time")
 	}
 	if len(fact.DuePlans) != len(request.DuePlans) {
@@ -572,7 +609,7 @@ func (fact FrozenSlotContractFact) Validate(request FreezeSlotContractRequest) e
 		if err != nil {
 			return err
 		}
-		deadline, ok := due.ScheduleSpec.completionDeadlineUnixMilli(request.EvaluationTime)
+		deadline, ok := due.ScheduleSpec.HeldCompletionDeadlineUnixMilli(request.EvaluationTime, request.ReadHoldMillis)
 		if !ok || revision != due.ScheduleRevision || !due.ScheduleSpec.IsAligned(request.EvaluationTime) ||
 			deadline != due.CompletionDeadlineUnixMilli {
 			return errors.New("alarmd execution: frozen due Plan ScheduleSpec or deadline is invalid")
@@ -585,13 +622,6 @@ func (fact FrozenSlotContractFact) Validate(request FreezeSlotContractRequest) e
 			return errors.New("alarmd execution: duplicate frozen due Plan fact")
 		}
 		seen[due.Identity] = struct{}{}
-	}
-	digest, err := fact.DeriveDuePlanSetDigest()
-	if err != nil {
-		return err
-	}
-	if digest != fact.Contract.DuePlanSetDigest {
-		return errors.New("alarmd execution: frozen due Plan digest cannot be independently reproduced")
 	}
 	return nil
 }

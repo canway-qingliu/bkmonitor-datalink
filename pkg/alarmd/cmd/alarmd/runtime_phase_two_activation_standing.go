@@ -10,6 +10,9 @@
 package main
 
 import (
+	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/controlplane"
@@ -94,6 +97,28 @@ func (bundle *phaseTwoWorkerBundle) noteActivationLocked(outcome *phaseTwoActiva
 	state.lastFailure = text
 }
 
+// activationHeaderFleetFacts is a missing activation header while this
+// replica holds the control leadership and has not written the header back.
+// Nil on every other replica: only the leader looks, and a replica that lost
+// the leadership keeps the standing it last had, which is not the
+// deployment's any more.
+func (bundle *phaseTwoWorkerBundle) activationHeaderFleetFacts() *fleet.ActivationHeaderFacts {
+	bundle.mu.RLock()
+	leader := bundle.controlLeader
+	bundle.mu.RUnlock()
+	if !leader || bundle.dependencies.ActivationHeader == nil {
+		return nil
+	}
+	reading := bundle.dependencies.ActivationHeader()
+	if !reading.Missing {
+		return nil
+	}
+	return &fleet.ActivationHeaderFacts{
+		MissingSeconds: bundle.dependencies.Now().Sub(reading.MissingSince).Seconds(),
+		LastRebuild:    string(reading.LastRebuild),
+	}
+}
+
 // activationFleetFacts is what the fleet snapshot publishes. Nil before any
 // attempt, which every replica but the leader is. Behind is the one fact the
 // verdict reads once it has held past the bound: the fleet is executing a
@@ -116,6 +141,31 @@ func (bundle *phaseTwoWorkerBundle) activationFleetFacts() *fleet.ActivationFact
 	if !state.lastSuccessAt.IsZero() {
 		age := now.Sub(state.lastSuccessAt).Seconds()
 		facts.LastSuccessAgeSeconds = &age
+	}
+	if bundle.dependencies.ActivationBlocked != nil {
+		reading := bundle.dependencies.ActivationBlocked()
+		for _, count := range reading.ByReason {
+			facts.BlockedQueryGroups += count
+		}
+		if facts.BlockedQueryGroups > 0 {
+			reasons := make([]string, 0, len(reading.ByReason))
+			for reason, count := range reading.ByReason {
+				reasons = append(reasons, fmt.Sprintf("%s=%d", reason, count))
+			}
+			sort.Strings(reasons)
+			facts.BlockedReasons = strings.Join(reasons, ",")
+			facts.BlockedSamples = strings.Join(reading.Samples, ",")
+			facts.BlockedKeys = strings.Join(reading.Keys, ",")
+		}
+	}
+	if bundle.dependencies.ActivationSkipped != nil {
+		reading := bundle.dependencies.ActivationSkipped()
+		facts.SkippedTimelines = reading.Total
+		named := make([]string, 0, len(reading.Named))
+		for _, skipped := range reading.Named {
+			named = append(named, string(skipped.QueryGroup)+":"+string(skipped.Reason))
+		}
+		facts.SkippedNamed = strings.Join(named, ",")
 	}
 	if !state.failingSince.IsZero() {
 		failing := now.Sub(state.failingSince).Seconds()

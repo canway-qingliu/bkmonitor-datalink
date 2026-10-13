@@ -10,16 +10,91 @@
 package platformsettings
 
 import (
-	"bytes"
 	"context"
-	"net"
-	"os/exec"
-	"strconv"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/go-redis/redis/v8"
+
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/internal/redistest"
 )
+
+// Use the publisher's literal keys rather than deriving fixtures from DBKey:
+// the producer and consumer must agree even when fields belong to different domains.
+func TestRedisSourceReadsPlatformDomainSettings(t *testing.T) {
+	executable := redistest.Server(t)
+	address := reserveTCPAddress(t)
+	startRedisServer(t, executable, address)
+	client := redis.NewClient(&redis.Options{Addr: address})
+	t.Cleanup(func() { _ = client.Close() })
+	waitRedisReady(t, client)
+	ctx := context.Background()
+	const prefix = "platform:"
+	const root = prefix + "dynamic_config:"
+	const hostKey = root + "{system}:base_config.metadata.host_disable_monitor_states"
+	const diskKey = root + "{system}:base_config.domains.dataview.file_system_type_ignore"
+	source, err := NewRedisSource(client, prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deploymentHosts := []string{"deployment-host-state"}
+	cache, err := New(Options{Source: source, Deployment: Layer{HostDisableMonitorStates: &deploymentHosts}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publish := func(values map[string]string, removed ...string) {
+		t.Helper()
+		_, err := client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			for key, value := range values {
+				pipe.Set(ctx, key, value, 0)
+			}
+			if len(removed) != 0 {
+				pipe.Del(ctx, removed...)
+			}
+			pipe.Set(ctx, root+"revision", "published", 0)
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cache.Refresh(ctx)
+	}
+	publish(map[string]string{
+		hostKey: `["maintenance"]`,
+		root + "{system}:base_config.metadata.is_access_bk_data":                `true`,
+		root + "{system}:base_config.domains.strategy.bkdata_cmdb_level_tables": `["system.cpu_summary"]`,
+		diskKey: `["tmpfs"]`,
+		root + "{tenant-a}:base_config.metadata.host_disable_monitor_states": `["other-tenant"]`,
+	})
+	want := Settings{HostDisableMonitorStates: []string{"maintenance"}, IsAccessBKData: true,
+		BKDataCMDBLevelTables: []string{"system.cpu_summary"}, FileSystemTypeIgnore: []string{"tmpfs"},
+		NoDataTrackingHorizonSeconds: DefaultNoDataTrackingHorizonSeconds, NoDataTrackingHorizonSource: HorizonSourceDefault}
+	if got := cache.Current(); !reflect.DeepEqual(got, want) || cache.Stats().Mode != ModeAuthoritative {
+		t.Fatalf("published settings = %+v (%s), want %+v", got, cache.Stats().Mode, want)
+	}
+	// A periodic reread observes changed values even if the global revision is unchanged.
+	publish(map[string]string{hostKey: `[]`, diskKey: `[]`})
+	if got := cache.Current(); len(got.HostDisableMonitorStates) != 0 || len(got.FileSystemTypeIgnore) != 0 {
+		t.Fatalf("empty overrides were lost: %+v", got)
+	}
+	publish(nil, hostKey)
+	if got := cache.Current(); !reflect.DeepEqual(got.HostDisableMonitorStates, deploymentHosts) {
+		t.Fatalf("deleted override did not fall back: %+v", got)
+	}
+	previous := cache.Current()
+	publish(map[string]string{diskKey: `123`})
+	if !reflect.DeepEqual(cache.Current(), previous) || cache.Stats().Mode != ModeStale {
+		t.Fatalf("invalid publication replaced the last good settings: %+v", cache.Stats())
+	}
+	if err := client.Del(ctx, root+"revision").Err(); err != nil {
+		t.Fatal(err)
+	}
+	cache.Refresh(ctx)
+	if !reflect.DeepEqual(cache.Current(), previous) || cache.Stats().Unavailable[UnavailableUnpublished] != 1 {
+		t.Fatalf("missing revision reset settings: %+v", cache.Stats())
+	}
+}
 
 // The Redis source against a real server, on the protocol's own keys and
 // in its own shape (one MULTI: GET revision, MGET fields). Nothing
@@ -27,10 +102,7 @@ import (
 // present field comes back as the raw JSON the platform wrote, null
 // included, so that "no override" and "present and empty" stay apart.
 func TestRedisSourceReadsTheProtocolKeysInOneTransaction(t *testing.T) {
-	executable, err := exec.LookPath("redis-server")
-	if err != nil {
-		t.Skip("redis-server is not installed")
-	}
+	executable := redistest.Server(t)
 	address := reserveTCPAddress(t)
 	startRedisServer(t, executable, address)
 	client := redis.NewClient(&redis.Options{Addr: address, DialTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second})
@@ -103,45 +175,19 @@ func TestRedisSourceReadsTheProtocolKeysInOneTransaction(t *testing.T) {
 
 func reserveTCPAddress(t *testing.T) string {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	address := listener.Addr().String()
-	if err := listener.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return address
+	return redistest.FreeAddress(t)
 }
 
-func startRedisServer(t *testing.T, executable, address string) {
+func startRedisServer(t *testing.T, _ string, address string) {
 	t.Helper()
-	_, portText, err := net.SplitHostPort(address)
-	if err != nil {
-		t.Fatal(err)
-	}
-	port, err := strconv.Atoi(portText)
-	if err != nil {
-		t.Fatal(err)
-	}
-	command := exec.Command(executable,
-		"--bind", "127.0.0.1", "--port", strconv.Itoa(port), "--save", "", "--appendonly", "no",
-		"--dir", t.TempDir(), "--daemonize", "no", "--loglevel", "warning",
-	)
-	var output bytes.Buffer
-	command.Stdout, command.Stderr = &output, &output
-	if err := command.Start(); err != nil {
-		t.Fatalf("redis-server start error = %v", err)
-	}
-	t.Cleanup(func() {
-		_ = command.Process.Kill()
-		_ = command.Wait()
-	})
+	redistest.StartAt(t, address)
 }
 
 func waitRedisReady(t *testing.T, client *redis.Client) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	// The server answered before StartAt returned; what is left is this
+	// client's own connection, under the same bound.
+	deadline := time.Now().Add(redistest.ReadyWithin)
 	for time.Now().Before(deadline) {
 		if err := client.Ping(context.Background()).Err(); err == nil {
 			return

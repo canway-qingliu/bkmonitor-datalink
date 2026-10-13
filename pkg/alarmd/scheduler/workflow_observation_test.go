@@ -82,7 +82,7 @@ func TestWorkflowPermitWaitCountsEveryReturnOnce(t *testing.T) {
 }
 
 func TestWorkflowRunnerActualExits(t *testing.T) {
-	for _, name := range []string{"single_flight_busy", "ownership_rejected", "source_backoff", "source_retry", "source_blocked", "source_not_due", "source_error", "operation_not_ready", "admission_denied", "execute_returned", "cancelled", "other_error"} {
+	for _, name := range []string{"single_flight_busy", "ownership_rejected", "source_backoff", "source_retry", "source_blocked", "view_not_executable", "source_not_due", "source_error", "operation_not_ready", "admission_denied", "execute_returned", "cancelled", "other_error"} {
 		t.Run(name, func(t *testing.T) {
 			now := time.Unix(100, 0)
 			slot := frozenSlot("query-group-1")
@@ -104,7 +104,7 @@ func TestWorkflowRunnerActualExits(t *testing.T) {
 			expectedAttempted := false
 			switch name {
 			case "single_flight_busy":
-				release, _ := flights.tryAcquire("query-group-1")
+				release, _, _ := flights.tryAcquireAs("query-group-1", FlightHeldBySlot)
 				defer release()
 			case "ownership_rejected":
 				session.err = errors.New("owner changed")
@@ -115,6 +115,9 @@ func TestWorkflowRunnerActualExits(t *testing.T) {
 				expectedAttempted = true
 			case "source_blocked":
 				source.err = &SourceBlockedError{Err: errors.New("blocked")}
+				expectedAttempted = true
+			case "view_not_executable":
+				source.err = &ViewNotExecutableError{Reason: "not_in_view"}
 				expectedAttempted = true
 			case "source_not_due":
 				source.slot = FrozenSlot{}
@@ -137,6 +140,15 @@ func TestWorkflowRunnerActualExits(t *testing.T) {
 			_, attempted, _ := runner.runOne(ctx, admission)
 			if len(observed) != 1 || observed[0].RunOutcome != name || observed[0].Attempted != expectedAttempted || attempted != expectedAttempted {
 				t.Fatalf("outcome=%+v attempted=%v want %s/%v", observed, attempted, name, expectedAttempted)
+			}
+			// A round the source or the view refused carries what it was
+			// refused with; every other exit carries no words of its own.
+			if refused := source.err; refused != nil && name != "ownership_rejected" {
+				if observed[0].Err == nil || observed[0].Err.Error() != refused.Error() {
+					t.Fatalf("%s carried %v, want the refusal %v", name, observed[0].Err, refused)
+				}
+			} else if observed[0].Err != nil {
+				t.Fatalf("%s carried %v, want no refusal", name, observed[0].Err)
 			}
 		})
 	}
@@ -167,7 +179,7 @@ func TestWorkflowRunnerPanicAndObserverIsolation(t *testing.T) {
 	if outcome != "panic" {
 		t.Fatalf("outcome=%s", outcome)
 	}
-	release, ok := flights.tryAcquire("query-group-1")
+	release, _, ok := flights.tryAcquireAs("query-group-1", FlightHeldBySlot)
 	if !ok {
 		t.Fatal("flight leaked")
 	}

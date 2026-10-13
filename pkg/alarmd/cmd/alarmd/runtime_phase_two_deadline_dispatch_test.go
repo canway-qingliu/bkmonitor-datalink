@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/config"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/metric"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/observability"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/scheduler"
 )
 
@@ -102,7 +104,7 @@ func stopDeadlineDispatcher(t *testing.T, cancel context.CancelFunc, done <-chan
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("runScheduler(cancel) error = %v, want context canceled", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(signalWaitBound):
 		t.Fatal("dispatcher did not stop after cancellation")
 	}
 }
@@ -133,7 +135,7 @@ func TestPhaseTwoDispatcherTakesTheEarliestDeadlineAcrossBothQueues(t *testing.T
 	defer cancel()
 	wake := make(chan struct{}, 1)
 	done := make(chan error, 1)
-	go func() { done <- bundle.runScheduler(ctx, wake, false) }()
+	go func() { done <- bundle.runScheduler(ctx, wake, nil, false) }()
 	wake <- struct{}{}
 	order := collectDispatches(t, started, len(runners))
 	stopDeadlineDispatcher(t, cancel, done)
@@ -172,7 +174,7 @@ func TestPhaseTwoDispatcherFullReadyQueueGivesUpTheLatestDeadlineForAnEarlierOne
 	defer cancel()
 	wake := make(chan struct{}, 1)
 	done := make(chan error, 1)
-	go func() { done <- bundle.runScheduler(ctx, wake, false) }()
+	go func() { done <- bundle.runScheduler(ctx, wake, nil, false) }()
 	wake <- struct{}{}
 	// Walk: 1 and 2 fill the queue; 3 arrives no earlier than either and is
 	// held back, the walk stopping at it. Dispatching 1 frees a place; the
@@ -200,4 +202,156 @@ func TestPhaseTwoDispatcherFullReadyQueueGivesUpTheLatestDeadlineForAnEarlierOne
 		t.Fatalf("next rotation dispatched %v first, want the evicted query-group-3", next)
 	}
 	stopDeadlineDispatcher(t, cancel, done)
+}
+
+// A one-shot run evicts as production does: the Query Group a full ready
+// queue gave up is not offered again in the same generation, and gets its
+// turn at the next tick, which the one-shot run issues itself. The run
+// ends once every target has run, the evicted one last.
+func TestAOneShotRunEvictsAsProductionDoesAndRunsTheEvictedAtTheNextTick(t *testing.T) {
+	cfg := validGoAccessRuntimeConfig()
+	cfg.PhaseTwo.Scheduler.ProcessQueryPermits = 1
+	cfg.PhaseTwo.Scheduler.RecoveryQueryPermits = 0
+	cfg.PhaseTwo.Scheduler.ActiveExecutionLimit = 1
+	cfg.PhaseTwo.Scheduler.ReadyQueueCapacity = 2
+	now := time.Unix(1_700_000_000, 0)
+	minute := func(name execution.QueryGroupIdentity) deadlineDispatchRunner {
+		return deadlineDispatchRunner{queryGroup: name, deadline: now.Add(55 * time.Second), interval: 60}
+	}
+	runners := []deadlineDispatchRunner{
+		minute("query-group-1"), minute("query-group-2"), minute("query-group-3"),
+		{queryGroup: "query-group-4-short", deadline: now.Add(15 * time.Second), interval: 10},
+	}
+	bundle, started, recorder := newDeadlineDispatchBundle(t, configForDeadlineDispatch{config: cfg, now: now, runners: runners})
+
+	done := make(chan error, 1)
+	go func() { done <- bundle.runScheduledOnce(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runScheduledOnce() error = %v", err)
+		}
+	case <-time.After(signalWaitBound):
+		t.Fatal("the one-shot run did not end")
+	}
+	order := collectDispatches(t, started, len(runners))
+	want := []execution.QueryGroupIdentity{"query-group-1", "query-group-4-short", "query-group-2", "query-group-3"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("dispatch order = %v, want %v: the evicted Query Group runs at the next tick, after the generation it was evicted from", order, want)
+	}
+	if got := counterValue(t, recorder, "bkmonitor_alarmd_dispatch_queue_turnaways_total",
+		map[string]string{"outcome": "normal_queue_evicted", "cohort": "other"}); got != 1 {
+		t.Fatalf("normal_queue_evicted = %v, want 1", got)
+	}
+}
+
+// The walk starts over within a generation when the owned set changes, and
+// a one-shot run then treats the Query Group a full queue evicted as
+// production does: it is not offered again before the next generation,
+// even with room in the queue.
+func TestAnEvictedQueryGroupWaitsForTheNextGenerationInAOneShotRunToo(t *testing.T) {
+	cfg := validGoAccessRuntimeConfig()
+	cfg.PhaseTwo.Scheduler.ReadyQueueCapacity = 2
+	now := time.Unix(1_700_000_000, 0)
+	minute := func(name execution.QueryGroupIdentity) deadlineDispatchRunner {
+		return deadlineDispatchRunner{queryGroup: name, deadline: now.Add(55 * time.Second), interval: 60}
+	}
+	bundle, _, _ := newDeadlineDispatchBundle(t, configForDeadlineDispatch{config: cfg, now: now, runners: []deadlineDispatchRunner{
+		minute("query-group-1"), minute("query-group-2"), minute("query-group-3"),
+		{queryGroup: "query-group-4-short", deadline: now.Add(15 * time.Second), interval: 10},
+	}})
+	dispatcher := newPhaseTwoRunnerDispatcher(bundle, true)
+	dispatcher.beginGeneration()
+	runners, revision := bundle.snapshotScheduledRunners()
+	dispatcher.fillQueues(runners, revision)
+	dispatcher.markDispatched(dispatcher.normal[0].scheduled, false, -1, false)
+	dispatcher.fillQueues(runners, revision)
+	if got := queuedNames(dispatcher.normal); len(got) != 2 || !slices.Contains(got, "query-group-4-short") || !slices.Contains(got, "query-group-2") {
+		t.Fatalf("ready queue holds %v, want query-group-2 and query-group-4-short, which evicted query-group-3", got)
+	}
+	// One more dispatch makes room, and the owned set changes, so the walk
+	// starts over in the same generation.
+	dispatcher.markDispatched(dispatcher.normal[0].scheduled, false, -1, false)
+	bundle.mu.Lock()
+	bundle.removeRunnerLocked("query-group-1")
+	bundle.mu.Unlock()
+	runners, revision = bundle.snapshotScheduledRunners()
+	dispatcher.fillQueues(runners, revision)
+	for _, queued := range append(queuedNames(dispatcher.normal), queuedNames(dispatcher.delayed)...) {
+		if queued == "query-group-3" {
+			t.Fatalf("the evicted query-group-3 was offered again in the generation that evicted it: ready %v recovery %v",
+				queuedNames(dispatcher.normal), queuedNames(dispatcher.delayed))
+		}
+	}
+	if dispatcher.generation != 1 {
+		t.Fatalf("generation %d, want the walk restarted within generation 1", dispatcher.generation)
+	}
+}
+
+// A short-period Query Group turned away from a full ready queue says which
+// clause of the deadline order kept it out and what it lost to. The counter
+// alone reads the same for an arrival with no deadline, a tail that expires
+// earlier and a lost tie, and the fix for each is different.
+func TestPhaseTwoDispatcherTurnedAwayShortPeriodSlotSaysWhatItLostTo(t *testing.T) {
+	cfg := validGoAccessRuntimeConfig()
+	cfg.PhaseTwo.Scheduler.ProcessQueryPermits = 1
+	cfg.PhaseTwo.Scheduler.RecoveryQueryPermits = 0
+	cfg.PhaseTwo.Scheduler.ActiveExecutionLimit = 1
+	cfg.PhaseTwo.Scheduler.ReadyQueueCapacity = 2
+	now := time.Unix(1_700_000_000, 0)
+	runners := []deadlineDispatchRunner{
+		{queryGroup: "short-a", deadline: now.Add(5 * time.Second), interval: 10},
+		{queryGroup: "short-b", deadline: now.Add(9 * time.Second), interval: 10},
+		// Arrives behind a full queue whose tail expires before it does.
+		{queryGroup: "short-c", deadline: now.Add(10 * time.Second), interval: 10},
+		// Arrives with no deadline at all; an unknown deadline never displaces a known one.
+		{queryGroup: "short-d", interval: 10},
+	}
+	bundle, started, _ := newDeadlineDispatchBundle(t, configForDeadlineDispatch{config: cfg, now: now, runners: runners})
+	turnaways := make(chan observability.Observation, 64)
+	bundle.dependencies.Observer = observability.ObserverFunc(func(_ context.Context, observation observability.Observation) {
+		if observation.Stage == observability.StageDispatchTurnaway {
+			turnaways <- observation
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wake := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() { done <- bundle.runScheduler(ctx, wake, nil, false) }()
+	wake <- struct{}{}
+	order := collectDispatches(t, started, 4)
+	want := []execution.QueryGroupIdentity{"short-a", "short-b", "short-c", "short-d"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("dispatch order = %v, want %v", order, want)
+	}
+	stopDeadlineDispatcher(t, cancel, done)
+	close(turnaways)
+
+	byQueryGroup := map[string]*observability.DispatchTurnawayFacts{}
+	for observation := range turnaways {
+		if observation.DispatchTurnaway == nil || observation.Trace.QueryGroupKey == "" {
+			t.Fatalf("turnaway observation without facts or Query Group: %#v", observation)
+		}
+		if _, seen := byQueryGroup[observation.Trace.QueryGroupKey]; !seen {
+			byQueryGroup[observation.Trace.QueryGroupKey] = observation.DispatchTurnaway
+		}
+	}
+	for queryGroup, want := range map[string]observability.DispatchTurnawayFacts{
+		"short-c": {Outcome: "normal_queue_full", Cohort: "10s", Verdict: "tail_earlier",
+			DeadlineUnixMilli: now.Add(10 * time.Second).UnixMilli(), KeptQueryGroup: "short-b", KeptCohort: "10s",
+			KeptDeadlineUnixMilli: now.Add(9 * time.Second).UnixMilli(), QueueLength: 2, QueueCapacity: 2},
+		"short-d": {Outcome: "normal_queue_full", Cohort: "10s", Verdict: "deadline_unknown",
+			KeptQueryGroup: "short-c", KeptCohort: "10s",
+			KeptDeadlineUnixMilli: now.Add(10 * time.Second).UnixMilli(), QueueLength: 2, QueueCapacity: 2},
+	} {
+		got := byQueryGroup[queryGroup]
+		if got == nil {
+			t.Fatalf("%s was turned away and wrote no facts; observed %v", queryGroup, byQueryGroup)
+		}
+		if !reflect.DeepEqual(*got, want) {
+			t.Fatalf("%s turnaway facts = %+v, want %+v", queryGroup, *got, want)
+		}
+	}
 }

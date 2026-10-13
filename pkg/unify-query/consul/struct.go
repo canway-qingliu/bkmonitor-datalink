@@ -45,6 +45,13 @@ func NewConsulInstance(
 	ctx context.Context, serviceName, consulAddress string, tags []string,
 	address string, port int, ttl string, caFile, keyFile, certFile string,
 ) (*Instance, error) {
+	return NewConsulInstanceWithAuth(ctx, serviceName, consulAddress, tags, address, port, ttl, caFile, keyFile, certFile, nil)
+}
+
+func NewConsulInstanceWithAuth(
+	ctx context.Context, serviceName, consulAddress string, tags []string,
+	address string, port int, ttl string, caFile, keyFile, certFile string, auth *base.AuthConfig,
+) (*Instance, error) {
 	hash := fnv.New32a()
 	_, err := hash.Write([]byte(fmt.Sprintf("%s:%d", address, port)))
 	if err != nil {
@@ -52,7 +59,7 @@ func NewConsulInstance(
 	}
 	serviceID := fmt.Sprintf("%s-unify-query-%d", serviceName, hash.Sum32())
 	checkID := fmt.Sprintf("%s:%d", address, port)
-	client, err := base.NewClient(consulAddress, caFile, keyFile, certFile)
+	client, err := base.NewClientWithAuth(consulAddress, caFile, keyFile, certFile, auth)
 	if err != nil {
 		return nil, err
 	}
@@ -189,8 +196,20 @@ func (i *Instance) GetDataWithPrefix(prefix string) (api.KVPairs, error) {
 	return result, err
 }
 
+// GetDataWithPrefixContext 获取指定前缀的数据，并允许调用方取消正在进行的 Consul 请求。
+func (i *Instance) GetDataWithPrefixContext(ctx context.Context, prefix string) (api.KVPairs, error) {
+	result, _, err := i.client.KV.List(prefix, (&api.QueryOptions{}).WithContext(ctx))
+	return result, err
+}
+
 // GetData
 func (i *Instance) GetData(path string) (*api.KVPair, error) {
 	result, _, err := i.client.KV.Get(path, nil)
+	return result, err
+}
+
+// GetDataContext 获取指定路径，并允许调用方取消正在进行的 Consul 请求。
+func (i *Instance) GetDataContext(ctx context.Context, path string) (*api.KVPair, error) {
+	result, _, err := i.client.KV.Get(path, (&api.QueryOptions{}).WithContext(ctx))
 	return result, err
 }

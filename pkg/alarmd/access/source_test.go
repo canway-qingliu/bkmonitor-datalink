@@ -61,6 +61,7 @@ func TestSourceProjectsPartialAndUnavailableCompletions(t *testing.T) {
 		bindingDataState execution.DataState
 		disposition      execution.AccessDisposition
 		reason           execution.ReasonCode
+		attribution      execution.UnavailableAttribution
 		batches          int
 		bindings         int
 	}{
@@ -79,7 +80,16 @@ func TestSourceProjectsPartialAndUnavailableCompletions(t *testing.T) {
 		{
 			name: "unavailable", provider: &fakeProvider{completeness: execution.CompletenessUnavailable, empty: true, reason: execution.ReasonCode(contract.ReasonQueryTimeout)},
 			completeness: execution.CompletenessUnavailable, dataState: execution.DataStateUnknown, bindingDataState: execution.DataStateUnknown,
-			disposition: execution.AccessUnavailable, reason: execution.ReasonCode(contract.ReasonQueryTimeout), bindings: 1,
+			disposition: execution.AccessUnavailable, reason: execution.ReasonCode(contract.ReasonQueryTimeout),
+			attribution: execution.UnavailableFromAttempt, bindings: 1,
+		},
+		{
+			// The attempt failed without a word: the binding carries the
+			// fallback, and says it is the fallback.
+			name: "unavailable without a reason", provider: &fakeProvider{completeness: execution.CompletenessUnavailable, empty: true},
+			completeness: execution.CompletenessUnavailable, dataState: execution.DataStateUnknown, bindingDataState: execution.DataStateUnknown,
+			disposition: execution.AccessUnavailable, reason: execution.ReasonCode(contract.ReasonQueryUnavailable),
+			attribution: execution.UnavailableNoAttemptReason, bindings: 1,
 		},
 	}
 	for _, test := range tests {
@@ -106,7 +116,8 @@ func TestSourceProjectsPartialAndUnavailableCompletions(t *testing.T) {
 			if test.bindings == 1 {
 				binding := completion.CompletionBindings[0]
 				if binding.Completeness != test.completeness || binding.DataState != test.bindingDataState ||
-					binding.Disposition != test.disposition || binding.ReasonCode != test.reason {
+					binding.Disposition != test.disposition || binding.ReasonCode != test.reason ||
+					binding.UnavailableAttribution != test.attribution {
 					t.Fatalf("binding=%+v", binding)
 				}
 				if err := execution.ValidateNamedInputCompletion(binding, completion.PhysicalQueries[0]); err != nil {
@@ -569,6 +580,22 @@ func TestPrepareRejectsMissingOrMismatchedFrozenQueryPlanFacts(t *testing.T) {
 	}
 }
 
+// A series is admitted per Plan against the scopes indexed from the prepared
+// header's due Plans. Every Plan a prepared query feeds is one of them,
+// because Prepare refuses a requirement consumed by a Plan that is not due;
+// that is why admission has no branch for a Plan whose scope was not indexed.
+func TestPrepareRefusesAConsumerWhosePlanIsNotDue(t *testing.T) {
+	contractRef, frozen := frozenExecution(t)
+	stranger := frozen.Requirements[0].Consumers[0]
+	stranger.Consumer.Plan.StrategyID += "-not-due"
+	frozen.Requirements[0].Consumers = append(frozen.Requirements[0].Consumers, stranger)
+	contractRef = bindFrozenDueDigest(t, contractRef, frozen)
+	prepared, err := Prepare(contractRef, frozen, time.Second)
+	if err == nil {
+		t.Fatalf("Prepare admitted a consumer of a Plan that is not due: %d queries", len(prepared.Queries))
+	}
+}
+
 func TestDataBindingsShareFullImmutableViewAcrossConsumers(t *testing.T) {
 	_, frozen := frozenExecution(t)
 	requirement := frozen.Requirements[0]
@@ -598,6 +625,9 @@ type fakeProvider struct {
 	empty        bool
 	reason       execution.ReasonCode
 	attempts     []execution.QueryAttempt
+	// truncation is the suspected cut the provider's answer names, as the
+	// query service client sets it on the route.
+	truncation *execution.ProviderTruncationFact
 }
 
 func (provider *fakeProvider) Execute(ctx context.Context, attempt execution.QueryAttempt, sink execution.ProviderSeriesSink) (execution.ProviderCompletion, error) {
@@ -632,7 +662,7 @@ func (provider *fakeProvider) Execute(ctx context.Context, attempt execution.Que
 	}
 	return execution.ProviderCompletion{Ref: ref, PhysicalQuery: attempt.Spec.Digest, Completeness: completeness,
 		DataState: execution.DataStateData, Delivery: delivery,
-		RouteFacts: execution.ProviderRouteFacts{ProviderRouteRef: attempt.Spec.PlanFacts.ProviderRouteRef},
+		RouteFacts: execution.ProviderRouteFacts{ProviderRouteRef: attempt.Spec.PlanFacts.ProviderRouteRef, Truncation: provider.truncation},
 		Stats:      execution.ProviderStats{Series: 1, Records: 1}}, nil
 }
 
@@ -745,6 +775,10 @@ func (consumer *recordingConsumer) ConsumeSeries(_ context.Context, batch execut
 	consumer.batches = append(consumer.batches, batch)
 	return batch.Validate(consumer.header)
 }
+func (consumer *recordingConsumer) ResolvedTargets() execution.TargetMemberships { return nil }
+func (consumer *recordingConsumer) ResolvedScopeGroups() execution.ScopeGroupMemberships {
+	return nil
+}
 
 func frozenExecution(t *testing.T) (execution.FrozenExecutionContractRef, FrozenPlan) {
 	t.Helper()
@@ -810,13 +844,23 @@ func compilePlan(t *testing.T) *strategy.CompiledPlan {
 
 func compilePlanForStrategy(t *testing.T, strategyID string, scope ...*contract.TargetScopeV2) *strategy.CompiledPlan {
 	t.Helper()
-	compiler, err := strategy.NewCompiler(strategy.NewDefaultAlgorithmCompilerRegistry(), strategy.Limits{MaxPlanBytes: 64 << 10, MaxLevelsPerPlan: 4,
-		MaxAlgorithmsPerLevel: 4, MaxGroupsPerAlgorithm: 4, MaxConditionsPerAlgorithm: 8, MaxASTNodesPerLevel: 32,
-		MaxTriggerWindowSize: 64, MaxRecoveryConsecutiveWindows: 64, MaxRequiredHistoryPoints: 64, MaxTriggerComputeCost: 1 << 16,
-		MaxCompiledPlanBytes: 64 << 10, MaxCacheEntries: 4, MaxCacheBytes: 1 << 20, NegativeCacheTTL: time.Minute, BudgetRevision: "test"})
-	if err != nil {
-		t.Fatal(err)
+	plan := evaluationPlanForStrategy(strategyID)
+	if len(scope) == 1 {
+		plan.TargetScope = scope[0]
 	}
+	return compileEvaluationPlan(t, plan)
+}
+
+// compilePlanWithTargetPlan is compilePlanForStrategy for a Plan carrying
+// the target's second frozen form.
+func compilePlanWithTargetPlan(t *testing.T, strategyID string, target *contract.TargetPlanV1) *strategy.CompiledPlan {
+	t.Helper()
+	plan := evaluationPlanForStrategy(strategyID)
+	plan.TargetPlan = target
+	return compileEvaluationPlan(t, plan)
+}
+
+func evaluationPlanForStrategy(strategyID string) contract.EvaluationPlanV2 {
 	ref := contract.StrategyRefV2{TenantID: "tenant", StrategyID: strategyID, Revision: "r1"}
 	projection := contract.InputProjectionV2{ValueFields: []string{"value"}, DimensionFields: []string{"host"}, BusinessIdentityField: "bk_biz_id", MultiValueAlignment: "SINGLE_VALUE", DataUnit: "percent", MissingValuePolicy: contract.MissingValuePolicyRequired}
 	level := contract.LevelIRV2{
@@ -829,13 +873,21 @@ func compilePlanForStrategy(t *testing.T, strategyID string, scope ...*contract.
 		TriggerPlan:  contract.TypedPlanV1{Type: "N_OF_M", Version: 1, Config: json.RawMessage(`{"window_size":1,"required_anomalies":1,"step_seconds":60}`)},
 		RecoveryPlan: contract.TypedPlanV1{Type: "CONTINUOUS_TRIGGER_MISS", Version: 1, Config: json.RawMessage(`{"enabled":true,"consecutive_windows":1}`)},
 	}
-	plan := contract.EvaluationPlanV2{PlanID: strategyID, StrategyRef: ref, InputProjection: projection,
+	return contract.EvaluationPlanV2{PlanID: strategyID, StrategyRef: ref, InputProjection: projection,
 		StrategyIR: contract.StrategyIRV2{Schema: contract.Schema{Name: contract.StrategyIRSchemaV2, Major: 2},
 			StrategyRef: ref, InputProjection: projection,
 			ExecutionSemantics: contract.ExecutionSemanticsV2{EvaluationScope: contract.EvaluationScopeSeries, QueryWindow: 60, AggregationInterval: 60, EvaluationInterval: 60},
 			Levels:             []contract.LevelIRV2{level}}}
-	if len(scope) == 1 {
-		plan.TargetScope = scope[0]
+}
+
+func compileEvaluationPlan(t *testing.T, plan contract.EvaluationPlanV2) *strategy.CompiledPlan {
+	t.Helper()
+	compiler, err := strategy.NewCompiler(strategy.NewDefaultAlgorithmCompilerRegistry(), strategy.Limits{MaxPlanBytes: 64 << 10, MaxLevelsPerPlan: 4,
+		MaxAlgorithmsPerLevel: 4, MaxGroupsPerAlgorithm: 4, MaxConditionsPerAlgorithm: 8, MaxASTNodesPerLevel: 32,
+		MaxTriggerWindowSize: 64, MaxRecoveryConsecutiveWindows: 64, MaxRequiredHistoryPoints: 64, MaxTriggerComputeCost: 1 << 16,
+		MaxCompiledPlanBytes: 64 << 10, MaxCacheEntries: 4, MaxCacheBytes: 1 << 20, NegativeCacheTTL: time.Minute, BudgetRevision: "test"})
+	if err != nil {
+		t.Fatal(err)
 	}
 	result, err := compiler.Compile(context.Background(), strategy.CompileRequest{Plan: plan, DatasetContract: contract.DatasetContractV2{SchemaDigest: strings.Repeat("a", 64), NormalizationDigest: strings.Repeat("b", 64), IdentityFields: []string{"host"}, SourceTimeField: "_time", ReceivedTimeField: "_received_time"},
 		StateSemantics: strategy.StateSemantics{StateSchemaVersion: "v1", CodecSemanticsVersion: "v1", IdentitySchemaDigest: strings.Repeat("c", 64), SourceTimeSemanticsVersion: "seconds-v1", HistoryCellSemanticsVersion: "v1"}})
@@ -862,4 +914,29 @@ func (p *failAfterOneQueryPermits) AcquireRecoveryChannels(context.Context, exec
 }
 func (p deadlineCheckingQueryPermits) AcquireRecoveryChannels(context.Context, execution.SlotIdentity, execution.Operation, time.Time, int, func()) (RecoveryChannels, error) {
 	return testRecoveryChannels{p}, nil
+}
+
+// The cut the query service client named on its route reaches the Slot's
+// completion, so the worker projects it onto the query's line and the fleet
+// lists the object: the step between the client and the worker.
+func TestSourceCarriesTheProvidersSuspectedCut(t *testing.T) {
+	contractRef, frozen := frozenExecution(t)
+	cut := &execution.ProviderTruncationFact{Kind: execution.TruncationTermsCut, Dimension: "bk_target_ip", Cap: 10000, SourceSemantics: "custom/event"}
+	provider := &fakeProvider{truncation: cut}
+	source, err := NewSource(staticFrozenPlan{plan: frozen}, provider, &recordingQueryPermits{}, Config{MinReadyDelay: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source.now = func() time.Time { return time.UnixMilli(2_000_000_000_000) }
+	source.wait = func(context.Context, time.Duration) error { return nil }
+	completion, err := source.Execute(context.Background(), execution.QueryExecutionRequest{
+		Contract: contractRef, Operation: execution.OperationNormal, AttemptNo: 1,
+	}, &recordingConsumer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(completion.PhysicalQueries) != 1 || completion.PhysicalQueries[0].RouteFacts.Truncation == nil ||
+		*completion.PhysicalQueries[0].RouteFacts.Truncation != *cut {
+		t.Fatalf("physical queries = %+v, want the provider's cut %+v on the route", completion.PhysicalQueries, cut)
+	}
 }

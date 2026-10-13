@@ -13,6 +13,7 @@ import (
 	"context"
 	"sync"
 
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/consul/base"
 	"github.com/hashicorp/consul/api"
 )
 
@@ -42,6 +43,12 @@ func Wait() {
 func SetInstance(ctx context.Context, kvBasePath, serviceName, consulAddress string,
 	tags []string, address string, port int, ttl string, caFile, keyFile, certFile string,
 ) error {
+	return SetInstanceWithAuth(ctx, kvBasePath, serviceName, consulAddress, tags, address, port, ttl, caFile, keyFile, certFile, nil)
+}
+
+func SetInstanceWithAuth(ctx context.Context, kvBasePath, serviceName, consulAddress string,
+	tags []string, address string, port int, ttl string, caFile, keyFile, certFile string, auth *base.AuthConfig,
+) error {
 	lock.Lock()
 	defer lock.Unlock()
 	var err error
@@ -49,8 +56,8 @@ func SetInstance(ctx context.Context, kvBasePath, serviceName, consulAddress str
 		basePath = kvBasePath
 	}
 
-	globalInstance, err = NewConsulInstance(
-		ctx, serviceName, consulAddress, tags, address, port, ttl, caFile, keyFile, certFile,
+	globalInstance, err = NewConsulInstanceWithAuth(
+		ctx, serviceName, consulAddress, tags, address, port, ttl, caFile, keyFile, certFile, auth,
 	)
 	if err != nil {
 		return err
@@ -95,9 +102,26 @@ var GetDataWithPrefix = func(prefix string) (api.KVPairs, error) {
 	return globalInstance.GetDataWithPrefix(prefix)
 }
 
+// GetDataWithPrefixContext 通过前缀获取 KV 列表，并传递取消信号。
+var GetDataWithPrefixContext = func(ctx context.Context, prefix string) (api.KVPairs, error) {
+	return globalInstance.GetDataWithPrefixContext(ctx, prefix)
+}
+
 // GetKVData 通过 path 路径获取 value
 var GetKVData = func(path string) ([]byte, error) {
 	res, err := globalInstance.GetData(path)
+	if err != nil {
+		return nil, err
+	}
+	if res != nil {
+		return res.Value, nil
+	}
+	return nil, nil
+}
+
+// GetKVDataContext 读取 KV，并将取消信号传递到底层 HTTP 请求。
+var GetKVDataContext = func(ctx context.Context, path string) ([]byte, error) {
+	res, err := globalInstance.GetDataContext(ctx, path)
 	if err != nil {
 		return nil, err
 	}

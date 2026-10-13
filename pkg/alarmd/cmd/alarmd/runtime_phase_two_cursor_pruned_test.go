@@ -8,7 +8,6 @@ package main
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/controlplane"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
@@ -55,7 +54,7 @@ func TestProductionPhaseTwoDrainingViewReportsACursorTheTimelineNoLongerHolds(t 
 		return &execution.UnfinishedSlotProjection{
 			Contract: contract,
 			DuePlanTargets: execution.FrozenDuePlanTargets{DuePlanSetDigest: contract.DuePlanSetDigest,
-				Plans: []execution.PlanIdentity{{TenantID: "tenant", BusinessID: "business", StrategyID: "strategy"}}},
+				Plans: []execution.PlanKey{{PlanIdentity: execution.PlanIdentity{TenantID: "tenant", BusinessID: "business", StrategyID: "strategy"}}}},
 			EarliestQueryDeadlineUnixMilli: int64(slot)*1000 + 1_000, KeepUntilUnixMilli: int64(slot)*1000 + 601_000,
 		}
 	}
@@ -82,7 +81,6 @@ func TestProductionPhaseTwoDrainingViewReportsACursorTheTimelineNoLongerHolds(t 
 				Observer: observability.ObserverFunc(func(_ context.Context, observation observability.Observation) {
 					observations = append(observations, observation)
 				}),
-				RefreshInterval: time.Second, Wait: func(context.Context, time.Duration) error { return nil },
 			})
 			if err != nil {
 				t.Fatal(err)

@@ -28,18 +28,15 @@ var (
 // RecoveryLimits are process-wide fixed bounds. They deliberately do not
 // contain QG-specific weights or adaptive controls.
 type RecoveryLimits struct {
-	// QueryUnavailableCooldown enables QG-local suppression after repeated
-	// committed, wholly unavailable primary queries. Product defaults enable it.
-	QueryUnavailableCooldown bool
-	ProcessQueryPermits      int
-	RecoveryQueryPermits     int
-	ReadyQueueCapacity       int
-	RecoveryQueueCapacity    int
-	MaxQueuedItemsPerQG      int
-	MaxReplaySlots           uint32
-	MaxReplayAge             time.Duration
-	RetryMinDelay            time.Duration
-	RetryMaxDelay            time.Duration
+	ProcessQueryPermits   int
+	RecoveryQueryPermits  int
+	ReadyQueueCapacity    int
+	RecoveryQueueCapacity int
+	MaxQueuedItemsPerQG   int
+	MaxReplaySlots        uint32
+	MaxReplayAge          time.Duration
+	RetryMinDelay         time.Duration
+	RetryMaxDelay         time.Duration
 }
 
 func (limits RecoveryLimits) Validate() error {
@@ -76,12 +73,20 @@ const (
 	// have passed since the Slot, so replaying it would compete with Slots the
 	// worker still has to run.
 	ReplayExpiredByDistance ReplayExpiryReason = "REPLAY_DISTANCE_EXCEEDED"
-	// ReplayExpiredByWait is a defect report. The Slot is still inside its
-	// replay window, and the readiness rule would hold the read until after
-	// that window closes -- so the replay would be dispatched, wait, and be
-	// abandoned for being late. Whenever this is counted, the readiness rule
-	// and the replay window have been derived from settings that disagree;
-	// under the settings any deployment can hold today it cannot happen.
+	// ReplayExpiredByWait is a defect report: the readiness rule would hold the
+	// read until after the replay window closes, so the replay would be
+	// dispatched, wait, and be abandoned for being late. Whenever this is
+	// counted, the two rules have been derived from settings that disagree.
+	//
+	// Counting zero of these does not mean it is not happening. The readiness
+	// instant the guard compares is not the one access waits for: the guard
+	// uses evaluationTime plus the settling wait, while access computes it
+	// from the query window's end plus the source delay plus that same wait
+	// (access/source.go frozenConsumerReadyAt). The guard's number is a lower
+	// bound on the real one and is documented as deliberately under-firing, so
+	// a Query Group whose real readiness lands well past the window can be in
+	// this contradiction on every Slot and never be counted here. Read it as
+	// "the cheap comparison caught one", never as "there are none".
 	ReplayExpiredByWait ReplayExpiryReason = "REPLAY_WAIT_EXCEEDS_DISTANCE"
 	// ReplayExpiredRange is the whole-range finalization of a run of Slots
 	// already past their replay window, which carries one set of facts for the
@@ -312,11 +317,10 @@ func (coordinator *FlightCoordinator) acquireProcessQueryPermit(
 		return nil, context.DeadlineExceeded
 	}
 	waiter := &queryPermitWaiter{slot: slot, operation: operation, deadline: deadline, grant: make(chan *QueryPermit, 1)}
+	// A recovery operation arrives here only holding a recovery channel, and
+	// a channel is granted only while recovery permits are above zero: the
+	// recovery-off refusal is the channel's.
 	recovery := operation != execution.OperationNormal
-	if recovery && coordinator.limits.RecoveryQueryPermits == 0 {
-		coordinator.observeQueryPermit(ctx, operation, observability.ResultFailed, true, coordinator.queryPermitSnapshot())
-		return nil, ErrRecoveryPermitsOff
-	}
 	coordinator.mu.Lock()
 	queue := &coordinator.normalWaiters
 	capacity := coordinator.limits.ReadyQueueCapacity
@@ -327,7 +331,7 @@ func (coordinator *FlightCoordinator) acquireProcessQueryPermit(
 	coordinator.expireWaitersLocked(queue)
 	if len(*queue) >= capacity || queuedForQueryGroup(*queue, slot.QueryGroup) >= coordinator.limits.MaxQueuedItemsPerQG {
 		coordinator.mu.Unlock()
-		coordinator.observeQueryPermit(ctx, operation, observability.ResultFailed, true, coordinator.queryPermitSnapshot())
+		coordinator.observeQueryPermitReason(ctx, operation, observability.ResultFailed, permitQueueFull, true, coordinator.queryPermitSnapshot())
 		return nil, ErrQueryPermitQueueFull
 	}
 	*queue = append(*queue, waiter)
@@ -339,6 +343,8 @@ func (coordinator *FlightCoordinator) acquireProcessQueryPermit(
 	coordinator.permitAcquires++
 	if queued {
 		coordinator.permitQueued++
+		// A formal query waits: no lookback read may be why.
+		coordinator.yieldLookbackLocked()
 	}
 	snapshot := coordinator.queryPermitSnapshotLocked()
 	coordinator.mu.Unlock()
@@ -491,6 +497,34 @@ func (coordinator *FlightCoordinator) observeQueryPermit(
 	admission bool,
 	snapshot queryPermitSnapshot,
 ) {
+	// A permit not granted names why, as the query that needed it does.
+	reason := observability.ReasonNone
+	switch result {
+	case observability.Result(observability.ResultTimeout):
+		reason = permitDeadline
+	case observability.ResultPaused:
+		reason = permitCancelled
+	}
+	coordinator.observeQueryPermitReason(ctx, operation, result, reason, admission, snapshot)
+}
+
+// The words a permit that was not granted names. The deadline is the same
+// word the query that needed it carries.
+const (
+	permitDeadline    observability.ReasonCode = "QUERY_PERMIT_DEADLINE"
+	permitQueueFull   observability.ReasonCode = "QUERY_PERMIT_QUEUE_FULL"
+	permitRecoveryOff observability.ReasonCode = "QUERY_PERMIT_RECOVERY_OFF"
+	permitCancelled   observability.ReasonCode = "QUERY_PERMIT_CANCELLED"
+)
+
+func (coordinator *FlightCoordinator) observeQueryPermitReason(
+	ctx context.Context,
+	operation execution.Operation,
+	result observability.Result,
+	reason observability.ReasonCode,
+	admission bool,
+	snapshot queryPermitSnapshot,
+) {
 	if coordinator == nil || coordinator.observer == nil {
 		return
 	}
@@ -501,7 +535,7 @@ func (coordinator *FlightCoordinator) observeQueryPermit(
 	defer func() { _ = recover() }()
 	coordinator.observer.Observe(ctx, observability.Observation{
 		Component: observability.ComponentScheduler, Stage: observability.StageQueryAdmission,
-		Result: result, Operation: observability.Operation(operation), Direction: observability.DirectionInternal,
+		Result: result, ReasonCode: reason, Operation: observability.Operation(operation), Direction: observability.DirectionInternal,
 		QueryPermit: &observability.QueryPermitFacts{
 			QueueKind: queueKind, Admission: admission,
 			NormalWaiting: snapshot.NormalWaiting, RecoveryWaiting: snapshot.RecoveryWaiting,

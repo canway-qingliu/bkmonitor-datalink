@@ -42,20 +42,14 @@ import (
 
 // catalogIndexEntry is what the index keeps per Query Group.
 type catalogIndexEntry struct {
+	Group  execution.QueryGroupIdentity
 	Digest execution.ObjectDigest
-	Plans  []execution.PlanIdentity
-}
-
-func (entry catalogIndexEntry) samePlans(plans []execution.PlanIdentity) bool {
-	if len(entry.Plans) != len(plans) {
-		return false
-	}
-	for index := range plans {
-		if entry.Plans[index] != plans[index] {
-			return false
-		}
-	}
-	return true
+	// Plans are keyed by strategy and piece: the index is where a Query
+	// Group's Plans are looked up against activation records, and two pieces
+	// of one strategy are two records.
+	Plans            []execution.PlanKey
+	QueryRevision    execution.QueryRevision
+	ScheduleRevision execution.ScheduleRevision
 }
 
 type catalogIndex struct {
@@ -78,10 +72,10 @@ func (index *catalogIndex) replace(revision execution.SnapshotRevision, groups m
 
 // planIdentities lists a Query Group's Plans in catalog order, which is the
 // order the object stores them in.
-func planIdentities(group QueryGroup) []execution.PlanIdentity {
-	plans := make([]execution.PlanIdentity, 0, len(group.Plans))
+func planKeys(group QueryGroup) []execution.PlanKey {
+	plans := make([]execution.PlanKey, 0, len(group.Plans))
 	for _, plan := range group.Plans {
-		plans = append(plans, plan.Identity)
+		plans = append(plans, plan.Key())
 	}
 	return plans
 }
@@ -102,7 +96,7 @@ func indexFromCatalog(catalog Catalog) (map[execution.QueryGroupIdentity]catalog
 		if err != nil {
 			return nil, err
 		}
-		groups[group.Identity] = catalogIndexEntry{Digest: digest, Plans: planIdentities(group)}
+		groups[group.Identity] = catalogIndexEntry{Group: group.Identity, Digest: digest, Plans: planKeys(group), QueryRevision: group.QueryPlan.QueryRevision, ScheduleRevision: group.ScheduleRevision}
 	}
 	return groups, nil
 }
@@ -112,7 +106,7 @@ func indexFromCatalog(catalog Catalog) (map[execution.QueryGroupIdentity]catalog
 // context each Plan references, in the order the cutover compares them.
 type ContentEntry struct {
 	Digest execution.ObjectDigest
-	Plans  []execution.PlanIdentity
+	Plans  []execution.PlanKey
 	Refs   []execution.OutputContextRef
 }
 
@@ -129,29 +123,56 @@ type PublishedContent struct {
 // a cold load of the index.
 const catalogIndexBatch = 500
 
-// publishedContentMemo remembers the content of the publication read last:
-// an activation asks for the same publication many times in one round (the
-// reconcile, the cutover, every schedule it materializes), and a
-// publication's content never changes once written.
+// publishedContentMemo remembers the content of the two publications read
+// last: an activation asks for the same publication many times in one round
+// (the reconcile, the cutover, every schedule it materializes), and a
+// publication's content never changes once written. Two, because while a
+// Query Group drains after its query changed the activation carries Plans on
+// the current publication and the one before it, and a round reads both:
+// with one remembered, each read put out the other and every round read
+// both manifests again.
 type publishedContentMemo struct {
-	mu          sync.Mutex
-	publication SnapshotPublicationRef
-	content     PublishedContent
+	mu sync.Mutex
+	// held is newest first; an empty publication is an empty slot.
+	held [2]PublishedContent
 }
 
 func (memo *publishedContentMemo) lookup(publication SnapshotPublicationRef) (PublishedContent, bool) {
 	memo.mu.Lock()
 	defer memo.mu.Unlock()
-	if memo.publication != publication || memo.publication == (SnapshotPublicationRef{}) {
+	if publication == (SnapshotPublicationRef{}) {
 		return PublishedContent{}, false
 	}
-	return memo.content, true
+	for _, content := range memo.held {
+		if content.Publication == publication {
+			return content, true
+		}
+	}
+	return PublishedContent{}, false
 }
 
 func (memo *publishedContentMemo) store(content PublishedContent) {
 	memo.mu.Lock()
 	defer memo.mu.Unlock()
-	memo.publication, memo.content = content.Publication, content
+	if memo.held[0].Publication == content.Publication {
+		memo.held[0] = content
+		return
+	}
+	// The newest moves second, over the older one or over this same
+	// publication's earlier copy.
+	memo.held[1], memo.held[0] = memo.held[0], content
+}
+
+// release puts out the older content when nothing the activation carries
+// names it any more. The second slot is for a drain; past it, what it holds
+// is a whole publication's index kept for nothing until the next publication
+// happens to push it out. The newest read stays whatever it is.
+func (memo *publishedContentMemo) release(carried func(SnapshotPublicationRef) bool) {
+	memo.mu.Lock()
+	defer memo.mu.Unlock()
+	if older := memo.held[1].Publication; older != (SnapshotPublicationRef{}) && !carried(older) {
+		memo.held[1] = PublishedContent{}
+	}
 }
 
 // LoadPublishedContent describes a publication from its manifest and the
@@ -248,16 +269,24 @@ func contentFromManifest(
 	content := PublishedContent{Publication: publication, Groups: make(map[execution.QueryGroupIdentity]ContentEntry, len(manifest.QueryGroups))}
 	for _, entry := range manifest.QueryGroups {
 		indexed := entries[entry.QueryGroup]
+		// The output context is the strategy's, shared by every piece of it,
+		// so the refs are one per strategy however many pieces the group
+		// holds - and a group holds at most one piece of a strategy anyway.
 		refs := make([]execution.OutputContextRef, 0, len(indexed.Plans))
+		referenced := make(map[execution.PlanIdentity]struct{}, len(indexed.Plans))
 		for _, plan := range indexed.Plans {
-			digest, ok := contexts[plan]
+			if _, done := referenced[plan.PlanIdentity]; done {
+				continue
+			}
+			referenced[plan.PlanIdentity] = struct{}{}
+			digest, ok := contexts[plan.PlanIdentity]
 			if !ok || digest == "" {
 				return PublishedContent{}, fmt.Errorf("alarmd controlplane: catalog manifest names no output context for Plan %s", plan.StrategyID)
 			}
-			refs = append(refs, execution.OutputContextRef{Plan: plan, Digest: digest})
+			refs = append(refs, execution.OutputContextRef{Plan: plan.PlanIdentity, Digest: digest})
 		}
 		sort.Slice(refs, func(i, j int) bool { return lessPlanIdentity(refs[i].Plan, refs[j].Plan) })
-		content.Groups[entry.QueryGroup] = ContentEntry{Digest: entry.ObjectDigest, Plans: append([]execution.PlanIdentity(nil), indexed.Plans...), Refs: refs}
+		content.Groups[entry.QueryGroup] = ContentEntry{Digest: entry.ObjectDigest, Plans: append([]execution.PlanKey(nil), indexed.Plans...), Refs: refs}
 	}
 	return content, nil
 }
@@ -318,11 +347,11 @@ func (repository *RedisCatalogRepository) ensureCatalogIndex(
 			if object.Identity != entry.QueryGroup {
 				return ensuredCatalogIndex{}, fmt.Errorf("alarmd controlplane: catalog object of %s belongs to another Query Group", entry.QueryGroup)
 			}
-			plans := make([]execution.PlanIdentity, 0, len(object.Plans))
+			plans := make([]execution.PlanKey, 0, len(object.Plans))
 			for _, plan := range object.Plans {
-				plans = append(plans, plan.Identity)
+				plans = append(plans, plan.Key())
 			}
-			ensured.entries[entry.QueryGroup] = catalogIndexEntry{Digest: entry.ObjectDigest, Plans: plans}
+			ensured.entries[entry.QueryGroup] = catalogIndexEntry{Group: object.Identity, Digest: entry.ObjectDigest, Plans: plans, QueryRevision: object.QueryPlan.QueryRevision, ScheduleRevision: object.ScheduleRevision}
 			repository.controlReads.index.misses.Add(1)
 		}
 	}
@@ -337,6 +366,8 @@ func (repository *RedisCatalogRepository) loadQueryGroupObjects(
 	ctx context.Context,
 	batch []ManifestQueryGroup,
 ) (map[execution.ObjectDigest]QueryGroupObject, error) {
+	reading := repository.objects().announce(len(batch))
+	defer reading.settle()
 	replies := make([]*redis.StringCmd, len(batch))
 	if _, err := repository.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
 		for index, entry := range batch {
@@ -356,13 +387,22 @@ func (repository *RedisCatalogRepository) loadQueryGroupObjects(
 		if err != nil {
 			return nil, activationDependencyIO(err)
 		}
-		hashed, err := contract.DeriveCanonicalDigestV2OverCanonical(queryGroupObjectContractVersion, payload)
+		domain, err := queryGroupObjectDomain(payload)
+		if errors.Is(err, ErrCatalogObjectContractNewer) {
+			repository.observeObjectRead(ctx, objectReadKindQueryGroup, objectReadNewer)
+			return nil, err
+		}
+		if err != nil {
+			repository.observeObjectRead(ctx, objectReadKindQueryGroup, objectReadInvalid)
+			return nil, fmt.Errorf("%w: %v", ErrCatalogObjectCorrupt, err)
+		}
+		hashed, err := contract.DeriveCanonicalDigestV2OverCanonical(domain, payload)
 		if err != nil || hashed != string(entry.ObjectDigest) {
 			repository.observeObjectRead(ctx, objectReadKindQueryGroup, objectReadInvalid)
 			return nil, ErrCatalogObjectCorrupt
 		}
 		var object QueryGroupObject
-		if err := json.Unmarshal(payload, &object); err != nil || object.ContractVersion != queryGroupObjectContractVersion || object.Identity == "" {
+		if err := json.Unmarshal(payload, &object); err != nil || !knownQueryGroupObjectVersion(object.ContractVersion) || object.Identity == "" {
 			repository.observeObjectRead(ctx, objectReadKindQueryGroup, objectReadInvalid)
 			return nil, fmt.Errorf("%w: not a Query Group object of this contract", ErrCatalogObjectCorrupt)
 		}
@@ -371,7 +411,7 @@ func (repository *RedisCatalogRepository) loadQueryGroupObjects(
 		// write this key. Storing a bare object here and a decorated one there
 		// made the cache hold two types under one key, which the reader only
 		// finds out about by panicking on whichever it did not expect.
-		repository.objectCache.store(repository.queryGroupObjectKey(entry.ObjectDigest), storedQueryGroupObject{
+		repository.objects().store(reading, repository.queryGroupObjectKey(entry.ObjectDigest), storedQueryGroupObject{
 			object: object, noDataOccurrences: noDataOccurrencesIn(payload),
 		}, len(payload))
 		objects[entry.ObjectDigest] = object

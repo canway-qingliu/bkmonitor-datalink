@@ -42,7 +42,7 @@ func TestEvaluateSeriesProducesOneAbnormalAndRecoveryForNamedInputs(t *testing.T
 	}
 
 	history := []execution.StateHistoryPoint{{RecordID: strings.Repeat("d", 64), SourceTime: 39,
-		Levels: []execution.StateLevelFact{{LevelID: 5, DetectFingerprint: plan.Levels()[0].Fingerprints().Detect, Result: execution.LevelFactAnomalous}}}}
+		Levels: []execution.StateLevelFact{{LevelID: 5, DetectFingerprint: plan.Levels().At(0).Fingerprints().Detect, Result: execution.LevelFactAnomalous}}}}
 	recoveryRequest := requestFixtureForPlan(t, plan, []contract.CanonicalRecordV2{g4Record(99, `100`, nil)}, history)
 	recoveryInput := g4Input(t, recoveryRequest, map[string][]contract.CanonicalRecordV2{
 		"primary":  {g4Record(99, `100`, nil)},
@@ -99,7 +99,7 @@ func TestEvaluateSeriesPreservesActiveStateGuardReasonForEveryUnknownOutcome(t *
 	guard := execution.ReasonCode(contract.ReasonSnapshotUnavailable)
 	normal := func(plan *strategy.CompiledPlan, id string, sourceTime int64) execution.StateHistoryPoint {
 		return execution.StateHistoryPoint{RecordID: strings.Repeat(id, 64), SourceTime: sourceTime,
-			Levels: []execution.StateLevelFact{{LevelID: 5, DetectFingerprint: plan.Levels()[0].Fingerprints().Detect, Result: execution.LevelFactNormal}}}
+			Levels: []execution.StateLevelFact{{LevelID: 5, DetectFingerprint: plan.Levels().At(0).Fingerprints().Detect, Result: execution.LevelFactNormal}}}
 	}
 	tests := []struct {
 		name         string
@@ -116,10 +116,12 @@ func TestEvaluateSeriesPreservesActiveStateGuardReasonForEveryUnknownOutcome(t *
 			// a durable reason and the ring-ratio previous point is missing.
 			name: "warming guard and missing dependency point", plan: single,
 			status: execution.StateFoundWarming, completeness: execution.HistoryWarming, primary: g4Record(99, `80`, nil),
+			previous: []contract.CanonicalRecordV2{g4OffsetMissRecord(39, `100`)},
 		},
 		{
 			name: "gapped guard and missing dependency point", plan: single,
 			status: execution.StateFoundGapped, completeness: execution.HistoryGapped, primary: g4Record(99, `80`, nil),
+			previous: []contract.CanonicalRecordV2{g4OffsetMissRecord(39, `100`)},
 		},
 		{
 			// The loaded history already lets WARMING converge, so the evaluator
@@ -128,6 +130,7 @@ func TestEvaluateSeriesPreservesActiveStateGuardReasonForEveryUnknownOutcome(t *
 			name: "converged warming guard and missing dependency point", plan: single,
 			status: execution.StateFoundWarming, completeness: execution.HistoryWarming,
 			history: []execution.StateHistoryPoint{normal(single, "d", 39)}, primary: g4Record(99, `80`, nil),
+			previous: []contract.CanonicalRecordV2{g4OffsetMissRecord(39, `100`)},
 		},
 		{
 			// Converged WARMING and a hole before the new record: the trigger sees
@@ -255,11 +258,16 @@ func primaryOnlyInput(request execution.EvaluationRequest, record contract.Canon
 func g4Input(t *testing.T, request execution.EvaluationRequest, records map[string][]contract.CanonicalRecordV2) execution.SeriesEvaluationInputRequest {
 	t.Helper()
 	consumer := execution.ConsumerRef{Plan: request.Header.DuePlans[0].Identity, LevelID: 5, HasLevel: true}
-	algorithm := request.Header.DuePlans[0].CompiledPlan.Levels()[0].Algorithms()[0]
+	algorithm := request.Header.DuePlans[0].CompiledPlan.Levels().At(0).Algorithms().At(0)
 	input := execution.SeriesEvaluationInputRequest{Contract: request.Header.Contract, Consumer: consumer,
 		SeriesIdentity: execution.SeriesIdentityDigest(request.State.Items[0].Identity.SeriesIdentityDigest)}
 	for _, requirement := range algorithm.InputRequirements() {
 		dataset := execution.NewDataset(records[requirement.DatasetName])
+		// The whole dataset is the view: the worker hands the evaluator one
+		// series at a time and a binding's dataset holds that series' rows and
+		// no other's. A dataset with no rows is a dependency that completed
+		// empty; a missing point is a row at a time the algorithm does not ask
+		// for (g4OffsetMissRecord), never another series' row.
 		ordinals := make([]uint32, dataset.Len())
 		for index := range ordinals {
 			ordinals[index] = uint32(index)
@@ -352,6 +360,23 @@ func g4Requirement(t *testing.T, name string, role strategy.AlgorithmInputRole, 
 		LogicalQueryRef: "query-" + name, RelativeWindow: strategy.AlgorithmRelativeWindow{StartOffsetSeconds: start, EndOffsetSeconds: end, HalfOpen: true},
 		StepMillis: 60_000, AlignmentMillis: 60_000, ReadinessClass: strategy.AlgorithmReadinessFinalizedRequired,
 		InputProjection: projection, PointOffsetsSeconds: offsets, NamedPoints: points}
+}
+
+// g4OffsetMissRecord is this series' own dependency point at a time the
+// algorithm does not ask for. The dependency dataset is then FULL and carries
+// data, and the point the algorithm wants -- one step before the primary --
+// is not in it: the per-series missing point, which the evaluator guards with
+// a Level state written for the series.
+//
+// This is the only way production produces that shape. The worker hands the
+// evaluator one series at a time, and every binding's dataset holds that
+// series' rows and no other's, so "a dataset holding another series' rows and
+// an empty view for this one" is a fixture nothing upstream can bind. A
+// dependency holding no rows at all is the other shape, a dependency that
+// completed empty, and that one is guarded by a Level marker the worker
+// proposes; a test that means the first must not build the second.
+func g4OffsetMissRecord(wantedSourceTime int64, value string) contract.CanonicalRecordV2 {
+	return g4Record(wantedSourceTime-1, value, nil)
 }
 
 func g4Record(sourceTime int64, value string, dimensions map[string]json.RawMessage) contract.CanonicalRecordV2 {

@@ -119,11 +119,8 @@ func TestTheAdmissionChainAgreesWithTheRunningPython(t *testing.T) {
 		}
 		builder.addFields(fields)
 	}
-	store := &Store{index: builder.index, now: time.Now, maxAge: time.Hour, interval: time.Minute}
-	hostStatus, installed := admission.NewHostStatusFilter(corpus.DisableStates)
-	if !installed {
-		t.Fatalf("corpus carries no disabled states, so the host status half cannot be compared")
-	}
+	store := &Store{index: builder.index, now: builder.index.BuiltAt, maxAge: time.Hour}
+	hostStatus := admission.NewHostStatusFilter(corpus.DisableStates)
 	chain := admission.NewChain(
 		[]admission.Fuller{admission.IdentityFuller{}, NewHostTopologyFuller(store)},
 		[]admission.Filter{admission.TargetScopeFilter{}, hostStatus},
@@ -166,7 +163,7 @@ func TestTheAdmissionChainAgreesWithTheRunningPython(t *testing.T) {
 				"case %d strategy %s: alarmd=%t python=%t (in_target=%t ignore_monitoring=%t) dimensions=%v topo=%v",
 				index, testCase.StrategyID, admitted, want,
 				testCase.PythonInTarget, testCase.PythonIgnoreMonitored,
-				testCase.RawDimensions, facts.TopoNodes))
+				testCase.RawDimensions, facts.TopoNodes()))
 		}
 	}
 	t.Logf("corpus %s revision %s: compared %d cases, %d without a compiled scope",

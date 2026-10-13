@@ -6,13 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/config"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/controlplane"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
-	enginekafka "github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/kafka"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/metric"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/observability"
-	"github.com/go-redis/redis/v8"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -21,6 +14,14 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/config"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/controlplane"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
+	enginekafka "github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/kafka"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/metric"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/observability"
+	"github.com/go-redis/redis/v8"
 )
 
 // A recovery Query Group waiting on a recovery permit must not hold up the
@@ -76,6 +77,7 @@ func TestBoundedRunnerRecoveryWaitDoesNotBlockNormal(t *testing.T) {
 	var inflight atomic.Int64
 	var maxInflight atomic.Int64
 	uqServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
 		raw, _ := io.ReadAll(request.Body)
 		uqCalls.Add(1)
 		current := inflight.Add(1)
@@ -148,9 +150,9 @@ func TestBoundedRunnerRecoveryWaitDoesNotBlockNormal(t *testing.T) {
 					}
 				}
 			}),
-			OpenEvents: func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
+			PrepareEvents: preparedEvents(func(enginekafka.DecisionSinkConfig) (productionPhaseTwoEventSink, error) {
 				return &recordingPhaseTwoEventSink{}, nil
-			},
+			}),
 		},
 	)
 	if err != nil {
@@ -219,7 +221,7 @@ func TestBoundedRunnerRecoveryWaitDoesNotBlockNormal(t *testing.T) {
 	clock.Store(time.Unix(base+1, 0).Add(500 * time.Millisecond).UnixMilli())
 
 	tickDone := make(chan error, 1)
-	go func() { tickDone <- bundle.runScheduledOnce(ctx) }()
+	go func() { tickDone <- runScheduledOnceSettled(ctx, bundle) }()
 	select {
 	case <-firstEntered:
 	case err := <-tickDone:

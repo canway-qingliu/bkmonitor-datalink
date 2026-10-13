@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/contract"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/controlplane"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/observability"
@@ -18,8 +19,13 @@ import (
 )
 
 var (
-	ErrScheduleFactsInvalid          = errors.New("alarmd scheduler: frozen schedule facts are invalid")
-	ErrProgressOffSchedule           = errors.New("alarmd scheduler: Progress next Slot is outside the frozen schedule")
+	ErrScheduleFactsInvalid = errors.New("alarmd scheduler: frozen schedule facts are invalid")
+	ErrProgressOffSchedule  = errors.New("alarmd scheduler: Progress next Slot is outside the frozen schedule")
+	// ErrNoPlanDueInSegment is the segment holding the cursor's time and no
+	// Plan being due at it, which is not the cursor being off the schedule.
+	// The two shared one error until a Plan that left the activation and came
+	// back had its missed Slots recorded as pruned by retention.
+	ErrNoPlanDueInSegment            = errors.New("alarmd scheduler: frozen schedule holds the Slot but no Plan is due at it")
 	ErrSlotContractDrift             = errors.New("alarmd scheduler: frozen Slot contract differs from requested facts")
 	ErrSlotOwnershipChanged          = errors.New("alarmd scheduler: ownership changed while freezing Slot")
 	ErrSnapshotRetentionInsufficient = errors.New("alarmd scheduler: Snapshot retention cannot cover recovery contract")
@@ -173,6 +179,15 @@ type SlotCatalogReader interface {
 	ReadScheduleRetirement(context.Context, execution.QueryGroupIdentity) (execution.EvaluationTime, bool, error)
 	NextSlotAfter(context.Context, execution.QueryGroupIdentity, execution.EvaluationTime) (execution.EvaluationTime, error)
 	FreezeSlotContract(context.Context, execution.FreezeSlotContractRequest) (execution.FrozenSlotContractFact, error)
+	// ReadSegmentRepair says whether the Segment starting at segmentStart was
+	// opened by the Control Leader in place of a timeline it could not carry
+	// on, and how and when; false for every other Segment. It is how the source
+	// tells the one jump navigation makes into such a Segment from the jumps of
+	// the same shape that are not losses of this deployment's making (a
+	// retirement's hole, a pruned prefix). In the interface rather than behind
+	// a type assertion: a catalog that quietly did not answer it would leave
+	// that jump unrecorded with every test green.
+	ReadSegmentRepair(context.Context, execution.QueryGroupIdentity, execution.EvaluationTime) (execution.SegmentRepair, bool, error)
 }
 
 type ScheduleProgressReader interface {
@@ -190,7 +205,6 @@ type PrunedCursorAdvancer interface {
 // ProductionSlotSource is bound to one owned Query Group. It reads current
 // control facts and returns one normal due Slot; it never executes queries,
 type ProductionSlotSource struct {
-	expiredRangeEnabled       bool
 	queryGroup                execution.QueryGroupIdentity
 	workerID                  string
 	session                   OwnerSession
@@ -204,9 +218,108 @@ type ProductionSlotSource struct {
 	snapshotRetention         time.Duration
 	publicationDelayAllowance time.Duration
 	observer                  observability.Observer
+	// takeovers is when this process took Query Groups over (TakeoverClock),
+	// shared by every source the process builds; nil keeps the distance rule
+	// on every Slot, as before.
+	takeovers *TakeoverClock
+	// readHolds answers the Query Group's current read hold, which a Slot
+	// frozen for the first time carries; nil holds none.
+	readHolds ReadHolds
 }
 
+// ReadHolds answers a Query Group's current read hold: how much later than
+// its schedule says a Slot of it frozen now is read and due
+// (execution.FrozenExecutionContractRef.ReadHoldMillis).
+type ReadHolds interface {
+	ReadHold(execution.QueryGroupIdentity) time.Duration
+}
+
+// SlotReadHolds persists the hold for a newly frozen Slot, including a
+// predecessor's completion deadline during a Plan's QG transition.
+type SlotReadHolds interface {
+	SlotReadHold(context.Context, execution.FrozenQueryGroupSchedule, execution.EvaluationTime, execution.OwnerFence) (time.Duration, error)
+	// PeekSlotReadHold is the hold a Slot would be frozen with, asked
+	// without freezing it: what an expired range compares its last Slot by.
+	// In the interface rather than beside it, so an implementation cannot
+	// leave the range freezing a Slot it only meant to ask about.
+	PeekSlotReadHold(execution.FrozenQueryGroupSchedule, execution.EvaluationTime) (time.Duration, error)
+}
+
+// ErrReadHoldDegraded marks a read hold its Query Group could not prepare
+// for a reason of the hold's own -- not ownership, not its record unread.
+// The source does not refuse the Slot for it: SlotReadHold freezes the Slot
+// with the hold the group last read, and the hold's owner counts it.
+var ErrReadHoldDegraded = errors.New("alarmd scheduler: read hold degraded")
+
 type ProductionSlotSourceOption func(*ProductionSlotSource) error
+
+// WithReadHolds lets the source freeze each new Slot with its Query Group's
+// current read hold. A Slot begun before is resumed with the hold it was
+// frozen with, whatever the Query Group's is now.
+func WithReadHolds(holds ReadHolds) ProductionSlotSourceOption {
+	return func(source *ProductionSlotSource) error {
+		source.readHolds = holds
+		return nil
+	}
+}
+
+// readHoldMillis is the read hold a Slot at slot is frozen with: the one its
+// unfinished projection was frozen with when it was begun before, so every
+// freeze of it is the contract it began under, and the Query Group's current
+// one otherwise.
+func (source *ProductionSlotSource) readHoldMillis(progress *execution.ScheduleProgress, slot execution.EvaluationTime) int64 {
+	if progress != nil && progress.UnfinishedSlot != nil && progress.UnfinishedSlot.Contract.Slot.EvaluationTime == slot {
+		return progress.UnfinishedSlot.Contract.ReadHoldMillis
+	}
+	if source.readHolds == nil {
+		return 0
+	}
+	hold := source.readHolds.ReadHold(source.queryGroup).Milliseconds()
+	return min(max(hold, 0), execution.MaxReadHoldMillis)
+}
+
+func (source *ProductionSlotSource) slotReadHoldMillis(ctx context.Context, schedule execution.FrozenQueryGroupSchedule, progress *execution.ScheduleProgress, slot execution.EvaluationTime, fence execution.OwnerFence) (int64, error) {
+	if progress != nil && progress.UnfinishedSlot != nil && progress.UnfinishedSlot.Contract.Slot.EvaluationTime == slot {
+		return progress.UnfinishedSlot.Contract.ReadHoldMillis, nil
+	}
+	if holds, ok := source.readHolds.(SlotReadHolds); ok {
+		hold, err := holds.SlotReadHold(ctx, schedule, slot, fence)
+		if err != nil {
+			return 0, err
+		}
+		if hold < 0 || hold.Milliseconds() > execution.MaxReadHoldMillis {
+			return 0, ErrSlotContractDrift
+		}
+		return hold.Milliseconds(), nil
+	}
+	return source.readHoldMillis(progress, slot), nil
+}
+
+// peekSlotReadHoldMillis is the hold a later Slot would be frozen with,
+// asked without freezing it. Freezing it to compare wrote the read hold
+// record as in force from that Slot, and the Slots before it could no
+// longer be written. An error refuses the question. The answer is only
+// compared with a Slot's frozen hold, so a hold no Slot could be frozen
+// with refuses the range by not matching it.
+func (source *ProductionSlotSource) peekSlotReadHoldMillis(schedule execution.FrozenQueryGroupSchedule, slot execution.EvaluationTime) (int64, error) {
+	if holds, ok := source.readHolds.(SlotReadHolds); ok {
+		hold, err := holds.PeekSlotReadHold(schedule, slot)
+		return hold.Milliseconds(), err
+	}
+	return source.readHoldMillis(nil, slot), nil
+}
+
+// WithTakeoverClock lets the source tell a Slot due before this process took
+// its Query Group over -- replayed within the replay age -- from one the
+// Query Group fell behind on while held here, which the distance rule gives
+// up on to keep it current. One clock per process, shared by every source:
+// a Runner rebuilt here must find the moment its predecessor recorded.
+func WithTakeoverClock(clock *TakeoverClock) ProductionSlotSourceOption {
+	return func(source *ProductionSlotSource) error {
+		source.takeovers = clock
+		return nil
+	}
+}
 
 // WithObserver lets the source report the facts it acts on itself, such
 // as a cursor it advanced past a pruned range; without it those facts are
@@ -313,7 +426,15 @@ func NewProductionSlotSource(
 func (source *ProductionSlotSource) Next(
 	ctx context.Context,
 	queryGroup execution.QueryGroupIdentity,
-) (FrozenSlot, bool, SlotDueFacts, error) {
+) (_ FrozenSlot, _ bool, _ SlotDueFacts, nextErr error) {
+	// A timeline whose bytes do not decode blocks the source by that name
+	// whichever read met it first. Navigation already said so; the
+	// retirement check before it, the first Segment's read and the recovery
+	// classification returned the failure raw, so for a Query Group with
+	// Progress - nearly every one - the round failed unclassified and the
+	// Worker never named it SCHEDULE_UNREADABLE, the word its registration
+	// reports the timeline to the leader by.
+	defer func() { nextErr = blockUndecodableTimeline(nextErr) }()
 	if source == nil || queryGroup == "" || queryGroup != source.queryGroup {
 		return FrozenSlot{}, false, SlotDueFacts{}, errors.New("alarmd scheduler: SlotSource Query Group mismatch")
 	}
@@ -334,6 +455,11 @@ func (source *ProductionSlotSource) Next(
 	if err != nil {
 		return FrozenSlot{}, false, SlotDueFacts{}, err
 	}
+	// The takeover is noted on the first round under a new owner epoch,
+	// whatever that round finds: noted only when a Slot first came up past
+	// its deadline, it would be the moment this owner first fell behind, and
+	// the Slots it fell behind on itself would read as due before it.
+	source.takeovers.Anchor(queryGroup, initialFence, at)
 	decision = "progress_load"
 	identity := execution.ProgressIdentity{QueryGroup: source.queryGroup}
 	load, err := source.progress.LoadProgress(ctx, identity)
@@ -368,6 +494,7 @@ func (source *ProductionSlotSource) Next(
 			schedule, nextSlot, retired, err = source.firstAvailableSchedule(ctx, schedule)
 			if retired {
 				decision = "retired"
+				source.prepareRetiredReadHold(ctx, initialFence)
 				return FrozenSlot{}, false, SlotDueFacts{Retired: true}, nil
 			}
 		}
@@ -378,11 +505,15 @@ func (source *ProductionSlotSource) Next(
 		}
 		if retired {
 			decision = "retired"
+			source.prepareRetiredReadHold(ctx, initialFence)
 			return FrozenSlot{}, false, SlotDueFacts{Retired: true}, nil
 		}
-		schedule, nextSlot, err = source.nextSlotAfterProgress(ctx, *load.Progress)
+		// navigated is the Progress the Slot below was navigated from: the
+		// loaded one, or the one a pruned advance left.
+		navigated := *load.Progress
+		schedule, nextSlot, err = source.nextSlotAfterProgress(ctx, navigated)
 		if err != nil {
-			resumed, advanced, advanceErr := source.advancePrunedCursor(ctx, *load.Progress, initialFence, err)
+			resumed, advanced, advanceErr := source.advancePrunedCursor(ctx, navigated, initialFence, err)
 			if advanceErr != nil {
 				return FrozenSlot{}, false, SlotDueFacts{}, advanceErr
 			}
@@ -393,9 +524,23 @@ func (source *ProductionSlotSource) Next(
 				}
 				if retired {
 					decision = "retired"
+					source.prepareRetiredReadHold(ctx, initialFence)
 					return FrozenSlot{}, false, SlotDueFacts{Retired: true}, nil
 				}
+				navigated = resumed
 				schedule, nextSlot, err = source.nextSlotAfterProgress(ctx, resumed)
+			}
+		}
+		if err == nil {
+			resumed, skipped, skipErr := source.skipIntoRepairedSegment(ctx, navigated, schedule, nextSlot, initialFence)
+			if skipErr != nil {
+				return FrozenSlot{}, false, SlotDueFacts{}, skipErr
+			}
+			if skipped {
+				// What the store now holds: the Slot below is frozen against the
+				// cursor the skip set, and nothing of the discarded one is
+				// carried into its read hold or its range.
+				load.Progress = &resumed
 			}
 		}
 	}
@@ -404,6 +549,13 @@ func (source *ProductionSlotSource) Next(
 	}
 	if err := source.validateSchedule(schedule, nextSlot); err != nil {
 		return FrozenSlot{}, false, SlotDueFacts{}, err
+	}
+	if holds, ok := source.readHolds.(interface {
+		PrepareSchedule(context.Context, execution.FrozenQueryGroupSchedule, execution.OwnerFence) error
+	}); ok {
+		if err := holds.PrepareSchedule(ctx, schedule, initialFence); err != nil && !errors.Is(err, ErrReadHoldDegraded) {
+			return FrozenSlot{}, false, SlotDueFacts{}, &SourceRetryError{Err: err}
+		}
 	}
 	decision = "schedule_validated"
 	trace.EvaluationTime = int64(nextSlot)
@@ -433,9 +585,15 @@ func (source *ProductionSlotSource) Next(
 		decision = "future_slot"
 		return FrozenSlot{}, false, SlotDueFacts{NotDueUntilUnix: int64(nextSlot), IntervalSeconds: dueInterval}, nil
 	}
+	decision = "read_hold"
+	hold, err := source.slotReadHoldMillis(ctx, schedule, load.Progress, nextSlot, initialFence)
+	if err != nil {
+		return FrozenSlot{}, false, SlotDueFacts{}, &SourceRetryError{Err: err}
+	}
 	request := execution.FreezeSlotContractRequest{
 		QueryGroup: source.queryGroup, ScheduleRevision: schedule.Segment.ScheduleRevision,
 		ScheduleSegmentStart: schedule.Segment.Start, EvaluationTime: nextSlot, DuePlans: duePlans,
+		ReadHoldMillis: hold,
 	}
 	decision = "freeze"
 	fact, err := source.catalog.FreezeSlotContract(ctx, request)
@@ -453,7 +611,10 @@ func (source *ProductionSlotSource) Next(
 			slot, due, err := source.slotFromProjection(ctx, initialAssignment, initialFence, *load.Progress.UnfinishedSlot, at)
 			return slot, due, SlotDueFacts{IntervalSeconds: dueInterval}, err
 		}
+		// The deadline the Slot would have been frozen with: its schedule's,
+		// read hold later.
 		deadline, deadlineErr := source.scheduleQueryDeadline(schedule, nextSlot)
+		deadline += hold
 		if deadlineErr != nil {
 			return FrozenSlot{}, false, SlotDueFacts{}, deadlineErr
 		}
@@ -473,7 +634,7 @@ func (source *ProductionSlotSource) Next(
 			// never freeze that Slot, never advance and stayed blocked with
 			// BLOCKED_EXACT_SET_UNAVAILABLE on every attempt.
 			decision = "snapshot_unavailable_finalization"
-			slot, due, finalizeErr := source.snapshotUnavailableSlot(ctx, schedule, nextSlot, duePlans, deadline, recoveryUntil, initialAssignment, initialFence, at)
+			slot, due, finalizeErr := source.snapshotUnavailableSlot(ctx, schedule, nextSlot, duePlans, deadline, hold, recoveryUntil, initialAssignment, initialFence, at)
 			return slot, due, SlotDueFacts{IntervalSeconds: dueInterval}, finalizeErr
 		}
 		if errors.As(err, &corrupt) || at.UnixMilli() >= recoveryUntil {
@@ -500,7 +661,7 @@ func (source *ProductionSlotSource) Next(
 	if err := source.validateSnapshotRetention(fact.Contract.Slot.EvaluationTime, queryDeadline); err != nil {
 		return FrozenSlot{}, false, SlotDueFacts{}, err
 	}
-	operation, recovery, err := source.classifyRecovery(ctx, fact.Contract.Slot.EvaluationTime, queryDeadline, at)
+	operation, recovery, err := source.classifyRecovery(ctx, fact.Contract.Slot.EvaluationTime, queryDeadline, fact.Contract.ReadHoldMillis, at, initialFence)
 	if err != nil {
 		return FrozenSlot{}, false, SlotDueFacts{}, err
 	}
@@ -519,17 +680,39 @@ func (source *ProductionSlotSource) Next(
 		RecoveryUntilUnixMilli:         recoveryUntil,
 		KeepUntilUnixMilli:             keepUntil,
 		Dispatch: SlotDispatchContext{Operation: operation, OwnerFence: currentFence,
-			AssignmentGeneration: currentAssignment.AssignmentGeneration},
+			AssignmentGeneration: currentAssignment.AssignmentGeneration, ContentScope: declaredContentScope(schedule.Segment)},
 		ExpectedNextSlot: nextSlot,
 		Recovery:         recovery,
+		FollowingSlot:    followingSlot(schedule, nextSlot),
 	}
-	if source.expiredRangeEnabled && load.Progress != nil && load.Progress.NextSlot == nextSlot && load.Progress.UnfinishedSlot == nil &&
+	if load.Progress != nil && load.Progress.NextSlot == nextSlot && load.Progress.UnfinishedSlot == nil &&
 		ctx.Value(rangeFlightContextKey{}) == queryGroup && recovery.Disposition == ReplayExpired {
-		if rangeSlot, eligible, rangeErr := source.buildExpiredRange(ctx, slot, schedule, at); rangeErr != nil {
+		outcome := refusedRange(observability.RangeGateApplied)
+		if rangeSlot, refusal, rangeErr := source.buildExpiredRange(ctx, slot, schedule, at); rangeErr != nil {
 			return FrozenSlot{}, false, SlotDueFacts{}, rangeErr
-		} else if eligible && rangeFitsProgress(*load.Progress, rangeSlot.ExpiredRange) {
+		} else if refusal.word != "" {
+			outcome = refusal
+		} else if !rangeFitsProgress(*load.Progress, rangeSlot.ExpiredRange) {
+			// The builder sealed a proof and this round cannot store it beside
+			// the Progress record. Same word the builder uses when the seal
+			// itself refuses the size, because to a reader they are one
+			// situation: the range that would catch this Query Group up does
+			// not fit in what carries it.
+			outcome = refusedRange(observability.RangeGateProofTooLarge)
+		} else {
 			slot = rangeSlot
 		}
+		source.observeRangeGate(ctx, fact.Contract.Slot.EvaluationTime, outcome, load, nextSlot)
+	} else if recovery.Disposition == ReplayExpired {
+		// The Slot is being given up on and the one path that could catch the
+		// Query Group up was not taken. Which of the gate's conditions refused
+		// it is a local of this comparison and is kept nowhere: a Query Group
+		// shedding a Slot every round reports GAP_SKIPPED and nothing about
+		// why it never catches up, and four Query Groups sat at a constant
+		// four Slots behind for hours with no reading that could name the
+		// reason.
+		source.observeRangeGate(ctx, fact.Contract.Slot.EvaluationTime,
+			refusedRange(rangeGateRefusal(source, load, nextSlot, ctx, queryGroup)), load, nextSlot)
 	}
 	if err := slot.Validate(queryGroup); err != nil {
 		return FrozenSlot{}, false, SlotDueFacts{}, err
@@ -590,6 +773,45 @@ func shortPeriodCohort(schedule execution.FrozenQueryGroupSchedule, slot executi
 // nothing; a Slot must not fail to resume because the schedule under it could
 // not be read, which is a state a resumed Slot is more likely to be in than
 // any other.
+// declaredContentScope is the content a Slot frozen from the Segment
+// declares to its fenced writes (decision-016): the Segment's ObjectDigest
+// while the Segment is the open one, nothing once it is closed.
+//
+// The content scope guards one thing: a worker whose view of the timeline
+// is behind, executing a Slot under a Segment it still believes open when
+// the leader has since cut a new one. Such a Slot declares the old content
+// and the record, which by then names the new, refuses it. A Slot under a
+// Segment the worker itself knows to be closed is not that: it is a replay
+// of a time the closed Segment covered, executed under the content that
+// governed that time, which is what the timeline is for -- a recovery walks
+// old Segments for hours after a publication. Declaring the old content
+// there would have the record refuse every replay once the change took
+// effect, and the Query Group would never catch up. Replays run under the
+// lease alone, as they always have.
+func declaredContentScope(segment execution.ScheduleSegmentFact) string {
+	if segment.End != nil {
+		return ""
+	}
+	return string(segment.ObjectDigest)
+}
+
+// projectionContentScope is declaredContentScope for a Slot rebuilt from
+// its persisted projection: the content the first attempt froze under, if
+// the live timeline still has that Segment open with that content; nothing
+// otherwise, including when the timeline cannot be read -- a retry that
+// cannot tell is a replay under the lease alone, never a declared write on
+// content it cannot vouch for.
+func (source *ProductionSlotSource) projectionContentScope(ctx context.Context, projection execution.UnfinishedSlotProjection) string {
+	if projection.ContentScope == "" {
+		return ""
+	}
+	schedule, err := source.catalog.ReadFrozenSchedule(ctx, source.queryGroup, projection.Contract.Slot.EvaluationTime)
+	if err != nil || schedule.Segment.End != nil || string(schedule.Segment.ObjectDigest) != projection.ContentScope {
+		return ""
+	}
+	return projection.ContentScope
+}
+
 func (source *ProductionSlotSource) cohortForSlot(ctx context.Context, slot execution.EvaluationTime) string {
 	schedule, err := source.catalog.ReadFrozenSchedule(ctx, source.queryGroup, slot)
 	if err != nil {
@@ -601,6 +823,15 @@ func (source *ProductionSlotSource) cohortForSlot(ctx context.Context, slot exec
 	// that one would be a branch nothing can reach and no test could tell from
 	// its absence.
 	return shortPeriodCohort(schedule, slot)
+}
+
+// followingSlot is the Slot schedule has after at, zero when its Segment
+// ends first.
+func followingSlot(schedule execution.FrozenQueryGroupSchedule, at execution.EvaluationTime) execution.EvaluationTime {
+	if next, ok := schedule.NextSlotAfter(at); ok {
+		return next
+	}
+	return 0
 }
 
 // ShortPeriodCohortForInterval names the cohort of an evaluation interval as
@@ -650,7 +881,8 @@ func (source *ProductionSlotSource) slotFromProjection(
 	if err != nil || projection.KeepUntilUnixMilli <= recoveryUntil {
 		return FrozenSlot{}, false, &SourceBlockedError{Err: ErrSlotContractDrift}
 	}
-	operation, recovery, err := source.classifyRecovery(ctx, projection.Contract.Slot.EvaluationTime, projection.EarliestQueryDeadlineUnixMilli, at)
+	operation, recovery, err := source.classifyRecovery(ctx, projection.Contract.Slot.EvaluationTime, projection.EarliestQueryDeadlineUnixMilli,
+		projection.Contract.ReadHoldMillis, at, initialFence)
 	if err != nil {
 		return FrozenSlot{}, false, err
 	}
@@ -665,7 +897,13 @@ func (source *ProductionSlotSource) slotFromProjection(
 		Contract: projection.Contract, DuePlanTargets: projection.DuePlanTargets.Clone(),
 		EarliestQueryDeadlineUnixMilli: projection.EarliestQueryDeadlineUnixMilli,
 		RecoveryUntilUnixMilli:         recoveryUntil, KeepUntilUnixMilli: projection.KeepUntilUnixMilli,
-		Dispatch:         SlotDispatchContext{Operation: operation, OwnerFence: currentFence, AssignmentGeneration: currentAssignment.AssignmentGeneration},
+		// The content the first attempt froze under, from the projection it
+		// wrote down, declared only while that Segment is still the open one:
+		// a retry of a Slot the timeline has since moved past is a replay,
+		// and replays declare nothing (declaredContentScope).
+		Dispatch: SlotDispatchContext{Operation: operation, OwnerFence: currentFence,
+			AssignmentGeneration: currentAssignment.AssignmentGeneration,
+			ContentScope:         source.projectionContentScope(ctx, projection)},
 		ExpectedNextSlot: projection.Contract.Slot.EvaluationTime, Recovery: recovery,
 		ShortPeriodCohort: source.cohortForSlot(ctx, projection.Contract.Slot.EvaluationTime),
 	}
@@ -687,6 +925,7 @@ func (source *ProductionSlotSource) snapshotUnavailableSlot(
 	nextSlot execution.EvaluationTime,
 	duePlans []execution.FrozenPlanScheduleRef,
 	deadline int64,
+	hold int64,
 	recoveryUntil int64,
 	initialAssignment ownership.AssignmentRecord,
 	initialFence execution.OwnerFence,
@@ -700,20 +939,20 @@ func (source *ProductionSlotSource) snapshotUnavailableSlot(
 	if err != nil {
 		return FrozenSlot{}, false, &SourceBlockedError{Err: err}
 	}
-	targets := execution.FrozenDuePlanTargets{DuePlanSetDigest: digest, Plans: make([]execution.PlanIdentity, len(duePlans))}
+	targets := execution.FrozenDuePlanTargets{DuePlanSetDigest: digest, Plans: make([]execution.PlanKey, len(duePlans))}
 	for index, due := range duePlans {
-		targets.Plans[index] = due.Identity
+		targets.Plans[index] = due.Key()
 	}
 	contractRef := execution.FrozenExecutionContractRef{
 		Slot:             execution.SlotIdentity{QueryGroup: source.queryGroup, EvaluationTime: nextSlot},
 		SnapshotRevision: schedule.Segment.Publication.SnapshotRevision, QueryRevision: schedule.Segment.QueryRevision,
 		ScheduleRevision: schedule.Segment.ScheduleRevision, ScheduleSegmentStart: schedule.Segment.Start,
-		DuePlanSetDigest: digest,
+		DuePlanSetDigest: digest, ReadHoldMillis: hold,
 	}
 	if err := source.validateSnapshotRetention(nextSlot, deadline); err != nil {
 		return FrozenSlot{}, false, err
 	}
-	operation, recovery, err := source.classifyRecovery(ctx, nextSlot, deadline, at)
+	operation, recovery, err := source.classifyRecovery(ctx, nextSlot, deadline, hold, at, initialFence)
 	if err != nil {
 		return FrozenSlot{}, false, err
 	}
@@ -732,9 +971,10 @@ func (source *ProductionSlotSource) snapshotUnavailableSlot(
 		RecoveryUntilUnixMilli:         recoveryUntil,
 		KeepUntilUnixMilli:             keepUntil,
 		Dispatch: SlotDispatchContext{Operation: operation, OwnerFence: currentFence,
-			AssignmentGeneration: currentAssignment.AssignmentGeneration},
+			AssignmentGeneration: currentAssignment.AssignmentGeneration, ContentScope: declaredContentScope(schedule.Segment)},
 		ExpectedNextSlot: nextSlot,
 		Recovery:         recovery,
+		FollowingSlot:    followingSlot(schedule, nextSlot),
 	}
 	if err := slot.Validate(source.queryGroup); err != nil {
 		return FrozenSlot{}, false, &SourceBlockedError{Err: err}
@@ -768,11 +1008,24 @@ func (source *ProductionSlotSource) validateSnapshotRetention(
 	return nil
 }
 
+// classifyRecovery decides whether a Slot past its deadline is replayed or
+// given up on. Past the replay age every Slot is given up on. Inside it, a
+// Slot evaluated before this process took the Query Group over
+// (TakeoverClock, under the owner fence this round holds) is replayed: nobody
+// here could have run it, and a rollout's handover made every short-period
+// Query Group of a restarted replica miss one or more. It is the evaluation
+// time that is compared, not when the Slot became ready, so one evaluated
+// just before the takeover and ready after it is replayed too if it falls
+// behind: lenient, and bounded by the replay age. The distance rule is for the
+// Slots a Query Group fell behind on while held here, and gives the old
+// ones up so it stays current.
 func (source *ProductionSlotSource) classifyRecovery(
 	ctx context.Context,
 	evaluationTime execution.EvaluationTime,
 	deadline int64,
+	hold int64,
 	at time.Time,
+	fence execution.OwnerFence,
 ) (execution.Operation, SlotRecoveryFacts, error) {
 	if source.recovery == nil {
 		return execution.OperationNormal, SlotRecoveryFacts{}, nil
@@ -784,6 +1037,11 @@ func (source *ProductionSlotSource) classifyRecovery(
 		return execution.OperationNormal, SlotRecoveryFacts{Disposition: ReplayLive, RecheckAtUnixMilli: deadline}, nil
 	}
 	age := at.Sub(time.UnixMilli(deadline))
+	takenOver := source.takeovers.Anchor(source.queryGroup, fence, at)
+	// Not for a Query Group the degraded pool holds (withQueryCooldownHeld):
+	// its replay could not run, and the pool gives its Slots up for distance
+	// as it always did.
+	beforeTakeover := !takenOver.IsZero() && time.Unix(int64(evaluationTime), 0).Before(takenOver) && !queryCooldownHeld(ctx)
 	if age >= source.recovery.MaxReplayAge {
 		aged := SlotRecoveryFacts{
 			Disposition: ReplayExpired,
@@ -792,24 +1050,40 @@ func (source *ProductionSlotSource) classifyRecovery(
 			Age:         age,
 		}
 		source.observeReplayExpiry(ctx, evaluationTime, aged)
+		if beforeTakeover {
+			source.observeReplayTakeover(ctx, evaluationTime, observability.ReplayTakeoverAgeExceeded, age, at.Sub(takenOver))
+		}
 		return execution.OperationNormal, aged, nil
 	}
-	distance, recheckAt, err := source.replayDistance(ctx, evaluationTime, at)
+	distance, recheckAt, err := source.replayDistance(ctx, evaluationTime, hold, at)
 	if err != nil {
 		return "", SlotRecoveryFacts{}, err
 	}
 	facts := SlotRecoveryFacts{Disposition: ReplayEligible, Distance: distance, Age: age, RecheckAtUnixMilli: recheckAt}
-	if distance > source.recovery.MaxReplaySlots {
-		facts.Disposition = ReplayExpired
-		facts.Reason = ReplayExpiredByDistance
-		source.observeReplayExpiry(ctx, evaluationTime, facts)
-		return execution.OperationNormal, facts, nil
+	if beforeTakeover {
+		source.observeReplayTakeover(ctx, evaluationTime, observability.ReplayTakeoverReplayed, age, at.Sub(takenOver))
+		return execution.OperationReplay, facts, nil
 	}
-	expired, err := source.replayWaitOutlastsDistance(ctx, evaluationTime, deadline, &facts)
+	// The contradiction is decided before the distance, and the order is the
+	// meaning. Both can be true of the same Slot, and they are not two ways of
+	// saying one thing: distance says the Query Group fell behind and the gap
+	// is accepted, the contradiction says two rules were derived from settings
+	// that disagree and somebody can fix it. Deciding distance first hides the
+	// second inside the first exactly when it is permanent -- a Query Group
+	// held past its own window on every Slot is always also too far by the
+	// time anyone looks, so it reports the accepted gap forever and the
+	// fixable defect is never once named.
+	expired, err := source.replayWaitOutlastsDistance(ctx, evaluationTime, deadline, hold, &facts)
 	if err != nil {
 		return "", SlotRecoveryFacts{}, err
 	}
 	if expired {
+		source.observeReplayExpiry(ctx, evaluationTime, facts)
+		return execution.OperationNormal, facts, nil
+	}
+	if distance > source.recovery.MaxReplaySlots {
+		facts.Disposition = ReplayExpired
+		facts.Reason = ReplayExpiredByDistance
 		source.observeReplayExpiry(ctx, evaluationTime, facts)
 		return execution.OperationNormal, facts, nil
 	}
@@ -832,13 +1106,45 @@ func (source *ProductionSlotSource) observeReplayExpiry(
 	}
 	// Observability is a fail-open side channel, as everywhere else.
 	defer func() { _ = recover() }()
+	// The reason is the line's reason_code as well as a fact: left empty, a
+	// degraded result read as reason_not_reported on a line that had named
+	// its reason one level down.
 	source.observer.Observe(ctx, observability.Observation{
 		Component: observability.ComponentScheduler, Stage: observability.StageReplayExpired,
-		Result: observability.ResultDegraded, Direction: observability.DirectionInternal,
-		Trace: observability.TraceFields{QueryGroupKey: string(source.queryGroup), EvaluationTime: int64(evaluationTime)},
+		Result: observability.ResultDegraded, ReasonCode: observability.ReasonCode(facts.Reason),
+		Direction: observability.DirectionInternal,
+		Trace:     observability.TraceFields{QueryGroupKey: string(source.queryGroup), EvaluationTime: int64(evaluationTime)},
 		ReplayExpiry: &observability.ReplayExpiryFacts{
 			Reason: string(facts.Reason), Distance: facts.Distance, AgeSeconds: facts.Age.Seconds(),
 			ReadyAtUnixMilli: facts.ReadyAtUnixMilli, DistanceBoundaryUnixMilli: facts.DistanceBoundaryUnixMilli,
+			// What the round before this one did with the Query Group. A Slot
+			// given up on for distance says nothing about how it got that far
+			// behind, and the four Query Groups that did this for hours were
+			// being held every round by something this line never named.
+			HeldBy: HeldByFromContext(ctx),
+		},
+	})
+}
+
+// observeReplayTakeover reports one Slot due before this process took its
+// Query Group over, and what became of it: once per Slot and outcome
+// (TakeoverClock.FirstClassification), however many times it is classified.
+func (source *ProductionSlotSource) observeReplayTakeover(
+	ctx context.Context,
+	evaluationTime execution.EvaluationTime,
+	outcome string,
+	age, sinceTakeover time.Duration,
+) {
+	if source.observer == nil || !source.takeovers.FirstClassification(source.queryGroup, evaluationTime, outcome) {
+		return
+	}
+	defer func() { _ = recover() }()
+	source.observer.Observe(ctx, observability.Observation{
+		Component: observability.ComponentScheduler, Stage: observability.StageReplayTakeover,
+		Result: observability.ResultSuccess, Direction: observability.DirectionInternal,
+		Trace: observability.TraceFields{QueryGroupKey: string(source.queryGroup), EvaluationTime: int64(evaluationTime)},
+		ReplayTakeover: &observability.ReplayTakeoverFacts{
+			Outcome: outcome, AgeSeconds: age.Seconds(), TakeoverOffsetSeconds: sinceTakeover.Seconds(),
 		},
 	})
 }
@@ -865,29 +1171,44 @@ func (source *ProductionSlotSource) replayWaitOutlastsDistance(
 	ctx context.Context,
 	evaluationTime execution.EvaluationTime,
 	deadline int64,
+	hold int64,
 	facts *SlotRecoveryFacts,
 ) (bool, error) {
 	if source.settlingWait <= 0 {
 		return false, nil
 	}
-	queryBudget := time.Duration(deadline-int64(evaluationTime)*1000) * time.Millisecond
+	// The Slot's read hold is in its deadline, and is not budget for the
+	// settling wait: access chooses the wait within the schedule's own
+	// budget and reads that much later, and so does this estimate.
+	queryBudget := time.Duration(deadline-int64(evaluationTime)*1000-hold) * time.Millisecond
 	readyAt := time.Unix(int64(evaluationTime), 0).
-		Add(execution.SettlingWaitWithinQueryBudget(queryBudget, source.settlingWait)).UnixMilli()
+		Add(execution.SettlingWaitWithinQueryBudget(queryBudget, source.settlingWait)).UnixMilli() + hold
 	// The boundary is never earlier than the next grid point while the distance
 	// is still inside the limit, so a read that lands before that point cannot
 	// outlast the boundary and the walk below is not worth its reads. This is
 	// the ordinary case -- it is what a healthy deployment does on every
 	// replay -- and the walk happens only when the arithmetic cannot rule the
-	// contradiction out. A recheck instant of zero means the schedule retires
-	// before the limit, so there is no boundary to outlast.
-	if facts.RecheckAtUnixMilli == 0 || readyAt < facts.RecheckAtUnixMilli {
+	// contradiction out.
+	//
+	// The shortcut applies only inside the limit. Past it the recheck instant
+	// is zero because the distance walk stopped at the limit rather than
+	// because the schedule retires, and reading zero as "no boundary to
+	// outlast" is what made this guard silent on exactly the Query Groups it
+	// was written for: one permanently held past its window is also past the
+	// limit by the time anyone looks, so the shortcut fired on every round and
+	// the contradiction was never computed once. Past the limit the Slot is
+	// being given up on anyway, so the walk it costs is affordable.
+	if facts.Distance <= source.recovery.MaxReplaySlots &&
+		(facts.RecheckAtUnixMilli == 0 || readyAt < facts.RecheckAtUnixMilli) {
 		return false, nil
 	}
 	boundary, bounded, err := source.replayDistanceBoundary(ctx, evaluationTime)
 	if err != nil || !bounded {
 		return false, err
 	}
-	boundaryMilli := int64(boundary) * 1000
+	// replayDistance counts on the clock the read hold shifts: the distance
+	// passes the limit when the boundary's grid point is a hold behind.
+	boundaryMilli := int64(boundary)*1000 + hold
 	if readyAt < boundaryMilli {
 		return false, nil
 	}
@@ -951,10 +1272,10 @@ func frozenSlotExecutionFacts(
 	}
 	targets := execution.FrozenDuePlanTargets{
 		DuePlanSetDigest: fact.Contract.DuePlanSetDigest,
-		Plans:            make([]execution.PlanIdentity, len(fact.DuePlans)),
+		Plans:            make([]execution.PlanKey, len(fact.DuePlans)),
 	}
 	for index := range fact.DuePlans {
-		targets.Plans[index] = fact.DuePlans[index].Identity
+		targets.Plans[index] = fact.DuePlans[index].Key()
 	}
 	if deadline <= int64(fact.Contract.Slot.EvaluationTime)*1000 || targets.Validate(fact.Contract) != nil {
 		return execution.FrozenDuePlanTargets{}, 0, ErrSlotContractDrift
@@ -962,11 +1283,18 @@ func frozenSlotExecutionFacts(
 	return targets, deadline, nil
 }
 
+// replayDistance counts the grid points after first that at has passed, on
+// the clock the Slot's read hold shifts: a Slot read hold later than its
+// schedule is that much later behind, and its grid points are passed that
+// much later. replayDistanceBoundary and an expired range's DistanceHead
+// count the same way. The recheck instant is when the next one is passed.
 func (source *ProductionSlotSource) replayDistance(
 	ctx context.Context,
 	first execution.EvaluationTime,
+	hold int64,
 	at time.Time,
 ) (uint32, int64, error) {
+	shifted := at.Add(-time.Duration(hold) * time.Millisecond)
 	retiredAt, retired, err := source.catalog.ReadScheduleRetirement(ctx, source.queryGroup)
 	if err != nil {
 		return 0, 0, err
@@ -984,13 +1312,41 @@ func (source *ProductionSlotSource) replayDistance(
 		if retired && next == retiredAt {
 			return distance, 0, nil
 		}
-		if int64(next) > at.Unix() {
-			return distance, int64(next) * 1000, nil
+		if int64(next) > shifted.Unix() {
+			return distance, int64(next)*1000 + hold, nil
 		}
 		distance++
 		cursor = next
 	}
 	return distance, 0, nil
+}
+
+// prepareRetiredReadHold closes a retired group's read hold at its last
+// boundary. It never holds the retirement up: answering retry until it could
+// close kept a group whose closing could not succeed unretired for good, and
+// its successor waiting on it. A group that cannot close retires all the
+// same, counted, and a successor reads its unclosed record as the hold bound.
+func (source *ProductionSlotSource) prepareRetiredReadHold(ctx context.Context, fence execution.OwnerFence) {
+	holds, ok := source.readHolds.(interface {
+		PrepareSchedule(context.Context, execution.FrozenQueryGroupSchedule, execution.OwnerFence) error
+	})
+	if !ok {
+		return
+	}
+	err := func() error {
+		boundary, retired, err := source.catalog.ReadScheduleRetirement(ctx, source.queryGroup)
+		if err != nil || !retired {
+			return err
+		}
+		schedule, err := source.catalog.ReadFrozenSchedule(ctx, source.queryGroup, boundary-1)
+		if err != nil {
+			return err
+		}
+		return holds.PrepareSchedule(ctx, schedule, fence)
+	}()
+	if failed, counts := source.readHolds.(interface{ RetireCloseFailed(error) }); err != nil && counts {
+		failed.RetireCloseFailed(err)
+	}
 }
 
 func (source *ProductionSlotSource) isRetiredBoundary(
@@ -1050,7 +1406,12 @@ func (source *ProductionSlotSource) nextSlotAfterProgress(
 		return execution.FrozenQueryGroupSchedule{}, 0, failClosedScheduleNavigation(err)
 	}
 	if len(schedule.DuePlanRefs(next)) == 0 {
-		return execution.FrozenQueryGroupSchedule{}, 0, &SourceBlockedError{Err: ErrProgressOffSchedule}
+		// The segment holds this time and validated; what it does not hold is a
+		// Plan due at it. That is a different fact from the cursor being off
+		// the schedule, and it used to arrive as the same error - which sent it
+		// down the pruned-cursor path and recorded the stretch as retention
+		// loss.
+		return execution.FrozenQueryGroupSchedule{}, 0, &SourceBlockedError{Err: ErrNoPlanDueInSegment}
 	}
 	return schedule, next, nil
 }
@@ -1063,6 +1424,11 @@ func (source *ProductionSlotSource) nextSlotAfterProgress(
 // read, or a reader without the write side leaves the original error in
 // place. The advance is reported whatever its outcome; a conflict or a
 // stale owner leaves the cursor for the next attempt.
+//
+// In production this is reached by a cursor with no completion behind it: a
+// cursor anchored on a completion is continued by the catalog at the first
+// Segment after the anchor (NextSlotAfter) and never fails here for a
+// missing Segment.
 func (source *ProductionSlotSource) advancePrunedCursor(
 	ctx context.Context,
 	progress execution.ScheduleProgress,
@@ -1071,8 +1437,18 @@ func (source *ProductionSlotSource) advancePrunedCursor(
 ) (execution.ScheduleProgress, bool, error) {
 	var blocked *SourceBlockedError
 	if !errors.As(cause, &blocked) ||
-		(!errors.Is(cause, controlplane.ErrScheduleUnavailable) && !errors.Is(cause, ErrProgressOffSchedule)) {
+		(!errors.Is(cause, controlplane.ErrScheduleUnavailable) && !errors.Is(cause, ErrProgressOffSchedule) &&
+			!errors.Is(cause, ErrNoPlanDueInSegment)) {
 		return progress, false, nil
+	}
+	// Both causes move the cursor the same way, and only the recorded reason
+	// differs. Advancing is right for either: the Slots behind the cursor were
+	// never evaluated and no later read makes them evaluable - pruned because
+	// the timeline dropped them, plan-not-active because replaying them would
+	// alert for a strategy that was not there while they passed.
+	reason := execution.ReasonCode(contract.ReasonSchedulePruned)
+	if errors.Is(cause, ErrNoPlanDueInSegment) {
+		reason = execution.ReasonCode(contract.ReasonPlanNotActive)
 	}
 	advancer, ok := source.progress.(PrunedCursorAdvancer)
 	if !ok {
@@ -1087,17 +1463,134 @@ func (source *ProductionSlotSource) advancePrunedCursor(
 	// Slot navigation can begin at rather than on a segment start that may
 	// hold no due Slot. A retired boundary reached on the way is a valid
 	// resume point too: the caller sees the retirement at the new cursor.
-	_, earliest, _, err := source.firstAvailableSchedule(ctx, initial)
+	landing, earliest, _, err := source.firstAvailableSchedule(ctx, initial)
 	if err != nil || earliest <= progress.NextSlot {
+		return progress, false, nil
+	}
+	// The cursor's Segments were not pruned when the Segment it lands in was
+	// opened by a rewrite of the whole timeline: they went with the timeline
+	// the rewrite replaced, and the skip says so rather than blaming retention.
+	var repairedAt int64
+	if reason != execution.ReasonCode(contract.ReasonPlanNotActive) {
+		if repaired, at, marked, markErr := source.repairedLanding(ctx, progress, landing); markErr == nil && marked {
+			reason, repairedAt = repaired, at
+		}
+	}
+	request := execution.ProgressSkipPrunedRequest{
+		Identity: execution.ProgressIdentity{QueryGroup: source.queryGroup}, OwnerFence: fence,
+		ExpectedNextSlot: progress.NextSlot, ResumeAt: earliest, Reason: reason,
+	}
+	result, err := advancer.SkipPrunedRange(ctx, request)
+	if source.observeCursorAdvance(ctx, request, result, err, repairedAt) != observability.CursorAdvanceApplied {
+		return progress, false, nil
+	}
+	return skippedProgress(progress, request), true, nil
+}
+
+// skipIntoRepairedSegment records the one jump navigation makes without a
+// record of its own: from a cursor inside Segments a rewritten timeline no
+// longer holds, to the first Slot of the Segment the rewrite opened.
+//
+// The catalog continues an anchored cursor at the first Segment after the
+// anchor when no Segment holds it (NextSlotAfter), which is right for the two
+// other ways a timeline comes to lack the cursor's time - the hole a
+// retirement leaves and a pruned prefix - and those keep that behaviour. A
+// rewrite is not either: the Slots between the cursor and the new Segment
+// were on the timeline and were lost with it, and continuing silently there
+// left the stretch on no record at all. So when the Slot navigation chose
+// lies in a Segment that starts after the cursor and carries the rewrite's
+// mark, the cursor is first moved there under the owner's fence with the
+// span recorded under the mark's word, the same uncounted shape a pruned skip
+// has. Once per rewrite: after it the cursor stands inside the new Segment.
+//
+// A skip the store does not apply is retried on the next round rather than
+// passed over, because passing over it is the silent jump this exists to
+// end. A reader without the write side keeps the old behaviour.
+func (source *ProductionSlotSource) skipIntoRepairedSegment(
+	ctx context.Context,
+	progress execution.ScheduleProgress,
+	schedule execution.FrozenQueryGroupSchedule,
+	next execution.EvaluationTime,
+	fence execution.OwnerFence,
+) (execution.ScheduleProgress, bool, error) {
+	if next <= progress.NextSlot {
+		return progress, false, nil
+	}
+	reason, repairedAt, marked, err := source.repairedLanding(ctx, progress, schedule)
+	if err != nil {
+		return progress, false, failClosedScheduleNavigation(err)
+	}
+	if !marked {
+		return progress, false, nil
+	}
+	advancer, ok := source.progress.(PrunedCursorAdvancer)
+	if !ok {
 		return progress, false, nil
 	}
 	request := execution.ProgressSkipPrunedRequest{
 		Identity: execution.ProgressIdentity{QueryGroup: source.queryGroup}, OwnerFence: fence,
-		ExpectedNextSlot: progress.NextSlot, ResumeAt: earliest,
+		ExpectedNextSlot: progress.NextSlot, ResumeAt: next, Reason: reason,
 	}
 	result, err := advancer.SkipPrunedRange(ctx, request)
-	facts := &observability.CursorAdvanceFacts{From: int64(progress.NextSlot), To: int64(earliest),
-		Refusal: string(result.Refusal), InFlightSlot: int64(result.InFlightSlot)}
+	if source.observeCursorAdvance(ctx, request, result, err, repairedAt) != observability.CursorAdvanceApplied {
+		if err == nil {
+			err = ErrRepairSkipUnrecorded
+		}
+		return progress, false, &SourceRetryError{Err: err}
+	}
+	return skippedProgress(progress, request), true, nil
+}
+
+// ErrRepairSkipUnrecorded is a skip into a rewritten timeline's Segment the
+// store did not apply - the cursor moved, the compare-and-set lost, the
+// owner changed. The round is retried; the Slot is not run past the skip.
+var ErrRepairSkipUnrecorded = errors.New("alarmd scheduler: the skip into a rewritten timeline was not recorded")
+
+// repairedLanding says whether landing is a Segment a rewrite of the whole
+// timeline opened after the cursor, and under which word and since when the
+// skip into it is recorded. A mark of a kind this build does not know reads
+// as no mark.
+func (source *ProductionSlotSource) repairedLanding(
+	ctx context.Context,
+	progress execution.ScheduleProgress,
+	landing execution.FrozenQueryGroupSchedule,
+) (execution.ReasonCode, int64, bool, error) {
+	if landing.Segment.Start <= progress.NextSlot {
+		return "", 0, false, nil
+	}
+	repair, marked, err := source.catalog.ReadSegmentRepair(ctx, source.queryGroup, landing.Segment.Start)
+	if err != nil || !marked {
+		return "", 0, false, err
+	}
+	reason, known := repair.ReasonCode()
+	if !known {
+		return "", 0, false, nil
+	}
+	return reason, repair.AtUnixMilli, true, nil
+}
+
+// skippedProgress is what the store wrote for an applied skip: a skip keeps
+// both facts about records and drops every continuity anchor.
+func skippedProgress(progress execution.ScheduleProgress, request execution.ProgressSkipPrunedRequest) execution.ScheduleProgress {
+	return execution.ScheduleProgress{
+		Identity: request.Identity, NextSlot: request.ResumeAt, LastCompletionKind: execution.CompletionGapSkipped,
+		CurrentOrRecentGap: request.SkipGap(),
+		LastDataSlot:       progress.LastDataSlot, EmptyRunSinceSlot: progress.EmptyRunSinceSlot,
+	}
+}
+
+// observeCursorAdvance reports one skip attempt whatever its outcome and
+// returns the outcome's word.
+func (source *ProductionSlotSource) observeCursorAdvance(
+	ctx context.Context,
+	request execution.ProgressSkipPrunedRequest,
+	result execution.ProgressSkipResult,
+	err error,
+	repairedAt int64,
+) string {
+	facts := &observability.CursorAdvanceFacts{From: int64(request.ExpectedNextSlot), To: int64(request.ResumeAt),
+		Refusal: string(result.Refusal), InFlightSlot: int64(result.InFlightSlot),
+		Reason: string(request.SkipGap().ReasonCode), RepairedAtUnixMilli: repairedAt}
 	observed := observability.Observation{
 		Component: observability.ComponentScheduler, Stage: observability.StageScheduleCursorAdvanced,
 		Operation: observability.OperationWrite, Direction: observability.DirectionInternal,
@@ -1123,14 +1616,20 @@ func (source *ProductionSlotSource) advancePrunedCursor(
 	if source.observer != nil {
 		source.observer.Observe(ctx, observed)
 	}
-	if facts.Status != observability.CursorAdvanceApplied {
-		return progress, false, nil
+	return facts.Status
+}
+
+// blockUndecodableTimeline is a source error that is a timeline which does
+// not decode, as a blocked source; every other error as it is. A refusal the
+// source already classified keeps its classification.
+func blockUndecodableTimeline(err error) error {
+	var undecodable *controlplane.DeterministicScheduleError
+	var blocked *SourceBlockedError
+	var retry *SourceRetryError
+	if err == nil || !errors.As(err, &undecodable) || errors.As(err, &blocked) || errors.As(err, &retry) {
+		return err
 	}
-	resumed := execution.ScheduleProgress{
-		Identity: request.Identity, NextSlot: earliest, LastCompletionKind: execution.CompletionGapSkipped,
-		CurrentOrRecentGap: execution.PrunedSkipGap(progress.NextSlot, earliest),
-	}
-	return resumed, true, nil
+	return &SourceBlockedError{Err: err}
 }
 
 func failClosedScheduleNavigation(err error) error {

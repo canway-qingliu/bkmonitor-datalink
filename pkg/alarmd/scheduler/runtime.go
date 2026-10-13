@@ -12,12 +12,23 @@ import (
 	"time"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/contract"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/controlplane"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/observability"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/ownership"
 )
 
 var ErrSlotInFlight = errors.New("alarmd scheduler: Query Group Slot is already in flight")
+
+// SlotInFlightError is a round turned away from its Query Group's flight,
+// and what held it (FlightHeldBy*). It is ErrSlotInFlight.
+type SlotInFlightError struct{ HeldBy string }
+
+func (err *SlotInFlightError) Error() string {
+	return ErrSlotInFlight.Error() + ", held by " + err.HeldBy
+}
+
+func (err *SlotInFlightError) Is(target error) bool { return target == ErrSlotInFlight }
 
 var errExecutionAdmissionDenied = errors.New("alarmd scheduler: execution admission denied")
 
@@ -35,6 +46,53 @@ func (err *SourceBlockedError) Error() string {
 }
 func (err *SourceBlockedError) Unwrap() error { return err.Err }
 
+// ReasonCode is the word a blocked round is named by: SCHEDULE_UNREADABLE
+// when what blocked it is a schedule timeline that does not decode, and
+// BLOCKED_EXACT_SET_UNAVAILABLE for the rest. The timeline case used to read
+// as the other word, which says the control plane handed nothing to run;
+// told apart, a rollout's old build that cannot read its new timelines is a
+// reading rather than an inference.
+//
+// Retire when: the upstream snapshot after the one that adds this word is
+// merged, its rollout reading is gone; the word stays for timelines whose
+// bytes are corrupt.
+func (err *SourceBlockedError) ReasonCode() execution.ReasonCode {
+	var undecodable *controlplane.DeterministicScheduleError
+	if err != nil && errors.As(err.Err, &undecodable) {
+		return execution.ReasonCode(contract.ReasonScheduleUnreadable)
+	}
+	return execution.ReasonBlockedExactSetUnavailable
+}
+
+// ViewNotExecutableError is a Slot source, or the executor, refusing a
+// Query Group its Worker's installed executable view does not yet allow
+// (decision-016 batch 4b): the view does not carry it, or the Assignment
+// record the renewal brought does not agree with the view on its content
+// or timeline. Reason is the gate's own word for which. The Runner ends
+// the round as view_not_executable and comes back on the same backoff a
+// blocked source gets - the record's word arrives by renewal and the view's
+// by delta, so the next round asks again. AwaitingView says the refusal is
+// that one wait: the Worker holds the Query Group's lease and its view has
+// not carried the Query Group yet -- every Query Group at a Worker's start,
+// and each one that moves to it.
+type ViewNotExecutableError struct {
+	Reason       string
+	AwaitingView bool
+	// RetryWithin bounds how long the Runner waits before asking again; zero
+	// leaves it on the blocked source's backoff. What a refusal waits for
+	// arrives by the view's delta or the lease's renewal, and B4 §2 bounds
+	// the view's lag behind the record by the renewal interval plus the
+	// delta's propagation, so the gate names the renewal interval here: a
+	// refused Query Group is asked again within it however often it was
+	// refused, and a growing backoff past it only keeps the Query Group
+	// dark after the view has come.
+	RetryWithin time.Duration
+}
+
+func (err *ViewNotExecutableError) Error() string {
+	return "alarmd scheduler: the executable view does not allow this Query Group: " + err.Reason
+}
+
 type FrozenSlot struct {
 	ExpiredRange                   *execution.ExpiredRangeProjectionV1
 	ShortPeriodCohort              string
@@ -46,6 +104,10 @@ type FrozenSlot struct {
 	Dispatch                       SlotDispatchContext
 	ExpectedNextSlot               execution.EvaluationTime
 	Recovery                       SlotRecoveryFacts
+	// FollowingSlot is the Slot the frozen schedule has after this one, zero
+	// when the Segment it was frozen from ends first. Observation only: the
+	// lookback reads it to know when the Query Group reads next.
+	FollowingSlot execution.EvaluationTime
 }
 
 // SlotDispatchContext contains current, replaceable execution authority. It is
@@ -54,6 +116,11 @@ type SlotDispatchContext struct {
 	Operation            execution.Operation
 	OwnerFence           execution.OwnerFence
 	AssignmentGeneration uint64
+	// ContentScope is the content the Slot runs under, the ObjectDigest of
+	// the Segment it was frozen from; the Slot's fenced writes declare it
+	// (execution.SlotExecutionRequest.ContentScope). Empty for a Segment
+	// that predates content addressing.
+	ContentScope string
 }
 
 func (slot FrozenSlot) Validate(queryGroup execution.QueryGroupIdentity) error {
@@ -97,6 +164,21 @@ func (slot FrozenSlot) Validate(queryGroup execution.QueryGroupIdentity) error {
 
 type OwnerSession interface {
 	ValidateCurrent(context.Context, time.Time) (execution.OwnerFence, error)
+	// Deadline is the instant, on this process's clock, after which the
+	// Session no longer admits work on its lease; under a pending content
+	// change it is the change's effective time. The Runner hands it to the
+	// executor as the attempt's execution.LeaseAuthority, which the output
+	// sink consults before starting a batch (decision-016). Required, not
+	// discovered: a session without it would leave every batch admitted
+	// against no lease at all, with nothing failing to say so.
+	Deadline() time.Time
+	// NoteContentScope tells the session the content scope of the Slot
+	// about to run, so its renewals say what the holder runs (a holder
+	// already on a pending change's content is not capped at the change).
+	// Required, like Deadline: a session without it would have every
+	// renewal capped at every content change, and the Query Group would
+	// hand itself over on each one with nothing failing to say why.
+	NoteContentScope(string)
 	// ValidateCurrentWithAssignment is ValidateCurrent plus the Assignment
 	// record naming the fence owner, from one store round trip. The Runner
 	// opens every attempt with it and hands the result to the SlotSource, which
@@ -197,8 +279,12 @@ type ExecutionAdmission func(execution.Operation) (release func(), admitted bool
 // FlightCoordinator is one process-wide gate keyed by Query Group. It keeps
 // query execution single-flight without introducing a Redis business lock.
 type FlightCoordinator struct {
-	mu                     sync.Mutex
-	active                 map[execution.QueryGroupIdentity]struct{}
+	mu sync.Mutex
+	// active is each Query Group's flight held now, by what; released is
+	// told of each Query Group whose hold turned a Slot away, once the hold
+	// ends (OnTurnedAwayReleased).
+	active                 map[execution.QueryGroupIdentity]flightHold
+	released               func(execution.QueryGroupIdentity)
 	recoveryEnabled        bool
 	limits                 RecoveryLimits
 	now                    func() time.Time
@@ -231,15 +317,24 @@ type FlightCoordinator struct {
 	// yet; without it a permit that never comes back contributes nothing, which
 	// is the opposite of what should happen.
 	heldPermits map[uint64]heldPermit
+	// lookbackInflight, lookbackHeld and lookbackSeconds are the lookback's
+	// share of the query budget: counted into queryInflight, the process
+	// total, and nowhere else. See lookback_permit.go.
+	lookbackInflight int
+	lookbackHeld     map[uint64]heldPermit
+	lookbackSeconds  float64
 }
 
 type heldPermit struct {
 	operation execution.Operation
 	since     time.Time
+	// yield is a lookback permit's, closed when it is asked to yield; nil
+	// once it has been, and on every other permit.
+	yield chan struct{}
 }
 
 func NewFlightCoordinator() *FlightCoordinator {
-	return &FlightCoordinator{active: make(map[execution.QueryGroupIdentity]struct{}), now: time.Now}
+	return &FlightCoordinator{active: make(map[execution.QueryGroupIdentity]flightHold), now: time.Now}
 }
 
 func NewFlightCoordinatorWithRecovery(
@@ -250,7 +345,7 @@ func NewFlightCoordinatorWithRecovery(
 	if err := limits.Validate(); err != nil || now == nil {
 		return nil, ErrRecoveryLimitsInvalid
 	}
-	return &FlightCoordinator{active: make(map[execution.QueryGroupIdentity]struct{}), recoveryEnabled: true,
+	return &FlightCoordinator{active: make(map[execution.QueryGroupIdentity]flightHold), recoveryEnabled: true,
 		limits: limits, now: now, nextRecovery: true, observer: observability.Multi(observers...),
 		inflightByOp:      make(map[execution.Operation]int),
 		permitSecondsByOp: make(map[execution.Operation]float64),
@@ -291,6 +386,11 @@ type QueryPermitOccupancy struct {
 	// a share and not a ratio between two different things.
 	Acquires uint64
 	Queued   uint64
+	// LookbackInflight and LookbackHeldSeconds are the lookback's permits,
+	// apart from every Operation: part of the process's occupancy, never of
+	// normal's or recovery's.
+	LookbackInflight    int
+	LookbackHeldSeconds float64
 }
 
 // QueryPermitOccupancySource reports live occupancy.
@@ -326,6 +426,12 @@ func (coordinator *FlightCoordinator) QueryPermitOccupancy() QueryPermitOccupanc
 			occupancy.HeldSeconds[held.operation] += elapsed.Seconds()
 		}
 	}
+	occupancy.LookbackInflight, occupancy.LookbackHeldSeconds = coordinator.lookbackInflight, coordinator.lookbackSeconds
+	for _, held := range coordinator.lookbackHeld {
+		if elapsed := at.Sub(held.since); elapsed > 0 {
+			occupancy.LookbackHeldSeconds += elapsed.Seconds()
+		}
+	}
 	occupancy.Waiting["normal"] = len(coordinator.normalWaiters)
 	occupancy.Waiting["recovery"] = len(coordinator.recoveryWaiters) + len(coordinator.recoveryChannelWaiters)
 	occupancy.Budget = coordinator.limits.ProcessQueryPermits
@@ -333,26 +439,99 @@ func (coordinator *FlightCoordinator) QueryPermitOccupancy() QueryPermitOccupanc
 	return occupancy
 }
 
-func (coordinator *FlightCoordinator) tryAcquire(queryGroup execution.QueryGroupIdentity) (func(), bool) {
+// Flight holders, closed: what holds a Query Group's flight. A Slot turned
+// away from a flight held by anything but a Slot is told what held it, and
+// is not an unexplained failure.
+const (
+	FlightHeldBySlot        = "slot"
+	FlightHeldBySupplement  = "supplement"
+	FlightHeldByMaintenance = "maintenance"
+)
+
+// flightHold is one Query Group's flight held: by what, and whether it
+// turned a Slot away.
+type flightHold struct {
+	holder     string
+	turnedAway bool
+}
+
+// TryMaintenance shares the QG's existing flight exclusion with detection.
+// It never queues: maintenance yields to an executing Slot and retries later.
+func (coordinator *FlightCoordinator) TryMaintenance(queryGroup execution.QueryGroupIdentity) (func(), bool) {
+	release, _, acquired := coordinator.tryAcquireAs(queryGroup, FlightHeldByMaintenance)
+	return release, acquired
+}
+
+// TrySupplement is TryMaintenance for a supplement of a completed Slot.
+func (coordinator *FlightCoordinator) TrySupplement(queryGroup execution.QueryGroupIdentity) (func(), bool) {
+	release, _, acquired := coordinator.tryAcquireAs(queryGroup, FlightHeldBySupplement)
+	return release, acquired
+}
+
+// OnTurnedAwayReleased has told be called with each Query Group whose
+// flight, held by a supplement or maintenance, turned a Slot away, once
+// that hold ends: the Slot can run now, and need not wait for its next turn.
+// told is called outside the coordinator's lock and must not block.
+func (coordinator *FlightCoordinator) OnTurnedAwayReleased(told func(execution.QueryGroupIdentity)) {
 	if coordinator == nil {
-		return nil, false
+		return
+	}
+	coordinator.mu.Lock()
+	coordinator.released = told
+	coordinator.mu.Unlock()
+}
+
+// FlightHeld reports what holds the Query Group's flight now, if anything.
+func (coordinator *FlightCoordinator) FlightHeld(queryGroup execution.QueryGroupIdentity) (string, bool) {
+	if coordinator == nil {
+		return "", false
 	}
 	coordinator.mu.Lock()
 	defer coordinator.mu.Unlock()
-	if _, exists := coordinator.active[queryGroup]; exists {
-		return nil, false
+	hold, held := coordinator.active[queryGroup]
+	return hold.holder, held
+}
+
+// tryAcquireAs takes the Query Group's flight for holder, or says what
+// holds it. A Slot turned away from a hold that is not a Slot's marks it,
+// and its end is told (OnTurnedAwayReleased).
+func (coordinator *FlightCoordinator) tryAcquireAs(queryGroup execution.QueryGroupIdentity, holder string) (func(), string, bool) {
+	if coordinator == nil {
+		return nil, "", false
 	}
-	coordinator.active[queryGroup] = struct{}{}
+	coordinator.mu.Lock()
+	defer coordinator.mu.Unlock()
+	if hold, exists := coordinator.active[queryGroup]; exists {
+		if holder == FlightHeldBySlot && hold.holder != FlightHeldBySlot && !hold.turnedAway {
+			hold.turnedAway = true
+			coordinator.active[queryGroup] = hold
+		}
+		return nil, hold.holder, false
+	}
+	coordinator.active[queryGroup] = flightHold{holder: holder}
 	return func() {
 		coordinator.mu.Lock()
+		hold, held := coordinator.active[queryGroup]
 		delete(coordinator.active, queryGroup)
+		told := coordinator.released
 		coordinator.mu.Unlock()
-	}, true
+		if held && hold.turnedAway && told != nil {
+			told(queryGroup)
+		}
+	}, "", true
 }
 
 // Runner is bound to one owned Query Group. normal, retry, replay and probe use
 // this same single-flight path and the same frozen Slot contract.
 type Runner struct {
+	// stage is the execution in flight under this Runner's flight: where it
+	// has got to (the Runner enters the source and the execution, the
+	// coordinator the phases inside it), the deadline it runs under, and
+	// whether it has begun to commit. Cleared when the execution returns, so
+	// a round still waiting for the flight, or a supplement holding it, is
+	// never judged by the last execution's deadline. Read from the
+	// watchdog's goroutine.
+	stage          execution.StageMarker
 	queryGroup     execution.QueryGroupIdentity
 	session        OwnerSession
 	source         SlotSource
@@ -364,6 +543,20 @@ type Runner struct {
 	sourceNextAt   time.Time
 	dueBound       RunnerDueBound
 	queryCooldown  queryCooldownState
+	// cooldownMemory, cooldownStore, cooldownLoaded and cooldownFence carry
+	// the pool membership across Runners: what it remembers of the pool, the
+	// store it is kept in, whether it has been read back, and the fence the
+	// writes go under.
+	cooldownMemory queryCooldownMemory
+	cooldownStore  QueryCooldownStore
+	cooldownLoaded bool
+	cooldownFence  execution.OwnerFence
+	// heldBy is what the previous round did, carried forward so the next
+	// round's Slot can report what kept it from running. It is the Runner's
+	// own word -- the same one run_one_return_total counts -- and is read on
+	// the far side of the source call, which is why it has to survive the
+	// round that produced it rather than being passed down it.
+	heldBy observability.HeldByFacts
 	// nextDeadline is the query deadline of the Slot this Runner froze and did
 	// not complete -- deferred for readiness, refused admission, or failed and
 	// backing off -- so a dispatcher can order it against the others by when
@@ -448,7 +641,7 @@ func (runner *Runner) recordDueBound(decision string, facts SlotDueFacts) {
 		bound.Verdict = DueVerdictNotDue
 		bound.Deferred = true
 		bound.NotDueUntilUnix = runnerBoundSecond(runner.NextReadyAt())
-	case "source_retry", "source_blocked":
+	case "source_retry", "source_blocked", "view_not_executable":
 		// A failed read says nothing about the schedule, so there is no verdict
 		// to compare against. The retry backoff is still a real bound.
 		bound.Deferred = true
@@ -501,10 +694,19 @@ func NewRunner(
 
 // NextDeadline reports when the next Slot this Runner would run stops being
 // worth running: the frozen Slot's query deadline when one is held, else a
-// bound derived from the schedule -- the next due second plus the shortest
-// interval due there, which for every cohort is at or before the true
-// deadline and orders the cohorts the same way. Zero when nothing is known,
-// which a dispatcher orders after everything that is.
+// bound derived from the schedule. Zero only when nothing is known, which a
+// dispatcher orders after everything that is.
+//
+// The bound is the next due second plus the shortest interval due there,
+// and when the next due second is not known -- the Slot just completed and
+// the next one is not frozen until the next round -- the current second plus
+// that interval. Both are within the query reserve of the true deadline for
+// every cohort (a cohort's deadline is due time plus offset minus reserve,
+// and the offset is at least the interval) and order the cohorts the same
+// way. The second case is the one the minute's tide found: a ten-second
+// Runner back in the ready queue right after completing a Slot carried no
+// deadline, ranked behind a thousand minute Slots that did, and was held
+// back at the full queue -- the one cohort the ordering exists for.
 //
 // It is read at the same point NextReadyAt is: a dispatcher deciding what to
 // run next needs both, and a Slot that is ready first but expires last is
@@ -517,11 +719,37 @@ func (runner *Runner) NextDeadline() time.Time {
 		return runner.nextDeadline
 	}
 	bound := runner.dueBound
-	if bound.Verdict == DueVerdictNotDue && !bound.Deferred && !bound.Retired &&
-		bound.NotDueUntilUnix > 0 && bound.IntervalSeconds > 0 {
+	if bound.IntervalSeconds <= 0 || bound.Retired {
+		return time.Time{}
+	}
+	if bound.Verdict == DueVerdictNotDue && !bound.Deferred && bound.NotDueUntilUnix > 0 {
 		return time.Unix(bound.NotDueUntilUnix+bound.IntervalSeconds, 0)
 	}
-	return time.Time{}
+	return runner.now().Add(time.Duration(bound.IntervalSeconds) * time.Second)
+}
+
+// DeclineHung claims the execution in flight as hung when it is past its own
+// deadline by more than grace and has not begun to commit
+// (execution.StageMarker.Decline), and returns the stage it is stuck in and
+// the deadline it overran. A claimed execution writes nothing more. An
+// execution with no deadline yet - in the source, or a recovery before access
+// has derived its deadline - is not judged, nor is one inside its commit
+// boundary.
+func (runner *Runner) DeclineHung(now time.Time, grace time.Duration) (string, time.Time, bool) {
+	if runner == nil {
+		return "", time.Time{}, false
+	}
+	return runner.stage.Decline(now, grace)
+}
+
+// ExecutionDeadline is the deadline the execution in flight runs under, as
+// DeclineHung judges it, zero when none is in flight or it has none yet. It
+// claims nothing.
+func (runner *Runner) ExecutionDeadline() time.Time {
+	if runner == nil {
+		return time.Time{}
+	}
+	return runner.stage.Deadline()
 }
 
 // NextReadyAt reports when the Runner can make its next QG-local attempt.
@@ -559,6 +787,11 @@ func (runner *Runner) RunOneAdmitted(
 
 func (runner *Runner) runOne(ctx context.Context, admission ExecutionAdmission) (result execution.SlotExecutionResult, attempted bool, err error) {
 	outcome := "other_error"
+	// refusal is what the Slot source or the view said when it refused the
+	// round. The outcome names only which of them; the sentence travels
+	// beside it, because no later observation of a round that never ran
+	// carries it.
+	var refusal error
 	returned := false
 	defer func() {
 		if !returned {
@@ -571,7 +804,11 @@ func (runner *Runner) runOne(ctx context.Context, admission ExecutionAdmission) 
 			defer func() { _ = recover() }()
 			runner.flights.observer.Observe(ctx, observability.Observation{
 				Component: observability.ComponentScheduler, Stage: observability.StageRunnerReturned,
-				Result: observability.ResultTerminal, RunOutcome: outcome, Attempted: attempted,
+				Result: observability.ResultTerminal, RunOutcome: outcome, Attempted: attempted, Err: refusal,
+				// The view's one wait, kept apart from its other refusals:
+				// the fleet reads it here, the line it decides a blocked
+				// round on.
+				AwaitingView: awaitingView(refusal),
 				// Carry the object this round belongs to. Observers that only
 				// merge context fields would otherwise see an anonymous round:
 				// the scheduler path only injects the key into the context for
@@ -580,7 +817,7 @@ func (runner *Runner) runOne(ctx context.Context, admission ExecutionAdmission) 
 			})
 		}()
 	}()
-	result, attempted, err = runner.runOneTracked(ctx, admission, &outcome)
+	result, attempted, err = runner.runOneTracked(ctx, admission, &outcome, &refusal)
 	returned = true
 	return
 }
@@ -589,6 +826,7 @@ func (runner *Runner) runOneTracked(
 	ctx context.Context,
 	admission ExecutionAdmission,
 	outcome *string,
+	refusal *error,
 ) (flowResult execution.SlotExecutionResult, flowAttempted bool, flowErr error) {
 	decision := "preflight"
 	defer func() {
@@ -620,20 +858,30 @@ func (runner *Runner) runOneTracked(
 	// that hangs leaves its old bound standing and falls behind the wall clock,
 	// where a scheme that cleared the entry on dispatch would show nothing at all.
 	var sourceFacts SlotDueFacts
-	defer func() { runner.recordDueBound(decision, sourceFacts) }()
+	defer func() {
+		runner.recordDueBound(decision, sourceFacts)
+		runner.rememberHeldBy(decision)
+	}()
+	// What the previous round did travels into this one, so a Slot that is
+	// given up on can name it on its own line. Injected before the source is
+	// called because the source is where the decision to give up is taken, and
+	// again available to the executor below, which reports the completion.
+	ctx = withHeldBy(ctx, runner.heldBy)
 	if err := ctx.Err(); err != nil {
 		decision = "cancelled"
 		return execution.SlotExecutionResult{}, false, err
 	}
-	release, acquired := runner.flights.tryAcquire(runner.queryGroup)
+	release, heldBy, acquired := runner.flights.tryAcquireAs(runner.queryGroup, FlightHeldBySlot)
 	if !acquired {
 		decision = "single_flight_busy"
-		return execution.SlotExecutionResult{}, false, ErrSlotInFlight
+		return execution.SlotExecutionResult{}, false, &SlotInFlightError{HeldBy: heldBy}
 	}
 	defer release()
-	if source, ok := runner.source.(interface{ RangeCreationEnabled() bool }); ok && source.RangeCreationEnabled() {
-		ctx = context.WithValue(ctx, rangeFlightContextKey{}, runner.queryGroup)
-	}
+	// Under the flight, which is what makes the marker this execution's
+	// alone; cleared before the flight is released.
+	runner.stage.Begin(execution.SlotStageSource)
+	defer runner.stage.Clear()
+	ctx = context.WithValue(ctx, rangeFlightContextKey{}, runner.queryGroup)
 
 	// The local backoff decision comes first because it needs nothing from the
 	// store. It is free today -- a normal Query Group has no source backoff
@@ -657,10 +905,16 @@ func (runner *Runner) runOneTracked(
 		return execution.SlotExecutionResult{}, false, err
 	}
 	ctx = withVerifiedOwnership(ctx, runner.queryGroup, confirmedAssignment, confirmedFence)
+	runner.restoreQueryCooldown(ctx, confirmedFence)
 	decision = "source_next"
-	slot, due, facts, err := runner.source.Next(ctx, runner.queryGroup)
+	slot, due, facts, err := runner.source.Next(withQueryCooldownHeld(ctx, runner.queryCooldownHolds()), runner.queryGroup)
 	sourceFacts = facts
 	if err != nil {
+		if isViewNotExecutable(err) {
+			decision, *refusal = "view_not_executable", err
+			return runner.refuseViewNotExecutable(err), true, nil
+		}
+		*refusal = err
 		var retry *SourceRetryError
 		var blocked *SourceBlockedError
 		if errors.As(err, &retry) || errors.As(err, &blocked) {
@@ -670,7 +924,7 @@ func (runner *Runner) runOneTracked(
 			}
 			runner.sourceFailures++
 			runner.sourceNextAt = runner.now().Add(retryDelay(runner.flights.limits, runner.queryGroup, runner.sourceFailures))
-			reason := execution.ReasonCode(execution.ReasonBlockedExactSetUnavailable)
+			reason := blocked.ReasonCode()
 			if retry != nil {
 				reason = execution.ReasonCode(contract.ReasonSlotSourceRetry)
 			}
@@ -727,6 +981,7 @@ func (runner *Runner) runOneTracked(
 		KeepUntilUnixMilli:             slot.KeepUntilUnixMilli,
 		ReplayExpired:                  slot.Recovery.Disposition == ReplayExpired,
 		Operation:                      operation, AttemptNo: runner.attemptNo(slot), OwnerFence: fence, ExpectedNextSlot: slot.ExpectedNextSlot,
+		ContentScope: slot.Dispatch.ContentScope,
 	}
 	if err := request.Validate(); err != nil {
 		return execution.SlotExecutionResult{}, false, err
@@ -743,8 +998,31 @@ func (runner *Runner) runOneTracked(
 		defer releaseAdmission()
 	}
 	decision = "execute"
-	result, err := runner.executor.Execute(ctx, request)
+	runner.session.NoteContentScope(slot.Dispatch.ContentScope)
+	runner.stage.Enter(execution.SlotStageExecute)
+	if operation == execution.OperationNormal {
+		// A normal execution runs under its frozen Slot's query deadline.
+		// A replay, retry or probe does not - its budget starts at its
+		// arrival - and has no deadline until access derives that one.
+		runner.stage.Extend(time.UnixMilli(slot.EarliestQueryDeadlineUnixMilli), runner.now())
+	}
+	executeCtx := execution.WithFollowingSlot(execution.ContextWithLeaseAuthority(ctx, runner.session), slot.FollowingSlot)
+	executeCtx = execution.WithStageMarker(executeCtx, &runner.stage)
+	decidesPool := runner.queryCooldownLetsRun()
+	if decidesPool {
+		executeCtx = execution.WithNormalQueryBudget(executeCtx)
+	}
+	result, err := runner.executor.Execute(executeCtx, request)
 	if err != nil {
+		// The gate is asked again at execution, and a lease that moved
+		// between the source's reads and here is refused by the same name:
+		// not an attempt of this Slot that failed, the round did not run.
+		// The Slot stays due, with its deadline held, for when the view and
+		// the records agree again.
+		if isViewNotExecutable(err) {
+			decision, *refusal = "view_not_executable", err
+			return runner.refuseViewNotExecutable(err), true, nil
+		}
 		var deferred interface{ ReadinessReadyAt() time.Time }
 		if errors.As(err, &deferred) {
 			decision = "query_readiness_deferred"
@@ -760,10 +1038,39 @@ func (runner *Runner) runOneTracked(
 	if err == nil {
 		runner.nextDeadline = time.Time{}
 		runner.recordResult(slot, result, runner.now())
-		runner.recordQueryAvailability(ctx, slot, result, sourceFacts.IntervalSeconds)
+		runner.recordQueryAvailability(ctx, slot, operation, result, sourceFacts.IntervalSeconds, decidesPool)
 	}
 	decision = "execution_returned"
 	return result, true, err
+}
+
+func isViewNotExecutable(err error) bool {
+	var notExecutable *ViewNotExecutableError
+	return errors.As(err, &notExecutable)
+}
+
+// awaitingView reports a refusal that is the view's one wait
+// (ViewNotExecutableError.AwaitingView).
+func awaitingView(err error) bool {
+	var notExecutable *ViewNotExecutableError
+	return errors.As(err, &notExecutable) && notExecutable.AwaitingView
+}
+
+// refuseViewNotExecutable ends a round the executable view did not allow,
+// from the source or from the executor alike: retrying by name, on the
+// backoff a blocked source gets, counted against neither the Slot's attempts
+// nor its execution backoff - the record's word arrives by renewal and the
+// view's by delta, and the next round asks again.
+func (runner *Runner) refuseViewNotExecutable(err error) execution.SlotExecutionResult {
+	runner.sourceFailures++
+	delay := retryDelay(runner.flights.limits, runner.queryGroup, runner.sourceFailures)
+	var refusal *ViewNotExecutableError
+	if errors.As(err, &refusal) && refusal.RetryWithin > 0 && delay > refusal.RetryWithin {
+		delay = refusal.RetryWithin
+	}
+	runner.sourceNextAt = runner.now().Add(delay)
+	return execution.SlotExecutionResult{Result: observability.ResultRetrying,
+		ReasonCode: execution.ReasonCode(contract.ReasonViewNotExecutable), SourceRetry: true}
 }
 
 // executionErrorBacksOff reports whether a Go error returned by Execute counts

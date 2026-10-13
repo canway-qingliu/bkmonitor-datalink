@@ -11,9 +11,9 @@ package strategy
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"iter"
 	"math/big"
 	"sort"
 	"strings"
@@ -49,12 +49,23 @@ type Limits struct {
 	MaxTriggerWindowSize          uint32
 	MaxRecoveryConsecutiveWindows uint32
 	MaxRequiredHistoryPoints      uint32
-	MaxTriggerComputeCost         uint64
-	MaxCompiledPlanBytes          int
-	MaxCacheEntries               int
-	MaxCacheBytes                 int
-	NegativeCacheTTL              time.Duration
-	BudgetRevision                string
+	// MaxRetainedPointsByLevels is the most retained points a Plan may keep,
+	// indexed by how many Levels share one stored record. Index 0 is unused;
+	// an index past the end means no ceiling is stated for that shape.
+	//
+	// It is a table rather than one number because the stored record holds
+	// every Level's facts on every point, so what fits depends on the Level
+	// count: about 2100 points for one Level and about 1400 for two, against a
+	// MaxRequiredHistoryPoints of 4096 that neither shape can reach. Derived
+	// from the representation by whoever builds these limits, so the two move
+	// together instead of one being written down beside the other.
+	MaxRetainedPointsByLevels []uint32
+	MaxTriggerComputeCost     uint64
+	MaxCompiledPlanBytes      int
+	MaxCacheEntries           int
+	MaxCacheBytes             int
+	NegativeCacheTTL          time.Duration
+	BudgetRevision            string
 }
 
 type StateSemantics struct {
@@ -69,12 +80,27 @@ type CompileRequest struct {
 	Plan            contract.EvaluationPlanV2
 	DatasetContract contract.DatasetContractV2
 	StateSemantics  StateSemantics
+	// ContentKey, when set, names the content Plan and DatasetContract were
+	// built from, such that the same key always means the same Plan and the
+	// same DatasetContract: the caller says so, and the compiler takes its
+	// word for it. The cache key is then derived from the Plan the first time
+	// a key is seen and remembered for it after. Empty derives the cache key
+	// from the Plan every time, as a caller with nothing to name does.
+	ContentKey string
 }
 
 type Terminal struct {
 	LevelID    uint32
 	ReasonCode string
 	FieldPath  string
+	// Detail is what the check that refused said, when the refusal came from
+	// an error: which key a strict decode met, which value a parse could not
+	// read. The code and the path say where; this says what, and without it a
+	// level refused as LEVEL_INVALID at level.trigger_plan had to be compiled
+	// again offline to learn a key was one the decoder does not know. Empty
+	// for a refusal decided without an error. Unbounded here; the catalog
+	// bounds it where it becomes a disposition.
+	Detail string
 }
 
 type CompileResult struct {
@@ -123,6 +149,34 @@ type RecoveryPlan struct {
 type StateRequirement struct {
 	RequiredDetectHistoryPoints uint32
 	RetentionPoints             uint32
+}
+
+// StateIdentityView is this requirement as the two hashes that decide state
+// identity see it: the retention filled in as the required count.
+//
+// Retention is not part of what makes stored state compatible with a Plan. It
+// decides how many positions are kept beyond the ones detection reads, so a
+// Level that raises it keeps more and one that lowers it trims more, and
+// either way the record it was already keeping is still readable by the Plan
+// that asks. Hashing it made raising the retention indistinguishable from
+// changing what the Level detects: the Plan's state generation moved, so the
+// record moved to a new key and started from zero, and the Level contract
+// stored on the old record no longer matched the compiled one, so what could
+// still be read was refused and dropped.
+//
+// Filling the field rather than removing it from the hashed shape is what
+// keeps this byte-compatible. Until retention could differ from the required
+// count it was always equal to it, so every hash a deployment has stored was
+// derived over a value shaped exactly like this one. A Level that never took
+// any slack hashes to the same string it already had; a Level that took some
+// goes back to the string it had before it did.
+//
+// Both sites derive this from here rather than each filling the field: the
+// two hashes have to agree about what state identity means, and a rule stated
+// twice is a rule that will be changed once.
+func (requirement StateRequirement) StateIdentityView() StateRequirement {
+	requirement.RetentionPoints = requirement.RequiredDetectHistoryPoints
+	return requirement
 }
 
 type ResourceEstimate struct {
@@ -448,7 +502,45 @@ func (l CompiledLevel) Detectors() []DetectorSpec {
 	return append([]DetectorSpec(nil), l.detectors...)
 }
 
-func (l CompiledLevel) Algorithms() []CompiledAlgorithmPlan {
+func (l CompiledLevel) Algorithms() AlgorithmList {
+	return AlgorithmList{algorithms: l.algorithms}
+}
+
+// AlgorithmList is a Level's compiled algorithms, read-only, as LevelList is
+// a Plan's Levels: each can be read, none replaced, reordered or appended to,
+// and a caller that needs a slice of its own asks for one with Copy.
+//
+// Algorithms copied the whole slice on every call, from every stage that
+// walks a Level's algorithms for every series of every Slot -- 1.1% of a
+// replica's allocation -- for seven callers that all only read it.
+type AlgorithmList struct {
+	algorithms []CompiledAlgorithmPlan
+}
+
+// Len is the number of algorithms.
+func (l AlgorithmList) Len() int { return len(l.algorithms) }
+
+// At is the algorithm at index, as a value: changing it does not change the
+// Level.
+func (l AlgorithmList) At(index int) CompiledAlgorithmPlan { return l.algorithms[index] }
+
+// All yields each algorithm with its index, in order, as range does over a
+// slice.
+func (l AlgorithmList) All() iter.Seq2[int, CompiledAlgorithmPlan] {
+	return func(yield func(int, CompiledAlgorithmPlan) bool) {
+		for index := range l.algorithms {
+			if !yield(index, l.algorithms[index]) {
+				return
+			}
+		}
+	}
+}
+
+// Copy is a slice of the algorithms the caller owns.
+func (l AlgorithmList) Copy() []CompiledAlgorithmPlan {
+	if l.algorithms == nil {
+		return nil
+	}
 	return append([]CompiledAlgorithmPlan(nil), l.algorithms...)
 }
 
@@ -483,22 +575,29 @@ func (l CompiledLevel) Fingerprints() LevelFingerprints {
 func (l CompiledLevel) ResourceEstimate() ResourceEstimate { return l.resourceEstimate }
 
 type CompiledPlan struct {
+	effectiveRules      *compiledEffectiveRules
 	planRef             contract.RuntimePlanRefV1
 	strategyRef         contract.StrategyRefV2
 	outputIdentity      *contract.MonitorOutputIdentity
 	subjectFacts        *contract.MonitorSubjectFacts
 	wireFormat          string
+	signalType          string
 	legacyOutput        *contract.FrozenLegacyOutput
 	projection          contract.InputProjectionV2
 	evaluationSemantics contract.ExecutionSemanticsV2
-	levels              []CompiledLevel
-	normalizers         map[string]NumericNormalizerSpec
-	fingerprints        PlanFingerprints
-	resourceEstimate    ResourceEstimate
-	datasetDigest       string
-	targetScope         *contract.TargetScopeV2
-	noData              *contract.NoDataConfigV1
-	noDataLevel         *CompiledLevel
+	// boundaryLocation is the compiler's (WithBoundaryLocation); nil lays the
+	// aggregation grid in UTC.
+	boundaryLocation *time.Location
+	levels           []CompiledLevel
+	normalizers      map[string]NumericNormalizerSpec
+	fingerprints     PlanFingerprints
+	resourceEstimate ResourceEstimate
+	datasetDigest    string
+	targetScope      *contract.TargetScopeV2
+	targetPlan       *contract.TargetPlanV1
+	noData           *contract.NoDataConfigV1
+	noDataLevel      *CompiledLevel
+	globalBusiness   bool
 }
 
 // NoData is the strategy's no-data configuration, frozen with the Plan. Nil
@@ -537,7 +636,8 @@ func (p *CompiledPlan) NoDataLevel() *CompiledLevel {
 // nothing to thread and nothing to forget.
 //
 // Everything else is shared with the Plan it came from, deliberately: the plan
-// ref, the fingerprints, the state compatibility hash. A synthetic series is
+// ref, the fingerprints, the state compatibility hash. The alert identity is
+// the exception, below. A synthetic series is
 // this Plan's series, and its runtime state is told apart by the series digest
 // - its dimensions carry the no-data tag - not by pretending to be a different
 // Plan.
@@ -555,6 +655,16 @@ func (p *CompiledPlan) NoDataView() *CompiledPlan {
 	}
 	view := *p
 	view.levels = []CompiledLevel{*p.noDataLevel}
+	// The one thing not shared: the alert identity reads the record's own
+	// dimensions, the group's and the tag. The backend's adapter hands
+	// extract_target the event's dimension_fields (adapter.py:109-111), which
+	// for a no-data record are exactly those (nodata.py:259); the Plan's
+	// fields name the item's dimensions, and a topology or service-instance
+	// group read through them stopped at an empty host target and filed every
+	// such group of the strategy under one alert.
+	if p.outputIdentity != nil {
+		view.outputIdentity = &contract.MonitorOutputIdentity{DynamicDimensions: true}
+	}
 	return &view
 }
 
@@ -566,6 +676,23 @@ func (p *CompiledPlan) TargetScope() *contract.TargetScopeV2 {
 		return nil
 	}
 	return p.targetScope
+}
+
+// TargetPlan is the target's second frozen form, for a Plan compiled from a
+// target_plan document. Nil for every other Plan. A Plan with neither this
+// nor TargetScope names no target; a Plan with this and no resolution for
+// it admits nothing, which is the filter's rule, not this accessor's.
+func (p *CompiledPlan) TargetPlan() *contract.TargetPlanV1 {
+	if p == nil {
+		return nil
+	}
+	return p.targetPlan
+}
+
+// GlobalBusiness reports whether the Plan belongs to a global business,
+// whose events name the business each one is about beside the Plan's own.
+func (p *CompiledPlan) GlobalBusiness() bool {
+	return p != nil && p.globalBusiness
 }
 
 func (p *CompiledPlan) StrategyRef() contract.StrategyRefV2 {
@@ -582,6 +709,16 @@ func (p *CompiledPlan) OutputIdentity() *contract.MonitorOutputIdentity {
 	return &contract.MonitorOutputIdentity{DimensionFields: append([]string{}, p.outputIdentity.DimensionFields...), DynamicDimensions: p.outputIdentity.DynamicDimensions}
 }
 
+// CompatibleOffBoundary reports whether a record at sourceTime is one of the
+// detections between two aggregation boundaries of a Plan detected more often
+// than it aggregates (contract.CompatibleOffBoundary).
+func (p *CompiledPlan) CompatibleOffBoundary(sourceTime int64) bool {
+	if p == nil {
+		return false
+	}
+	return contract.CompatibleOffBoundary(p.evaluationSemantics, p.boundaryLocation, sourceTime)
+}
+
 // PublishesCompatibleProtocol reports whether this Plan's events go out as the
 // Python-compatible event.
 func (p *CompiledPlan) PublishesCompatibleProtocol() bool {
@@ -595,11 +732,20 @@ func (p *CompiledPlan) PublishesCompatibleProtocol() bool {
 }
 
 // WireFormat returns the format this Plan's events are published as.
+// SignalType is what this Plan's events are observed from, frozen with the
+// Plan. Empty means this build could not name it; see EvaluationPlanV2.
+func (p *CompiledPlan) SignalType() string {
+	if p == nil {
+		return ""
+	}
+	return p.signalType
+}
+
 func (p *CompiledPlan) WireFormat() string {
 	if p == nil {
 		return ""
 	}
-	return p.wireFormat
+	return contract.ResolveOutputWireFormat(p.wireFormat, p.strategyRef.SnapshotRevision)
 }
 
 // SubjectFacts returns the frozen strategy facts the subject projection reads.
@@ -651,15 +797,54 @@ func (p *CompiledPlan) EvaluationSemantics() contract.ExecutionSemanticsV2 {
 	return p.evaluationSemantics
 }
 
-func (p *CompiledPlan) Levels() []CompiledLevel {
-	if p == nil {
+// LevelList is a Plan's compiled Levels, read-only. Its slice is unexported,
+// so code outside this package can read each Level but cannot replace,
+// reorder or append to the Plan's own: code that tries does not compile, and
+// code that needs a slice of its own asks for one with Copy.
+//
+// It is what Levels returns because Levels was called from every stage of
+// every Slot, a few dozen times per series per round, and copied the whole
+// slice each time -- 336 bytes a Level -- for callers that, all but four,
+// only read it.
+type LevelList struct {
+	levels []CompiledLevel
+}
+
+// Len is the number of Levels.
+func (l LevelList) Len() int { return len(l.levels) }
+
+// At is the Level at index, as a value: changing it does not change the Plan.
+func (l LevelList) At(index int) CompiledLevel { return l.levels[index] }
+
+// All yields each Level with its index, in order, as range does over a slice.
+func (l LevelList) All() iter.Seq2[int, CompiledLevel] {
+	return func(yield func(int, CompiledLevel) bool) {
+		for index := range l.levels {
+			if !yield(index, l.levels[index]) {
+				return
+			}
+		}
+	}
+}
+
+// Copy is a slice of the Levels the caller owns: for a caller that appends to
+// it, reorders it or keeps it.
+func (l LevelList) Copy() []CompiledLevel {
+	if l.levels == nil {
 		return nil
 	}
-	return append([]CompiledLevel(nil), p.levels...)
+	return append([]CompiledLevel(nil), l.levels...)
+}
+
+func (p *CompiledPlan) Levels() LevelList {
+	if p == nil {
+		return LevelList{}
+	}
+	return LevelList{levels: p.levels}
 }
 
 func (p *CompiledPlan) LevelsByPriority() []CompiledLevel {
-	levels := p.Levels()
+	levels := p.Levels().Copy()
 	sort.Slice(levels, func(left, right int) bool {
 		if levels[left].definition.Priority == levels[right].definition.Priority {
 			return levels[left].definition.LevelID < levels[right].definition.LevelID
@@ -799,8 +984,4 @@ func (n predicateNode) wire() predicateWire {
 		}
 	}
 	return wire
-}
-
-func cloneRawMessage(raw json.RawMessage) json.RawMessage {
-	return append(json.RawMessage(nil), raw...)
 }

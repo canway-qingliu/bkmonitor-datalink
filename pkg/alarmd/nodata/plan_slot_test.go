@@ -10,6 +10,7 @@
 package nodata
 
 import (
+	"sort"
 	"testing"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/contract"
@@ -61,14 +62,68 @@ func presentSeries() map[string]string {
 	return map[string]string{HostIPDimension: "10.0.0.1", HostCloudDimension: "0"}
 }
 
-func storedSnapshot(t *testing.T, groups ...execution.NoDataGroupMemory) execution.NoDataMemorySnapshot {
+func storedSnapshot(
+	t *testing.T, presentAsOf int64, groups ...execution.NoDataGroupMemory,
+) execution.NoDataMemorySnapshot {
 	return execution.NoDataMemorySnapshot{
 		Identity: planSlotIdentity(), Status: execution.NoDataMemoryFound,
-		MarkerRevision: 4, SchemaVersion: execution.NoDataMemorySchemaV1,
+		Representation: execution.NoDataRepresentationPerGroup,
+		MarkerRevision: 4, SchemaVersion: execution.NoDataMemorySchemaV2,
 		PersistedApplyVersion:   execution.ApplyVersion{StateApplyEpoch: 6, EvaluationTime: 940, SlotDigest: "slot"},
 		PersistedMutationDigest: "digest", LastScheduleRevision: "revision-1",
-		RosterVersion: planSlotRosterVersion(t), Groups: groups,
+		RosterVersion: planSlotRosterVersion(t), PresentAsOf: presentAsOf, Groups: groups,
 	}
+}
+
+// storedAfter is the record a store would hold once it applied one round's
+// delta, as the next round would read it back.
+//
+// It applies the delta rather than restating the memory. The mutation no longer
+// carries the memory, and a test that reconstructed it by hand would be
+// asserting against its own copy of the evaluation - so the delta is the thing
+// under test here as much as anywhere, and a round-trip through it is what says
+// the two agree.
+func storedAfter(
+	t *testing.T, loaded execution.NoDataMemorySnapshot, mutation *execution.PlanNoDataMutation,
+) execution.NoDataMemorySnapshot {
+	t.Helper()
+	if mutation == nil {
+		t.Fatal("storedAfter: the round wrote nothing")
+	}
+	memory := make(map[string]execution.NoDataGroupMemory, len(loaded.Groups))
+	for _, group := range loaded.Groups {
+		memory[group.GroupKey] = group
+	}
+	for _, group := range mutation.Set {
+		if group.Absent == nil {
+			memory[group.GroupKey] = execution.NoDataGroupMemory{
+				GroupKey: group.GroupKey, LastSeen: mutation.PresentAsOf,
+			}
+			continue
+		}
+		// Every field the absence form carries, because this helper is a writer
+		// of the stored memory like any other: one it forgets is a field the
+		// next round reads as zero, and a suppression read as zero is a stopped
+		// absence that starts producing again.
+		memory[group.GroupKey] = execution.NoDataGroupMemory{
+			GroupKey: group.GroupKey, LastSeen: group.Absent.LastSeen, FirstAbsent: group.Absent.FirstAbsent,
+			SuppressedAt: group.Absent.SuppressedAt,
+		}
+	}
+	for _, key := range mutation.Del {
+		delete(memory, key)
+	}
+	groups := make([]execution.NoDataGroupMemory, 0, len(memory))
+	for _, group := range memory {
+		groups = append(groups, group)
+	}
+	sort.Slice(groups, func(left, right int) bool { return groups[left].GroupKey < groups[right].GroupKey })
+	snapshot := storedSnapshot(t, mutation.PresentAsOf, groups...)
+	snapshot.MarkerRevision = mutation.ExpectedMarkerRevision + 1
+	snapshot.PersistedMutationDigest = mutation.MutationDigest
+	snapshot.RosterVersion = mutation.RosterVersion
+	snapshot.TrackingExhaustedAt = mutation.TrackingExhaustedAt
+	return snapshot
 }
 
 // The whole round for a Plan that has never stored anything: one host reports,
@@ -76,7 +131,8 @@ func storedSnapshot(t *testing.T, groups ...execution.NoDataGroupMemory) executi
 // hold next.
 func TestPlanSlotProducesSeriesAndTheMemoryToStore(t *testing.T) {
 	result, err := EvaluatePlanSlot(planSlotInput(
-		execution.NoDataMemorySnapshot{Identity: planSlotIdentity(), Status: execution.NoDataMemoryMissing},
+		execution.NoDataMemorySnapshot{Identity: planSlotIdentity(), Status: execution.NoDataMemoryMissing,
+			Representation: execution.NoDataRepresentationNone},
 		presentSeries(),
 	))
 	if err != nil {
@@ -85,8 +141,9 @@ func TestPlanSlotProducesSeriesAndTheMemoryToStore(t *testing.T) {
 	if result.Outcome != OutcomeEvaluated {
 		t.Fatalf("outcome = %q, want %q", result.Outcome, OutcomeEvaluated)
 	}
-	if len(result.Series) != 2 {
-		t.Fatalf("series = %+v, want one per judged host", result.Series)
+	// One per judged host, and the whole item's NORMAL: the round had data.
+	if len(result.Series) != 3 {
+		t.Fatalf("series = %+v, want one per judged host and one for the whole item", result.Series)
 	}
 	if result.Mutation == nil {
 		t.Fatal("a round that judged two hosts stored nothing")
@@ -104,8 +161,13 @@ func TestPlanSlotProducesSeriesAndTheMemoryToStore(t *testing.T) {
 	}
 	// Both hosts are remembered: the one that reported by when it was seen, the
 	// one that did not by when its absence started.
-	if len(result.Mutation.Groups) != 2 {
-		t.Fatalf("stored groups = %+v, want both hosts", result.Mutation.Groups)
+	if len(result.Mutation.Set) != 2 || result.Mutation.GroupCount != 2 {
+		t.Fatalf("stored groups = %+v count = %d, want both hosts",
+			result.Mutation.Set, result.Mutation.GroupCount)
+	}
+	if result.Mutation.PresentAsOf != 1000 {
+		t.Fatalf("present as of = %d, want this round: one host reported",
+			result.Mutation.PresentAsOf)
 	}
 }
 
@@ -113,7 +175,7 @@ func TestPlanSlotProducesSeriesAndTheMemoryToStore(t *testing.T) {
 // and writes nothing. The absence clocks must not move on evidence the round
 // did not have.
 func TestPlanSlotWritesNothingOnAnIncompleteRound(t *testing.T) {
-	input := planSlotInput(storedSnapshot(t,
+	input := planSlotInput(storedSnapshot(t, 940,
 		execution.NoDataGroupMemory{GroupKey: hostTargetGroup(HostIdentity{IP: "10.0.0.1", CloudID: "0"}).Key(), LastSeen: 940},
 	))
 	input.Completeness = execution.CompletenessPartial
@@ -145,7 +207,7 @@ func TestPlanSlotWritesNothingOnAnIncompleteRound(t *testing.T) {
 	}
 	if staleResult.Mutation != nil {
 		t.Fatalf("a round that judged nothing rewrote the memory because the roster version moved: %+v",
-			staleResult.Mutation.Groups)
+			staleResult.Mutation.Set)
 	}
 }
 
@@ -192,7 +254,8 @@ func TestPlanSlotRefusesAMemoryThatCouldNotBeRead(t *testing.T) {
 // Slot's budget to store what is already stored.
 func TestPlanSlotWritesNothingWhenTheMemoryDidNotMove(t *testing.T) {
 	first, err := EvaluatePlanSlot(planSlotInput(
-		execution.NoDataMemorySnapshot{Identity: planSlotIdentity(), Status: execution.NoDataMemoryMissing},
+		execution.NoDataMemorySnapshot{Identity: planSlotIdentity(), Status: execution.NoDataMemoryMissing,
+			Representation: execution.NoDataRepresentationNone},
 		presentSeries(),
 	))
 	if err != nil || first.Mutation == nil {
@@ -201,7 +264,8 @@ func TestPlanSlotWritesNothingWhenTheMemoryDidNotMove(t *testing.T) {
 
 	// Feed the memory it just produced back in as the stored record, with the
 	// same Slot. Nothing about the round changed, so nothing is written.
-	repeat, err := EvaluatePlanSlot(planSlotInput(storedSnapshot(t, first.Mutation.Groups...), presentSeries()))
+	stored := storedAfter(t, execution.NoDataMemorySnapshot{Representation: execution.NoDataRepresentationNone}, first.Mutation)
+	repeat, err := EvaluatePlanSlot(planSlotInput(stored, presentSeries()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,12 +273,12 @@ func TestPlanSlotWritesNothingWhenTheMemoryDidNotMove(t *testing.T) {
 		t.Fatalf("outcome = %q, want the round to have judged", repeat.Outcome)
 	}
 	if repeat.Mutation != nil {
-		t.Fatalf("an unchanged memory was written again: %+v", repeat.Mutation.Groups)
+		t.Fatalf("an unchanged memory was written again: %+v", repeat.Mutation.Set)
 	}
 	// It still produced the series - the trigger needs a point every round, and
 	// skipping the write is about the store, not about the evaluation.
-	if len(repeat.Series) != 2 {
-		t.Fatalf("series = %d, want one per judged host even when nothing is written", len(repeat.Series))
+	if len(repeat.Series) != 3 {
+		t.Fatalf("series = %d, want one per judged host and the whole item even when nothing is written", len(repeat.Series))
 	}
 }
 
@@ -222,13 +286,14 @@ func TestPlanSlotWritesNothingWhenTheMemoryDidNotMove(t *testing.T) {
 // against a different expected set writes, even when every timestamp is equal.
 func TestPlanSlotWritesWhenOnlyTheRosterVersionMoved(t *testing.T) {
 	first, err := EvaluatePlanSlot(planSlotInput(
-		execution.NoDataMemorySnapshot{Identity: planSlotIdentity(), Status: execution.NoDataMemoryMissing},
+		execution.NoDataMemorySnapshot{Identity: planSlotIdentity(), Status: execution.NoDataMemoryMissing,
+			Representation: execution.NoDataRepresentationNone},
 		presentSeries(),
 	))
 	if err != nil || first.Mutation == nil {
 		t.Fatalf("fixture: %+v, %v", first.Mutation, err)
 	}
-	stored := storedSnapshot(t, first.Mutation.Groups...)
+	stored := storedAfter(t, execution.NoDataMemorySnapshot{Representation: execution.NoDataRepresentationNone}, first.Mutation)
 	stored.RosterVersion = "HISTORY/1"
 
 	result, err := EvaluatePlanSlot(planSlotInput(stored, presentSeries()))

@@ -218,6 +218,8 @@ type fakeLeaseStore struct {
 	// assignmentErr fails only the Assignment half of the merged fence check,
 	// which is how the store reports a record it read but could not accept.
 	assignmentErr error
+	// declared is what each RenewDeclaring was told the holder runs.
+	declared []string
 }
 
 func (store *fakeLeaseStore) Acquire(
@@ -246,14 +248,24 @@ func (store *fakeLeaseStore) Renew(
 	return store.renewed, nil
 }
 
-func (store *fakeLeaseStore) CheckFence(context.Context, execution.OwnerFence, time.Time) error {
+func (store *fakeLeaseStore) RenewDeclaring(
+	ctx context.Context,
+	fence execution.OwnerFence,
+	declared string,
+	at time.Time,
+	ttl time.Duration,
+) (Lease, error) {
+	store.declared = append(store.declared, declared)
+	return store.Renew(ctx, fence, at, ttl)
+}
+
+func (store *fakeLeaseStore) CheckFence(context.Context, execution.OwnerFence) error {
 	return store.checkErr
 }
 
 func (store *fakeLeaseStore) CheckFenceWithAssignment(
 	context.Context,
 	execution.OwnerFence,
-	time.Time,
 ) (AssignmentRecord, error) {
 	if store.checkErr != nil {
 		return AssignmentRecord{}, store.checkErr

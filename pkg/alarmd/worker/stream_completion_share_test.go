@@ -44,9 +44,16 @@ func TestSlotExecutionCoordinatorCompletesFullEmptyWhenPrimaryIsEmptyAndDependen
 	if err != nil || !result.Completed || result.Result != observability.ResultSuccess {
 		t.Fatalf("Execute() result=%+v error=%v, want FULL EMPTY completion without error", result, err)
 	}
-	if len(evaluator.results) != 0 || ports.eventCount != 0 || ports.stateApplyCalls != 0 || ports.stateLoadCalls != 0 || len(ports.gapMutations) != 0 {
-		t.Fatalf("no-series Plan produced business effects: evaluations=%d events=%d state_apply=%d state_load=%d gaps=%d",
-			len(evaluator.results), ports.eventCount, ports.stateApplyCalls, ports.stateLoadCalls, len(ports.gapMutations))
+	if len(evaluator.results) != 0 || ports.eventCount != 0 || ports.stateApplyCalls != 0 || ports.stateLoadCalls != 0 {
+		t.Fatalf("no-series Plan produced business effects: evaluations=%d events=%d state_apply=%d state_load=%d",
+			len(evaluator.results), ports.eventCount, ports.stateApplyCalls, ports.stateLoadCalls)
+	}
+	// The dependency delivered data and no PRIMARY record consumed it, so
+	// every binding this Plan is judged on was whole: the round is evidence
+	// the input is whole, and the Plan scope recovers on it.
+	assertOnlyPlanScopeRecoveries(t, ports.gapMutations)
+	if len(ports.gapMutations) != 1 {
+		t.Fatalf("gap mutations=%+v, want the Plan scope recovered once", ports.gapMutations)
 	}
 	progress := ports.lastProgress
 	if progress.Completion.Kind != execution.CompletionFullEmpty || progress.Completion.Primary == nil ||
@@ -116,6 +123,11 @@ func TestSlotExecutionCoordinatorCompletesFullEmptyWhenPrimaryIsEmptyAndDependen
 			if err != nil || !result.Completed || result.Result != observability.ResultSuccess {
 				t.Fatalf("Execute() result=%+v error=%v, want FULL EMPTY completion without error", result, err)
 			}
+			// The zero gap mutations are the second half of this case: the
+			// round completes FULL EMPTY, and it is still not evidence that
+			// the dependency is answering again, so it does not advance the
+			// Plan scope's warmup. A round that never asked the question the
+			// guard is waiting on cannot count towards lifting it.
 			if len(evaluator.results) != 0 || ports.eventCount != 0 || ports.stateApplyCalls != 0 || ports.stateLoadCalls != 0 || len(ports.gapMutations) != 0 {
 				t.Fatalf("no-series Plan produced business effects: evaluations=%d events=%d state_apply=%d state_load=%d gaps=%d",
 					len(evaluator.results), ports.eventCount, ports.stateApplyCalls, ports.stateLoadCalls, len(ports.gapMutations))
@@ -179,6 +191,76 @@ func TestSlotExecutionCoordinatorDoesNotCompleteFullEmptyWhenPrimaryIsUnavailabl
 		progress.Completion.Primary.Completeness != execution.CompletenessUnavailable ||
 		progress.Completion.Primary.DataState != execution.DataStateUnknown || progress.Completion.ReasonCode != reason {
 		t.Fatalf("Progress=%+v, want COMPLETED_WITH_UNAVAILABLE", progress)
+	}
+}
+
+// A PRIMARY that was never sent, or whose attempt said nothing, completes
+// with the fallback code on its binding - the gap and the round's result
+// read it as before - and the completion and the query's failure name what
+// the fallback stands in for, so neither files the round under the backend.
+// Whichever binding the round is judged on says so: access's, and a
+// streamed series' whose query then failed.
+func TestAnUnavailablePrimaryWithoutANamedAttemptSaysSo(t *testing.T) {
+	silent := []execution.RouteAttemptFact{{AttemptNo: 1, Endpoint: "uq", Result: execution.RouteAttemptFailed}}
+	for _, testCase := range []struct {
+		name     string
+		attempts []execution.RouteAttemptFact
+		want     execution.ReasonCode
+		streamed bool
+	}{
+		{name: "never sent", want: execution.ReasonQueryNotAttempted},
+		{name: "no attempt said why", attempts: silent, want: execution.ReasonQueryReasonUnrecorded},
+		{name: "streamed, then no attempt said why", attempts: silent, want: execution.ReasonQueryReasonUnrecorded, streamed: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			header, batches := workerG4StreamFixture(t, strategy.DetectorKindOsRestart)
+			primary, history := shareFixtureQueries(t, header)
+			primaryBatch, historyBatch := batches[primary.index], batches[history.index]
+			fallback := execution.ReasonCode(contract.ReasonQueryUnavailable)
+			unavailable := execution.PhysicalQueryCompletion{Ref: "unavailable-primary", PhysicalQuery: primary.query.Digest,
+				QueryRevision: primary.query.QueryRevision, Completeness: execution.CompletenessUnavailable, DataState: execution.DataStateUnknown,
+				RouteFacts: execution.ProviderRouteFacts{Attempts: testCase.attempts}}
+			streamedBatches := []execution.SeriesExecutionBatch{historyBatch}
+			if testCase.streamed {
+				unavailable.Ref, unavailable.DataState, unavailable.Delivery = primaryBatch.CompletionRef, execution.DataStateData, primaryBatch.Delivery
+				streamedBatches = []execution.SeriesExecutionBatch{primaryBatch, historyBatch}
+			}
+			completion := execution.QueryExecutionCompletion{AllRequiredCompleted: true, PhysicalQueries: []execution.PhysicalQueryCompletion{
+				unavailable,
+				{Ref: historyBatch.CompletionRef, PhysicalQuery: history.query.Digest, QueryRevision: history.query.QueryRevision,
+					Completeness: execution.CompletenessFull, DataState: execution.DataStateData, Delivery: historyBatch.Delivery},
+			}}
+			completion.CompletionBindings = accessShapedCompletionBindings(t, header, completion.PhysicalQueries)
+
+			observations := make([]observability.Observation, 0)
+			observer := observability.ObserverFunc(func(_ context.Context, observation observability.Observation) {
+				observations = append(observations, observability.NormalizeObservation(observation))
+			})
+			ports, _, coordinator := workerG4CoordinatorWithObserver(t, observer)
+			ports.gapMissing = true
+			ports.executeOverride = streamExecution(header, streamedBatches, completion)
+
+			result, err := coordinator.Execute(context.Background(), workerSlotRequest(header.Contract))
+			if err != nil || !result.Completed || result.ReasonCode != fallback {
+				t.Fatalf("Execute() result=%+v error=%v, want the round completed with the fallback code", result, err)
+			}
+			var committed, failed *observability.Observation
+			for index := range observations {
+				switch observation := &observations[index]; {
+				case observation.Stage == observability.StageProgressCommitted && observation.ProgressCompletionKind != "":
+					committed = observation
+				case observation.Stage == observability.StageQueryCompleted && observation.QueryFailure != nil:
+					failed = observation
+				}
+			}
+			if committed == nil || committed.ProgressCompletionCause != string(execution.CausePrimaryInputUnavailable) ||
+				committed.ProgressCompletionReason != string(testCase.want) {
+				t.Fatalf("committed = %+v, want the primary unavailable for %s", committed, testCase.want)
+			}
+			if failed == nil || failed.QueryFailure.Code != string(testCase.want) {
+				t.Fatalf("query failure = %+v, want it to name %s as the completion does", failed, testCase.want)
+			}
+		})
 	}
 }
 
@@ -341,13 +423,8 @@ func accessShapedCompletionBindings(t *testing.T, header execution.InternalExecu
 			case execution.CompletenessUnavailable:
 				binding.DataState = execution.DataStateUnknown
 				binding.Disposition = execution.AccessUnavailable
-				binding.ReasonCode = execution.ReasonCode(contract.ReasonQueryUnavailable)
-				for index := len(completion.RouteFacts.Attempts) - 1; index >= 0; index-- {
-					if reason := completion.RouteFacts.Attempts[index].ReasonCode; reason != "" {
-						binding.ReasonCode = reason
-						break
-					}
-				}
+				binding.ReasonCode, binding.UnavailableAttribution = execution.AttributeUnavailable(completion.RouteFacts,
+					execution.ReasonCode(contract.ReasonQueryUnavailable))
 			}
 			bindings = append(bindings, binding)
 		}

@@ -21,6 +21,12 @@ type stateMutationDigestPayload struct {
 	SeriesGuard     *StateGuardFact             `json:"series_guard,omitempty"`
 	Levels          []RuntimeLevelStateMutation `json:"levels"`
 	Points          []StateHistoryPoint         `json:"points"`
+	// The retention bound decides how much of the merged record survives the
+	// write, so two mutations that carry the same points under different bounds
+	// leave different bytes behind. A field that decides the stored content and
+	// is not in the digest is a digest that answers "same statement" for two
+	// different outcomes.
+	RetentionPoints uint32 `json:"retention_points"`
 }
 
 // One evaluated series derives its mutation digest once and is then asked for
@@ -66,19 +72,30 @@ func stateMutationDigestPayloadOf(mutation StateMutation) stateMutationDigestPay
 	return stateMutationDigestPayload{
 		Identity: mutation.Identity, ApplyVersion: mutation.ApplyVersion,
 		AffectedRecords: mutation.AffectedRecords, SeriesGuard: mutation.SeriesGuard,
-		Levels: mutation.Levels, Points: mutation.Points,
+		Levels: mutation.Levels, Points: mutation.Points, RetentionPoints: mutation.RetentionPoints,
 	}
 }
 
 // stateMutationContentKey reports the content key of payload. A payload that
 // cannot be encoded has no key; the caller then derives without the seal and
 // the canonical encoder reports the real error.
+//
+// The payload is encoded into the hash rather than into a document that is
+// then hashed: the document was a copy of every point's bytes made only to be
+// read once, and on a profiled replica it was the largest allocation site by
+// bytes. The encoder escapes as Marshal does and ends with a newline Marshal
+// does not write, so the key is not the one the document gave. Nothing holds
+// a key but the seal on a mutation in this process, and the seal is written
+// and checked by this one function, so no key made the other way is ever
+// compared with one made this way.
 func stateMutationContentKey(payload stateMutationDigestPayload) ([sha256.Size]byte, bool) {
-	encoded, err := json.Marshal(payload)
-	if err != nil {
+	hash := sha256.New()
+	if err := json.NewEncoder(hash).Encode(payload); err != nil {
 		return [sha256.Size]byte{}, false
 	}
-	return sha256.Sum256(encoded), true
+	var key [sha256.Size]byte
+	hash.Sum(key[:0])
+	return key, true
 }
 
 // answers reports whether the seal was derived from this exact content and

@@ -16,7 +16,8 @@ import (
 	"time"
 )
 
-type WindowLogLimiterConfig struct {
+// PacingLogBudget is how many lines a bucket keeps per window.
+type PacingLogBudget struct {
 	Window    time.Duration
 	MaxEvents int
 }
@@ -24,12 +25,35 @@ type WindowLogLimiterConfig struct {
 // LogAdmission is the result of asking a limiter whether one observation may
 // be logged. Suppressed counts the lines this bucket dropped since its last
 // admitted line; SuppressedEvicted counts lines dropped by scope buckets of
-// the same reason that were evicted before they could report.
+// the same reason that were evicted before they could report. Sampled marks
+// a line admitted under the hourly sample (RoutineLogSample): the one line
+// its bucket keeps per hour, written so that a reader can tell a quiet
+// emitter from a dead one.
 type LogAdmission struct {
 	Allowed           bool
 	Suppressed        uint64
 	SuppressedEvicted uint64
+	Sampled           bool
+	// Candidate is an observation the policy decides a line for: written,
+	// held back by its limiter, or counted and not written. A routine
+	// success outside the workflow stages is not one.
+	Candidate bool
+	// Unwritten is a workflow stage's routine success, or a Control Leader
+	// round that changed nothing: counted, never written.
+	Unwritten bool
 }
+
+// RoutineLogSample is the budget of every result that is neither a success
+// nor a failure -- degraded, retrying, paused, terminal, skipped, rejected:
+// one line per (reason, stage, Query Group) per hour, carrying how many were
+// merged into it since the previous one. Those results repeat every Slot
+// while a condition lasts, and every one of them is already counted by its
+// stage's metrics; the line is the positive control, so that a reading of
+// none over a window can show the emitter was alive. A failure keeps the
+// limiter's own, shorter window. The bound is fixed here and not a
+// deployment parameter: the operator does not know better than the program
+// how often a repeating word needs to be seen.
+var RoutineLogSample = PacingLogBudget{Window: time.Hour, MaxEvents: 1}
 
 // RepeatedLogLimiter is the admission contract BoundedLogPolicy uses for
 // repeated transitions and exceptional results.
@@ -37,82 +61,9 @@ type RepeatedLogLimiter interface {
 	Admit(Observation) LogAdmission
 }
 
-// WindowLogLimiter is a concurrency-safe, constant-memory fixed-window
-// limiter. Its window and capacity must be supplied by the caller; M8 does not
-// define production defaults before G3 calibration.
-type WindowLogLimiter struct {
-	mu sync.Mutex
-
-	window    time.Duration
-	maxEvents int
-	now       func() time.Time
-	buckets   map[logBucketKey]windowLogBucket
-}
-
 type logBucketKey struct {
 	reason ReasonCode
 	stage  Stage
-}
-
-type windowLogBucket struct {
-	windowStart time.Time
-	used        int
-}
-
-func NewWindowLogLimiter(config WindowLogLimiterConfig) (*WindowLogLimiter, error) {
-	return newWindowLogLimiter(config, time.Now)
-}
-
-func newWindowLogLimiter(config WindowLogLimiterConfig, now func() time.Time) (*WindowLogLimiter, error) {
-	if config.Window <= 0 {
-		return nil, errors.New("observability: log limiter window must be positive")
-	}
-	if config.MaxEvents <= 0 {
-		return nil, errors.New("observability: log limiter capacity must be positive")
-	}
-	if now == nil {
-		return nil, errors.New("observability: log limiter clock is required")
-	}
-	buckets := make(map[logBucketKey]windowLogBucket, len(AllLogReasons())+len(AllStages()))
-	for _, reason := range AllLogReasons() {
-		buckets[logBucketKey{reason: reason}] = windowLogBucket{}
-	}
-	for _, stage := range AllStages() {
-		buckets[logBucketKey{reason: ReasonNone, stage: stage}] = windowLogBucket{}
-	}
-	return &WindowLogLimiter{window: config.Window, maxEvents: config.MaxEvents, now: now, buckets: buckets}, nil
-}
-
-func (l *WindowLogLimiter) Allow(observation Observation) bool {
-	if l == nil {
-		return false
-	}
-	observation = NormalizeObservation(observation)
-	key := limiterBucketKey(observation)
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	// Sample in admission order so delayed callers cannot look like a clock rollback.
-	now := l.now()
-	bucket, ok := l.buckets[key]
-	if !ok {
-		return false
-	}
-	if bucket.windowStart.IsZero() || now.Before(bucket.windowStart) || now.Sub(bucket.windowStart) >= l.window {
-		bucket.windowStart = now
-		bucket.used = 0
-	}
-	if bucket.used >= l.maxEvents {
-		return false
-	}
-	bucket.used++
-	l.buckets[key] = bucket
-	return true
-}
-
-// Admit keeps the phase-one behaviour: fixed reason/stage buckets and no
-// suppressed-count reporting.
-func (l *WindowLogLimiter) Admit(observation Observation) LogAdmission {
-	return LogAdmission{Allowed: l.Allow(observation)}
 }
 
 func limiterBucketKey(observation Observation) logBucketKey {
@@ -133,14 +84,14 @@ type ScopedLogLimiterConfig struct {
 	MaxScopes int
 }
 
-// ScopedLogLimiter is a concurrency-safe fixed-window limiter with two bucket
-// layers. Observations that carry a Query Group coordinate are limited per
-// (reason or stage, query group) so one noisy object cannot hide every other
-// object's coordinates; observations without a Query Group fall back to the
-// fixed reason/stage buckets. Every bucket counts the lines it suppressed and
-// reports that count on the next admitted line so readers can tell how many
-// events were merged. Memory is bounded by MaxScopes scope buckets plus the
-// fixed reason/stage set.
+// ScopedLogLimiter is a concurrency-safe fixed-window limiter. Observations
+// are limited per (reason or stage, stage, Query Group), failures apart from
+// the stage's other results, so one noisy object cannot hide every other
+// object's coordinates and one stage cannot hide another's; a line with no
+// Query Group has its stage's bucket. Every bucket counts the lines it
+// suppressed and reports that count on the next admitted line so readers can
+// tell how many events were merged. Memory is bounded by MaxScopes buckets;
+// the closed set of reasons and stages is what a bucket may be keyed by.
 type ScopedLogLimiter struct {
 	mu sync.Mutex
 
@@ -149,7 +100,7 @@ type ScopedLogLimiter struct {
 	maxScopes int
 	now       func() time.Time
 
-	fixed   map[logBucketKey]*scopedLogBucket
+	known   map[logBucketKey]struct{}
 	scoped  map[scopedLogBucketKey]*list.Element
 	order   *list.List
 	evicted map[logBucketKey]uint64
@@ -184,16 +135,16 @@ func newScopedLogLimiter(config ScopedLogLimiterConfig, now func() time.Time) (*
 	if now == nil {
 		return nil, errors.New("observability: log limiter clock is required")
 	}
-	fixed := make(map[logBucketKey]*scopedLogBucket, len(AllLogReasons())+len(AllStages()))
+	known := make(map[logBucketKey]struct{}, len(AllLogReasons())+len(AllStages()))
 	for _, reason := range AllLogReasons() {
-		fixed[logBucketKey{reason: reason}] = &scopedLogBucket{}
+		known[logBucketKey{reason: reason}] = struct{}{}
 	}
 	for _, stage := range AllStages() {
-		fixed[logBucketKey{reason: ReasonNone, stage: stage}] = &scopedLogBucket{}
+		known[logBucketKey{reason: ReasonNone, stage: stage}] = struct{}{}
 	}
 	return &ScopedLogLimiter{
 		window: config.Window, maxEvents: config.MaxEvents, maxScopes: config.MaxScopes, now: now,
-		fixed:   fixed,
+		known:   known,
 		scoped:  make(map[scopedLogBucketKey]*list.Element, config.MaxScopes),
 		order:   list.New(),
 		evicted: make(map[logBucketKey]uint64),
@@ -208,30 +159,47 @@ func (l *ScopedLogLimiter) Admit(observation Observation) LogAdmission {
 	reasonKey := limiterBucketKey(observation)
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if _, known := l.fixed[reasonKey]; !known {
+	if _, listed := l.known[reasonKey]; !listed {
 		return LogAdmission{}
 	}
 	now := l.now()
-	bucket := l.bucketFor(reasonKey, observation.Trace.QueryGroupKey)
-	if bucket.windowStart.IsZero() || now.Before(bucket.windowStart) || now.Sub(bucket.windowStart) >= l.window {
+	// A failure keeps the limiter's window and capacity; any other result
+	// keeps the hourly sample, and its admitted line is marked as that sample.
+	window, maxEvents := l.window, l.maxEvents
+	sampled := !failedResult(observation.Result)
+	if sampled {
+		window, maxEvents = RoutineLogSample.Window, RoutineLogSample.MaxEvents
+	}
+	// A bucket is per stage as well: a Slot that fails writes its query's
+	// line and its own, and two stages sharing one bucket would hand a
+	// reader who greps one stage nothing in the windows the other stage's
+	// line came first -- the same reading a dead emitter gives.
+	// A line with no Query Group has a bucket per stage too, rather than the
+	// one bucket every stage's line without one shared. Failures keep a
+	// bucket apart from the stage's other results: the two have different
+	// windows, and a recovery must not be counted against the failures before
+	// it.
+	scope := observation.Trace.QueryGroupKey + "\x00" + string(observation.Stage)
+	if !sampled {
+		scope += "\x00failed"
+	}
+	bucket := l.bucketFor(reasonKey, scope)
+	if bucket.windowStart.IsZero() || now.Before(bucket.windowStart) || now.Sub(bucket.windowStart) >= window {
 		bucket.windowStart = now
 		bucket.used = 0
 	}
-	if bucket.used >= l.maxEvents {
+	if bucket.used >= maxEvents {
 		bucket.suppressed++
 		return LogAdmission{}
 	}
 	bucket.used++
-	admission := LogAdmission{Allowed: true, Suppressed: bucket.suppressed, SuppressedEvicted: l.evicted[reasonKey]}
+	admission := LogAdmission{Allowed: true, Suppressed: bucket.suppressed, SuppressedEvicted: l.evicted[reasonKey], Sampled: sampled}
 	bucket.suppressed = 0
 	delete(l.evicted, reasonKey)
 	return admission
 }
 
 func (l *ScopedLogLimiter) bucketFor(reasonKey logBucketKey, scope string) *scopedLogBucket {
-	if scope == "" {
-		return l.fixed[reasonKey]
-	}
 	key := scopedLogBucketKey{reason: reasonKey, scope: scope}
 	if element, ok := l.scoped[key]; ok {
 		l.order.MoveToFront(element)

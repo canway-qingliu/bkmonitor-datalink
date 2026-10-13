@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -52,6 +53,13 @@ type strategyConfig struct {
 		} `json:"query_configs"`
 	} `json:"items"`
 }
+
+// FrozenStrategySources are what the converter decodes the frozen strategy
+// document into. The operator evidence walks them for the keys alarmd reads.
+func FrozenStrategySources() []reflect.Type {
+	return []reflect.Type{reflect.TypeOf(strategyConfig{}), reflect.TypeOf(targetStrategy{})}
+}
+
 type preparedStrategy struct {
 	config   strategyConfig
 	raw      json.RawMessage
@@ -67,75 +75,211 @@ func (c *Converter) ConvertBatch(ctx context.Context, events []contract.TriggerE
 	if c.Store == nil {
 		return nil, fmt.Errorf("legacy snapshot store required")
 	}
+	judged := c.convertAll(ctx, events)
+	output := make([]Event, 0, len(events))
+	for index, err := range judged.failures {
+		if err != nil {
+			return nil, err
+		}
+		output = append(output, judged.events[index])
+	}
+	// Validate every event before one bounded, de-duplicated snapshot write.
+	if err := c.Store.SaveBatch(ctx, judged.snapshots); err != nil {
+		return nil, &SnapshotStoreError{Err: fmt.Errorf("save legacy snapshots: %w", err)}
+	}
+	return output, nil
+}
+
+// ConvertEach converts every event on its own account: the events and the
+// failures it returns are aligned with the events it was given, and an event
+// the converter will not write fails alone instead of taking the batch with
+// it. A strategy whose frozen configuration cannot be prepared fails each of
+// its own events and no other strategy's. The snapshots of the strategies
+// that converted at least one event are written once, after every event has
+// been judged, so isolating a bad event costs no extra write. That write is
+// the one failure that says nothing about the events; it comes back as the
+// third result, a SnapshotStoreError, and so does a cancelled context.
+func (c *Converter) ConvertEach(ctx context.Context, events []contract.TriggerEventV1) ([]Event, []error, error) {
+	if len(events) == 0 {
+		return []Event{}, []error{}, nil
+	}
+	if c.Store == nil {
+		return nil, nil, fmt.Errorf("legacy snapshot store required")
+	}
+	judged := c.convertAll(ctx, events)
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	used := make([]bool, len(judged.snapshots))
+	for index, err := range judged.failures {
+		if err == nil && judged.snapshotOf[index] >= 0 {
+			used[judged.snapshotOf[index]] = true
+		}
+	}
+	kept := make([]Snapshot, 0, len(judged.snapshots))
+	for index, snapshot := range judged.snapshots {
+		if used[index] {
+			kept = append(kept, snapshot)
+		}
+	}
+	if len(kept) > 0 {
+		if err := c.Store.SaveBatch(ctx, kept); err != nil {
+			return nil, nil, &SnapshotStoreError{Err: fmt.Errorf("save legacy snapshots: %w", err)}
+		}
+	}
+	return judged.events, judged.failures, nil
+}
+
+// judgedBatch is every event of a batch judged and nothing written: events
+// and failures are aligned with the batch, snapshots holds one record per
+// strategy that could be prepared, and snapshotOf says which of them each
+// event converted against (-1 when its strategy could not be prepared).
+type judgedBatch struct {
+	events     []Event
+	failures   []error
+	snapshots  []Snapshot
+	snapshotOf []int
+}
+
+func (c *Converter) convertAll(ctx context.Context, events []contract.TriggerEventV1) judgedBatch {
 	now := time.Now()
 	if c.Now != nil {
 		now = c.Now()
 	}
-	configs := map[string]preparedStrategy{}
-	snapshots := make([]Snapshot, 0)
-	output := make([]Event, 0, len(events))
+	type prepared struct {
+		strategy preparedStrategy
+		snapshot int
+		err      error
+	}
+	configs := map[string]prepared{}
+	judged := judgedBatch{
+		events: make([]Event, len(events)), failures: make([]error, len(events)),
+		snapshots: make([]Snapshot, 0), snapshotOf: make([]int, len(events)),
+	}
 	pods := NewBatchPodResolver(c.Pods)
-	for _, event := range events {
+	for index, event := range events {
+		judged.snapshotOf[index] = -1
 		if event.StrategyRef != nil || event.LegacyOutput == nil || event.LegacyOutput.Configuration == nil {
-			return nil, fmt.Errorf("legacy event requires frozen context and no strategy_ref")
+			judged.failures[index] = fmt.Errorf("legacy event requires frozen context and no strategy_ref")
+			continue
 		}
 		metadata := event.LegacyOutput.Configuration
-		frozen, exists := configs[metadata.StrategyKey()]
+		entry, exists := configs[metadata.StrategyKey()]
 		if !exists {
-			frozen.raw = metadata.StrategyJSON()
-			if err := json.Unmarshal(frozen.raw, &frozen.config); err != nil {
-				return nil, err
+			entry.snapshot = -1
+			entry.strategy, entry.err = prepareStrategy(metadata, c.SnapshotPrefix)
+			if entry.err != nil {
+				entry.err = &StrategyConfigError{Err: entry.err}
 			}
-			var err error
-			frozen.target, err = PrepareTarget(frozen.raw)
-			if err != nil {
-				return nil, err
+			if entry.err == nil {
+				entry.snapshot = len(judged.snapshots)
+				judged.snapshots = append(judged.snapshots, Snapshot{
+					StrategyID: entry.strategy.config.ID, Key: entry.strategy.snapshot, Value: entry.strategy.raw,
+				})
 			}
-			s := frozen.config
-			if s.ID <= 0 || s.BusinessID == 0 || s.UpdateTime <= 0 || s.Name == "" || len(s.Items) == 0 || len(s.Items[0].Queries) == 0 {
-				return nil, fmt.Errorf("incomplete frozen legacy strategy")
-			}
-			frozen.snapshot = strings.TrimSuffix(c.SnapshotPrefix, ".") + ".cache.strategy.snapshot." + strconv.FormatInt(s.ID, 10) + "." + strconv.FormatInt(s.UpdateTime, 10)
-			if c.SnapshotPrefix == "" {
-				frozen.snapshot = strings.TrimPrefix(frozen.snapshot, ".")
-			}
-			seen := map[string]bool{}
-			addMetric := func(value string) {
-				if !seen[value] {
-					seen[value] = true
-					frozen.metrics = append(frozen.metrics, value)
-				}
-			}
-			for _, item := range s.Items {
-				for _, query := range item.Queries {
-					addMetric(query.MetricID)
-				}
-			}
-			for _, item := range s.Items {
-				addMetric(item.Name)
-			}
-			for _, item := range s.Items {
-				for _, query := range item.Queries {
-					if query.PromQL != "" {
-						addMetric(query.PromQL)
-					}
-				}
-			}
-			configs[metadata.StrategyKey()] = frozen
-			snapshots = append(snapshots, Snapshot{StrategyID: s.ID, Key: frozen.snapshot, Value: frozen.raw})
+			configs[metadata.StrategyKey()] = entry
 		}
-		converted, err := convertEvent(ctx, event, frozen, now.Unix(), pods, c.PluginID)
-		if err != nil {
-			return nil, err
+		if entry.err != nil {
+			judged.failures[index] = entry.err
+			continue
 		}
-		output = append(output, converted)
+		judged.snapshotOf[index] = entry.snapshot
+		judged.events[index], judged.failures[index] = convertEvent(ctx, event, entry.strategy, now.Unix(), pods, c.PluginID)
 	}
-	// Validate every event before one bounded, de-duplicated snapshot write.
-	if err := c.Store.SaveBatch(ctx, snapshots); err != nil {
-		return nil, fmt.Errorf("save legacy snapshots: %w", err)
-	}
-	return output, nil
+	return judged
 }
+
+// prepareStrategy reads one frozen strategy configuration into what every
+// event of it converts against. A failure here is the strategy's, and every
+// event of that strategy shares it.
+func prepareStrategy(metadata *contract.FrozenLegacyOutput, snapshotPrefix string) (preparedStrategy, error) {
+	var frozen preparedStrategy
+	frozen.raw = metadata.StrategyJSON()
+	if err := json.Unmarshal(frozen.raw, &frozen.config); err != nil {
+		return preparedStrategy{}, err
+	}
+	var err error
+	frozen.target, err = PrepareTarget(frozen.raw)
+	if err != nil {
+		return preparedStrategy{}, err
+	}
+	s := frozen.config
+	if s.ID <= 0 || s.BusinessID == 0 || s.UpdateTime <= 0 || s.Name == "" || len(s.Items) == 0 || len(s.Items[0].Queries) == 0 {
+		return preparedStrategy{}, fmt.Errorf("incomplete frozen legacy strategy")
+	}
+	frozen.snapshot = strings.TrimSuffix(snapshotPrefix, ".") + ".cache.strategy.snapshot." + strconv.FormatInt(s.ID, 10) + "." + strconv.FormatInt(s.UpdateTime, 10)
+	if snapshotPrefix == "" {
+		frozen.snapshot = strings.TrimPrefix(frozen.snapshot, ".")
+	}
+	seen := map[string]bool{}
+	addMetric := func(value string) {
+		if !seen[value] {
+			seen[value] = true
+			frozen.metrics = append(frozen.metrics, value)
+		}
+	}
+	for _, item := range s.Items {
+		for _, query := range item.Queries {
+			addMetric(query.MetricID)
+		}
+	}
+	for _, item := range s.Items {
+		addMetric(item.Name)
+	}
+	for _, item := range s.Items {
+		for _, query := range item.Queries {
+			if query.PromQL != "" {
+				addMetric(query.PromQL)
+			}
+		}
+	}
+	return frozen, nil
+}
+
+// StrategyConfigError is a refusal whose cause is the frozen strategy
+// configuration itself: it cannot be read, is incomplete, or names no item
+// or level the event was decided for. The strategy's owner fixes it; every
+// other refusal is alarmd's own.
+type StrategyConfigError struct {
+	Err error
+}
+
+func (err *StrategyConfigError) Error() string { return err.Err.Error() }
+func (err *StrategyConfigError) Unwrap() error { return err.Err }
+
+// SnapshotStoreError is the snapshot store not taking the batch. It is the
+// one failure ConvertBatch returns that says nothing about the events: every
+// other error is the converter's own answer about their content, which it
+// gives again on every retry, while this one is a store that may answer next
+// time. The pod cache does not fail this way -- an unreachable cache takes
+// Python's no-instance branch and converts -- so the store is the only
+// dependency on this path. It marks RetryableOutputDependency so the sink and
+// the coordinator treat it as they treat a broker that did not acknowledge.
+type SnapshotStoreError struct {
+	Err error
+}
+
+func (err *SnapshotStoreError) Error() string {
+	if err == nil || err.Err == nil {
+		return "legacy snapshot store failed"
+	}
+	return err.Err.Error()
+}
+
+func (err *SnapshotStoreError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.Err
+}
+
+func (err *SnapshotStoreError) RetryableOutputDependency() {}
+
+// OutputFailureKind names the failure as the snapshot store's - a Redis's,
+// not the broker's - whatever wraps it on the way up (observability's
+// OutputFailureSnapshotStore; the word is spelled here, not imported, to keep
+// this package free of the observation types).
+func (err *SnapshotStoreError) OutputFailureKind() string { return "snapshot_store" }
 
 func convertEvent(ctx context.Context, event contract.TriggerEventV1, frozen preparedStrategy, now int64, pods PodResolver, pluginID string) (Event, error) {
 	if pluginID == "" {
@@ -146,15 +290,25 @@ func convertEvent(ctx context.Context, event contract.TriggerEventV1, frozen pre
 	if strconv.FormatInt(s.ID, 10) != event.PlanRef.StrategyID || strconv.FormatInt(s.BusinessID, 10) != event.BusinessID || (s.TenantID != "" && s.TenantID != event.TenantID) {
 		return Event{}, fmt.Errorf("frozen legacy strategy identity mismatch")
 	}
-	itemName := ""
+	itemName, itemFound := "", false
 	for _, item := range s.Items {
 		if strconv.FormatInt(item.ID, 10) == metadata.ItemID() {
-			itemName = item.Name
+			itemName, itemFound = item.Name, true
 			break
 		}
 	}
-	if itemName == "" || event.PrimaryLevelID < 1 || event.PrimaryLevelID > 3 {
-		return Event{}, fmt.Errorf("invalid legacy item/severity")
+	// The item id and the strategy are frozen together, so an item the
+	// strategy does not hold is the freeze disagreeing with itself: alarmd's.
+	// An item with no name, or a level the Python protocol has no severity
+	// for, is the strategy as configured.
+	if !itemFound {
+		return Event{}, fmt.Errorf("frozen legacy item %s is not in its frozen strategy", metadata.ItemID())
+	}
+	if itemName == "" {
+		return Event{}, &StrategyConfigError{Err: fmt.Errorf("legacy item %s has no name", metadata.ItemID())}
+	}
+	if event.PrimaryLevelID < 1 || event.PrimaryLevelID > 3 {
+		return Event{}, &StrategyConfigError{Err: fmt.Errorf("legacy protocol has no severity for level %d", event.PrimaryLevelID)}
 	}
 	// The Python protocol represents anomaly points only. Anything else
 	// reaching the converter is a routing mistake, and a loud one is better
@@ -178,20 +332,20 @@ func convertEvent(ctx context.Context, event contract.TriggerEventV1, frozen pre
 		}
 		sort.Strings(dimensionFields)
 	}
-	// A no-data point's identity is its group's dimensions plus the tag, which
-	// is what makes it a different object from the threshold anomaly on the
-	// same series -- on both sides. The tag is on the record already; it was
-	// the field list that did not have it, so the dimensions md5 was hashed
-	// from the item's identity fields alone and matched nothing the backend
-	// ever wrote. Nothing downstream would have called that an error: every
-	// round would simply have looked like a fresh anomaly that never closes.
+	// A no-data point's identity is its group's dimensions plus the tag, and
+	// nothing else (nodata.py:106-107): the record carries exactly those, so
+	// its own keys are the field list. The item's identity fields are not:
+	// the item aggregates by its own dimensions and no-data by its
+	// agg_dimension, and hashing the item's fields -- the absent ones as null
+	// -- gave an object the backend never wrote. Its recovery looks the
+	// group up by that md5 (recover.py:203-221), so each alert would have
+	// opened and closed every round.
 	//
-	// The same list decides dimension_fields on the wire, so both follow from
-	// the one correction.
+	// The same list decides dimension_fields on the wire, sorted as the
+	// backend sorts it (nodata.py:259).
 	_, noData := event.RecordRef.Dimensions[contract.NoDataDimensionTag]
-	if noData && !containsField(dimensionFields, contract.NoDataDimensionTag) {
-		dimensionFields = append(append([]string(nil), dimensionFields...), contract.NoDataDimensionTag)
-		sort.Strings(dimensionFields)
+	if noData {
+		dimensionFields = noDataDimensionFields(event.RecordRef.Dimensions)
 	}
 	identity := map[string]json.RawMessage{}
 	for _, field := range dimensionFields {
@@ -281,6 +435,17 @@ func convertEvent(ctx context.Context, event contract.TriggerEventV1, frozen pre
 		}
 	}
 	data := map[string]any{"record_id": md5 + "." + strconv.FormatInt(event.RecordRef.SourceTime, 10), "time": event.RecordRef.SourceTime, "dimensions": event.RecordRef.Dimensions, "dimension_fields": dimensionFields, "value": value, "values": observed}
+	if !noData {
+		// The time the point was processed, which the backend's access stamps
+		// on every record it reads (records.py:244) and the alert builder
+		// decides expiry from (event.py:394-415); without it the data time
+		// stands in, and an anomaly whose data is more than a minute older than
+		// an alert's end is dropped as expired. Here it is the conversion's,
+		// trigger_time's own value, in whole seconds where the backend's is
+		// fractional. A no-data record is built by the backend itself, never
+		// read by access, and carries none (nodata.py:253-261).
+		data["access_time"] = now
+	}
 	payload := map[string]any{
 		"event_id": anomalyID(event.RecordRef.SourceTime), "plugin_id": pluginID, "strategy_id": s.ID, "alert_name": name, "description": description, "severity": event.PrimaryLevelID, "tags": tags, "target_type": projection.Type, "target": projection.Target, "status": status, "metric": frozen.metrics, "category": s.Scenario, "data_type": s.Items[0].Queries[0].DataType, "dedupe_keys": dedupeKeys, "time": event.RecordRef.SourceTime, "anomaly_time": anomalyTime, "bk_ingest_time": now, "bk_clean_time": now, "bk_biz_id": s.BusinessID, "bk_tenant_id": event.TenantID,
 		"extra_info": map[string]any{"additional_dimensions": additional, "origin_alarm": map[string]any{"trigger_time": now, "data": data, "trigger": map[string]any{"level": level, "anomaly_ids": anomalyIDs}, "anomaly": map[string]any{level: map[string]any{"anomaly_id": anomalyID(event.RecordRef.SourceTime), "anomaly_message": description}}, "dimension_translation": map[string]any{}, "strategy_snapshot_key": frozen.snapshot, "alarmd_event_id": event.EventID}},
@@ -290,15 +455,6 @@ func convertEvent(ctx context.Context, event contract.TriggerEventV1, frozen pre
 		return Event{}, err
 	}
 	return Event{EventID: event.EventID, Payload: raw, DedupeMD5: dedupe}, nil
-}
-
-func containsField(fields []string, name string) bool {
-	for _, field := range fields {
-		if field == name {
-			return true
-		}
-	}
-	return false
 }
 
 // noDataMessage is the alert text for a group that has stopped reporting.
@@ -319,4 +475,25 @@ func noDataMessage(itemName string, periods json.RawMessage) string {
 		}
 	}
 	return fmt.Sprintf("当前指标(%s)已经有%d个周期无数据上报", itemName, count)
+}
+
+// noDataDimensionFields is a no-data point's field list: every key its
+// record carries, the tag included, sorted as the backend sorts it. See
+// convertEvent for why the item's own identity fields are not used.
+func noDataDimensionFields(dimensions map[string]json.RawMessage) []string {
+	fields := make([]string, 0, len(dimensions))
+	for field := range dimensions {
+		fields = append(fields, field)
+	}
+	sort.Strings(fields)
+	return fields
+}
+
+// NoDataDedupeMD5 is the key a no-data event's message is written under,
+// the md5 Python's alert builder files the alert by: computed the way
+// convertEvent computes it, from the record alone, so a reader of what was
+// sent can name the alert without the frozen strategy in hand.
+func NoDataDedupeMD5(event *contract.TriggerEventV1) (string, error) {
+	return contract.MonitorDedupeMD5(event.PlanRef.StrategyID, event.BusinessID, event.RecordRef.Dimensions,
+		contract.MonitorOutputIdentity{DimensionFields: noDataDimensionFields(event.RecordRef.Dimensions)})
 }

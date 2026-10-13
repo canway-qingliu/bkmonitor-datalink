@@ -10,8 +10,12 @@
 package controlplane
 
 import (
+	"slices"
+	"sort"
+
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/contract"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/nodata"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/observability"
 )
 
 // SupportedSourceSemantics is every data source a query can be compiled from,
@@ -33,7 +37,6 @@ var SupportedSourceSemantics = []string{
 	"custom/time_series",
 	"custom/event",
 	"prometheus/time_series",
-	"bk_fta/event",
 }
 
 // SourceSemanticsOther is the label for semantics outside the supported list.
@@ -106,21 +109,72 @@ type CatalogComposition struct {
 	// the shape where the page says forty and the log names thirty-nine and
 	// nothing is wrong with either.
 	WithheldObjects []ObjectDisposition
+	// ListedStrategies names every strategy the source listed this round,
+	// once each, sorted: every disposition but the two that mean the source
+	// no longer lists the strategy (PENDING_REMOVAL, REMOVED). A reader that
+	// keeps the strategies the source dropped needs the round's listed set
+	// to tell "back in the list" from "gone for good" -- a strategy the grace
+	// cycle removed has no disposition at all the round after, and its
+	// absence from the withheld records reads the same as its return.
+	// Listed rather than accepted, because a strategy that is back but
+	// compiles no Plan this round (STALE_CONFIG running its last good one,
+	// CONFIG_REJECTED, a compatibility word) is back in the list all the
+	// same, and a disposition added later lands on this side by default --
+	// the side that clears an absence, not the side that invents one.
+	ListedStrategies []string
 	// NoDataPlans counts the Plans that detect no-data, by where their expected
 	// set comes from. Only accepted Plans are in it - a Plan that was withheld
 	// is in Withheld under the reason that withheld it.
 	//
 	// The two together are one partition over the items that asked for no-data
-	// detection: a source here, or a reason there. NoDataPlansPartition states
-	// the sum, because a count of what is working answers nothing on its own -
-	// three sources adding to fewer items than are configured is the reading
-	// that matters, and it is only visible against what the other side holds.
+	// detection: a source here, or a reason there. Their sum is the reading
+	// that matters, because a count of what is working answers nothing on its
+	// own - three sources adding to fewer items than are configured is only
+	// visible against what the other side holds; the catalog gauges carry both
+	// halves and a reader sums them (METRICS.md, catalog_no_data_plans).
 	NoDataPlans map[nodata.RosterSource]int
 	// NoDataPlansUnclassified counts an accepted Plan whose expected set cannot
 	// be classified. The compiler refuses those, so this is zero and is here to
 	// say so: were it not, the partition would lose a member silently and the
 	// three sources would simply read low.
 	NoDataPlansUnclassified int
+	// NoDataNotConfigured counts the Plans that never asked for no-data
+	// detection. It is not published beside the others -- the family answers
+	// "what is no-data detection doing for the items that asked for it" -- and
+	// it is computed all the same, because it is the third member of the
+	// partition and a partition whose members are not all computed cannot be
+	// checked. The test adds the three against the Plan count; without this
+	// one, a suspended Plan filed as "never asked" would keep the published
+	// family adding up while the objects disappeared.
+	NoDataNotConfigured int
+	// SuspendedNoDataObjects names the strategies whose no-data half is off,
+	// one record each.
+	//
+	// They are ObjectDispositions because that is what the changed-only line
+	// machinery takes, and because the fields are the same four an operator
+	// reads -- which strategy, at what scope, why. They are deliberately not
+	// in Catalog.Dispositions: that list is a partition of what happened to
+	// each object, every one of these is ACCEPTED in it, and putting them in
+	// twice would break the equation the partition exists to make checkable.
+	SuspendedNoDataObjects []ObjectDisposition
+	// RevisionedPlans counts the accepted Plans whose strategy carries an
+	// authoritative snapshot revision, and PlansTotal every accepted Plan.
+	// The revision is what makes a strategy publishable as the standard raw
+	// event under the automatic protocol choice: a deployment whose source
+	// publishes no revisions sends every event the Python-compatible way, and
+	// its standard output path is unreachable however the sink is wired. On a
+	// live deployment that fact took two lines of investigation and a Kafka
+	// read to establish, from a gate counter that only ever said not gated.
+	RevisionedPlans int
+	PlansTotal      int
+	// PlansByWireFormat counts the accepted Plans by the wire format their
+	// events are published as, resolved the way the sink resolves it from
+	// the frozen word and the revision. Every format the build names is
+	// present at zero, and a word it does not name lands under _other, so
+	// the counts partition PlansTotal. This is the number that answers "how
+	// many strategies publish the standard raw event"; before it the answer
+	// was a Kafka read.
+	PlansByWireFormat map[string]int
 	// InertPlans counts the Plans whose schedule cannot hold the wait their
 	// data needs to land. Such a Plan is ACCEPTED, is scheduled, and executes
 	// -- and every round every one of its consumers is bound unavailable,
@@ -134,6 +188,50 @@ type CatalogComposition struct {
 	// it is what makes the residual readable from outside instead of only
 	// from the test that pins it.
 	InertPlans int
+	// Retention is the Catalog's own measurement of what its Levels ask the
+	// store to keep, carried through unchanged. It is summed where the
+	// compiled Levels are in hand; recomputing it here from the frozen
+	// strategy documents would be the same relation derived twice.
+	Retention CatalogRetention
+
+	// GlobalStrategies counts the strategies the source marks global by what
+	// the round did with them (GlobalOutcomes), every outcome present at
+	// zero: a partition of Catalog.GlobalStrategies, so the three add up to
+	// the global strategies the source listed this round. A zero here is
+	// what a deployment reads to say no global strategy was refused, and a
+	// zero that reads the same as "this build does not count them" is not a
+	// reading.
+	GlobalStrategies map[string]int
+	// GlobalUnsupported splits the global_unsupported outcome by the word it
+	// was refused for and the source its query reads, and adds up to it. It
+	// is what decides which query source alarmd learns to run globally next,
+	// which is why it is by source and not by word alone. Only the pairs a
+	// round produced are present: both labels are closed sets (the four
+	// words, GlobalQuerySource), and most of their product cannot happen.
+	GlobalUnsupported map[GlobalUnsupportedKey]int
+}
+
+// What a round did with a strategy the source marks global.
+const (
+	// GlobalOutcomeAccepted: runs as a global strategy - its ACCEPTED
+	// disposition survived to the Catalog as published.
+	GlobalOutcomeAccepted = "accepted"
+	// GlobalOutcomeUnsupported: refused as GLOBAL_STRATEGY_UNSUPPORTED - a
+	// strategy this build cannot yet run across businesses. It stopped
+	// detecting unless a last good Plan was retained for it.
+	GlobalOutcomeUnsupported = "global_unsupported"
+	// GlobalOutcomeWithheld: withheld for any other reason, which
+	// catalog_withheld_objects names like any other strategy's.
+	GlobalOutcomeWithheld = "withheld"
+)
+
+// GlobalOutcomes is every outcome, for the partition to pre-create.
+var GlobalOutcomes = []string{GlobalOutcomeAccepted, GlobalOutcomeUnsupported, GlobalOutcomeWithheld}
+
+// GlobalUnsupportedKey is one pair GlobalUnsupported counts under.
+type GlobalUnsupportedKey struct {
+	Reason      string
+	QuerySource string
 }
 
 // SourceSemanticsLabel is the partition key for one Query Group's query: the
@@ -178,6 +276,7 @@ func ComposeCatalog(catalog Catalog) CatalogComposition {
 		Objects:     make(map[Disposition]int, len(CatalogDispositions)+1),
 		Withheld:    make(map[WithheldKey]int),
 		NoDataPlans: make(map[nodata.RosterSource]int, 3),
+		Retention:   catalog.Retention,
 	}
 	for _, semantics := range SupportedSourceSemantics {
 		composition.QueryGroups[semantics] = 0
@@ -194,6 +293,10 @@ func ComposeCatalog(catalog Catalog) CatalogComposition {
 	for _, source := range NoDataRosterSources {
 		composition.NoDataPlans[source] = 0
 	}
+	composition.PlansByWireFormat = make(map[string]int, len(observability.WireFormats))
+	for _, format := range observability.WireFormats {
+		composition.PlansByWireFormat[format] = 0
+	}
 	for _, key := range AlwaysReportedWithheld {
 		composition.Withheld[key] = 0
 	}
@@ -202,18 +305,53 @@ func ComposeCatalog(catalog Catalog) CatalogComposition {
 		composition.QueryGroups[label]++
 		composition.Plans[label] += len(group.Plans)
 		for _, plan := range group.Plans {
+			composition.PlansTotal++
+			if plan.Plan.StrategyRef.SnapshotRevision > 0 {
+				composition.RevisionedPlans++
+			}
+			composition.PlansByWireFormat[observability.NormalizeWireFormat(
+				contract.ResolveOutputWireFormat(plan.Plan.WireFormat, plan.Plan.StrategyRef.SnapshotRevision))]++
 			if !plan.ScheduleSpec.AffordsSettlingWait() {
 				composition.InertPlans++
 			}
-			if plan.Plan.NoData == nil {
-				continue
+			// Three states, read from two fields and never inferred from one.
+			// A suspended Plan carries no no-data section either, so deciding
+			// "not configured" by the section being absent would file every
+			// suspended Plan as one that never asked -- the count would still
+			// look like a partition and would have lost exactly the objects
+			// this change exists to make visible.
+			switch {
+			case plan.NoDataSuspended != "":
+				// Named as well as counted. A count of suspensions tells an
+				// operator that some strategies are detecting thresholds and
+				// not absence, and nothing at all about which -- and the
+				// coverage list the migration is read from is a list of
+				// strategies, not a number.
+				composition.SuspendedNoDataObjects = append(composition.SuspendedNoDataObjects,
+					ObjectDisposition{SourceID: plan.Identity.StrategyID, Scope: "PLAN",
+						Disposition: DispositionAccepted, Reason: plan.NoDataSuspended})
+				source, known := suspendedNoDataSource(plan.NoDataSuspended)
+				if !known {
+					// A reason nobody mapped. Counted where an unclassifiable
+					// Plan is already counted rather than given a label of its
+					// own: a label minted from whatever string arrived would
+					// make the family's cardinality follow the reasons anyone
+					// adds, and a reason that reaches here is a gap between
+					// two vocabularies rather than a state of the fleet.
+					composition.NoDataPlansUnclassified++
+					continue
+				}
+				composition.NoDataPlans[source]++
+			case plan.Plan.NoData == nil:
+				composition.NoDataNotConfigured++
+			default:
+				class, err := nodata.ClassifyTarget(plan.Plan.TargetScope, plan.Plan.TargetPlan, plan.Plan.NoData.AggDimension)
+				if err != nil {
+					composition.NoDataPlansUnclassified++
+					continue
+				}
+				composition.NoDataPlans[class.Source]++
 			}
-			class, err := nodata.ClassifyRoster(plan.Plan.TargetScope, plan.Plan.NoData.AggDimension)
-			if err != nil {
-				composition.NoDataPlansUnclassified++
-				continue
-			}
-			composition.NoDataPlans[class.Source]++
 		}
 	}
 	for _, disposition := range catalog.Dispositions {
@@ -226,6 +364,9 @@ func ComposeCatalog(catalog Catalog) CatalogComposition {
 			kind = DispositionOther
 		}
 		composition.Objects[kind]++
+		if kind != DispositionPendingRemoval && kind != DispositionRemoved && disposition.SourceID != "" {
+			composition.ListedStrategies = append(composition.ListedStrategies, disposition.SourceID)
+		}
 		if kind == DispositionAccepted {
 			continue
 		}
@@ -237,6 +378,45 @@ func ComposeCatalog(catalog Catalog) CatalogComposition {
 		withheld.Disposition = kind
 		composition.WithheldObjects = append(composition.WithheldObjects, withheld)
 	}
+	// Once each: a strategy has a disposition at the strategy scope and one
+	// for each of its Plans or levels.
+	sort.Strings(composition.ListedStrategies)
+	composition.ListedStrategies = slices.Compact(composition.ListedStrategies)
+	composition.GlobalStrategies = make(map[string]int, len(GlobalOutcomes))
+	for _, outcome := range GlobalOutcomes {
+		composition.GlobalStrategies[outcome] = 0
+	}
+	composition.GlobalUnsupported = make(map[GlobalUnsupportedKey]int)
+	// Accepted is read off the Catalog as published, not off the record: a
+	// strategy this build compiled can still be withheld by the runtime check
+	// or the deployment's admission, and each replaces its ACCEPTED with the
+	// reason it withheld it. Counted from the record it would read accepted
+	// while it stopped running.
+	accepted := make(map[string]bool, len(catalog.GlobalStrategies))
+	for _, disposition := range catalog.Dispositions {
+		if disposition.Scope == "PLAN" && disposition.Disposition == DispositionAccepted {
+			accepted[disposition.SourceID] = true
+		}
+	}
+	// Once per strategy: the same one listed twice is one strategy, as it
+	// is one object in catalog_objects, and its first record is the one
+	// that compiled.
+	counted := make(map[string]bool, len(catalog.GlobalStrategies))
+	for _, global := range catalog.GlobalStrategies {
+		if counted[global.SourceID] {
+			continue
+		}
+		counted[global.SourceID] = true
+		switch {
+		case global.Refusal != "":
+			composition.GlobalStrategies[GlobalOutcomeUnsupported]++
+			composition.GlobalUnsupported[GlobalUnsupportedKey{Reason: global.Refusal, QuerySource: global.QuerySource}]++
+		case accepted[global.SourceID]:
+			composition.GlobalStrategies[GlobalOutcomeAccepted]++
+		default:
+			composition.GlobalStrategies[GlobalOutcomeWithheld]++
+		}
+	}
 	return composition
 }
 
@@ -244,8 +424,41 @@ func ComposeCatalog(catalog Catalog) CatalogComposition {
 // the partition to pre-create and for a reader to bound the family by.
 var NoDataRosterSources = []nodata.RosterSource{
 	nodata.RosterTargetStatic,
+	nodata.RosterTargetPlan,
 	nodata.RosterHistory,
 	nodata.RosterWhole,
+	SuspendedNoDataConfigInvalid,
+	SuspendedNoDataRosterUnsupported,
+}
+
+// The two states a Plan's no-data detection is in when it is configured and
+// not running. They sit in the same family as the roster sources because the
+// question the family answers is "what is this Plan's no-data detection
+// doing", and "nothing, because this build cannot compile it" is one of the
+// answers -- kept out, it would be an item that asked for detection and
+// appears nowhere.
+const (
+	SuspendedNoDataConfigInvalid     = nodata.RosterSource("SUSPENDED_CONFIG_INVALID")
+	SuspendedNoDataRosterUnsupported = nodata.RosterSource("SUSPENDED_ROSTER_UNSUPPORTED")
+)
+
+// suspendedNoDataSource maps the reason a Plan's no-data half was suspended to
+// the bucket it is counted in.
+//
+// Two vocabularies, one mapping, in one place. The reason is what the line
+// names to an operator -- the same word the withheld line used to carry, so a
+// reader who knew it still knows it -- and the bucket is what the family is
+// labelled by. Casting one to the other would work today and would make every
+// future reason a new label nobody chose, on a family whose labels are meant
+// to be a closed set.
+func suspendedNoDataSource(reason string) (nodata.RosterSource, bool) {
+	switch reason {
+	case contract.ReasonNoDataConfigInvalid:
+		return SuspendedNoDataConfigInvalid, true
+	case contract.ReasonNoDataRosterUnsupported:
+		return SuspendedNoDataRosterUnsupported, true
+	}
+	return "", false
 }
 
 // AlwaysReportedWithheld are the pairs the composition publishes even when
@@ -264,35 +477,20 @@ var NoDataRosterSources = []nodata.RosterSource{
 var AlwaysReportedWithheld = []WithheldKey{
 	{Disposition: DispositionUnsupported, Reason: contract.ReasonSnapshotRetentionInsufficient},
 	{Disposition: DispositionUnsupported, Reason: contract.ReasonCompletionOffsetBelowReserve},
-}
-
-// NoDataReasons is the set of reasons that withhold a Plan from no-data
-// detection. The partition below sums over them.
-var NoDataReasons = []string{"NO_DATA_CONFIG_INVALID", "NO_DATA_ROSTER_UNSUPPORTED"}
-
-// NoDataPlansPartition is how many items asked for no-data detection: the ones
-// that got it, by source, plus the ones a no-data reason withheld.
-//
-// The withheld half is summed by reason across dispositions rather than read at
-// one of them. A strategy refused for the first time is CONFIG_REJECTED, and
-// the same strategy is STALE_CONFIG once a previous good Plan is retained for
-// it - same reason, different disposition, on different rounds. Reading only
-// CONFIG_REJECTED would make the total drop by one the round a strategy starts
-// running its last good Plan, which reads as a gauge that lost a count rather
-// than as a strategy that changed state.
-func (composition CatalogComposition) NoDataPlansPartition() int {
-	total := composition.NoDataPlansUnclassified
-	for _, count := range composition.NoDataPlans {
-		total += count
-	}
-	for key, count := range composition.Withheld {
-		for _, reason := range NoDataReasons {
-			if key.Reason == reason {
-				total += count
-			}
-		}
-	}
-	return total
+	// "No strategy's effective time was widened to the whole day because a
+	// range did not parse" is a claim a reader acts on: the widening is the
+	// direction of more detection, and the only way to see it is this pair.
+	{Disposition: DispositionConfigNoted, Reason: ReasonEffectiveTimeRangeInvalid},
+	// "No strategy here takes part in priority arbitration" is the zero that
+	// says every strategy detects exactly as it would alone on the platform.
+	{Disposition: DispositionConfigNoted, Reason: ReasonPriorityIgnored},
+	// "No strategy here runs a level on another level's trigger."
+	{Disposition: DispositionConfigNoted, Reason: ReasonLevelTriggerBorrowed},
+	// "No strategy here runs on a period it did not write."
+	{Disposition: DispositionConfigNoted, Reason: ReasonAggIntervalDefaulted},
+	// "No strategy here has a no-data trigger the tracking horizon stops
+	// before it can fire."
+	{Disposition: DispositionConfigNoted, Reason: ReasonNoDataTriggerBeyondHorizon},
 }
 
 // WithheldKey pairs what happened to an object with why. Neither half answers
@@ -319,4 +517,5 @@ var CatalogDispositions = []Disposition{
 	DispositionRemoved,
 	DispositionUnsupported,
 	DispositionCompatibilityIgnored,
+	DispositionConfigNoted,
 }
