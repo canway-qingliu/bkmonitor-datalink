@@ -561,3 +561,41 @@ instance:
 {%- endif %}
 {%- endfor %}
 {%- endif %}
+
+{% if profiling_config is defined %}
+profiling:
+  {% if profiling_config.enabled is defined %}
+  # profiling 总开关，随接口返回给客户端，由客户端自行决定是否采集
+  enabled: {{ profiling_config.enabled }}
+  {%- endif %}
+  {% if profiling_config.cpu is defined %}
+  cpu:
+    {% if profiling_config.cpu.enabled is defined %}
+    enabled: {{ profiling_config.cpu.enabled }}
+    {%- endif %}
+    {% if profiling_config.cpu.collection_period is defined %}
+    collection_period: "{{ profiling_config.cpu.collection_period }}"
+    {%- endif %}
+    {% if profiling_config.cpu.collection_window is defined %}
+    collection_window: "{{ profiling_config.cpu.collection_window }}"
+    {%- endif %}
+    {% if profiling_config.cpu.sampling_frequency is defined %}
+    sampling_frequency: "{{ profiling_config.cpu.sampling_frequency }}"
+    {%- endif %}
+  {%- endif %}
+  {% if profiling_config.memory is defined %}
+  memory:
+    {% if profiling_config.memory.enabled is defined %}
+    enabled: {{ profiling_config.memory.enabled }}
+    {%- endif %}
+    {% if profiling_config.memory.collection_period is defined %}
+    collection_period: "{{ profiling_config.memory.collection_period }}"
+    {%- endif %}
+    {% if profiling_config.memory.collection_window is defined %}
+    collection_window: "{{ profiling_config.memory.collection_window }}"
+    {%- endif %}
+    {% if profiling_config.memory.sampling_frequency is defined %}
+    sampling_frequency: "{{ profiling_config.memory.sampling_frequency }}"
+    {%- endif %}
+  {%- endif %}
+{%- endif %}

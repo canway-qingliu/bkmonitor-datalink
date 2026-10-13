@@ -69,6 +69,9 @@
       pingserver:
         disabled: true
 
+      profiling:
+        enabled: false
+
       receiver:
         http_server:
           enabled: true
@@ -344,6 +347,7 @@
             - "token_checker/aes256"
             - "pprof_translator/common"
             - "sampler/drop_profiles"
+
 
         - name: "beat_pipeline/common"
           type: "beat"
