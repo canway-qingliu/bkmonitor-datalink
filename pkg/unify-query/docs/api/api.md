@@ -398,6 +398,15 @@
 
 `trace_profile`、`trace_contract_version`、`trace_request` 是 `trace_query_v2` 的 typed Trace 信封；出现任一字段（包括显式 `null`）时不能作为普通 raw 查询返回成功。UQ 对 `trace_span` / `trace_summary` 依据 Kingeye Metadata 的逐业务 Consul 读目标直连 Doris，库表由受信 `(租户, 业务, profile)` 路由确定；只读连接、JWT 验证及专用 app code 允许列表缺失时明确返回 400，不回落到 BKSQL/QueryEngine。typed 时间为 UTC epoch **微秒字符串**，结束时间为排他边界；Span/Summary 均支持预算内的 `offset`，`offset` 与 `page_token` 不能同时使用；直读配置 `max_offset` 必须为正数。客户端不得提交 RT、库表、集群或 SQL。结构化 `/query/ts` 和 raw-with-scroll 拒绝 typed 信封，普通 raw 请求沿用原路径。A3 边/覆盖直读与目标环境验收另行完成。
 
+`trace_query_v3` 只在同一 `/query/ts/raw` typed 入口表达原生仪表盘的服务端 `COUNT` 聚合，必须带
+`trace_request.aggregation={"method":"count","interval_seconds":正整数,"timezone_offset_seconds":整数,"group_by":[]}`；
+V2 列表仍拒绝该字段，V3 不带聚合也拒绝。聚合请求不能混用 `offset`、`order_by` 或 `member_lookup`，
+最多五个直接标量分组字段，JSON/VARIANT 和受信身份列不可分组。UQ 在受信物理表上先固定租户、业务与
+调用方收窄的应用谓词，再按 UTC 微秒时间列和固定时区偏移编译有界分桶 SQL；调用方不能指定库表或 SQL。
+响应只含版本、profile、scope fingerprint、`product_state=null` 与 `buckets[]`（每项为
+`bucket_start_ms`、`count`、`dimensions`）。若返回桶数超过 `limit`，整次拒绝而非截断。时区偏移变化的
+查询窗口由 Kingeye 在发请求前拒绝；真实 Doris SQL 执行与 Test 数据面仍需单独验收。
+
 T6.6 的 Doris `trace_summary` 内部 `member_lookup` 形如 `{"trace_id":"<32 位小写 hex>","expected_route_version":3,"allowed_pairs":[{"app_id":7,"bk_biz_id":42}]}`，只接受 `scene=global`、空过滤/排序且无 offset 的请求。允许对按业务 ID、应用 ID 严格排序并去重，单请求最多 128 对，且每对业务必须等于受信空间对应的业务物理表；UQ 在 SQL 前要求期望版本与已加载的发布读路由快照一致。SQL 使用成对 OR 条件与精确 Trace ID，不把两列拆成独立 IN。真实命中数超过 `limit`、查询行数不等于 total 或回包出现范围外行均失败，不返回截断成员。该模式还要求 `trace_profile.member_lookup_allowed_bk_app_codes` 单独授权，默认关闭。KAPM 授权目录编排、ES 分支、保留期覆盖和目标读回仍由 T6.6 后续验收。
 
 Kingeye 单租户发布物可选 `es_summary_targets`，每项目标包含租户、业务、应用 ID/名称、观测域、新 ES Summary 逻辑 `read_result_table_id`、ES 存储集群与保留期。UQ 现严格解析并随发布版本冻结这些候选路由；旧发布文档不含此段时继续加载 Doris。A3 段此阶段仅检查为数组，不加载为查询路由。启用 Kingeye 的 `--include-es-summary` 前须先部署能解析该段的 UQ，目标 RT→读别名、索引暖机和真实行仍须独立验证。

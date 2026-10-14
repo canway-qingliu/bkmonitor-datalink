@@ -414,6 +414,17 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 
 	span.Set("trace-profile", string(request.Profile))
 	span.Set("trace-profile-route-version", runtime.routeVersion)
+	if request.Aggregation != nil {
+		rows, aggregateErr := runtime.executor.ExecuteAggregate(ctx, request, scope)
+		if aggregateErr != nil {
+			writeTraceProfileReject(ctx, c, traceprofile.ErrorCode(aggregateErr), aggregateErr.Error())
+			return
+		}
+		span.Set("trace-profile-aggregate-points", len(rows))
+		metric.APIRequestInc(ctx, c.Request.URL.Path, metric.StatusSuccess, user.SpaceUID, user.Source)
+		c.JSON(http.StatusOK, traceprofile.NewAggregateResponse(request, rows))
+		return
+	}
 	var page traceprofile.Page
 	if isESMember {
 		page, err = executeESMemberLookup(ctx, request, scope, esTarget, runtime.esMemberReader)

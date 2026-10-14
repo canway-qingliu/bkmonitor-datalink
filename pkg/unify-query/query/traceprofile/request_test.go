@@ -25,6 +25,32 @@ func validRequestJSON() string {
 		`"order_by":["-timestamp","trace_id"],"limit":25,"offset":0}}`
 }
 
+func TestParseRequestAcceptsVersionedCountAggregation(t *testing.T) {
+	body := strings.Replace(validRequestJSON(), `"trace_query_v2"`, `"trace_query_v3"`, 1)
+	body = strings.Replace(body, `"order_by":["-timestamp","trace_id"],"limit":25,"offset":0`,
+		`"order_by":[],"limit":10000,"aggregation":{"method":"count","interval_seconds":60,`+
+			`"timezone_offset_seconds":28800,"group_by":["root_service_name"]}`, 1)
+	if _, err := ParseRequest([]byte(body), 1<<20, 10000); err != nil {
+		t.Fatalf("bounded typed count aggregation was rejected: %v", err)
+	}
+	legacy := strings.Replace(body, `"trace_query_v3"`, `"trace_query_v2"`, 1)
+	if _, err := ParseRequest([]byte(legacy), 1<<20, 10000); err == nil {
+		t.Fatal("v2 list contract accepted aggregation extension")
+	}
+	for name, invalid := range map[string]string{
+		"offset":     strings.Replace(body, `"limit":10000,`, `"limit":10000,"offset":0,`, 1),
+		"order":      strings.Replace(body, `"order_by":[]`, `"order_by":["trace_id"]`, 1),
+		"physical":   strings.Replace(body, `"aggregation":{`, `"database":"system_kapm","aggregation":{`, 1),
+		"wrong mode": strings.Replace(body, `"method":"count"`, `"method":"sum"`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseRequest([]byte(invalid), 1<<20, 10000); err == nil {
+				t.Fatal("unsafe aggregate request was accepted")
+			}
+		})
+	}
+}
+
 func validMemberLookupJSON() string {
 	return `{"trace_profile":"trace_summary","trace_contract_version":"trace_query_v2","trace_request":{` +
 		`"observation_domain_id":"t1_kapm",` +

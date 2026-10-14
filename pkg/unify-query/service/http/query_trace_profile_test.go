@@ -38,6 +38,18 @@ func typedTraceBody(profile, domain string) string {
 		`"filters":{"field_list":[],"condition_list":[]},"order_by":[],"limit":100}}`
 }
 
+func TestTypedCountAggregationUsesAggregateCompiler(t *testing.T) {
+	withTraceProfileRuntime(t, traceProfileRuntimeConfig())
+	withTraceProfileAuth(t, true, "kingeye-apm")
+	body := strings.Replace(typedTraceBody("trace_span", "system_kapm"), `"trace_query_v2"`, `"trace_query_v3"`, 1)
+	body = strings.Replace(body, `"limit":100}}`,
+		`"limit":100,"aggregation":{"method":"count","interval_seconds":60,`+
+			`"timezone_offset_seconds":28800,"group_by":["resource"]}}}`, 1)
+	if code := decodeTraceProfileError(t, runTraceProfileRequest(t, body, "kingeye-apm")); code != traceprofile.CodeUnsupportedSchemaCapability {
+		t.Fatalf("typed aggregate did not enforce scalar dimension whitelist: %s", code)
+	}
+}
+
 func TestDefaultTraceProfileBudgetCoversThirtyDayInclusiveWindow(t *testing.T) {
 	scope, err := traceprofile.ResolveScope("system", "bkcc__42", "system_kapm")
 	if err != nil {

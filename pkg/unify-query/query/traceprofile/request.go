@@ -22,6 +22,7 @@ import (
 )
 
 const contractVersion = "trace_query_v2"
+const aggregateContractVersion = "trace_query_v3"
 
 // Trace 数据不会早于 2000 年；该下界使误传的秒/毫秒 epoch 明确失败。
 const minTraceEpochUS int64 = 946684800000000
@@ -81,6 +82,15 @@ type Request struct {
 	Limit               int64
 	Offset              *int64
 	MemberLookup        *MemberLookup
+	Aggregation         *CountAggregation
+}
+
+// CountAggregation is a bounded, server-side count query over one trusted Trace profile.
+type CountAggregation struct {
+	Method                string   `json:"method"`
+	IntervalSeconds       int64    `json:"interval_seconds"`
+	TimezoneOffsetSeconds int64    `json:"timezone_offset_seconds"`
+	GroupBy               []string `json:"group_by"`
 }
 
 type wireRequest struct {
@@ -95,6 +105,7 @@ type wireRequest struct {
 	Offset                   json.RawMessage `json:"offset,omitempty"`
 	PageToken                json.RawMessage `json:"page_token,omitempty"`
 	MemberLookup             json.RawMessage `json:"member_lookup,omitempty"`
+	Aggregation              json.RawMessage `json:"aggregation,omitempty"`
 }
 
 type wireEnvelope struct {
@@ -120,13 +131,18 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 	if err := decoder.Decode(&extra); err != io.EOF {
 		return Request{}, fmt.Errorf("Trace profile 请求包含多余 JSON 内容")
 	}
-	if wire.TraceContractVersion != contractVersion || wire.TraceRequest == nil {
+	if wire.TraceRequest == nil ||
+		wire.TraceContractVersion != contractVersion && wire.TraceContractVersion != aggregateContractVersion {
 		return Request{}, fmt.Errorf("Trace profile 合同版本或请求体不受支持")
 	}
 	if wire.TraceProfile != metadata.TraceProfileSpan && wire.TraceProfile != metadata.TraceProfileSummary {
 		return Request{}, fmt.Errorf("Trace profile 类型不受支持")
 	}
 	query := wire.TraceRequest
+	if wire.TraceContractVersion == contractVersion && len(query.Aggregation) != 0 ||
+		wire.TraceContractVersion == aggregateContractVersion && len(query.Aggregation) == 0 {
+		return Request{}, fmt.Errorf("Trace profile 聚合与合同版本不匹配")
+	}
 	scene := ""
 	if len(query.Scene) != 0 {
 		if bytes.Equal(query.Scene, []byte("null")) || json.Unmarshal(query.Scene, &scene) != nil {
@@ -170,6 +186,36 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 	if err := validateFilters(*query.Filters); err != nil {
 		return Request{}, err
 	}
+	var aggregation *CountAggregation
+	if len(query.Aggregation) != 0 {
+		if bytes.Equal(query.Aggregation, []byte("null")) || offset != nil || len(query.OrderBy) != 0 ||
+			len(query.MemberLookup) != 0 {
+			return Request{}, fmt.Errorf("Trace 聚合不能混用分页、排序或成员查询")
+		}
+		aggregationDecoder := json.NewDecoder(bytes.NewReader(query.Aggregation))
+		aggregationDecoder.DisallowUnknownFields()
+		var value CountAggregation
+		if err := aggregationDecoder.Decode(&value); err != nil {
+			return Request{}, fmt.Errorf("Trace 聚合形状非法: %w", err)
+		}
+		if err := aggregationDecoder.Decode(&extra); err != io.EOF || value.Method != "count" ||
+			value.IntervalSeconds <= 0 || value.IntervalSeconds > 86400 ||
+			value.TimezoneOffsetSeconds < -14*3600 || value.TimezoneOffsetSeconds > 14*3600 ||
+			value.GroupBy == nil || len(value.GroupBy) > 5 {
+			return Request{}, fmt.Errorf("Trace 聚合方法、周期、时区或分组超出合同")
+		}
+		seen := make(map[string]struct{}, len(value.GroupBy))
+		for _, field := range value.GroupBy {
+			if !fieldPattern.MatchString(field) {
+				return Request{}, fmt.Errorf("Trace 聚合分组字段非法")
+			}
+			if _, duplicate := seen[field]; duplicate {
+				return Request{}, fmt.Errorf("Trace 聚合分组字段重复")
+			}
+			seen[field] = struct{}{}
+		}
+		aggregation = &value
+	}
 	var memberLookup *MemberLookup
 	if len(query.MemberLookup) != 0 {
 		if bytes.Equal(query.MemberLookup, []byte("null")) || wire.TraceProfile != metadata.TraceProfileSummary ||
@@ -205,6 +251,7 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 		StartUS: startUS, EndUS: endUS, Filters: *query.Filters,
 		OrderBy: append([]string(nil), query.OrderBy...), Limit: query.Limit, Offset: offset,
 		MemberLookup: memberLookup,
+		Aggregation:  aggregation,
 	}, nil
 }
 
