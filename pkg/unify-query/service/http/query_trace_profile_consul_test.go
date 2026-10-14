@@ -129,6 +129,7 @@ func TestReloadTraceProfileRuntimeConsumesPublishedConsulRoutes(t *testing.T) {
 	prefix := "kingeye/metadata/unify-query/data/trace/read_target"
 	versionPath := "kingeye/metadata/unify-query/version/trace/read_target"
 	config := traceProfileRuntimeConfig()
+	config["single_tenant_id"] = "system"
 	delete(config, "read_routes")
 	config["read_target_data_path"] = prefix
 	config["read_target_version_path"] = versionPath
@@ -162,6 +163,9 @@ func TestReloadTraceProfileRuntimeConsumesPublishedConsulRoutes(t *testing.T) {
 	runtime := traceProfileRuntimeValue.Load()
 	if runtime == nil || runtime.routeCount != 2 || runtime.routeVersion <= 0 {
 		t.Fatalf("published business routes were not installed: %+v", runtime)
+	}
+	if tenant := runtime.singleTenantID; tenant != "system" {
+		t.Fatalf("Consul runtime lost the local tenant binding: %s", tenant)
 	}
 }
 

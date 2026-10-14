@@ -23,6 +23,7 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/dorisclient"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metric"
@@ -91,6 +92,10 @@ type traceProfileConfig struct {
 	ReadRoutes            []traceProfileRouteConfig      `json:"read_routes"`
 	ESSummaryTargets      []traceProfileESTargetConfig   `json:"es_summary_targets,omitempty"`
 	ReadonlyConnections   []traceProfileConnectionConfig `json:"readonly_connections"`
+
+	// 单租户 typed Trace 的真实数据租户；应用和空间权限沿用 JWT 鉴权。
+	// 未配置时沿用入站租户，不从请求参数猜测数据归属。
+	SingleTenantID string `json:"single_tenant_id,omitempty"`
 	// 该键由 settings.TraceProfileAllowedAppCodes 负责，这里只为其保留严格解码入口。
 	AllowedBkAppCodes             []string `json:"allowed_bk_app_codes"`
 	MemberLookupAllowedBkAppCodes []string `json:"member_lookup_allowed_bk_app_codes"`
@@ -126,6 +131,10 @@ type traceProfileRuntime struct {
 	maxLimit       int64
 	routeVersion   int64
 	routeCount     int
+
+	// 模式和数据租户在同一快照内，避免配置热更新时混用新旧值。
+	singleTenantID  string
+	multiTenantMode bool
 }
 
 func traceProfileMaxRangeUS(days int64) int64 {
@@ -306,6 +315,9 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 		maxLimit:       config.MaxLimit,
 		routeVersion:   config.RouteSnapshotVersion,
 		routeCount:     len(routes),
+
+		singleTenantID:  config.SingleTenantID,
+		multiTenantMode: viper.GetBool(influxdb.MultiTenantModeConfigPath),
 	}, nil
 }
 
@@ -385,7 +397,16 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 		}
 	}
 	user := metadata.GetUser(ctx)
-	scope, err := traceprofile.ResolveScope(user.TenantID, user.SpaceUID, request.ObservationDomainID)
+	dataTenantID := user.TenantID
+	// 单租户 APIGW 把租户头规范化为 default，这是传输协议值。
+	// JWT 应用和空间已鉴权；只按环境配置找数据租户，不从请求体猜租户，
+	// 映射结果仍须通过下方的作用域与发布路由校验。
+	if !runtime.multiTenantMode && dataTenantID == "default" && runtime.singleTenantID != "" {
+		dataTenantID = runtime.singleTenantID
+	}
+	span.Set("trace-profile-request-tenant-id", user.TenantID)
+	span.Set("trace-profile-data-tenant-id", dataTenantID)
+	scope, err := traceprofile.ResolveScope(dataTenantID, user.SpaceUID, request.ObservationDomainID)
 	if err != nil {
 		writeTraceProfileReject(ctx, c, traceprofile.ErrorCode(err), err.Error())
 		return
