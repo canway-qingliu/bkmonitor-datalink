@@ -68,7 +68,7 @@
     "path": "/query_sync/",
     "body": {
       "properties": {"cluster_name": "doris_cluster_fanout"},
-      "sql": "SELECT `service`, COUNT(`events_total`) AS `_value_`, ((CAST((FLOOR(__shard_key__ / 1000) + 0) / 1 AS INT) * 1 - 0) * 60 * 1000) AS `_timestamp_` FROM `golden_doris_fanout_1`.doris WHERE `dtEventTimeStamp` >= 1784701739999 AND `dtEventTimeStamp` <= 1784702135999 AND `dtEventTime` >= '2026-07-22 14:28:59' AND `dtEventTime` <= '2026-07-22 14:35:36' AND `thedate` = '20260722' AND (`message` LIKE 'event%') GROUP BY `service`, _timestamp_ ORDER BY `_timestamp_` ASC LIMIT 2000005"
+      "sql": "SELECT `service`, COUNT(`events_total`) AS `_value_`, (CAST(FLOOR((dtEventTimeStamp + 0) / 60000) AS BIGINT) * 60000 - 0) AS `_timestamp_` FROM `golden_doris_fanout_1`.doris WHERE `dtEventTimeStamp` >= 1784701739999 AND `dtEventTimeStamp` <= 1784702135999 AND `dtEventTime` >= '2026-07-22 14:28:59' AND `dtEventTime` <= '2026-07-22 14:35:36' AND `thedate` = '20260722' AND (`message` LIKE 'event%') GROUP BY `service`, _timestamp_ ORDER BY `_timestamp_` ASC LIMIT 2000005"
     }
   },
   {
@@ -77,7 +77,7 @@
     "path": "/query_sync/",
     "body": {
       "properties": {"cluster_name": "doris_cluster_fanout"},
-      "sql": "SELECT `service`, COUNT(`events_total`) AS `_value_`, ((CAST((FLOOR(__shard_key__ / 1000) + 0) / 1 AS INT) * 1 - 0) * 60 * 1000) AS `_timestamp_` FROM `golden_doris_fanout_2`.doris WHERE `dtEventTimeStamp` >= 1784701739999 AND `dtEventTimeStamp` <= 1784702135999 AND `dtEventTime` >= '2026-07-22 14:28:59' AND `dtEventTime` <= '2026-07-22 14:35:36' AND `thedate` = '20260722' AND (`message` LIKE 'event%') GROUP BY `service`, _timestamp_ ORDER BY `_timestamp_` ASC LIMIT 2000005"
+      "sql": "SELECT `service`, COUNT(`events_total`) AS `_value_`, (CAST(FLOOR((dtEventTimeStamp + 0) / 60000) AS BIGINT) * 60000 - 0) AS `_timestamp_` FROM `golden_doris_fanout_2`.doris WHERE `dtEventTimeStamp` >= 1784701739999 AND `dtEventTimeStamp` <= 1784702135999 AND `dtEventTime` >= '2026-07-22 14:28:59' AND `dtEventTime` <= '2026-07-22 14:35:36' AND `thedate` = '20260722' AND (`message` LIKE 'event%') GROUP BY `service`, _timestamp_ ORDER BY `_timestamp_` ASC LIMIT 2000005"
     }
   },
   {
@@ -86,7 +86,7 @@
     "path": "/query_sync/",
     "body": {
       "properties": {"cluster_name": "doris_cluster_fanout"},
-      "sql": "SELECT `service`, COUNT(`events_total`) AS `_value_`, ((CAST((FLOOR(__shard_key__ / 1000) + 0) / 1 AS INT) * 1 - 0) * 60 * 1000) AS `_timestamp_` FROM `golden_doris_fanout_3`.doris WHERE `dtEventTimeStamp` >= 1784701739999 AND `dtEventTimeStamp` <= 1784702135999 AND `dtEventTime` >= '2026-07-22 14:28:59' AND `dtEventTime` <= '2026-07-22 14:35:36' AND `thedate` = '20260722' AND (`message` LIKE 'event%') GROUP BY `service`, _timestamp_ ORDER BY `_timestamp_` ASC LIMIT 2000005"
+      "sql": "SELECT `service`, COUNT(`events_total`) AS `_value_`, (CAST(FLOOR((dtEventTimeStamp + 0) / 60000) AS BIGINT) * 60000 - 0) AS `_timestamp_` FROM `golden_doris_fanout_3`.doris WHERE `dtEventTimeStamp` >= 1784701739999 AND `dtEventTimeStamp` <= 1784702135999 AND `dtEventTime` >= '2026-07-22 14:28:59' AND `dtEventTime` <= '2026-07-22 14:35:36' AND `thedate` = '20260722' AND (`message` LIKE 'event%') GROUP BY `service`, _timestamp_ ORDER BY `_timestamp_` ASC LIMIT 2000005"
     }
   },
   {
@@ -95,7 +95,7 @@
     "path": "/query_sync/",
     "body": {
       "properties": {"cluster_name": "doris_cluster_fanout"},
-      "sql": "SELECT `service`, COUNT(`events_total`) AS `_value_`, ((CAST((FLOOR(__shard_key__ / 1000) + 0) / 1 AS INT) * 1 - 0) * 60 * 1000) AS `_timestamp_` FROM `golden_doris_fanout_4`.doris WHERE `dtEventTimeStamp` >= 1784701739999 AND `dtEventTimeStamp` <= 1784702135999 AND `dtEventTime` >= '2026-07-22 14:28:59' AND `dtEventTime` <= '2026-07-22 14:35:36' AND `thedate` = '20260722' AND (`message` LIKE 'event%') GROUP BY `service`, _timestamp_ ORDER BY `_timestamp_` ASC LIMIT 2000005"
+      "sql": "SELECT `service`, COUNT(`events_total`) AS `_value_`, (CAST(FLOOR((dtEventTimeStamp + 0) / 60000) AS BIGINT) * 60000 - 0) AS `_timestamp_` FROM `golden_doris_fanout_4`.doris WHERE `dtEventTimeStamp` >= 1784701739999 AND `dtEventTimeStamp` <= 1784702135999 AND `dtEventTime` >= '2026-07-22 14:28:59' AND `dtEventTime` <= '2026-07-22 14:35:36' AND `thedate` = '20260722' AND (`message` LIKE 'event%') GROUP BY `service`, _timestamp_ ORDER BY `_timestamp_` ASC LIMIT 2000005"
     }
   },
   {
@@ -104,7 +104,7 @@
     "path": "/query_sync/",
     "body": {
       "properties": {"cluster_name": "doris_cluster_fanout"},
-      "sql": "SELECT `service`, COUNT(`events_total`) AS `_value_`, ((CAST((FLOOR(__shard_key__ / 1000) + 0) / 1 AS INT) * 1 - 0) * 60 * 1000) AS `_timestamp_` FROM `golden_doris_fanout_5`.doris WHERE `dtEventTimeStamp` >= 1784701739999 AND `dtEventTimeStamp` <= 1784702135999 AND `dtEventTime` >= '2026-07-22 14:28:59' AND `dtEventTime` <= '2026-07-22 14:35:36' AND `thedate` = '20260722' AND (`message` LIKE 'event%') GROUP BY `service`, _timestamp_ ORDER BY `_timestamp_` ASC LIMIT 2000005"
+      "sql": "SELECT `service`, COUNT(`events_total`) AS `_value_`, (CAST(FLOOR((dtEventTimeStamp + 0) / 60000) AS BIGINT) * 60000 - 0) AS `_timestamp_` FROM `golden_doris_fanout_5`.doris WHERE `dtEventTimeStamp` >= 1784701739999 AND `dtEventTimeStamp` <= 1784702135999 AND `dtEventTime` >= '2026-07-22 14:28:59' AND `dtEventTime` <= '2026-07-22 14:35:36' AND `thedate` = '20260722' AND (`message` LIKE 'event%') GROUP BY `service`, _timestamp_ ORDER BY `_timestamp_` ASC LIMIT 2000005"
     }
   },
   {
@@ -113,7 +113,7 @@
     "path": "/query_sync/",
     "body": {
       "properties": {"cluster_name": "doris_cluster_fanout"},
-      "sql": "SELECT `service`, COUNT(`events_total`) AS `_value_`, ((CAST((FLOOR(__shard_key__ / 1000) + 0) / 1 AS INT) * 1 - 0) * 60 * 1000) AS `_timestamp_` FROM `golden_doris_fanout_6`.doris WHERE `dtEventTimeStamp` >= 1784701739999 AND `dtEventTimeStamp` <= 1784702135999 AND `dtEventTime` >= '2026-07-22 14:28:59' AND `dtEventTime` <= '2026-07-22 14:35:36' AND `thedate` = '20260722' AND (`message` LIKE 'event%') GROUP BY `service`, _timestamp_ ORDER BY `_timestamp_` ASC LIMIT 2000005"
+      "sql": "SELECT `service`, COUNT(`events_total`) AS `_value_`, (CAST(FLOOR((dtEventTimeStamp + 0) / 60000) AS BIGINT) * 60000 - 0) AS `_timestamp_` FROM `golden_doris_fanout_6`.doris WHERE `dtEventTimeStamp` >= 1784701739999 AND `dtEventTimeStamp` <= 1784702135999 AND `dtEventTime` >= '2026-07-22 14:28:59' AND `dtEventTime` <= '2026-07-22 14:35:36' AND `thedate` = '20260722' AND (`message` LIKE 'event%') GROUP BY `service`, _timestamp_ ORDER BY `_timestamp_` ASC LIMIT 2000005"
     }
   },
   {
@@ -122,7 +122,7 @@
     "path": "/query_sync/",
     "body": {
       "properties": {"cluster_name": "doris_cluster_fanout"},
-      "sql": "SELECT `service`, COUNT(`events_total`) AS `_value_`, ((CAST((FLOOR(__shard_key__ / 1000) + 0) / 1 AS INT) * 1 - 0) * 60 * 1000) AS `_timestamp_` FROM `golden_doris_fanout_7`.doris WHERE `dtEventTimeStamp` >= 1784701739999 AND `dtEventTimeStamp` <= 1784702135999 AND `dtEventTime` >= '2026-07-22 14:28:59' AND `dtEventTime` <= '2026-07-22 14:35:36' AND `thedate` = '20260722' AND (`message` LIKE 'event%') GROUP BY `service`, _timestamp_ ORDER BY `_timestamp_` ASC LIMIT 2000005"
+      "sql": "SELECT `service`, COUNT(`events_total`) AS `_value_`, (CAST(FLOOR((dtEventTimeStamp + 0) / 60000) AS BIGINT) * 60000 - 0) AS `_timestamp_` FROM `golden_doris_fanout_7`.doris WHERE `dtEventTimeStamp` >= 1784701739999 AND `dtEventTimeStamp` <= 1784702135999 AND `dtEventTime` >= '2026-07-22 14:28:59' AND `dtEventTime` <= '2026-07-22 14:35:36' AND `thedate` = '20260722' AND (`message` LIKE 'event%') GROUP BY `service`, _timestamp_ ORDER BY `_timestamp_` ASC LIMIT 2000005"
     }
   }
 ]

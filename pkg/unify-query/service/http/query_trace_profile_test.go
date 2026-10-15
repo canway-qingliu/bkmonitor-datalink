@@ -107,20 +107,31 @@ func withTraceProfileRuntime(t *testing.T, raw any) {
 
 func withTraceProfileAuth(t *testing.T, enabled bool, allowed ...string) {
 	t.Helper()
-	previousEnabled, previousAllowed := JwtEnabled, TraceProfileAllowedAppCodes
-	JwtEnabled, TraceProfileAllowedAppCodes = enabled, allowed
+	previousEnabled := JwtEnabled
+	JwtEnabled = enabled
+	runtime := traceProfileRuntimeValue.Load()
+	var previousAllowed []string
+	if runtime != nil {
+		previousAllowed = runtime.allowedAppCodes
+		runtime.allowedAppCodes = allowed
+	}
 	t.Cleanup(func() {
-		JwtEnabled, TraceProfileAllowedAppCodes = previousEnabled, previousAllowed
+		JwtEnabled = previousEnabled
+		if runtime != nil {
+			runtime.allowedAppCodes = previousAllowed
+		}
 	})
 }
 
 func traceProfileRuntimeConfig() map[string]any {
 	return map[string]any{
-		"route_snapshot_version": 7,
-		"max_body_bytes":         65536,
-		"max_limit":              100,
-		"max_offset":             1000,
-		"max_range_days":         7,
+		"route_snapshot_version":             7,
+		"allowed_bk_app_codes":               []string{"kingeye-apm"},
+		"member_lookup_allowed_bk_app_codes": []string{"kingeye-apm"},
+		"max_body_bytes":                     65536,
+		"max_limit":                          100,
+		"max_offset":                         1000,
+		"max_range_days":                     7,
 		"read_routes": []any{
 			map[string]any{
 				"bk_tenant_id": "system", "bk_biz_id": 42, "profile": "trace_span", "observation_domain_id": "system_kapm",
@@ -354,9 +365,7 @@ func TestTraceProfileDirectReadRequiresVerifiedAllowlistedWorkload(t *testing.T)
 func TestTraceMemberLookupRequiresItsOwnWorkloadAllowlist(t *testing.T) {
 	withTraceProfileRuntime(t, traceProfileRuntimeConfig())
 	withTraceProfileAuth(t, true, "kingeye-apm")
-	previous := TraceMemberLookupAllowedAppCodes
-	TraceMemberLookupAllowedAppCodes = nil
-	t.Cleanup(func() { TraceMemberLookupAllowedAppCodes = previous })
+	traceProfileRuntimeValue.Load().memberLookupAllowedAppCodes = nil
 	body := strings.Replace(typedTraceBody("trace_summary", "system_kapm"), `"limit":100}}`,
 		`"limit":100,"scene":"global","member_lookup":{`+
 			`"trace_id":"0123456789abcdef0123456789abcdef","expected_route_version":7,`+
@@ -365,18 +374,45 @@ func TestTraceMemberLookupRequiresItsOwnWorkloadAllowlist(t *testing.T) {
 	if code != traceprofile.CodeUnauthorizedMember {
 		t.Fatalf("member allow set escaped the dedicated workload gate: %s", code)
 	}
-	TraceMemberLookupAllowedAppCodes = []string{"kingeye-apm"}
+	traceProfileRuntimeValue.Load().memberLookupAllowedAppCodes = []string{"kingeye-apm"}
 	code = decodeTraceProfileError(t, runTraceProfileRequest(t, body, "kingeye-apm"))
 	if code != traceprofile.CodePartialFailure {
 		t.Fatalf("authorized member lookup was blocked before the configured readonly query: %s", code)
 	}
 }
 
+func TestESMemberLookupRejectsRangeBudgetBeforeIO(t *testing.T) {
+	config := traceProfileRuntimeConfig()
+	config["max_range_days"] = 1
+	config["es_summary_targets"] = []any{map[string]any{
+		"bk_tenant_id": "system", "bk_biz_id": 42, "app_id": 7,
+		"app_name": "checkout", "observation_domain_id": "system_kapm",
+		"read_result_table_id": "apm_global.trace_summary_v1_7",
+		"storage_cluster_id":   9, "retention_days": 30, "published_route_version": 7,
+	}}
+	withTraceProfileRuntime(t, config)
+	withTraceProfileAuth(t, true, "kingeye-apm")
+	called := false
+	traceProfileRuntimeValue.Load().esMemberReader = func(context.Context, *structured.QueryTs) (
+		int64, []map[string]any, metadata.ResultTableOptions, []metadata.RouteInfo, error,
+	) {
+		called = true
+		return 0, nil, nil, nil, nil
+	}
+	body := strings.Replace(typedTraceBody("trace_summary", "system_kapm"),
+		`"end_time":"1758672000000000"`, `"end_time":"1758758400000000"`, 1)
+	body = strings.Replace(body, `"limit":100}}`,
+		`"limit":100,"scene":"global","member_lookup":{`+
+			`"backend":"elasticsearch","trace_id":"0123456789abcdef0123456789abcdef",`+
+			`"expected_route_version":7,"allowed_pairs":[{"app_id":7,"bk_biz_id":42}]}}}`, 1)
+	code := decodeTraceProfileError(t, runTraceProfileRequest(t, body, "kingeye-apm"))
+	if code != traceprofile.CodeUnboundedRange || called {
+		t.Fatalf("range budget must reject before ES I/O: code=%s called=%v", code, called)
+	}
+}
+
 func TestESMemberLookupChecksPublishedTargetAndVersionBeforeExecution(t *testing.T) {
 	withTraceProfileAuth(t, true, "kingeye-apm")
-	previous := TraceMemberLookupAllowedAppCodes
-	TraceMemberLookupAllowedAppCodes = []string{"kingeye-apm"}
-	t.Cleanup(func() { TraceMemberLookupAllowedAppCodes = previous })
 	body := strings.Replace(typedTraceBody("trace_summary", "system_kapm"), `"limit":100}}`,
 		`"limit":100,"scene":"global","member_lookup":{`+
 			`"backend":"elasticsearch","trace_id":"0123456789abcdef0123456789abcdef",`+

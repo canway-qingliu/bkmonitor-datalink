@@ -130,11 +130,9 @@ var (
 	ClusterMetricQueryPrefix  string
 	ClusterMetricQueryTimeout time.Duration
 
-	JwtPublicKey                     string
-	JwtBkAppCodeSpaces               map[string][]string
-	JwtEnabled                       bool
-	TraceProfileAllowedAppCodes      []string
-	TraceMemberLookupAllowedAppCodes []string
+	JwtPublicKey       string
+	JwtBkAppCodeSpaces map[string][]string
+	JwtEnabled         bool
 
 	ScrollWindowTimeout      string
 	ScrollSessionLockTimeout string

@@ -142,6 +142,46 @@ func TestDecodePreparedRawResult_ExactTotalRejectsApproximateHits(t *testing.T) 
 	assert.Equal(t, int64(10000), total)
 }
 
+func TestDecodePreparedRawResult_ExactTotalRequiresCompleteSearch(t *testing.T) {
+	mock.Init()
+	ctx := metadata.InitHashID(context.Background())
+	instance, err := NewInstance(ctx, &InstanceOption{
+		Connect: Connect{Address: mock.EsUrl}, MaxSize: 100, Timeout: 3 * time.Second,
+	})
+	require.NoError(t, err)
+	prepared, err := instance.PrepareRawQuery(ctx, &metadata.Query{
+		DB: "es_index", Field: "a", TableID: "result_table.es", StorageID: "3",
+		StorageType: metadata.ElasticsearchStorageType, Size: 2,
+		TimeField: metadata.TimeField{Name: "dtEventTimeStamp", Type: TimeFieldTypeTime, Unit: "millisecond"},
+	}, time.UnixMilli(1723593608000), time.UnixMilli(1723679962000), nil)
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name, response string
+		complete       bool
+	}{
+		{"complete", `{"_shards":{"total":1,"successful":1,"failed":0},"hits":{"total":{"value":0,"relation":"eq"},"hits":[]}}`, true},
+		{"timeout", `{"timed_out":true,"_shards":{"total":1,"successful":1,"failed":0},"hits":{"total":{"value":0,"relation":"eq"},"hits":[]}}`, false},
+		{"missing shards", `{"hits":{"total":{"value":0,"relation":"eq"},"hits":[]}}`, false},
+		{"failed shard", `{"_shards":{"total":2,"successful":1,"failed":1},"hits":{"total":{"value":0,"relation":"eq"},"hits":[]}}`, false},
+		{"shard failure detail", `{"_shards":{"total":1,"successful":1,"failed":0,"failures":[{"reason":{"type":"error","reason":"partial"}}]},"hits":{"total":{"value":0,"relation":"eq"},"hits":[]}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var response elastic.SearchResult
+			require.NoError(t, json.Unmarshal([]byte(tc.response), &response))
+			prepared.query.ExactTotal = true
+			_, _, _, err := decodePreparedRawResult(prepared, &response, make(chan map[string]any, 1))
+			if tc.complete {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, "exact total")
+			}
+			prepared.query.ExactTotal = false
+			_, _, _, err = decodePreparedRawResult(prepared, &response, make(chan map[string]any, 1))
+			require.NoError(t, err, "legacy raw decoding must keep its existing behavior")
+		})
+	}
+}
+
 func TestQueryPreparedRawDataMatchesQueryRawData(t *testing.T) {
 	mock.Init()
 	ctx := metadata.InitHashID(context.Background())

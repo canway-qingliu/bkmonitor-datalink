@@ -353,8 +353,14 @@ func decodePreparedRawResult(
 		}
 		return size, total, option, nil
 	}
-	if rawQuery.ExactTotal && (sr.Hits == nil || sr.Hits.TotalHits == nil || sr.Hits.TotalHits.Relation != "eq") {
-		return size, total, option, fmt.Errorf("ES exact total unavailable: total hits relation is not eq")
+	if rawQuery.ExactTotal {
+		// relation=eq 只描述已处理分片的计数，超时或分片失败时仍可能是不完整结果。
+		if sr.TimedOut || sr.Shards == nil || sr.Shards.Failed != 0 || len(sr.Shards.Failures) != 0 {
+			return size, total, option, fmt.Errorf("ES exact total unavailable: search timed out or shards are incomplete")
+		}
+		if sr.Hits == nil || sr.Hits.TotalHits == nil || sr.Hits.TotalHits.Relation != "eq" {
+			return size, total, option, fmt.Errorf("ES exact total unavailable: total hits relation is not eq")
+		}
 	}
 	if sr.Hits != nil {
 		for idx, d := range sr.Hits.Hits {

@@ -34,3 +34,41 @@ func TestTraceProfileRequiresVerifiedAllowlistedWorkload(t *testing.T) {
 		})
 	}
 }
+
+func TestTraceProfileAuthorizationUsesOneRuntimeSnapshot(t *testing.T) {
+	newRuntime := func(app string) *traceProfileRuntime {
+		config := traceProfileRuntimeConfig()
+		config["allowed_bk_app_codes"] = []string{app}
+		config["member_lookup_allowed_bk_app_codes"] = []string{app}
+		runtime, err := newTraceProfileRuntime(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(runtime.close)
+		return runtime
+	}
+	first, second := newRuntime("first-app"), newRuntime("second-app")
+	previous := traceProfileRuntimeValue.Swap(first)
+	t.Cleanup(func() { traceProfileRuntimeValue.Store(previous) })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 10000 {
+			traceProfileRuntimeValue.Store(second)
+			traceProfileRuntimeValue.Store(first)
+		}
+	}()
+	for range 10000 {
+		runtime := traceProfileRuntimeValue.Load()
+		app := runtime.allowedAppCodes[0]
+		if authorizeTraceProfile(true, app, runtime.allowedAppCodes) != nil ||
+			authorizeTraceProfile(true, app, runtime.memberLookupAllowedAppCodes) != nil {
+			t.Error("one request mixed application and member allowlists from different runtimes")
+		}
+	}
+	<-done
+	if authorizeTraceProfile(true, "first-app", second.allowedAppCodes) == nil ||
+		authorizeTraceProfile(true, "second-app", first.memberLookupAllowedAppCodes) == nil {
+		t.Fatal("runtime authorization did not preserve its own allowlists")
+	}
+}

@@ -95,8 +95,7 @@ type traceProfileConfig struct {
 
 	// 单租户 typed Trace 的真实数据租户；应用和空间权限沿用 JWT 鉴权。
 	// 未配置时沿用入站租户，不从请求参数猜测数据归属。
-	SingleTenantID string `json:"single_tenant_id,omitempty"`
-	// 该键由 settings.TraceProfileAllowedAppCodes 负责，这里只为其保留严格解码入口。
+	SingleTenantID                string   `json:"single_tenant_id,omitempty"`
 	AllowedBkAppCodes             []string `json:"allowed_bk_app_codes"`
 	MemberLookupAllowedBkAppCodes []string `json:"member_lookup_allowed_bk_app_codes"`
 }
@@ -129,12 +128,15 @@ type traceProfileRuntime struct {
 	connections    map[string]*dorisclient.Instance
 	maxBodyBytes   int
 	maxLimit       int64
+	maxRangeUS     int64
 	routeVersion   int64
 	routeCount     int
 
 	// 模式和数据租户在同一快照内，避免配置热更新时混用新旧值。
-	singleTenantID  string
-	multiTenantMode bool
+	singleTenantID              string
+	multiTenantMode             bool
+	allowedAppCodes             []string
+	memberLookupAllowedAppCodes []string
 }
 
 func traceProfileMaxRangeUS(days int64) int64 {
@@ -313,11 +315,14 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 		connections:    connections,
 		maxBodyBytes:   config.MaxBodyBytes,
 		maxLimit:       config.MaxLimit,
+		maxRangeUS:     traceProfileMaxRangeUS(config.MaxRangeDays),
 		routeVersion:   config.RouteSnapshotVersion,
 		routeCount:     len(routes),
 
-		singleTenantID:  config.SingleTenantID,
-		multiTenantMode: viper.GetBool(influxdb.MultiTenantModeConfigPath),
+		singleTenantID:              config.SingleTenantID,
+		multiTenantMode:             viper.GetBool(influxdb.MultiTenantModeConfigPath),
+		allowedAppCodes:             config.AllowedBkAppCodes,
+		memberLookupAllowedAppCodes: config.MemberLookupAllowedBkAppCodes,
 	}, nil
 }
 
@@ -375,7 +380,7 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 		return
 	}
 	appCode, verified := middleware.VerifiedJWTAppCode(c)
-	if err := authorizeTraceProfile(verified, appCode, TraceProfileAllowedAppCodes); err != nil {
+	if err := authorizeTraceProfile(verified, appCode, runtime.allowedAppCodes); err != nil {
 		writeTraceProfileReject(ctx, c, traceprofile.CodeUnauthorizedMember, err.Error())
 		return
 	}
@@ -390,8 +395,13 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 		writeTraceProfileReject(ctx, c, traceprofile.CodeUnsupportedSchemaCapability, err.Error())
 		return
 	}
+	// 时间预算属于 typed 合同，Doris 与 ES 成员读取必须在分流前一致校验。
+	if request.EndUS-request.StartUS > runtime.maxRangeUS {
+		writeTraceProfileReject(ctx, c, traceprofile.CodeUnboundedRange, "Trace 查询时间范围超过预算")
+		return
+	}
 	if request.MemberLookup != nil {
-		if err := authorizeTraceProfile(verified, appCode, TraceMemberLookupAllowedAppCodes); err != nil {
+		if err := authorizeTraceProfile(verified, appCode, runtime.memberLookupAllowedAppCodes); err != nil {
 			writeTraceProfileReject(ctx, c, traceprofile.CodeUnauthorizedMember, err.Error())
 			return
 		}
