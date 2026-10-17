@@ -12,7 +12,7 @@ LDFLAGS="-X github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/config
 		-X 'github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/config.GitTag=${GIT_TAG}' \
 		-X 'github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/config.GitCommitter=${GIT_COMMITTER_NAME}' \
 		-X 'github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/config.GitCommitTime=${GIT_COMMIT_TIME}' \
-		-X 'github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/config.BuildTime=$(shell date -u +%Y-%m-%d_%I:%M:%S%p)' \
+		-X 'github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/config.BuildTime=$(shell date -u +%Y-%m-%dT%H:%M:%SZ)' \
 		-X 'github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/config.BuildId=${CI_BUILD_ID}' \
 		-X 'github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/config.BuildNo=${CI_BUILD_NUM}' \
 		-X 'github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/config.Release=${RELEASE_VALUE}'"
@@ -36,9 +36,12 @@ upx: build
 tidy:
 	go mod tidy
 
-.PHONY: test
-test:
+.PHONY: test test-promql
+test: test-promql
 	go test -tags "$(BUILDTAGS)" -cover -timeout 1m -parallel 8  ./...
+
+test-promql:
+	cd third_party/prometheus && go test ./promql/...
 
 .PHONY: swag
 swag:

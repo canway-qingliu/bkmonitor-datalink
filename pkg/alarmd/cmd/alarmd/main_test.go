@@ -17,7 +17,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/config"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/metric"
@@ -41,32 +40,34 @@ func TestRunPrintsVersionWithoutLoadingConfiguration(t *testing.T) {
 
 func TestRunChecksConfigurationWithoutStartingApplication(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "alarmd.yaml")
-	if err := os.WriteFile(path, []byte(validApplicationYAML()), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(validGoAccessApplicationYAML()), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 	want := errors.New("application must not start")
-	dependencies := applicationDependencies{
-		openBundle: func(context.Context, config.Config, *metric.Recorder, *observability.Logger) (*applicationBundle, error) {
-			return nil, want
+	dependencies := runtimeModeDependencies{
+		phaseTwo: phaseTwoApplicationDependencies{
+			run: func(context.Context, config.Config, *metric.Recorder, *observability.Logger) error {
+				return want
+			},
 		},
 	}
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := runWithDependencies(
+	code := runWithRuntimeModeDependencies(
 		context.Background(), []string{"--check-config", "--config", path}, &stdout, &stderr, dependencies,
 	)
 	if code != 0 {
-		t.Fatalf("runWithDependencies() code = %d, stderr = %q", code, stderr.String())
+		t.Fatalf("runWithRuntimeModeDependencies() code = %d, stderr = %q", code, stderr.String())
 	}
 	if strings.Contains(stderr.String(), want.Error()) {
-		t.Fatalf("runWithDependencies() started application: %q", stderr.String())
+		t.Fatalf("runWithRuntimeModeDependencies() started application: %q", stderr.String())
 	}
 }
 
 func TestRunCheckConfigurationRejectsUnknownField(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "alarmd.yaml")
-	contents := validApplicationYAML() + "unknown_field: true\n"
+	contents := validGoAccessApplicationYAML() + "unknown_field: true\n"
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -125,57 +126,53 @@ func TestRunRejectsUnknownFlag(t *testing.T) {
 	}
 }
 
-func TestRunUsesV2RuntimeAfterConfigurationLoads(t *testing.T) {
-	t.Parallel()
-
+func TestRunRoleFlagOverridesYAMLBeforeDependencyValidation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "alarmd.yaml")
-	if err := os.WriteFile(path, []byte(validApplicationYAML()), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
+	contents := "roles: [control]\nredis:\n  address: 127.0.0.1:6379\nphase_two:\n  worker:\n    id: channel-fixture\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	want := errors.New("sink open failed")
-	dependencies := applicationDependencies{
-		openBundle: func(context.Context, config.Config, *metric.Recorder, *observability.Logger) (*applicationBundle, error) {
-			return nil, want
-		},
-		newHTTP: func(*metric.Recorder, observability.HealthSource) (httpRuntime, error) {
-			return &fakeHTTPRuntime{run: func(ctx context.Context, _ string, _ time.Duration) error {
-				<-ctx.Done()
-				return nil
-			}}, nil
-		},
-	}
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	code := runWithDependencies(context.Background(), []string{"--config", path}, &stdout, &stderr, dependencies)
-	if code != 1 || !strings.Contains(stderr.String(), want.Error()) {
-		t.Fatalf("runWithDependencies() code=%d stderr=%q, want sink open failure", code, stderr.String())
+	for _, selected := range []string{"channel", "", "unknown", "worker,worker"} {
+		t.Run(selected, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := runWithRuntimeModeDependencies(context.Background(),
+				[]string{"--check-config", "--config", path, "--roles=" + selected}, &stdout, &stderr, runtimeModeDependencies{})
+			if selected == "channel" {
+				if code != 0 {
+					t.Fatalf("role override failed: code=%d stderr=%s", code, &stderr)
+				}
+			} else if code != 2 || !strings.Contains(stderr.String(), "roles") {
+				t.Fatalf("invalid roles were accepted: code=%d stderr=%s", code, &stderr)
+			}
+		})
 	}
 }
 
-func validApplicationYAML() string {
-	return `mode: shadow
-http:
+func validGoAccessApplicationYAML() string {
+	return `http:
   listen: 127.0.0.1:8080
-shutdown_timeout: 1s
 kafka:
   brokers:
     - 127.0.0.1:9092
-  input_topic: alarmd-shadow-input-v2
   trigger_event:
-    topic: alarmd-shadow-trigger-event-v1
-    max_message_bytes: 524288
-  message_receipt:
-    topic: alarmd-shadow-message-receipt-v1
-    max_message_bytes: 524288
-  allowed_output_topics:
-    - alarmd-shadow-trigger-event-v1
-    - alarmd-shadow-message-receipt-v1
-  group_id: alarmd-shadow-v2
-  client_id: alarmd
-  broker_version: 2.6.0
-  initial_offset: oldest
+    topic: alarmd-shadow-trigger-event-v2
+  legacy_adapter:
+    topic: alarmd_0bkmonitor_backend_event
+    snapshot_prefix: alarmd-compatibility-test
+    service_redis:
+      mode: standalone
+      address: 127.0.0.1:6379
 redis:
   address: 127.0.0.1:6379
-  state_prefix: alarmd-shadow
+  state_prefix: alarmd-phase-two
+phase_two:
+  worker:
+    id: alarmd-worker-0
+  control:
+    strategy_cache_prefix: alarm-config
+    timezone: Asia/Shanghai
+  access:
+    uq_endpoint: http://unify-query.service
+    query_source: alarmd
 `
 }

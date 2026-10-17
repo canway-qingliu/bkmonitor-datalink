@@ -253,7 +253,9 @@ func HandlerQueryRaw(c *gin.Context) {
 
 	// 解析请求 body
 	queryTs := &structured.QueryTs{}
-	err = json.NewDecoder(c.Request.Body).Decode(queryTs)
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.UseNumber()
+	err = decoder.Decode(queryTs)
 	if err != nil {
 		resp.failed(ctx, err)
 		return
@@ -275,6 +277,13 @@ func HandlerQueryRaw(c *gin.Context) {
 	listData.TraceID = span.TraceID()
 
 	if err = validateQueryTsDataSource(queryTs); err != nil {
+		resp.failed(ctx, metadata.NewMessage(
+			metadata.MsgQueryRaw,
+			"查询参数校验异常",
+		).Error(ctx, err))
+		return
+	}
+	if err = validateQueryTsRawPagination(queryTs); err != nil {
 		resp.failed(ctx, metadata.NewMessage(
 			metadata.MsgQueryRaw,
 			"查询参数校验异常",
@@ -307,6 +316,22 @@ func HandlerQueryRaw(c *gin.Context) {
 	resp.success(ctx, listData)
 }
 
+// exactTotalRequested reports whether any query of the request opted into an exact ES total.
+func exactTotalRequested(request *structured.QueryTs) bool {
+	if request == nil {
+		return false
+	}
+	for _, item := range request.QueryList {
+		if item != nil && item.ExactTotal {
+			return true
+		}
+	}
+	return false
+}
+
+// exactTotalAttested reports whether the returned total can be marked exact: one plain raw ES query that asked for it,
+// every resolved route on Elasticsearch, and nothing (merge, aggregation, SQL, scroll, collapse) that changes what the
+// total counts.
 func exactTotalAttested(request *structured.QueryTs, routes []metadata.RouteInfo) bool {
 	if request == nil || len(request.QueryList) != 1 || request.QueryList[0] == nil ||
 		!request.QueryList[0].ExactTotal || request.IsESBatch || len(routes) == 0 ||
@@ -325,18 +350,10 @@ func exactTotalAttested(request *structured.QueryTs, routes []metadata.RouteInfo
 	return true
 }
 
+// requireExactTotalAttestation fails a request that asked for an exact total it cannot be given, instead of returning
+// an unmarked total that looks exact.
 func requireExactTotalAttestation(request *structured.QueryTs, routes []metadata.RouteInfo) error {
-	if request == nil {
-		return nil
-	}
-	requested := false
-	for _, item := range request.QueryList {
-		if item != nil && item.ExactTotal {
-			requested = true
-			break
-		}
-	}
-	if requested && !exactTotalAttested(request, routes) {
+	if exactTotalRequested(request) && !exactTotalAttested(request, routes) {
 		return fmt.Errorf("ES exact total request requires one non-aggregated ES raw branch")
 	}
 	return nil
@@ -385,7 +402,9 @@ func HandlerQueryRawWithScroll(c *gin.Context) {
 	span.Set("query-space-uid", user.SpaceUID)
 
 	queryTs := &structured.QueryTs{}
-	err = json.NewDecoder(c.Request.Body).Decode(queryTs)
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.UseNumber()
+	err = decoder.Decode(queryTs)
 	if err != nil {
 		return
 	}
@@ -399,6 +418,15 @@ func HandlerQueryRawWithScroll(c *gin.Context) {
 	}
 
 	if err = validateQueryTsDataSource(queryTs); err != nil {
+		return
+	}
+	if queryTs.IsSearchAfter {
+		err = fmt.Errorf("is_search_after is not supported by query_raw_with_scroll")
+		return
+	}
+	if exactTotalRequested(queryTs) {
+		// a scrolled total is summed page by page and across routes; it cannot be attested as exact
+		err = fmt.Errorf("exact_total is not supported by query_raw_with_scroll")
 		return
 	}
 
@@ -553,6 +581,16 @@ func HandlerQueryTs(c *gin.Context) {
 		return
 	}
 
+	negotiation := resp.queryTsSharedSchemaNegotiation(query)
+	if negotiation.explicit {
+		varyAccept(c.Writer.Header())
+	}
+	if negotiation.reject {
+		err = fmt.Errorf("shared schema v1 requires application/json fallback in Accept")
+		resp.sharedSchemaNotAcceptable(ctx)
+		return
+	}
+
 	var res any
 	if query.ResponseContract == structured.NamedOutputsV1 {
 		res, err = queryTsNamedOutputs(ctx, query)
@@ -566,6 +604,12 @@ func HandlerQueryTs(c *gin.Context) {
 
 	span.Set("resp-size", fmt.Sprint(unsafe.Sizeof(res)))
 
+	if negotiation.selected {
+		if data, ok := res.(*PromData); ok {
+			err = resp.sharedSchemaSuccess(ctx, data)
+			return
+		}
+	}
 	resp.success(ctx, res)
 }
 
@@ -578,9 +622,9 @@ func HandlerQueryTs(c *gin.Context) {
 // @Param    X-Bk-Scope-Space-Uid   header    string                        false  "空间UID" default(bkcc__2)
 // @Param	 X-Bk-Scope-Skip-Space  header	  string						false  "是否跳过空间验证" default()
 // @Param    data                  	body      structured.QueryPromQL  		true   "json data"
-// @Success  200                   	{object}  PromData
+// @Success  200                   	{object}  QueryTsResponse
 // @Failure  400                   	{object}  ErrResponse
-// @Router   /query/promql [post]
+// @Router   /query/ts/promql [post]
 func HandlerQueryPromQL(c *gin.Context) {
 	var (
 		ctx = c.Request.Context()
@@ -627,6 +671,15 @@ func HandlerQueryPromQL(c *gin.Context) {
 			metadata.MsgQueryPromQL,
 			"查询语句不能为空",
 		).Error(ctx, err))
+		return
+	}
+	if queryPromQL.ResponseContract != "" || queryPromQL.LegacyOutputRef != "" || len(queryPromQL.OutputList) > 0 {
+		res, queryErr := queryPromQLNamedOutputs(ctx, queryPromQL)
+		if queryErr != nil {
+			resp.failed(ctx, queryErr)
+			return
+		}
+		resp.success(ctx, res)
 		return
 	}
 
@@ -804,6 +857,21 @@ func validateQueryTsDataSource(queryTs *structured.QueryTs) error {
 				ds, q.ReferenceName,
 			)
 		}
+	}
+	return nil
+}
+
+// validateQueryTsRawPagination validates options that are incompatible with
+// the raw SearchAfter execution path. Doris may fall back to per-result-table
+// offset pagination when a legacy table has neither __unique_key__ nor the
+// composite cursor fields, so from is intentionally validated by the query
+// factory after the storage schema is known.
+func validateQueryTsRawPagination(queryTs *structured.QueryTs) error {
+	if queryTs == nil || !queryTs.IsSearchAfter {
+		return nil
+	}
+	if queryTs.Scroll != "" {
+		return fmt.Errorf("is_search_after cannot be combined with scroll")
 	}
 	return nil
 }

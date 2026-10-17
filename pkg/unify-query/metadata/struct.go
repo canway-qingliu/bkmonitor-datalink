@@ -78,6 +78,8 @@ type FieldOption struct {
 	IsAgg           bool   `json:"is_agg"`
 	IsAnalyzed      bool   `json:"is_analyzed"`
 	IsCaseSensitive bool   `json:"is_case_sensitive"`
+	// HasMixedTypes 表示跨索引同名字段的类型不一致，不能按单一类型优化查询。
+	HasMixedTypes bool `json:"has_mixed_types,omitempty"`
 	// IsCaseInsensitive 只在 mapping 明确证明 keyword/text 会 lowercase 时置 true。
 	// 不能只用 IsCaseSensitive 的 false 值，因为历史/手写 FieldsMap 里的 keyword 零值仍应按大小写敏感处理。
 	IsCaseInsensitive bool `json:"is_case_insensitive,omitempty"`
@@ -142,6 +144,18 @@ const (
 	TraceProfileSummary TraceProfile = "trace_summary"
 )
 
+// QueryCostProfile describes structural query properties used for observation.
+// It must not be used as an environment-independent admission policy.
+type QueryCostProfile struct {
+	SelectAllCandidate bool
+	RangeFunction      bool
+	StepLessThanWindow bool
+	ASTBranchCount     int
+	SQLPushdown        bool
+	Window             time.Duration
+	Step               time.Duration
+}
+
 // Query 查询扩展信息，为后面查询提供定位
 type Query struct {
 	SourceType string `json:"source_type,omitempty"`
@@ -184,6 +198,8 @@ type Query struct {
 
 	Aggregates Aggregates `json:"aggregates,omitempty"` // 聚合方法列表，从内到外排序
 
+	CostProfile QueryCostProfile `json:"-"`
+
 	Condition string `json:"condition,omitempty"` // 过滤条件
 
 	// Vm 过滤条件
@@ -214,10 +230,11 @@ type Query struct {
 	Source []string `json:"source,omitempty"`
 	From   int      `json:"from,omitempty"`
 	Size   int      `json:"size,omitempty"`
-	// ExactTotal 仅在显式请求时令 ES 统计全部命中，供跨分支真实 total 归并。
+	// ExactTotal asks Elasticsearch to count every hit (track_total_hits); only set when the caller requests it.
 	ExactTotal bool `json:"exact_total,omitempty"`
 
 	Scroll            string             `json:"scroll,omitempty"`
+	IsSearchAfter     bool               `json:"is_search_after,omitempty"`
 	ResultTableOption *ResultTableOption `json:"result_table_option,omitempty"`
 
 	Orders      Orders    `json:"orders,omitempty"`

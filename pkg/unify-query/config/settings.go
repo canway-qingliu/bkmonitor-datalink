@@ -14,8 +14,10 @@ const (
 )
 
 var (
-	Version       = "?.?.?"
-	CommitHash    = "unknown"
+	Version    = "?.?.?"
+	CommitHash = "unknown"
+
+	// Build metadata, set through -ldflags at build time; empty when the build did not provide it.
 	GitTag        = ""
 	GitCommitter  = ""
 	GitCommitTime = ""

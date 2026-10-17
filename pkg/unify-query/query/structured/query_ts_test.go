@@ -45,14 +45,6 @@ func TestQueryTsIsESBatchJSON(t *testing.T) {
 	assert.JSONEq(t, `{"instant":false,"not_time_align":false,"is_es_batch":true}`, string(content))
 }
 
-func TestQueryExactTotalPassesToESMetadata(t *testing.T) {
-	var queryItem Query
-	require.NoError(t, json.Unmarshal([]byte(`{"exact_total":true}`), &queryItem))
-	ctx := md.InitHashID(context.Background())
-	prepared := queryItem.BuildMetadataQuery(ctx, &uqQuery.TsDBV2{}, nil)
-	assert.True(t, prepared.ExactTotal)
-}
-
 func TestQueryToMetric(t *testing.T) {
 	db := "result_table"
 	tableID := influxdb.ResultTableInfluxDB
@@ -565,6 +557,43 @@ func TestQueryToMetricStorageClusterRecordStorageType(t *testing.T) {
 	assert.Equal(t, md.ElasticsearchStorageType, storageTypes["1"])
 }
 
+func TestQueryTsSearchAfterIsNotPropagatedToMetric(t *testing.T) {
+	mock.Init()
+	ctx := md.InitHashID(context.Background())
+
+	queryTs := &QueryTs{
+		Start:         "1741056443",
+		End:           "1741060043",
+		Step:          "1m",
+		IsSearchAfter: true,
+		QueryList: []*Query{
+			{
+				DataSource:    BkLog,
+				TableID:       "result_table.es",
+				FieldName:     "dtEventTimeStamp",
+				ReferenceName: "a",
+			},
+		},
+		TsDBMap: map[string]TsDBs{
+			"a": {
+				&uqQuery.TsDBV2{
+					TableID:     "result_table.es",
+					DataLabel:   "log_index_set_test",
+					StorageID:   "1",
+					StorageType: md.ElasticsearchStorageType,
+					DB:          "es_index",
+					Measurement: "__default__",
+				},
+			},
+		},
+	}
+	queryReference, err := queryTs.ToQueryReference(ctx)
+	require.NoError(t, err)
+	require.Len(t, queryReference["a"], 1)
+	require.Len(t, queryReference["a"][0].QueryList, 1)
+	assert.False(t, queryReference["a"][0].QueryList[0].IsSearchAfter)
+}
+
 func TestQueryToMetricStorageClusterRecordStorageTypeFromResultTableDetail(t *testing.T) {
 	mock.Init()
 	ctx := md.InitHashID(context.Background())
@@ -691,7 +720,7 @@ func TestBkData_SQL_ToFinalSQL(t *testing.T) {
 				ReferenceName: "a",
 				SQL:           "SELECT dtEventTimeStamp, gseIndex FROM `2_bklog_unit_test`.doris WHERE gseIndex > 0 LIMIT 20",
 			},
-			wantSQL: "SELECT NULL AS dtEventTimeStamp, NULL AS gseIndex FROM `2_bklog_unit_test`.doris WHERE NULL > 0 AND (`dtEventTimeStamp` >= 1741795260000 AND `dtEventTimeStamp` <= 1741796260000 AND `dtEventTime` >= '2025-03-13 00:01:00' AND `dtEventTime` <= '2025-03-13 00:17:41' AND `thedate` = '20250313') LIMIT 20",
+			wantSQL: "SELECT NULL AS dtEventTimeStamp, NULL AS gseIndex FROM `2_bklog_unit_test`.doris WHERE (NULL > 0) AND ((`dtEventTimeStamp` >= 1741795260000 AND `dtEventTimeStamp` <= 1741796260000 AND `dtEventTime` >= '2025-03-13 00:01:00' AND `dtEventTime` <= '2025-03-13 00:17:41' AND `thedate` = '20250313')) LIMIT 20",
 		},
 		{
 			// tspider 表：Measurement="" 单段 table_id，表名无后缀
@@ -704,7 +733,7 @@ func TestBkData_SQL_ToFinalSQL(t *testing.T) {
 				ReferenceName: "a",
 				SQL:           "SELECT dtEventTimeStamp, gseIndex FROM `2_bklog_unit_test` WHERE gseIndex > 0 LIMIT 20",
 			},
-			wantSQL: "SELECT NULL AS dtEventTimeStamp, NULL AS gseIndex FROM `2_bklog_unit_test` WHERE NULL > 0 AND (`dtEventTimeStamp` >= 1741795260000 AND `dtEventTimeStamp` < 1741796260000 AND `dtEventTime` >= '2025-03-13 00:01:00' AND `dtEventTime` <= '2025-03-13 00:17:41' AND `thedate` = '20250313') LIMIT 20",
+			wantSQL: "SELECT NULL AS dtEventTimeStamp, NULL AS gseIndex FROM `2_bklog_unit_test` WHERE (NULL > 0) AND ((`dtEventTimeStamp` >= 1741795260000 AND `dtEventTimeStamp` < 1741796260000 AND `dtEventTime` >= '2025-03-13 00:01:00' AND `dtEventTime` <= '2025-03-13 00:17:41' AND `thedate` = '20250313')) LIMIT 20",
 		},
 		{
 			// 无用户 SQL：走 buildSQL 路径，SELECT 中包含内置字段 _value_ / _timestamp_
@@ -2357,6 +2386,7 @@ func TestQueryTs_ToQueryReference_DataSourceAlias(t *testing.T) {
 			{BkApm, "bk_apm 应被规范化为 bkapm"},
 		} {
 			assert.Equal(t, tc.want, ts.QueryList[i].DataSource, tc.msg)
+			assert.Equal(t, 2, ts.QueryList[i].ASTBranchCount)
 		}
 	})
 }
@@ -2456,4 +2486,103 @@ func TestOrderBy(t *testing.T) {
 			"minute1":      "202507221020",
 		},
 	}, data)
+}
+
+func TestBkDataQueryCostProfileIsObservationOnly(t *testing.T) {
+	ctx := md.InitHashID(context.Background())
+
+	rawMetric, err := (&Query{
+		DataSource: BkData,
+		TableID:    "2_cdn_flow",
+		FieldName:  "metric_value2",
+		Step:       "1m",
+		TimeAggregation: TimeAggregation{
+			Function: "count_over_time",
+			Window:   "1d",
+		},
+	}).ToQueryMetric(ctx, influxdb.SpaceUid, nil)
+	require.NoError(t, err)
+	require.Len(t, rawMetric.QueryList, 1)
+	require.Equal(t, md.QueryCostProfile{
+		SelectAllCandidate: true,
+		RangeFunction:      true,
+		StepLessThanWindow: true,
+		ASTBranchCount:     1,
+		Window:             24 * time.Hour,
+		Step:               time.Minute,
+	}, rawMetric.QueryList[0].CostProfile)
+
+	downsampledMetric, err := (&Query{
+		DataSource: BkData,
+		TableID:    "2_cdn_flow",
+		FieldName:  "metric_value2",
+		Step:       "1m",
+		AggregateMethodList: AggregateMethodList{{
+			Method:     "sum",
+			Dimensions: []string{"url"},
+		}},
+		TimeAggregation: TimeAggregation{
+			Function: "count_over_time",
+			Window:   "1m",
+		},
+	}).ToQueryMetric(ctx, influxdb.SpaceUid, nil)
+	require.NoError(t, err)
+	require.Len(t, downsampledMetric.QueryList, 1)
+	require.Equal(t, md.QueryCostProfile{
+		RangeFunction:  true,
+		ASTBranchCount: 1,
+		SQLPushdown:    true,
+		Window:         time.Minute,
+		Step:           time.Minute,
+	}, downsampledMetric.QueryList[0].CostProfile)
+
+	subqueryMetric, err := (&Query{
+		DataSource: BkData,
+		TableID:    "2_cdn_flow",
+		FieldName:  "metric_value2",
+		Step:       "1d",
+		TimeAggregation: TimeAggregation{
+			Function:   "count_over_time",
+			Window:     "1d",
+			IsSubQuery: true,
+			Step:       "1m",
+		},
+	}).ToQueryMetric(ctx, influxdb.SpaceUid, nil)
+	require.NoError(t, err)
+	require.Len(t, subqueryMetric.QueryList, 1)
+	require.Equal(t, md.QueryCostProfile{
+		SelectAllCandidate: true,
+		RangeFunction:      true,
+		StepLessThanWindow: true,
+		ASTBranchCount:     1,
+		Window:             24 * time.Hour,
+		Step:               time.Minute,
+	}, subqueryMetric.QueryList[0].CostProfile)
+}
+
+func TestQueryASTBranchCountUsesMetricMergeSelectors(t *testing.T) {
+	require.Equal(t, 2, queryASTBranchCount("a + a", 1))
+	require.Equal(t, 1, queryASTBranchCount("sum(a)", 2))
+	require.Equal(t, 2, queryASTBranchCount("invalid(", 2))
+}
+
+func TestQueryCostRangeProfileChoosesDensestNestedRange(t *testing.T) {
+	query := &Query{
+		Step: "1h",
+		TimeAggregation: TimeAggregation{
+			Function: "avg_over_time",
+			Window:   "5m",
+		},
+		AggregateMethodList: AggregateMethodList{{
+			Method:     "count_over_time",
+			Window:     "1d",
+			IsSubQuery: true,
+			Step:       "1m",
+		}},
+	}
+
+	hasRangeFunction, window, step := query.queryCostRangeProfile()
+	require.True(t, hasRangeFunction)
+	require.Equal(t, 24*time.Hour, window)
+	require.Equal(t, time.Minute, step)
 }

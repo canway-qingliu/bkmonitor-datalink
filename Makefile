@@ -7,6 +7,11 @@ COMMIT_ID = $(shell git rev-parse HEAD)
 MODULE =
 RELEASE ?= false
 
+# Preserve the UQ/BMW module defaults while allowing an explicit JSON_LIB=.
+ifneq ($(filter $(MODULE),unify-query bk-monitor-worker),)
+JSON_LIB ?= jsonsonic
+endif
+
 VERSION_FILE = $(if $(strip $(MODULE)),$(PWD)/pkg/$(MODULE)/VERSION,)
 MODULE_VERSION = $(subst v,ee-V, $(strip $(shell [ -n "$(VERSION_FILE)" ] && cat "$(VERSION_FILE)" || true)))
 BRANCH ?= $(shell git symbolic-ref --short HEAD)

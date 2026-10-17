@@ -157,14 +157,14 @@
 | `instant`           | bool   | 否   | 是否为瞬时查询                                                                                                                                                                                                                        |
 | `reference`         | bool   | 否   | 查询开始时间是否需要对齐                                                                                                                                                                                                              |
 | `not_time_align`    | bool   | 否   | 查询开始时间和聚合是否需要对齐                                                                                                                                                                                                        |
-| `from`              | int    | 否   | 翻页起始位置                                                                                                                                                                                                                          |
+| `from`              | int    | 否   | 翻页起始位置；Doris `is_search_after` 在缺少稳定游标字段时会自动使用该值进行 offset 分页                                                                                                                                                 |
 | `tsdb_map`          | object | 否   | 查询路由匹配中的 tsDB 列表，key 为 `reference_name`，用于直接指定存储信息（高级用法）                                                                                                                                                 |
 | `order_by`          | array  | 否   | 排序字段列表，按顺序排序，负数代表倒序，如 `["_time", "-_value"]`                                                                                                                                                                     |
 | `result_columns`    | array  | 否   | 指定保留返回字段值（内部使用）                                                                                                                                                                                                        |
 | `scroll`            | string | 否   | 滚动查询窗口超时时间，如 `3m`（用于 Elasticsearch 滚动查询）                                                                                                                                                                          |
 | `slice_max`         | int    | 否   | 最大切片数量（用于滚动查询）                                                                                                                                                                                                          |
 | `is_multi_from`     | bool   | 否   | 是否启用 MultiFrom 查询（用于 Elasticsearch）                                                                                                                                                                                         |
-| `is_search_after`   | bool   | 否   | 是否启用 SearchAfter 查询（用于 Elasticsearch）                                                                                                                                                                                       |
+| `is_search_after`   | bool   | 否   | 仅用于 `/query/raw` 原始查询。Elasticsearch 使用原生游标；Doris 对非聚合、非 DISTINCT 查询优先使用 `__unique_key__`，缺少时尝试 `dtEventTimeStamp + gseIndex + iterationIndex` 组合游标，再缺少时降级为 `from + limit`。不能与 `scroll` 同时使用；`TSpider` 不在 Doris SearchAfter 支持范围内 |
 | `clear_cache`       | bool   | 否   | 是否强制清理已存在的缓存会话（用于滚动查询）                                                                                                                                                                                          |
 | `highlight`         | object | 否   | 高亮配置（用于 Elasticsearch 查询）                                                                                                                                                                                                   |
 | `dry_run`           | bool   | 否   | 是否启用 DryRun（仅验证查询，不执行）                                                                                                                                                                                                 |
@@ -374,6 +374,30 @@
 
 **响应格式**: 同结构体查询（返回 `PromData` 格式，包含 `result_table_id`）
 
+#### PromQL 命名多输出（可选）
+
+告警策略需要在通知中同时展示判定结果和参与计算的 PromQL 值时，可在原请求上增加 `response_contract`、`legacy_output_ref`、`output_list`。每个 `output_list[].expression` 都是完整 PromQL，使用同一组时间、步长及其他查询参数；`legacy_output_ref` 指向的表达式必须与顶层 `promql` 等价。未添加这些字段时，响应仍是原来的单输出 `PromData`。
+
+```json
+{
+  "promql": "(sum(rate(error_count[5m])) / sum(rate(request_count[5m]))) * 100",
+  "response_contract": "named_outputs/v1",
+  "legacy_output_ref": "C",
+  "output_list": [
+    {"reference_name": "A", "expression": "sum(rate(error_count[5m]))"},
+    {"reference_name": "B", "expression": "sum(rate(request_count[5m]))"},
+    {"reference_name": "C", "expression": "(sum(rate(error_count[5m])) / sum(rate(request_count[5m]))) * 100"}
+  ],
+  "start": "1724490000",
+  "end": "1724490060",
+  "step": "60s"
+}
+```
+
+响应沿用上述 `named_outputs/v1` 的 `contract_version`、`outputs[].reference_name/state/series`、`is_partial` 和 `result_table_id` 结构；不直接返回 `ref_values`。最多 4 个输出，所有输出共享截止时间、Selector 缓存、Series/点数和响应大小预算；Selector 缓存仅在路由和选择器键相同时复用，不保证不同 PromQL 之间命中。服务先执行判定值 `C`，再执行其他输出，响应仍按 `output_list` 顺序排列。单个输出失败时遵循同一 partial 规则。一个 HTTP 请求不保证只发生一次底层存储读取。
+
+`response_contract` 缺失但带有其他命名输出字段、未知契约、重复或非法引用名、错误的 PromQL、`C` 与顶层 `promql` 不等价，均在查询前拒绝。部署旧版 UQ 时，旧服务可能忽略新增字段并返回原 `PromData`；调用方应检查响应中的 `contract_version` 后再读取 `outputs`。
+
 ### 2.3 引用查询
 
 **接口**: `POST /query/ts/reference`
@@ -390,7 +414,7 @@
 
 **接口**: `POST /query/ts/raw`
 
-**描述**: 执行原始查询，返回原始数据列表（用于特殊场景，如 Elasticsearch 查询）。
+**描述**: 执行原始查询，返回原始数据列表（用于 Elasticsearch、Doris 等存储）。`is_search_after` 仅在此接口生效；Doris 查询不能包含聚合、`DISTINCT` 或自定义 SQL。结果表存在 `__unique_key__` 时使用稳定 keyset 游标；缺少时尝试兼容组合游标，仍缺少时降级为 offset 分页。
 
 **请求头**: 同结构体查询（需要 `X-Bk-Scope-Space-Uid`）
 
@@ -414,6 +438,8 @@ Kingeye 单租户发布物可选 `es_summary_targets`，每项目标包含租户
 `member_lookup.backend` 可显式为 `elasticsearch`，省略时按原 Doris 分支执行；ES 模式只接受一个 `(app_id,bk_biz_id)` 对。UQ 先按已发布的租户/业务/应用/域目标和单租户版本核对，再用受信逻辑 RT 生成精确 Trace、成对应用/业务、租户/域及微秒时间条件，走现有 raw ES 执行器。实际 RT 路由的时间字段必须在 ES I/O 前解析为 `min_start_time/long/microsecond`，默认 `dtEventTimeStamp` 明确拒绝；校验后的路由引用直接用于 ES 执行，避免再次解析时切到不同的时间字段。返回前复核 RT、ES 存储类型/集群、真实 total、全部命中行和版本，把兼容 ES Summary 字段转换为闭合 typed Summary 行；任一子路由部分失败拒绝整次。本地模拟 Metadata RT 与 ES `_search` 已跑通真实 raw 路由，统计对象的点号展平字段按 Flink 固定的 6+4 键完整还原。目标 RT 读别名、ES mapping、保留期暖机与真实数据面仍待验证，不代表 T6.6 产品准入。
 
 可选本机真 ES 验证：设置 `ES_TEST_URL`（只接受 loopback HTTP）、`ES_TEST_USERNAME`、`ES_TEST_PASSWORD`，运行 `go test ./service/http -run '^TestESSummaryMemberLookupAgainstLocalElasticsearch$' -count=1`。测试在隔离临时索引及读别名写入同 Trace 的目标/外来应用 Summary，用真实 ES mapping 和 `_search` 验证精确过滤、typed 行及统计字段还原，结束时删除临时索引。缺环境变量时跳过；这不证明目标 RT 与目标读别名、保留期暖机或真实业务数据可查。
+
+`query_list[].exact_total`（bool，默认 `false`）：请求 Elasticsearch 返回精确命中总数（`track_total_hits`）。仅对单个、非聚合、全部路由到 ES 的原始查询生效（不含 `sql`、`scroll`、`collapse`、多查询合并），其他情况直接报错而不是返回看似精确的总数；ES 响应超时、分片失败或 `total.relation` 不为 `eq` 时报错；任一 ES 路由缺少索引前缀时报错（不请求时仍按原逻辑跳过该路由）。满足时响应带 `"total_exact": true`。不设置时请求体与响应与之前一致。
 
 **响应格式**: 返回 `ListData` 格式
 
@@ -1065,13 +1091,13 @@ typed Trace 信封不支持 scroll；上述预留字段在本入口会先返回 
 
 **响应**: HTTP 200 表示服务正常
 
-### 7.2 打印路由信息
+### 7.2 旧路由诊断兼容入口
 
 **接口**: `GET /print`
 
-**描述**: 打印当前的路由信息（用于调试）。
+**描述**: 旧 Consul 表属性和 DataID 路由缓存已退出，此接口保留兼容入口，不再加载或打印旧缓存。
 
-**响应**: 文本格式的路由信息
+**响应**: HTTP 200，文本说明旧诊断已退出，并返回当前配置的空间、Storage 和 InfluxDB 路由诊断地址；默认分别为 `/space_print`、`/tsdb_print` 和 `/influxdb_print`。
 
 ### 7.3 打印 InfluxDB 信息
 
