@@ -61,6 +61,14 @@ type MemberLookup struct {
 	AllowedPairs         []MemberPair `json:"allowed_pairs"`
 }
 
+// ESSummaryList 仅声明受信应用和已发布版本；物理 RT 由 UQ 路由解析。
+type ESSummaryList struct {
+	Backend              string `json:"backend"`
+	AppID                int64  `json:"app_id"`
+	BkBizID              int64  `json:"bk_biz_id"`
+	ExpectedRouteVersion int64  `json:"expected_route_version"`
+}
+
 const (
 	MemberBackendDoris         = "doris"
 	MemberBackendElasticsearch = "elasticsearch"
@@ -82,6 +90,7 @@ type Request struct {
 	Limit               int64
 	Offset              *int64
 	MemberLookup        *MemberLookup
+	ESSummaryList       *ESSummaryList
 	Aggregation         *CountAggregation
 }
 
@@ -105,6 +114,7 @@ type wireRequest struct {
 	Offset                   json.RawMessage `json:"offset,omitempty"`
 	PageToken                json.RawMessage `json:"page_token,omitempty"`
 	MemberLookup             json.RawMessage `json:"member_lookup,omitempty"`
+	ESSummaryList            json.RawMessage `json:"es_summary_list,omitempty"`
 	Aggregation              json.RawMessage `json:"aggregation,omitempty"`
 }
 
@@ -189,7 +199,7 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 	var aggregation *CountAggregation
 	if len(query.Aggregation) != 0 {
 		if bytes.Equal(query.Aggregation, []byte("null")) || offset != nil || len(query.OrderBy) != 0 ||
-			len(query.MemberLookup) != 0 {
+			len(query.MemberLookup) != 0 || len(query.ESSummaryList) != 0 {
 			return Request{}, fmt.Errorf("Trace 聚合不能混用分页、排序或成员查询")
 		}
 		aggregationDecoder := json.NewDecoder(bytes.NewReader(query.Aggregation))
@@ -218,7 +228,8 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 	}
 	var memberLookup *MemberLookup
 	if len(query.MemberLookup) != 0 {
-		if bytes.Equal(query.MemberLookup, []byte("null")) || wire.TraceProfile != metadata.TraceProfileSummary ||
+		if bytes.Equal(query.MemberLookup, []byte("null")) || len(query.ESSummaryList) != 0 ||
+			wire.TraceProfile != metadata.TraceProfileSummary ||
 			scene != "global" || offset != nil || len(query.Filters.FieldList) != 0 ||
 			len(query.Filters.ConditionList) != 0 || len(query.OrderBy) != 0 {
 			return Request{}, fmt.Errorf("Summary 成员查询模式不能混用列表条件或分页")
@@ -240,6 +251,31 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 		}
 		memberLookup = &lookup
 	}
+	var esSummaryList *ESSummaryList
+	if len(query.ESSummaryList) != 0 {
+		if bytes.Equal(query.ESSummaryList, []byte("null")) || memberLookup != nil || aggregation != nil ||
+			wire.TraceProfile != metadata.TraceProfileSummary || scene != "global" ||
+			endUS-startUS > 30*86_400_000_000 {
+			return Request{}, fmt.Errorf("ES Summary 列表模式、场景或三十天上限非法")
+		}
+		listDecoder := json.NewDecoder(bytes.NewReader(query.ESSummaryList))
+		listDecoder.DisallowUnknownFields()
+		var target ESSummaryList
+		if err := listDecoder.Decode(&target); err != nil {
+			return Request{}, fmt.Errorf("ES Summary 列表身份非法: %w", err)
+		}
+		if err := listDecoder.Decode(&extra); err != io.EOF || target.Backend != MemberBackendElasticsearch ||
+			target.AppID <= 0 || target.BkBizID <= 0 || target.ExpectedRouteVersion <= 0 {
+			return Request{}, fmt.Errorf("ES Summary 列表缺少单应用和发布版本")
+		}
+		if len(query.OrderBy) != 2 || query.OrderBy[0] != "-min_start_time" || query.OrderBy[1] != "trace_id" {
+			return Request{}, fmt.Errorf("ES Summary 列表必须按开始时间与 Trace ID 稳定排序")
+		}
+		if _, err := ParseESSummaryListPredicate(*query.Filters); err != nil {
+			return Request{}, err
+		}
+		esSummaryList = &target
+	}
 	for _, order := range query.OrderBy {
 		if !orderPattern.MatchString(order) {
 			return Request{}, fmt.Errorf("Trace profile 排序字段非法")
@@ -250,8 +286,9 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 		ObservationDomainID: query.ObservationDomainID, Scene: scene,
 		StartUS: startUS, EndUS: endUS, Filters: *query.Filters,
 		OrderBy: append([]string(nil), query.OrderBy...), Limit: query.Limit, Offset: offset,
-		MemberLookup: memberLookup,
-		Aggregation:  aggregation,
+		MemberLookup:  memberLookup,
+		ESSummaryList: esSummaryList,
+		Aggregation:   aggregation,
 	}, nil
 }
 

@@ -459,6 +459,39 @@ func TestESMemberLookupChecksPublishedTargetAndVersionBeforeExecution(t *testing
 	}
 }
 
+func TestESSummaryListUsesPublishedTargetInsteadOfDorisRoute(t *testing.T) {
+	withTraceProfileAuth(t, true, "kingeye-apm")
+	config := traceProfileRuntimeConfig()
+	config["es_summary_targets"] = []any{map[string]any{
+		"bk_tenant_id": "system", "bk_biz_id": 42, "app_id": 7,
+		"app_name": "checkout", "observation_domain_id": "system_kapm",
+		"read_result_table_id": "apm_global.trace_summary_v1_7",
+		"storage_cluster_id":   9, "retention_days": 7, "published_route_version": 7,
+	}}
+	withTraceProfileRuntime(t, config)
+	body := strings.Replace(typedTraceBody("trace_summary", "system_kapm"),
+		`"order_by":[]`, `"order_by":["-min_start_time","trace_id"]`, 1)
+	body = strings.Replace(body, `"limit":100}}`,
+		`"limit":2,"offset":1,"scene":"global","es_summary_list":{`+
+			`"backend":"elasticsearch","app_id":7,"bk_biz_id":42,"expected_route_version":7}}}`, 1)
+	called := false
+	traceProfileRuntimeValue.Load().esMemberReader = func(_ context.Context, query *structured.QueryTs) (
+		int64, []map[string]any, metadata.ResultTableOptions, []metadata.RouteInfo, error,
+	) {
+		called = true
+		if query.From != 1 || query.QueryList[0].TableID != "apm_global.trace_summary_v1_7" {
+			t.Fatalf("ES list did not use published target: %+v", query)
+		}
+		return 1, nil, nil, []metadata.RouteInfo{{
+			TableID: "apm_global.trace_summary_v1_7", StorageType: metadata.ElasticsearchStorageType, StorageID: "9",
+		}}, nil
+	}
+	recorder := runTraceProfileRequest(t, body, "kingeye-apm")
+	if !called || recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"total":1`) {
+		t.Fatalf("published ES list did not execute: called=%v status=%d body=%s", called, recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestTraceProfileDirectReadEnforcesAuthorizedScope(t *testing.T) {
 	withTraceProfileRuntime(t, traceProfileRuntimeConfig())
 	withTraceProfileAuth(t, true, "kingeye-apm")

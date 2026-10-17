@@ -128,6 +128,7 @@ type traceProfileRuntime struct {
 	connections    map[string]*dorisclient.Instance
 	maxBodyBytes   int
 	maxLimit       int64
+	maxOffset      int64
 	maxRangeUS     int64
 	routeVersion   int64
 	routeCount     int
@@ -315,6 +316,7 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 		connections:    connections,
 		maxBodyBytes:   config.MaxBodyBytes,
 		maxLimit:       config.MaxLimit,
+		maxOffset:      config.MaxOffset,
 		maxRangeUS:     traceProfileMaxRangeUS(config.MaxRangeDays),
 		routeVersion:   config.RouteSnapshotVersion,
 		routeCount:     len(routes),
@@ -400,11 +402,15 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 		writeTraceProfileReject(ctx, c, traceprofile.CodeUnboundedRange, "Trace 查询时间范围超过预算")
 		return
 	}
-	if request.MemberLookup != nil {
+	if request.MemberLookup != nil || request.ESSummaryList != nil {
 		if err := authorizeTraceProfile(verified, appCode, runtime.memberLookupAllowedAppCodes); err != nil {
 			writeTraceProfileReject(ctx, c, traceprofile.CodeUnauthorizedMember, err.Error())
 			return
 		}
+	}
+	if request.ESSummaryList != nil && request.Offset != nil && *request.Offset > runtime.maxOffset {
+		writeTraceProfileReject(ctx, c, traceprofile.CodeLimitExceeded, "ES Summary 列表 offset 超出预算")
+		return
 	}
 	user := metadata.GetUser(ctx)
 	dataTenantID := user.TenantID
@@ -422,9 +428,18 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 		return
 	}
 	isESMember := request.MemberLookup != nil && request.MemberLookup.Backend == traceprofile.MemberBackendElasticsearch
+	isESList := request.ESSummaryList != nil
 	var esTarget traceprofile.ESSummaryTarget
-	if isESMember {
-		pair := request.MemberLookup.AllowedPairs[0]
+	if isESMember || isESList {
+		pair := traceprofile.MemberPair{}
+		version := int64(0)
+		if isESMember {
+			pair = request.MemberLookup.AllowedPairs[0]
+			version = request.MemberLookup.ExpectedRouteVersion
+		} else {
+			pair = traceprofile.MemberPair{AppID: request.ESSummaryList.AppID, BkBizID: request.ESSummaryList.BkBizID}
+			version = request.ESSummaryList.ExpectedRouteVersion
+		}
 		if pair.BkBizID != scope.BkBizID {
 			writeTraceProfileReject(ctx, c, traceprofile.CodeUnauthorizedMember, "ES Summary 成员业务不在受信空间内")
 			return
@@ -436,8 +451,13 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 			writeTraceProfileReject(ctx, c, traceprofile.ErrorCode(targetErr), targetErr.Error())
 			return
 		}
-		if target.PublishedVersion == 0 || target.PublishedVersion != request.MemberLookup.ExpectedRouteVersion {
+		if target.PublishedVersion == 0 || target.PublishedVersion != version {
 			writeTraceProfileReject(ctx, c, traceprofile.CodeScopePartial, "ES Summary 单租户发布版本尚未在 UQ 生效")
+			return
+		}
+		if isESList && (target.RetentionDays < 1 || target.RetentionDays > 30 ||
+			request.EndUS-request.StartUS > target.RetentionDays*86_400_000_000) {
+			writeTraceProfileReject(ctx, c, traceprofile.CodeScopePartial, "ES Summary 已发布保留期不足以覆盖请求")
 			return
 		}
 		esTarget = target
@@ -459,6 +479,8 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 	var page traceprofile.Page
 	if isESMember {
 		page, err = executeESMemberLookup(ctx, request, scope, esTarget, runtime.esMemberReader)
+	} else if isESList {
+		page, err = executeESList(ctx, request, scope, esTarget, runtime.esMemberReader)
 	} else {
 		page, err = runtime.executor.Execute(ctx, request, scope)
 	}

@@ -10,6 +10,7 @@
 package traceprofile
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -59,6 +60,75 @@ func validMemberLookupJSON() string {
 		`"filters":{"field_list":[],"condition_list":[]},"order_by":[],"limit":25,` +
 		`"member_lookup":{"trace_id":"0123456789abcdef0123456789abcdef","expected_route_version":3,"allowed_pairs":` +
 		`[{"app_id":7,"bk_biz_id":7},{"app_id":8,"bk_biz_id":7}]}}}`
+}
+
+func validESSummaryListJSON() string {
+	return `{"trace_profile":"trace_summary","trace_contract_version":"trace_query_v2","trace_request":{` +
+		`"observation_domain_id":"system_kapm",` +
+		`"expected_scope_fingerprint":"` + strings.Repeat("a", 64) + `",` +
+		`"scene":"global","start_time":"1721024820000000","end_time":"1721024880000000",` +
+		`"filters":{"field_list":[{"field_name":"entry_type","value":["request"],"op":"eq"}],` +
+		`"condition_list":[]},"order_by":["-min_start_time","trace_id"],"limit":25,"offset":0,` +
+		`"es_summary_list":{"backend":"elasticsearch","app_id":7,"bk_biz_id":2,"expected_route_version":3}}}`
+}
+
+func TestParseRequestAcceptsBoundedESSummaryListAndRejectsScopeExpansion(t *testing.T) {
+	valid := validESSummaryListJSON()
+	if _, err := ParseRequest([]byte(valid), 1<<20, 100); err != nil {
+		t.Fatalf("bounded ES Summary list was rejected: %v", err)
+	}
+	for name, body := range map[string]string{
+		"wrong backend":     strings.Replace(valid, `"backend":"elasticsearch"`, `"backend":"doris"`, 1),
+		"zero app":          strings.Replace(valid, `"app_id":7`, `"app_id":0`, 1),
+		"zero version":      strings.Replace(valid, `"expected_route_version":3`, `"expected_route_version":0`, 1),
+		"wrong scene":       strings.Replace(valid, `"scene":"global"`, `"scene":"app"`, 1),
+		"unsupported field": strings.Replace(valid, `"entry_type"`, `"attributes"`, 1),
+		"physical target":   strings.Replace(valid, `"es_summary_list":{`, `"read_result_table_id":"other.rt","es_summary_list":{`, 1),
+		"with member":       strings.Replace(valid, `"es_summary_list":{`, `"member_lookup":{},"es_summary_list":{`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseRequest([]byte(body), 1<<20, 100); err == nil {
+				t.Fatal("unsafe ES Summary list request was accepted")
+			}
+		})
+	}
+}
+
+func TestParseRequestAcceptsEntryMultiselectWithoutArbitraryBooleanScope(t *testing.T) {
+	valid := strings.Replace(validESSummaryListJSON(),
+		`"field_name":"entry_type","value":["request"],"op":"eq"`,
+		`"field_name":"entry_type","value":["request","background"],"op":"eq"},`+
+			`{"field_name":"entry_subtype","value":["scheduled","async"],"op":"eq"`, 1)
+	valid = strings.Replace(valid, `"condition_list":[]`, `"condition_list":["and"]`, 1)
+	request, err := ParseRequest([]byte(valid), 1<<20, 100)
+	if err != nil || len(request.Filters.FieldList) != 2 {
+		t.Fatalf("bounded entry multiselect rejected: request=%+v err=%v", request, err)
+	}
+	for name, invalid := range map[string]string{
+		"or connector":               strings.Replace(valid, `"condition_list":["and"]`, `"condition_list":["or"]`, 1),
+		"unknown type":               strings.Replace(valid, `"request","background"`, `"request","foreign"`, 1),
+		"unknown subtype":            strings.Replace(valid, `"scheduled","async"`, `"scheduled","foreign"`, 1),
+		"subtype without background": strings.Replace(valid, `"request","background"`, `"request","other"`, 1),
+		"duplicate type":             strings.Replace(valid, `"request","background"`, `"request","request"`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseRequest([]byte(invalid), 1<<20, 100); err == nil {
+				t.Fatal("unsafe entry multiselect was accepted")
+			}
+		})
+	}
+}
+
+func TestParseRequestAllowsFutureTenantRetentionWithinThirtyDayBudget(t *testing.T) {
+	valid := validESSummaryListJSON()
+	for days, accepted := range map[int64]bool{10: true, 31: false} {
+		end := strconv.FormatInt(1721024820000000+days*86_400_000_000, 10)
+		body := strings.Replace(valid, `"end_time":"1721024880000000"`, `"end_time":"`+end+`"`, 1)
+		_, err := ParseRequest([]byte(body), 1<<20, 100)
+		if (err == nil) != accepted {
+			t.Fatalf("ES Summary range %d days accepted=%v err=%v", days, accepted, err)
+		}
+	}
 }
 
 func TestParseRequestAcceptsBoundedExactSummaryMemberLookup(t *testing.T) {
