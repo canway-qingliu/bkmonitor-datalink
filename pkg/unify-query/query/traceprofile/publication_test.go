@@ -28,6 +28,36 @@ const publishedESSummaryTargets = `[{"bk_tenant_id":"system","bk_biz_id":132,"ap
 	`"app_name":"checkout","observation_domain_id":"system_kapm",` +
 	`"read_result_table_id":"apm_global.trace_summary_v1_7","storage_cluster_id":9,"retention_days":30}]`
 
+func TestPublishedTenantSummaryRouteKeepsBusinessScopeInSharedTable(t *testing.T) {
+	body := strings.Replace(business132Document, `"table":"otel_trace_summary_132"`,
+		`"table":"otel_trace_summary"`, 1)
+	body = strings.Replace(body, `"schema_version":"sha256:281052267ec373fc"`,
+		`"schema_version":"`+tenantSummarySchemaVersion+`"`, 1)
+	document, err := ParsePublishedDocument([]byte(body), "system")
+	if err != nil || len(document.Routes) != 2 || document.Routes[1].Doris.Table != "otel_trace_summary" {
+		t.Fatalf("tenant Summary route rejected: routes=%+v err=%v", document.Routes, err)
+	}
+	scope, err := ResolveScope("system", "bkcc__132", "system_kapm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := Request{Profile: metadata.TraceProfileSummary, StartUS: 1721024820000000,
+		EndUS: 1721024880000000, Limit: 10}
+	compiled, err := CompileList(metadata.TraceProfileSummary, *document.Routes[1].Doris, scope, request, Limits{})
+	if err != nil || !strings.Contains(compiled.SnapshotStatement, "`system_kapm`.`otel_trace_summary`") ||
+		!strings.Contains(compiled.SnapshotStatement, "`bk_biz_id` = ?") {
+		t.Fatalf("tenant Summary SQL lost physical table or trusted biz: %+v err=%v", compiled, err)
+	}
+	for _, invalid := range []string{
+		strings.Replace(body, `"table":"otel_trace_summary"`, `"table":"otel_trace_summary_132"`, 1),
+		strings.Replace(body, tenantSummarySchemaVersion, "sha256:281052267ec373fc", 1),
+	} {
+		if _, err := ParsePublishedDocument([]byte(invalid), "system"); err == nil {
+			t.Fatal("tenant Summary layout accepted wrong table or schema version")
+		}
+	}
+}
+
 func TestPublishedESSummaryTargetsAreVersionedAndScoped(t *testing.T) {
 	body := strings.Replace(business132Document, `"a3_targets":[]`,
 		`"a3_targets":[],"es_summary_targets":`+publishedESSummaryTargets, 1)

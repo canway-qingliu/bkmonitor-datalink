@@ -16,6 +16,8 @@ import (
 	"io"
 	"regexp"
 	"strconv"
+
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 )
 
 var publishedSchemaVersionPattern = regexp.MustCompile(`^sha256:[0-9a-f]{16}$`)
@@ -95,8 +97,10 @@ func ParsePublishedDocument(body []byte, keyTenant string) (PublishedDocument, e
 	routes := make([]ReadRoute, 0, len(wire.Routes))
 	profilesByBiz := make(map[int64]uint8)
 	for index, item := range wire.Routes {
+		knownSchema := item.SchemaVersion == supportedPublishedSchemaVersion[item.Profile] ||
+			item.Profile == string(metadata.TraceProfileSummary) && item.SchemaVersion == tenantSummarySchemaVersion
 		if item.TenantID != keyTenant || item.ClusterName == "" || !publishedSchemaVersionPattern.MatchString(item.SchemaVersion) ||
-			item.SchemaVersion != supportedPublishedSchemaVersion[item.Profile] {
+			!knownSchema {
 			return PublishedDocument{}, fmt.Errorf("Trace 发布路由 %d 的租户、集群或 schema 非法", index)
 		}
 		profile, err := ParseProfile(item.Profile)

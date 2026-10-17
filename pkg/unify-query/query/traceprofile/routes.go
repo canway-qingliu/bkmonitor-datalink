@@ -65,6 +65,19 @@ var profilePhysicalTable = map[metadata.TraceProfile]string{
 	metadata.TraceProfileSummary: "otel_trace_summary",
 }
 
+// 与 Kingeye 租户 Summary 新表评审 DDL 的固定 shape 摘要配对；旧业务表仍按原版本解析。
+const tenantSummarySchemaVersion = "sha256:cc07585afea58a5d"
+
+func physicalTableForSchema(profile metadata.TraceProfile, bizID int64, schemaVersion string) (string, error) {
+	if profile == metadata.TraceProfileSummary && schemaVersion == tenantSummarySchemaVersion {
+		if bizID <= 0 {
+			return "", fmt.Errorf("租户 Summary 业务 ID 必须为正")
+		}
+		return "otel_trace_summary", nil
+	}
+	return businessPhysicalTable(profile, bizID)
+}
+
 func routeKey(tenantID string, bizID int64, profile metadata.TraceProfile) string {
 	return fmt.Sprintf("%s\x00%d\x00%s", tenantID, bizID, profile)
 }
@@ -92,7 +105,7 @@ func ParseProfile(value string) (metadata.TraceProfile, error) {
 
 // NewDorisTarget 从受信业务与 profile 派生物理表；调用方不能覆盖库表。
 func NewDorisTarget(clusterID, observationDomainID string, bizID int64, profile metadata.TraceProfile, schemaVersion string) (DorisTarget, error) {
-	table, err := businessPhysicalTable(profile, bizID)
+	table, err := physicalTableForSchema(profile, bizID, schemaVersion)
 	if err != nil {
 		return DorisTarget{}, err
 	}
@@ -166,16 +179,16 @@ func validateReadRoute(route ReadRoute) error {
 	if route.BkTenantID == "" || !physicalIdentifierPattern.MatchString(route.BkTenantID) {
 		return fmt.Errorf("租户标识非法")
 	}
-	table, err := businessPhysicalTable(route.Profile, route.BkBizID)
+	if route.Doris == nil {
+		return fmt.Errorf("缺少 Doris 物理目标")
+	}
+	table, err := physicalTableForSchema(route.Profile, route.BkBizID, route.Doris.SchemaVersion)
 	if err != nil {
 		return err
 	}
 	// 观测域与物理库名同源（裁定 A）：<bk_tenant_id>_kapm，两处漂移即拒绝。
 	if route.ObservationDomainID != route.BkTenantID+"_kapm" {
 		return fmt.Errorf("观测域与租户不匹配")
-	}
-	if route.Doris == nil {
-		return fmt.Errorf("缺少 Doris 物理目标")
 	}
 	if route.Doris.Database != route.ObservationDomainID {
 		return fmt.Errorf("物理库与观测域不匹配")

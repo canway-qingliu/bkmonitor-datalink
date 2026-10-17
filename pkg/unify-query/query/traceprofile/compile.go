@@ -101,7 +101,7 @@ func CompileList(
 	if _, supported := profilePhysicalTable[profile]; !supported {
 		return CompiledList{}, reject(CodeUnsupportedSchemaCapability, "Trace profile 不受支持: %s", profile)
 	}
-	expectedTable, err := businessPhysicalTable(profile, scope.BkBizID)
+	expectedTable, err := physicalTableForSchema(profile, scope.BkBizID, target.SchemaVersion)
 	if err != nil || target.Table != expectedTable {
 		return CompiledList{}, reject(CodeRouteNotFound, "Trace 读目标与 profile 不匹配")
 	}
