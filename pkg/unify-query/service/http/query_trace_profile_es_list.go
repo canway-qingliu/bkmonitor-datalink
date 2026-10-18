@@ -17,7 +17,9 @@ import (
 )
 
 var esListColumns = append(append(structured.KeepColumns(nil), esMemberColumns...),
-	"entry_span_id", "entry_parent_span_id", "entry_type", "entry_subtype")
+	"entry_span_id", "entry_parent_span_id", "entry_type", "entry_subtype", "entry_index_version",
+	"entry_parent_owner_keys", "entry_parent_owner_count", "entry_has_parent",
+	"entry_service_name", "entry_span_name", "entry_kind", "error")
 
 // executeESList 仅查询发布的单应用 Summary RT，并复核 raw ES 的完整路由与 total。
 func executeESList(
@@ -38,8 +40,10 @@ func executeESList(
 		return traceprofile.Page{}, esMemberReject(traceprofile.CodeScopePartial, "ES Summary 目标保留期或发布版本未生效")
 	}
 	if request.Limit < 1 || request.Limit > 1000 || request.StartUS >= request.EndUS ||
-		request.EndUS-request.StartUS > target.RetentionDays*86_400_000_000 ||
-		len(request.OrderBy) != 2 || request.OrderBy[0] != "-min_start_time" || request.OrderBy[1] != "trace_id" {
+		request.EndUS-request.StartUS > target.RetentionDays*86_400_000_000+1000 ||
+		len(request.OrderBy) != 2 || request.OrderBy[1] != "trace_id" ||
+		request.OrderBy[0] != "-min_start_time" && request.OrderBy[0] != "min_start_time" &&
+			request.OrderBy[0] != "-trace_duration" && request.OrderBy[0] != "trace_duration" {
 		return traceprofile.Page{}, esMemberReject(traceprofile.CodeLimitExceeded, "ES Summary 列表时间、排序或行预算非法")
 	}
 	offset := int64(0)
@@ -57,9 +61,26 @@ func executeESList(
 		{DimensionName: "min_start_time", Value: []string{strconv.FormatInt(request.StartUS, 10)}, Operator: "gte"},
 		{DimensionName: "min_start_time", Value: []string{strconv.FormatInt(request.EndUS-1, 10)}, Operator: "lte"},
 	}
+	if target.EntryIndexVersion == 2 {
+		baseFields = append(baseFields, structured.ConditionField{
+			DimensionName: "entry_index_version", Value: []string{"2"}, Operator: structured.ConditionEqual,
+		}, structured.ConditionField{
+			DimensionName: "entry_parent_owner_count", Value: []string{"0"}, Operator: structured.ConditionGte,
+		})
+	}
 	predicate, err := traceprofile.ParseESSummaryListPredicate(request.Filters)
 	if err != nil {
 		return traceprofile.Page{}, err
+	}
+	if (predicate.ParentState == "observed" || predicate.ParentState == "missing") &&
+		(target.EntryIndexVersion != 2 || target.RetentionDays != 30) {
+		return traceprofile.Page{}, esMemberReject(traceprofile.CodeUnsupportedSchemaCapability,
+			"ES Summary 跨应用父关系索引尚未发布")
+	}
+	parentOwnerKeys, err := traceprofile.ESParentOwnerKeys(*list, predicate.ParentState)
+	if err != nil {
+		return traceprofile.Page{}, esMemberReject(traceprofile.CodeUnsupportedSchemaCapability,
+			"ES Summary 跨应用父节点授权集合非法")
 	}
 	if predicate.TraceID != nil {
 		baseFields = append(baseFields, structured.ConditionField{
@@ -70,6 +91,60 @@ func executeESList(
 		baseFields = append(baseFields, structured.ConditionField{
 			DimensionName: "entry_parent_span_id", Value: []string{*predicate.ParentID}, Operator: "eq",
 		})
+	}
+	if len(predicate.Services) > 0 {
+		baseFields = append(baseFields, structured.ConditionField{
+			DimensionName: "entry_service_name", Value: predicate.Services, Operator: structured.ConditionEqual,
+		})
+	}
+	if len(predicate.Names) > 0 {
+		baseFields = append(baseFields, structured.ConditionField{
+			DimensionName: "entry_span_name", Value: predicate.Names, Operator: structured.ConditionEqual,
+		})
+	}
+	if len(predicate.Kinds) > 0 {
+		baseFields = append(baseFields, structured.ConditionField{
+			DimensionName: "entry_kind", Value: predicate.Kinds, Operator: structured.ConditionEqual,
+		})
+	}
+	if predicate.DurationGte != nil {
+		baseFields = append(baseFields, structured.ConditionField{
+			DimensionName: "trace_duration", Value: []string{strconv.FormatInt(*predicate.DurationGte, 10)},
+			Operator: structured.ConditionGte,
+		})
+	}
+	if predicate.DurationLte != nil {
+		baseFields = append(baseFields, structured.ConditionField{
+			DimensionName: "trace_duration", Value: []string{strconv.FormatInt(*predicate.DurationLte, 10)},
+			Operator: structured.ConditionLte,
+		})
+	}
+	if predicate.Error != nil {
+		baseFields = append(baseFields, structured.ConditionField{
+			DimensionName: "error", Value: []string{strconv.FormatBool(*predicate.Error)}, Operator: structured.ConditionEqual,
+		})
+	}
+	switch predicate.ParentState {
+	case "root":
+		if target.EntryIndexVersion == 2 {
+			baseFields = append(baseFields, structured.ConditionField{
+				DimensionName: "entry_has_parent", Value: []string{"false"}, Operator: structured.ConditionEqual,
+			})
+		} else {
+			baseFields = append(baseFields, structured.ConditionField{
+				DimensionName: "entry_parent_span_id", Value: []string{""}, Operator: structured.ConditionEqual,
+			})
+		}
+	case "observed", "missing":
+		operator := structured.ConditionEqual
+		if predicate.ParentState == "missing" {
+			operator = structured.ConditionNotEqual
+		}
+		baseFields = append(baseFields,
+			structured.ConditionField{DimensionName: "entry_has_parent", Value: []string{"true"},
+				Operator: structured.ConditionEqual},
+			structured.ConditionField{DimensionName: "entry_parent_owner_keys", Value: parentOwnerKeys,
+				Operator: operator})
 	}
 	groups := make([][]structured.ConditionField, 0, 2)
 	if len(predicate.Subtypes) == 0 {
@@ -109,7 +184,7 @@ func executeESList(
 			fields = append(fields, field)
 		}
 	}
-	order := structured.OrderBy{"-min_start_time", "trace_id"}
+	order := structured.OrderBy(request.OrderBy)
 	query := &structured.QueryTs{
 		SpaceUid: scope.SpaceUID,
 		Start:    strconv.FormatInt(request.StartUS/1_000_000, 10),

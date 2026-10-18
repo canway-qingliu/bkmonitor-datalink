@@ -63,10 +63,11 @@ type MemberLookup struct {
 
 // ESSummaryList 仅声明受信应用和已发布版本；物理 RT 由 UQ 路由解析。
 type ESSummaryList struct {
-	Backend              string `json:"backend"`
-	AppID                int64  `json:"app_id"`
-	BkBizID              int64  `json:"bk_biz_id"`
-	ExpectedRouteVersion int64  `json:"expected_route_version"`
+	Backend              string       `json:"backend"`
+	AppID                int64        `json:"app_id"`
+	BkBizID              int64        `json:"bk_biz_id"`
+	ExpectedRouteVersion int64        `json:"expected_route_version"`
+	ParentAllowedPairs   []MemberPair `json:"parent_allowed_pairs,omitempty"`
 }
 
 const (
@@ -255,7 +256,7 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 	if len(query.ESSummaryList) != 0 {
 		if bytes.Equal(query.ESSummaryList, []byte("null")) || memberLookup != nil || aggregation != nil ||
 			wire.TraceProfile != metadata.TraceProfileSummary || scene != "global" ||
-			endUS-startUS > 30*86_400_000_000 {
+			endUS-startUS > 30*86_400_000_000+1000 {
 			return Request{}, fmt.Errorf("ES Summary 列表模式、场景或三十天上限非法")
 		}
 		listDecoder := json.NewDecoder(bytes.NewReader(query.ESSummaryList))
@@ -268,10 +269,14 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 			target.AppID <= 0 || target.BkBizID <= 0 || target.ExpectedRouteVersion <= 0 {
 			return Request{}, fmt.Errorf("ES Summary 列表缺少单应用和发布版本")
 		}
-		if len(query.OrderBy) != 2 || query.OrderBy[0] != "-min_start_time" || query.OrderBy[1] != "trace_id" {
-			return Request{}, fmt.Errorf("ES Summary 列表必须按开始时间与 Trace ID 稳定排序")
+		if !validESSummaryListOrder(query.OrderBy) {
+			return Request{}, fmt.Errorf("ES Summary 列表必须按开始时间或耗时与 Trace ID 稳定排序")
 		}
-		if _, err := ParseESSummaryListPredicate(*query.Filters); err != nil {
+		predicate, err := ParseESSummaryListPredicate(*query.Filters)
+		if err != nil {
+			return Request{}, err
+		}
+		if err := validateESParentPairs(target, predicate.ParentState); err != nil {
 			return Request{}, err
 		}
 		esSummaryList = &target
@@ -290,6 +295,56 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 		ESSummaryList: esSummaryList,
 		Aggregation:   aggregation,
 	}, nil
+}
+
+func validESSummaryListOrder(order []string) bool {
+	if len(order) != 2 || order[1] != "trace_id" {
+		return false
+	}
+	switch order[0] {
+	case "-min_start_time", "min_start_time", "-trace_duration", "trace_duration":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateESParentPairs(target ESSummaryList, parentState string) error {
+	if parentState != "observed" && parentState != "missing" {
+		if len(target.ParentAllowedPairs) != 0 {
+			return fmt.Errorf("ES Summary 无跨应用父关系条件时不得提交授权应用集合")
+		}
+		return nil
+	}
+	if len(target.ParentAllowedPairs) == 0 || len(target.ParentAllowedPairs) > 64 {
+		return fmt.Errorf("ES Summary 跨应用父关系缺少有界授权应用集合")
+	}
+	previous := MemberPair{}
+	includesTarget := false
+	for index, pair := range target.ParentAllowedPairs {
+		if pair.AppID <= 0 || pair.BkBizID <= 0 || index > 0 &&
+			(pair.BkBizID < previous.BkBizID || pair.BkBizID == previous.BkBizID && pair.AppID <= previous.AppID) {
+			return fmt.Errorf("ES Summary 跨应用父关系授权集合未严格排序或含无效应用")
+		}
+		includesTarget = includesTarget || pair.AppID == target.AppID && pair.BkBizID == target.BkBizID
+		previous = pair
+	}
+	if !includesTarget {
+		return fmt.Errorf("ES Summary 跨应用父关系授权集合缺少目标应用")
+	}
+	return nil
+}
+
+// ESParentOwnerKeys only derives indexed owner terms from a bounded, validated typed request.
+func ESParentOwnerKeys(target ESSummaryList, parentState string) ([]string, error) {
+	if err := validateESParentPairs(target, parentState); err != nil {
+		return nil, err
+	}
+	keys := make([]string, 0, len(target.ParentAllowedPairs))
+	for _, pair := range target.ParentAllowedPairs {
+		keys = append(keys, fmt.Sprintf("%d:%d", pair.BkBizID, pair.AppID))
+	}
+	return keys, nil
 }
 
 func validateMemberLookup(lookup MemberLookup) error {

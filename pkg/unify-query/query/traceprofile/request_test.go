@@ -131,6 +131,46 @@ func TestParseRequestAllowsFutureTenantRetentionWithinThirtyDayBudget(t *testing
 	}
 }
 
+func TestParseRequestRequiresBoundedAuthorizedParentPairsForCrossAppRelation(t *testing.T) {
+	observed := strings.Replace(validESSummaryListJSON(),
+		`"field_name":"entry_type","value":["request"]`,
+		`"field_name":"entry_parent_state","value":["observed"]`, 1)
+	valid := strings.Replace(observed, `"expected_route_version":3}}}`,
+		`"expected_route_version":3,"parent_allowed_pairs":[{"app_id":7,"bk_biz_id":2},`+
+			`{"app_id":8,"bk_biz_id":3}]}}}`, 1)
+	request, err := ParseRequest([]byte(valid), 1<<20, 100)
+	if err != nil || request.ESSummaryList == nil || len(request.ESSummaryList.ParentAllowedPairs) != 2 {
+		t.Fatalf("authorized cross-app parent scope rejected or lost: request=%+v err=%v", request, err)
+	}
+	for name, body := range map[string]string{
+		"missing pairs": observed,
+		"duplicate": strings.Replace(valid, `{"app_id":8,"bk_biz_id":3}`,
+			`{"app_id":7,"bk_biz_id":2}`, 1),
+		"unsorted": strings.Replace(valid, `{"app_id":7,"bk_biz_id":2},{"app_id":8,"bk_biz_id":3}`,
+			`{"app_id":8,"bk_biz_id":3},{"app_id":7,"bk_biz_id":2}`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseRequest([]byte(body), 1<<20, 100); err == nil {
+				t.Fatal("cross-app parent relation accepted incomplete or ambiguous authorization")
+			}
+		})
+	}
+}
+
+func TestParseRequestAcceptsThirtyDayInclusiveMillisecondBoundary(t *testing.T) {
+	start := int64(1721024820000000)
+	valid := strings.Replace(validESSummaryListJSON(), `"end_time":"1721024880000000"`,
+		`"end_time":"`+strconv.FormatInt(start+30*86_400_000_000+1000, 10)+`"`, 1)
+	if _, err := ParseRequest([]byte(valid), 1<<20, 100); err != nil {
+		t.Fatalf("inclusive thirty-day UI window was rejected: %v", err)
+	}
+	invalid := strings.Replace(valid, strconv.FormatInt(start+30*86_400_000_000+1000, 10),
+		strconv.FormatInt(start+30*86_400_000_000+1001, 10), 1)
+	if _, err := ParseRequest([]byte(invalid), 1<<20, 100); err == nil {
+		t.Fatal("window longer than one inclusive endpoint was accepted")
+	}
+}
+
 func TestParseRequestAcceptsBoundedExactSummaryMemberLookup(t *testing.T) {
 	request, err := ParseRequest([]byte(validMemberLookupJSON()), 1<<20, 100)
 	if err != nil {

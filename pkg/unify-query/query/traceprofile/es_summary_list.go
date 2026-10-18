@@ -8,6 +8,8 @@ package traceprofile
 
 import (
 	"math"
+	"strconv"
+	"strings"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 )
@@ -23,8 +25,8 @@ func ShapeESSummaryListPage(raw []map[string]any, total int64, request Request, 
 		target.RetentionDays < 1 || target.RetentionDays > 30 || target.BkTenantID != scope.BkTenantID ||
 		target.ObservationDomainID != scope.ObservationDomainID ||
 		request.Limit <= 0 || request.Limit > 1000 || request.StartUS >= request.EndUS ||
-		request.EndUS-request.StartUS > target.RetentionDays*86_400_000_000 ||
-		len(request.OrderBy) != 2 || request.OrderBy[0] != "-min_start_time" || request.OrderBy[1] != "trace_id" {
+		request.EndUS-request.StartUS > target.RetentionDays*86_400_000_000+1000 ||
+		!validESSummaryListOrder(request.OrderBy) {
 		return Page{}, reject(CodeUnauthorizedMember, "ES Summary 列表作用域或已发布保留期不一致")
 	}
 	offset := int64(0)
@@ -48,8 +50,16 @@ func ShapeESSummaryListPage(raw []map[string]any, total int64, request Request, 
 	if err != nil {
 		return Page{}, err
 	}
+	if (predicate.ParentState == "observed" || predicate.ParentState == "missing") &&
+		(target.EntryIndexVersion != 2 || target.RetentionDays != 30) {
+		return Page{}, reject(CodeUnsupportedSchemaCapability, "ES Summary 跨应用父关系索引尚未发布")
+	}
+	allowedOwnerKeys, err := ESParentOwnerKeys(*list, predicate.ParentState)
+	if err != nil {
+		return Page{}, reject(CodeUnauthorizedMember, "ES Summary 跨应用父节点授权集合非法")
+	}
 	page := Page{Items: make([]map[string]any, 0, len(raw)), Total: total}
-	var previousStart int64
+	var previousSort int64
 	var previousTrace string
 	for index, row := range raw {
 		if row == nil {
@@ -60,10 +70,19 @@ func ShapeESSummaryListPage(raw []map[string]any, total int64, request Request, 
 			return Page{}, reject(CodePartialFailure, "ES Summary 列表 Trace ID 非法")
 		}
 		start, err := exactTraceInt64(row["min_start_time"])
-		if err != nil || index > 0 && (start > previousStart || start == previousStart && traceID <= previousTrace) {
+		if err != nil {
+			return Page{}, reject(CodePartialFailure, "ES Summary 列表开始时间非法")
+		}
+		sortValue := start
+		if request.OrderBy[0] == "-trace_duration" || request.OrderBy[0] == "trace_duration" {
+			sortValue, err = exactTraceInt64(row["trace_duration"])
+		}
+		descending := request.OrderBy[0][0] == '-'
+		if err != nil || index > 0 && (descending && sortValue > previousSort ||
+			!descending && sortValue < previousSort || sortValue == previousSort && traceID <= previousTrace) {
 			return Page{}, reject(CodePartialFailure, "ES Summary 列表排序不稳定")
 		}
-		previousStart, previousTrace = start, traceID
+		previousSort, previousTrace = sortValue, traceID
 		entrySpan, spanOK := row["entry_span_id"].(string)
 		entryParent, parentOK := row["entry_parent_span_id"].(string)
 		entryType, typeOK := row["entry_type"].(string)
@@ -75,7 +94,27 @@ func ShapeESSummaryListPage(raw []map[string]any, total int64, request Request, 
 			(entryType != "background" && entrySubtype != "") {
 			return Page{}, reject(CodePartialFailure, "ES Summary 入口字段缺失或非法")
 		}
-		if !predicate.Matches(traceID, entryParent, entryType, entrySubtype) {
+		var ownerKeys []string
+		if target.EntryIndexVersion == 2 {
+			version, versionErr := exactTraceInt64(row["entry_index_version"])
+			if versionErr != nil || version != 2 {
+				return Page{}, reject(CodePartialFailure, "ES Summary 入口证据版本缺失或非法")
+			}
+			hasParent, hasParentOK := row["entry_has_parent"].(bool)
+			if !hasParentOK || hasParent != (entryParent != "") {
+				return Page{}, reject(CodePartialFailure, "ES Summary 父节点存在标记与父 ID 不一致")
+			}
+			ownerKeys, err = parseESParentOwnerKeys(row["entry_parent_owner_keys"])
+			if err != nil {
+				return Page{}, reject(CodePartialFailure, "ES Summary 父节点归属字段缺失或非法")
+			}
+			ownerCount, countErr := exactTraceInt64(row["entry_parent_owner_count"])
+			if countErr != nil || ownerCount != int64(len(ownerKeys)) {
+				return Page{}, reject(CodePartialFailure, "ES Summary 父节点归属数量与证据不一致")
+			}
+		}
+		if !predicate.MatchesWithParent(traceID, entryParent, entryType, entrySubtype, ownerKeys, allowedOwnerKeys) ||
+			!predicate.MatchesIndexedFields(row) {
 			return Page{}, reject(CodePartialFailure, "ES Summary 列表行不满足过滤条件")
 		}
 		memberRequest := request
@@ -102,4 +141,29 @@ func ShapeESSummaryListPage(raw []map[string]any, total int64, request Request, 
 		page.Items = append(page.Items, item)
 	}
 	return page, nil
+}
+
+func parseESParentOwnerKeys(value any) ([]string, error) {
+	items, ok := value.([]any)
+	if !ok {
+		return nil, reject(CodePartialFailure, "ES Summary 父节点归属字段类型非法")
+	}
+	keys := make([]string, 0, len(items))
+	previous := ""
+	for _, item := range items {
+		key, ok := item.(string)
+		parts := strings.Split(key, ":")
+		if !ok || len(parts) != 2 || key <= previous {
+			return nil, reject(CodePartialFailure, "ES Summary 父节点归属值非法")
+		}
+		for _, part := range parts {
+			number, err := strconv.ParseInt(part, 10, 64)
+			if err != nil || number <= 0 || strconv.FormatInt(number, 10) != part {
+				return nil, reject(CodePartialFailure, "ES Summary 父节点归属值非法")
+			}
+		}
+		keys = append(keys, key)
+		previous = key
+	}
+	return keys, nil
 }

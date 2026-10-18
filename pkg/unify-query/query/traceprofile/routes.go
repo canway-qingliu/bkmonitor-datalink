@@ -46,6 +46,7 @@ type ESSummaryTarget struct {
 	ResultTableID       string
 	StorageClusterID    int64
 	RetentionDays       int64
+	EntryIndexVersion   int64
 	PublishedVersion    int64
 }
 
@@ -166,7 +167,9 @@ func validateESSummaryTarget(target ESSummaryTarget) error {
 	if !physicalIdentifierPattern.MatchString(target.BkTenantID) || target.BkBizID <= 0 || target.AppID <= 0 ||
 		target.AppName == "" || target.ObservationDomainID != target.BkTenantID+"_kapm" ||
 		!logicalResultTablePattern.MatchString(target.ResultTableID) || target.StorageClusterID <= 0 ||
-		target.RetentionDays < 1 || target.RetentionDays > 30 || target.PublishedVersion < 0 {
+		target.RetentionDays < 1 || target.RetentionDays > 30 || target.PublishedVersion < 0 ||
+		(target.EntryIndexVersion != 0 && target.EntryIndexVersion != 2) ||
+		target.EntryIndexVersion == 2 && target.RetentionDays != 30 {
 		return fmt.Errorf("ES Summary 应用身份、逻辑 RT、集群或保留期非法")
 	}
 	return nil

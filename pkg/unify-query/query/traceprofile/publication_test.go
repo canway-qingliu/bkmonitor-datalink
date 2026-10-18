@@ -82,6 +82,25 @@ func TestPublishedESSummaryTargetsAreVersionedAndScoped(t *testing.T) {
 	}
 }
 
+func TestPublishedESSummaryEntryV2RequiresThirtyDayTarget(t *testing.T) {
+	v2 := strings.Replace(publishedESSummaryTargets, `"retention_days":30`,
+		`"retention_days":30,"entry_index_version":2`, 1)
+	body := strings.Replace(business132Document, `"a3_targets":[]`,
+		`"a3_targets":[],"es_summary_targets":`+v2, 1)
+	document, err := ParsePublishedDocument([]byte(body), "system")
+	if err != nil || document.ESSummaryTargets[0].EntryIndexVersion != 2 {
+		t.Fatalf("published entry v2 capability missing: %+v err=%v", document.ESSummaryTargets, err)
+	}
+	for _, invalid := range []string{
+		strings.Replace(body, `"retention_days":30`, `"retention_days":7`, 1),
+		strings.Replace(body, `"entry_index_version":2`, `"entry_index_version":3`, 1),
+	} {
+		if _, err := ParsePublishedDocument([]byte(invalid), "system"); err == nil {
+			t.Fatal("invalid entry index version or retention was published")
+		}
+	}
+}
+
 func TestPublishedESSummaryTargetsRejectIdentityAndMetadataDrift(t *testing.T) {
 	for name, target := range map[string]string{
 		"wrong tenant":    strings.Replace(publishedESSummaryTargets, `"bk_tenant_id":"system"`, `"bk_tenant_id":"other"`, 1),

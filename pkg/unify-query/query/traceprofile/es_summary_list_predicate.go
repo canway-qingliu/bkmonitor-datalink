@@ -6,13 +6,22 @@
 
 package traceprofile
 
+import "strconv"
+
 // ESSummaryListPredicate 是入口筛选的闭合语义：子类型仅限制后台任务。
 // 由 UQ 编译查询并复核返回行，调用方不能自行提交 OR 布尔表达式。
 type ESSummaryListPredicate struct {
-	Types    []string
-	Subtypes []string
-	ParentID *string
-	TraceID  *string
+	Types       []string
+	Subtypes    []string
+	Services    []string
+	Names       []string
+	Kinds       []string
+	DurationGte *int64
+	DurationLte *int64
+	Error       *bool
+	ParentID    *string
+	ParentState string
+	TraceID     *string
 }
 
 func ParseESSummaryListPredicate(filters Filters) (ESSummaryListPredicate, error) {
@@ -27,7 +36,7 @@ func ParseESSummaryListPredicate(filters Filters) (ESSummaryListPredicate, error
 	}
 	seenFields := make(map[string]struct{}, len(filters.FieldList))
 	for _, filter := range filters.FieldList {
-		if _, duplicate := seenFields[filter.FieldName]; duplicate || filter.Operator != "eq" ||
+		if _, duplicate := seenFields[filter.FieldName]; duplicate ||
 			filter.IsWildcard || filter.IsPrefix || filter.IsSuffix || len(filter.Value) == 0 {
 			return result, reject(CodeUnsupportedSchemaCapability, "ES Summary 列表入口条件非法或重复")
 		}
@@ -43,10 +52,30 @@ func ParseESSummaryListPredicate(filters Filters) (ESSummaryListPredicate, error
 			maximum = 3
 		case "entry_parent_span_id":
 			allowed = nil
+		case "entry_parent_state":
+			allowed = map[string]bool{"root": true, "observed": true, "missing": true}
 		case "trace_id":
+			allowed = nil
+		case "entry_service_name", "entry_span_name":
+			allowed = nil
+			maximum = 64
+		case "entry_kind":
+			allowed = map[string]bool{"0": true, "1": true, "2": true, "3": true, "4": true, "5": true}
+			maximum = 6
+		case "trace_duration_gte", "trace_duration_lte", "error":
 			allowed = nil
 		default:
 			return result, reject(CodeUnsupportedSchemaCapability, "ES Summary 列表过滤字段非法")
+		}
+		wantOperator := "eq"
+		if filter.FieldName == "trace_duration_gte" {
+			wantOperator = "gte"
+		}
+		if filter.FieldName == "trace_duration_lte" {
+			wantOperator = "lte"
+		}
+		if filter.Operator != wantOperator {
+			return result, reject(CodeUnsupportedSchemaCapability, "ES Summary 列表过滤操作符非法")
 		}
 		if len(filter.Value) > maximum {
 			return result, reject(CodeUnsupportedSchemaCapability, "ES Summary 列表入口选择超过枚举范围")
@@ -72,18 +101,124 @@ func ParseESSummaryListPredicate(filters Filters) (ESSummaryListPredicate, error
 				return result, reject(CodeUnsupportedSchemaCapability, "ES Summary 父 Span ID 非法")
 			}
 			result.ParentID = &value
+		case "entry_parent_state":
+			result.ParentState = filter.Value[0]
 		case "trace_id":
 			value := filter.Value[0]
 			if !traceIDPattern.MatchString(value) {
 				return result, reject(CodeUnsupportedSchemaCapability, "ES Summary Trace ID 非法")
 			}
 			result.TraceID = &value
+		case "entry_service_name":
+			if !validEntryNames(filter.Value) {
+				return result, reject(CodeUnsupportedSchemaCapability, "ES Summary 入口服务非法")
+			}
+			result.Services = append([]string(nil), filter.Value...)
+		case "entry_span_name":
+			if !validEntryNames(filter.Value) {
+				return result, reject(CodeUnsupportedSchemaCapability, "ES Summary 入口方法非法")
+			}
+			result.Names = append([]string(nil), filter.Value...)
+		case "entry_kind":
+			result.Kinds = append([]string(nil), filter.Value...)
+		case "trace_duration_gte", "trace_duration_lte":
+			duration, parseErr := strconv.ParseInt(filter.Value[0], 10, 64)
+			if parseErr != nil || duration < 0 || strconv.FormatInt(duration, 10) != filter.Value[0] {
+				return result, reject(CodeUnsupportedSchemaCapability, "ES Summary 耗时边界非法")
+			}
+			if filter.FieldName == "trace_duration_gte" {
+				result.DurationGte = &duration
+			} else {
+				result.DurationLte = &duration
+			}
+		case "error":
+			if filter.Value[0] != "true" && filter.Value[0] != "false" {
+				return result, reject(CodeUnsupportedSchemaCapability, "ES Summary 错误状态非法")
+			}
+			value := filter.Value[0] == "true"
+			result.Error = &value
 		}
+	}
+	if result.DurationGte != nil && result.DurationLte != nil && *result.DurationGte > *result.DurationLte {
+		return result, reject(CodeUnsupportedSchemaCapability, "ES Summary 耗时范围逆序")
 	}
 	if len(result.Subtypes) > 0 && !containsEntryChoice(result.Types, "background") {
 		return result, reject(CodeUnsupportedSchemaCapability, "后台子类型需要明确选择后台任务")
 	}
 	return result, nil
+}
+
+func validEntryNames(values []string) bool {
+	for _, value := range values {
+		if value == "" || len(value) > 512 {
+			return false
+		}
+	}
+	return true
+}
+
+func (p ESSummaryListPredicate) MatchesIndexedFields(row map[string]any) bool {
+	if len(p.Services) > 0 {
+		value, ok := row["entry_service_name"].(string)
+		if !ok || !containsEntryChoice(p.Services, value) {
+			return false
+		}
+	}
+	if len(p.Names) > 0 {
+		value, ok := row["entry_span_name"].(string)
+		if !ok || !containsEntryChoice(p.Names, value) {
+			return false
+		}
+	}
+	if len(p.Kinds) > 0 {
+		value, err := exactTraceInt64(row["entry_kind"])
+		if err != nil || !containsEntryChoice(p.Kinds, strconv.FormatInt(value, 10)) {
+			return false
+		}
+	}
+	if p.DurationGte != nil || p.DurationLte != nil {
+		value, err := exactTraceInt64(row["trace_duration"])
+		if err != nil || value < 0 || p.DurationGte != nil && value < *p.DurationGte ||
+			p.DurationLte != nil && value > *p.DurationLte {
+			return false
+		}
+	}
+	if p.Error != nil {
+		value, ok := row["error"].(bool)
+		if !ok || value != *p.Error {
+			return false
+		}
+	}
+	return true
+}
+
+func (p ESSummaryListPredicate) MatchesWithParent(traceID, entryParent, entryType, entrySubtype string,
+	parentOwnerKeys, allowedOwnerKeys []string) bool {
+	if !p.Matches(traceID, entryParent, entryType, entrySubtype) {
+		return false
+	}
+	switch p.ParentState {
+	case "root":
+		return entryParent == ""
+	case "observed", "missing":
+		if entryParent == "" {
+			return false
+		}
+		allowed := make(map[string]struct{}, len(allowedOwnerKeys))
+		for _, key := range allowedOwnerKeys {
+			allowed[key] = struct{}{}
+		}
+		observed := false
+		for _, key := range parentOwnerKeys {
+			if _, ok := allowed[key]; ok {
+				observed = true
+				break
+			}
+		}
+		return observed == (p.ParentState == "observed")
+	default:
+		return true
+	}
 }
 
 func containsEntryChoice(values []string, wanted string) bool {

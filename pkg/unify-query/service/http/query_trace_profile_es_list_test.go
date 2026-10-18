@@ -161,3 +161,131 @@ func TestESListExecutionRepeatsTrustedScopeAcrossMixedTypeBranches(t *testing.T)
 		t.Fatalf("bounded mixed entry predicate failed: %v", err)
 	}
 }
+
+func TestESListExecutionPushesAuthorizedParentIntersectionBeforePagination(t *testing.T) {
+	for _, relation := range []string{"observed", "missing"} {
+		t.Run(relation, func(t *testing.T) {
+			request, scope, target := esListHTTPFixture(t)
+			request.ESSummaryList.ParentAllowedPairs = []traceprofile.MemberPair{
+				{AppID: 7, BkBizID: 42}, {AppID: 8, BkBizID: 42},
+			}
+			target.RetentionDays = 30
+			target.EntryIndexVersion = 2
+			request.Filters = traceprofile.Filters{FieldList: []traceprofile.FilterField{
+				{FieldName: "entry_type", Value: []string{"request", "background"}, Operator: "eq"},
+				{FieldName: "entry_subtype", Value: []string{"scheduled"}, Operator: "eq"},
+				{FieldName: "entry_parent_state", Value: []string{relation}, Operator: "eq"},
+			}, ConditionList: []string{"and", "and"}}
+			reader := func(_ context.Context, query *structured.QueryTs) (int64, []map[string]any, metadata.ResultTableOptions, []metadata.RouteInfo, error) {
+				groups, err := query.QueryList[0].Conditions.AnalysisConditions()
+				if err != nil || len(groups) != 2 {
+					t.Fatalf("parent relation lost mixed-type OR branches: groups=%+v err=%v", groups, err)
+				}
+				for _, group := range groups {
+					foundParent, foundOwners, foundVersion, foundCount := false, false, false, false
+					for _, field := range group {
+						if field.DimensionName == "entry_index_version" && field.Operator == "eq" &&
+							len(field.Value) == 1 && field.Value[0] == "2" {
+							foundVersion = true
+						}
+						if field.DimensionName == "entry_parent_owner_count" && field.Operator == "gte" &&
+							len(field.Value) == 1 && field.Value[0] == "0" {
+							foundCount = true
+						}
+						if field.DimensionName == "entry_has_parent" && field.Operator == "eq" &&
+							len(field.Value) == 1 && field.Value[0] == "true" {
+							foundParent = true
+						}
+						wantOp := "eq"
+						if relation == "missing" {
+							wantOp = "ne"
+						}
+						if field.DimensionName == "entry_parent_owner_keys" && field.Operator == wantOp &&
+							len(field.Value) == 2 && field.Value[0] == "42:7" && field.Value[1] == "42:8" {
+							foundOwners = true
+						}
+					}
+					if !foundParent || !foundOwners || !foundVersion || !foundCount {
+						t.Fatalf("parent relation was not pushed to every ES branch: %+v", group)
+					}
+				}
+				return 0, nil, nil, []metadata.RouteInfo{{
+					TableID: target.ResultTableID, StorageType: metadata.ElasticsearchStorageType,
+					StorageID: strconv.FormatInt(target.StorageClusterID, 10),
+				}}, nil
+			}
+			if _, err := executeESList(context.Background(), request, scope, target, reader); err != nil {
+				t.Fatalf("authorized cross-app relation query failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestESListExecutionPushesEntryNameDurationAndErrorBeforeTotal(t *testing.T) {
+	request, scope, target := esListHTTPFixture(t)
+	request.Filters = traceprofile.Filters{FieldList: []traceprofile.FilterField{
+		{FieldName: "entry_service_name", Value: []string{"checkout"}, Operator: "eq"},
+		{FieldName: "entry_span_name", Value: []string{"GET /pay"}, Operator: "eq"},
+		{FieldName: "entry_kind", Value: []string{"2"}, Operator: "eq"},
+		{FieldName: "trace_duration_gte", Value: []string{"100"}, Operator: "gte"},
+		{FieldName: "trace_duration_lte", Value: []string{"1000"}, Operator: "lte"},
+		{FieldName: "error", Value: []string{"false"}, Operator: "eq"},
+	}, ConditionList: []string{"and", "and", "and", "and", "and"}}
+	reader := func(_ context.Context, query *structured.QueryTs) (int64, []map[string]any, metadata.ResultTableOptions, []metadata.RouteInfo, error) {
+		groups, err := query.QueryList[0].Conditions.AnalysisConditions()
+		if err != nil || len(groups) != 1 || !query.QueryList[0].ExactTotal {
+			t.Fatalf("indexed entry filters lost before exact total: %+v err=%v", groups, err)
+		}
+		seen := make(map[string]string)
+		for _, field := range groups[0] {
+			seen[field.DimensionName] = field.Operator
+		}
+		for field, operator := range map[string]string{
+			"entry_service_name": "eq", "entry_span_name": "eq", "entry_kind": "eq",
+			"trace_duration": "lte", "error": "eq",
+		} {
+			if seen[field] != operator {
+				t.Fatalf("missing indexed filter %s: %+v", field, groups[0])
+			}
+		}
+		return 0, nil, nil, []metadata.RouteInfo{{
+			TableID: target.ResultTableID, StorageType: metadata.ElasticsearchStorageType,
+			StorageID: strconv.FormatInt(target.StorageClusterID, 10),
+		}}, nil
+	}
+	if _, err := executeESList(context.Background(), request, scope, target, reader); err != nil {
+		t.Fatalf("indexed entry query failed: %v", err)
+	}
+}
+
+func TestESListExecutionUsesV2ParentFlagForRoot(t *testing.T) {
+	request, scope, target := esListHTTPFixture(t)
+	target.RetentionDays = 30
+	target.EntryIndexVersion = 2
+	request.Filters = traceprofile.Filters{FieldList: []traceprofile.FilterField{
+		{FieldName: "entry_parent_state", Value: []string{"root"}, Operator: "eq"},
+	}}
+	reader := func(_ context.Context, query *structured.QueryTs) (int64, []map[string]any, metadata.ResultTableOptions, []metadata.RouteInfo, error) {
+		groups, err := query.QueryList[0].Conditions.AnalysisConditions()
+		if err != nil || len(groups) != 1 {
+			t.Fatalf("V2 root query shape invalid: %+v err=%v", groups, err)
+		}
+		found := false
+		for _, field := range groups[0] {
+			if field.DimensionName == "entry_has_parent" && field.Operator == "eq" &&
+				len(field.Value) == 1 && field.Value[0] == "false" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("V2 root did not use exact boolean parent flag: %+v", groups[0])
+		}
+		return 0, nil, nil, []metadata.RouteInfo{{
+			TableID: target.ResultTableID, StorageType: metadata.ElasticsearchStorageType,
+			StorageID: strconv.FormatInt(target.StorageClusterID, 10),
+		}}, nil
+	}
+	if _, err := executeESList(context.Background(), request, scope, target, reader); err != nil {
+		t.Fatalf("V2 root query failed: %v", err)
+	}
+}

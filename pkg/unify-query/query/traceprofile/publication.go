@@ -54,6 +54,7 @@ type publishedESSummaryTargetWire struct {
 	ResultTableID       string `json:"read_result_table_id"`
 	StorageClusterID    int64  `json:"storage_cluster_id"`
 	RetentionDays       int64  `json:"retention_days"`
+	EntryIndexVersion   int64  `json:"entry_index_version,omitempty"`
 }
 
 type publishedRouteWire struct {
@@ -142,7 +143,8 @@ func ParsePublishedDocument(body []byte, keyTenant string) (PublishedDocument, e
 			BkTenantID: item.TenantID, BkBizID: item.BizID, AppID: item.AppID,
 			AppName: item.AppName, ObservationDomainID: item.ObservationDomainID,
 			ResultTableID: item.ResultTableID, StorageClusterID: item.StorageClusterID,
-			RetentionDays: item.RetentionDays, PublishedVersion: wire.Version,
+			RetentionDays: item.RetentionDays, EntryIndexVersion: item.EntryIndexVersion,
+			PublishedVersion: wire.Version,
 		})
 	}
 	if _, err := NewRouteSnapshotWithESTargets(wire.Version, routes, esTargets); err != nil {
