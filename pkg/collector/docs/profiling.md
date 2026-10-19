@@ -11,7 +11,7 @@ profiling 段写在主配置的 `bk-collector:` 之下，定义所有应用的�
 ```yaml
 bk-collector:
   profiling:
-    enabled: true
+    disabled: false
     cpu:
       enabled: true
       collection_period: "10m"
@@ -21,30 +21,35 @@ bk-collector:
       enabled: true
       collection_period: "15m"
       collection_window: "1m"
-      sampling_frequency: "512KB"
+      allocation_threshold: "512KB"
 ```
 
 | 字段                  | 类型            | 说明                                            |
 |---------------------|---------------|-------------------------------------------------|
-| `enabled`           | bool           | profiling 总开关，缺省为 `false`；随接口返回，由客户端自行决定是否采集  |
+| `disabled`          | bool           | profiling 总开关，缺省为 `true`；`true` 不采集，`false` 允许采集  |
 | `cpu.enabled`       | bool           | 是否采集 CPU profiling                             |
-| `cpu.collection_period` | duration   | 采集周期，如 `"10m"`                               |
-| `cpu.collection_window` | duration   | 单次采集时长，如 `"30s"`                            |
-| `cpu.sampling_frequency` | string    | 采样频率，CPU 场景单位为 Hz，如 `"99Hz"`               |
-| `memory.*`          | -              | 同上，`sampling_frequency` 单位为字节，如 `"512KB"`     |
+| `cpu.collection_period` | string     | 采集周期，如 `"10m"`                               |
+| `cpu.collection_window` | string     | 单次采集时长，如 `"30s"`                            |
+| `cpu.sampling_frequency` | string    | CPU 采样频率，如 `"99Hz"`、`"1kHz"`                 |
+| `memory.enabled` | bool | 是否采集内存 profiling |
+| `memory.collection_period` | string | 内存采集周期，如 `"15m"` |
+| `memory.collection_window` | string | 单次内存采集时长，如 `"1m"` |
+| `memory.allocation_threshold` | string | 内存分配阈值，按分配量触发采集，如 `"512KB"`、`"1MB"` |
 
-profiling 只有 `enabled` 一个开关，不设模块级 `disabled`：接口始终可用，`enabled` 为 `false` 时照常返回 200 并完整下发其余参数，客户端据此停止采集。
+CPU / Memory 的 `collection_period`、`collection_window`，以及 CPU 的 `sampling_frequency`、Memory 的 `allocation_threshold` 均按不透明字符串加载并原样下发。YAML 中使用带引号的字符串，HTTP JSON 响应保持相同的字符串值（如 `"5m"`、`"30s"`），不转换为纳秒整数，也不规范化单位写法；参数的解析由客户端负责。CPU 按频率采样，内存按分配量触发，两者分别使用自己的字段。
+
+顶层总开关统一使用 Kingeye 下发的 `disabled`（取值为 `not is_enabled_profiling`），配置和 HTTP JSON 响应使用同一键名及极性。接口始终可用，`disabled` 为 `true` 时照常返回 200 并下发其余参数，客户端据此停止采集。`disabled: false` 时，再由 `cpu.enabled` / `memory.enabled` 分别决定是否采集对应类型。
 
 ### 子配置（per-token 覆盖）
 
-针对单个应用（以 token 区分）的个性化参数，写在 subconfig 文件里，命中后**整体替换**主配置的 profiling 段（`enabled` 除外，见下）：
+针对单个应用（以 token 区分）的个性化参数，写在 subconfig 文件里，命中后**整体替换**主配置的 profiling 段（`disabled` 除外，见下）：
 
 ```yaml
 type: "subconfig"
 token: "Ymtia2JrYmtia2JrYmtiaxUt..."
 
 profiling:
-  enabled: true
+  disabled: false
   cpu:
     enabled: true
     collection_period: "5m"
@@ -54,10 +59,10 @@ profiling:
     enabled: false
     collection_period: "30m"
     collection_window: "2m"
-    sampling_frequency: "1MB"
+    allocation_threshold: "1MB"
 ```
 
-总开关 `enabled` 是唯一的例外：subconfig 里省略它时继承主配置的取值，避免只为调整采样参数就把该应用的总开关顺带抹成 `false`。
+总开关 `disabled` 是唯一的例外：subconfig 里省略它时继承主配置的取值；显式 `disabled: false` 可覆盖主配置的 `disabled: true`，允许该应用采集。CPU / Memory 参数可以独立下发，例如只有 `disabled: false` 和 `cpu` 参数时，该应用仍可采集 CPU profiling，缺省的 Memory 保持不采集。
 
 subconfig 文件通过主配置的 `apm.patterns` 被发现，与 processor / pipeline 的子配置共用同一套机制：
 
@@ -89,23 +94,23 @@ token 通过 `X-BK-TOKEN` 传递，按 `internal/tokenparser.FromHttpRequest` �
 
 ```json
 {
-  "enabled": true,
+  "disabled": false,
   "cpu": {
     "enabled": true,
-    "collection_period": 300000000000,
-    "collection_window": 10000000000,
+    "collection_period": "5m",
+    "collection_window": "10s",
     "sampling_frequency": "199Hz"
   },
   "memory": {
     "enabled": false,
-    "collection_period": 1800000000000,
-    "collection_window": 120000000000,
-    "sampling_frequency": "1MB"
+    "collection_period": "30m",
+    "collection_window": "2m",
+    "allocation_threshold": "1MB"
   }
 }
 ```
 
-顶层 `enabled` 即 profiling 总开关。无论它是否为 `false`，接口都返回 200 并完整下发其余参数——客户端拿到后自行判断是否采集。
+顶层 `disabled` 即 profiling 总开关。无论它是否为 `true`，接口都返回 200 并下发其余参数，客户端据此判断是否采集。
 
 错误响应（body 为纯文本，非 JSON）：
 
@@ -180,9 +185,9 @@ per-token 覆盖没生效时，按顺序检查：
 1. 主配置有没有 `profiling` 段（整个段缺省时 `Reload` 直接短路，子配置完全不会被读取，接口返回 `no profiling config`）；
 2. 启动日志有无 `no config file found for pattern`（坑二）；
 3. 启动日志有无 `nests profiling under 'bk-collector'`（坑一）；
-4. 启动日志有无 `failed to decode override for token`（字段类型或 duration 格式非法，如 `"5分钟"`）；
+4. 启动日志有无 `failed to decode override for token`（配置结构无法解析；三个字符串参数不在 collector 中做格式校验）；
 5. 请求的 `X-BK-TOKEN` 是否与子配置的 `token` 字段完全一致。
 
 其中 2-4 均为日志可观测，5 可通过对比 `subconfig` 的 `token` 与请求头确认。
 
-客户端反馈"没在采"但接口能通时，另查两点：一是响应里顶层 `enabled` 是否为 `false`（未配置时即为 `false`）；二是该 token 命中的 subconfig 是否显式写了 `enabled: false`。
+客户端反馈"没在采"但接口能通时，检查响应的顶层 `disabled` 是否为 `true`（主配置未声明时默认为 `true`），以及对应类型的 `cpu.enabled` / `memory.enabled` 是否为 `true`。Kingeye 模板上下文、应用子配置和接口响应的总开关均应使用 `disabled`。

@@ -70,7 +70,7 @@
         disabled: true
 
       profiling:
-        enabled: false
+        disabled: true
 
       receiver:
         http_server:

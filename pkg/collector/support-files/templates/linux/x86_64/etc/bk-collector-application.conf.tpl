@@ -564,9 +564,9 @@ instance:
 
 {% if profiling_config is defined %}
 profiling:
-  {% if profiling_config.enabled is defined %}
-  # profiling 总开关，随接口返回给客户端，由客户端自行决定是否采集
-  enabled: {{ profiling_config.enabled }}
+  {% if profiling_config.disabled is defined %}
+  # 与 Kingeye 总开关一致：true 不采集，false 允许采集
+  disabled: {{ profiling_config.disabled }}
   {%- endif %}
   {% if profiling_config.cpu is defined %}
   cpu:
@@ -594,8 +594,8 @@ profiling:
     {% if profiling_config.memory.collection_window is defined %}
     collection_window: "{{ profiling_config.memory.collection_window }}"
     {%- endif %}
-    {% if profiling_config.memory.sampling_frequency is defined %}
-    sampling_frequency: "{{ profiling_config.memory.sampling_frequency }}"
+    {% if profiling_config.memory.allocation_threshold is defined %}
+    allocation_threshold: "{{ profiling_config.memory.allocation_threshold }}"
     {%- endif %}
   {%- endif %}
 {%- endif %}

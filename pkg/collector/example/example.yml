@@ -10,15 +10,15 @@ logging:
 
 # ================================ Output ====================================
 # console for debugging
-output.console:
+# output.console:
 
 # drop data for debugging
 #output.dropper:
 
 # bkpipe for production
-#output.bkpipe:
-#  endpoint: /var/run/ipc.state.report
-#  synccfg: true
+output.bkpipe:
+ endpoint: /Users/liuqing-super-mac/Project/code/cwoa/gse-server/tmp/ipc.state.report
+ synccfg: true
 
 
 # ================================= Path =====================================
@@ -111,9 +111,9 @@ bk-collector:
   # profiling 段定义 CPU / Memory profiling 默认采集参数；
   # 客户端可通过 `GET /-/profiling/config`（携带 X-BK-TOKEN）拉取本应用生效的配置。
   # per-token 覆盖通过 subconfig 文件提供（与 apm.patterns 共用同一套机制）。
-  # enabled 为 profiling 总开关，随接口返回给客户端，由客户端自行决定是否采集
+  # disabled 为 profiling 总开关：true 不采集，false 允许采集
   profiling:
-    enabled: true
+    disabled: false
 
   # =============================== Receiver =================================
   receiver:

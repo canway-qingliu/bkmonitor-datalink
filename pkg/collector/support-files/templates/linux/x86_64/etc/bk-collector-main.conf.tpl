@@ -128,10 +128,12 @@ bk-collector:
   # profiling 段定义 CPU / Memory profiling 的全局默认采集参数
   # 客户端通过 `GET /profiling/config`（携带 X-BK-TOKEN）拉取本应用生效的配置
   # per-token 覆盖由 type=subconfig 的子配置文件提供（与 apm.patterns 共用同一套机制）
-  # enabled 为 profiling 总开关，随接口返回给客户端，由客户端自行决定是否采集
+  # disabled 为 profiling 总开关：true 不采集，false 允许采集，缺省为 true
   profiling:
-{%- if profiling_config is defined and profiling_config.enabled is defined %}
-    enabled: {{ profiling_config.enabled }}
+{%- if profiling_config is defined and profiling_config.disabled is defined %}
+    disabled: {{ profiling_config.disabled }}
+{%- else %}
+    disabled: true
 {%- endif %}
 {%- if profiling_config is defined and profiling_config.cpu is defined %}
     cpu:
@@ -159,8 +161,8 @@ bk-collector:
 {%- if profiling_config.memory.collection_window is defined %}
       collection_window: "{{ profiling_config.memory.collection_window }}"
 {%- endif %}
-{%- if profiling_config.memory.sampling_frequency is defined %}
-      sampling_frequency: "{{ profiling_config.memory.sampling_frequency }}"
+{%- if profiling_config.memory.allocation_threshold is defined %}
+      allocation_threshold: "{{ profiling_config.memory.allocation_threshold }}"
 {%- endif %}
 {%- endif %}
 

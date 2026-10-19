@@ -29,19 +29,19 @@ exporter:
 # 客户端通过 `GET /profiling/config` 携带 X-BK-TOKEN 拉取到的就是这里的配置
 # 注意：profiling 必须平铺在文件根层级，不能像主配置那样嵌在 bk-collector: 之下
 # ——主配置的 bk-collector 段由 libbeat 剥去后交给 collector，而 subconfig 是直接读原始文件的
-# enabled 为总开关，省略时继承主配置的取值
+# disabled 为总开关（true 不采集），省略时继承主配置的取值
 profiling:
-  enabled: true
+  disabled: false
   cpu:
-    enabled: False
-    collection_period: "5m"
-    collection_window: "10s"
+    enabled: True
+    collection_period: "1m"
+    collection_window: "1m"
     sampling_frequency: "199Hz"
   memory:
     enabled: True
-    collection_period: "30m"
-    collection_window: "2m"
-    sampling_frequency: "1MB"
+    collection_period: "1m"
+    collection_window: "1m"
+    allocation_threshold: "512k"
 
 default:
   processor:

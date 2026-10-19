@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/confengine"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/json"
@@ -34,7 +35,7 @@ profiling:
     enabled: true
     collection_period: "15m"
     collection_window: "1m"
-    sampling_frequency: "512KB"
+    allocation_threshold: "512KB"
 `
 
 func resetGlobal() {
@@ -56,11 +57,16 @@ func TestHandler_DefaultConfig(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Header().Get("Content-Type"), "application/json")
+	assert.JSONEq(t, `{
+		"disabled": true,
+		"cpu": {"enabled": true, "collection_period": "10m", "collection_window": "30s", "sampling_frequency": "99Hz"},
+		"memory": {"enabled": true, "collection_period": "15m", "collection_window": "1m", "allocation_threshold": "512KB"}
+	}`, w.Body.String())
 
 	var got Config
 	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
 	assert.Equal(t, "99Hz", got.CPU.SamplingFrequency)
-	assert.Equal(t, "512KB", got.Memory.SamplingFrequency)
+	assert.Equal(t, "512KB", got.Memory.AllocationThreshold)
 }
 
 func TestHandler_WithToken(t *testing.T) {
@@ -78,6 +84,39 @@ func TestHandler_WithToken(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	body := w.Body.String()
 	assert.Contains(t, body, `"sampling_frequency":"99Hz"`)
+}
+
+func TestHandler_PreservesParameterStrings(t *testing.T) {
+	defer resetGlobal()
+
+	conf, err := confengine.LoadConfigContent(`
+profiling:
+  disabled: false
+  cpu:
+    enabled: true
+    collection_period: "300s"
+    collection_window: "1.50s"
+    sampling_frequency: "1kHz"
+  memory:
+    enabled: true
+    collection_period: "0.5h"
+    collection_window: "1500ms"
+    allocation_threshold: "1KiB"
+`)
+	assert.NoError(t, err)
+	assert.NoError(t, New(conf))
+
+	req := httptest.NewRequest(http.MethodGet, "/profiling/config", nil)
+	w := httptest.NewRecorder()
+	handleProfilingConfig(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	// 按客户端收到的 JSON 校验字符串类型与原文，不能通过 Config 往返掩盖单位转换。
+	assert.JSONEq(t, `{
+		"disabled": false,
+		"cpu": {"enabled": true, "collection_period": "300s", "collection_window": "1.50s", "sampling_frequency": "1kHz"},
+		"memory": {"enabled": true, "collection_period": "0.5h", "collection_window": "1500ms", "allocation_threshold": "1KiB"}
+	}`, w.Body.String())
 }
 
 func TestHandler_DifferentTokensReturnDifferentConfigs(t *testing.T) {
@@ -98,7 +137,7 @@ profiling:
     enabled: false
     collection_period: "30m"
     collection_window: "2m"
-    sampling_frequency: "1MB"
+    allocation_threshold: "1MB"
 `,
 		"token-b": `
 type: "subconfig"
@@ -113,7 +152,7 @@ profiling:
     enabled: true
     collection_period: "40m"
     collection_window: "3m"
-    sampling_frequency: "2MB"
+    allocation_threshold: "2MB"
 `,
 	}
 	for token, content := range subconfigs {
@@ -130,25 +169,37 @@ apm:
 	assert.NoError(t, New(conf))
 
 	tests := []struct {
-		token          string
-		cpuEnabled     bool
-		cpuSampling    string
-		memoryEnabled  bool
-		memorySampling string
+		token           string
+		cpuEnabled      bool
+		cpuPeriod       string
+		cpuWindow       string
+		cpuSampling     string
+		memoryEnabled   bool
+		memoryPeriod    string
+		memoryWindow    string
+		memoryThreshold string
 	}{
 		{
-			token:          "token-a",
-			cpuEnabled:     true,
-			cpuSampling:    "199Hz",
-			memoryEnabled:  false,
-			memorySampling: "1MB",
+			token:           "token-a",
+			cpuEnabled:      true,
+			cpuPeriod:       "5m",
+			cpuWindow:       "10s",
+			cpuSampling:     "199Hz",
+			memoryEnabled:   false,
+			memoryPeriod:    "30m",
+			memoryWindow:    "2m",
+			memoryThreshold: "1MB",
 		},
 		{
-			token:          "token-b",
-			cpuEnabled:     false,
-			cpuSampling:    "299Hz",
-			memoryEnabled:  true,
-			memorySampling: "2MB",
+			token:           "token-b",
+			cpuEnabled:      false,
+			cpuPeriod:       "20m",
+			cpuWindow:       "45s",
+			cpuSampling:     "299Hz",
+			memoryEnabled:   true,
+			memoryPeriod:    "40m",
+			memoryWindow:    "3m",
+			memoryThreshold: "2MB",
 		},
 	}
 
@@ -161,12 +212,18 @@ apm:
 			handleProfilingConfig(w, req)
 
 			assert.Equal(t, http.StatusOK, w.Code)
+			body := w.Body.String()
+			assert.Contains(t, body, `"collection_period":"`+tt.cpuPeriod+`"`)
+			assert.Contains(t, body, `"collection_window":"`+tt.cpuWindow+`"`)
+			assert.Contains(t, body, `"collection_period":"`+tt.memoryPeriod+`"`)
+			assert.Contains(t, body, `"collection_window":"`+tt.memoryWindow+`"`)
+			assert.Contains(t, body, `"allocation_threshold":"`+tt.memoryThreshold+`"`)
 			var got Config
 			assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
 			assert.Equal(t, tt.cpuEnabled, got.CPU.Enabled)
 			assert.Equal(t, tt.cpuSampling, got.CPU.SamplingFrequency)
 			assert.Equal(t, tt.memoryEnabled, got.Memory.Enabled)
-			assert.Equal(t, tt.memorySampling, got.Memory.SamplingFrequency)
+			assert.Equal(t, tt.memoryThreshold, got.Memory.AllocationThreshold)
 			configs[tt.token] = got
 		})
 	}
@@ -192,4 +249,69 @@ apm:
 	handleProfilingConfig(w, req)
 	assert.Equal(t, http.StatusNotFound, w.Code)
 	assert.True(t, strings.Contains(w.Body.String(), "no profiling config"))
+}
+
+func TestHandler_KingeyeCPUOnly(t *testing.T) {
+	defer resetGlobal()
+
+	path, err := filepath.Abs(filepath.Join("testdata", "kingeye_cpu_only.yml"))
+	require.NoError(t, err)
+	conf, err := confengine.LoadConfigContent(`
+profiling:
+  disabled: true
+apm:
+  patterns:
+    - "` + path + `"
+`)
+	require.NoError(t, err)
+	require.NoError(t, New(conf))
+
+	req := httptest.NewRequest(http.MethodGet, "/profiling/config", nil)
+	req.Header.Set("X-BK-TOKEN", "kingeye-cpu-only")
+	w := httptest.NewRecorder()
+	handleProfilingConfig(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.JSONEq(t, `{
+		"disabled": false,
+		"cpu": {"enabled": true, "collection_period": "5m", "collection_window": "30s", "sampling_frequency": "99Hz"},
+		"memory": {"enabled": false, "collection_period": "", "collection_window": "", "allocation_threshold": ""}
+	}`, w.Body.String())
+
+	// 应用子配置只开启自己的采集，其他 token 仍使用主配置的关闭状态。
+	req = httptest.NewRequest(http.MethodGet, "/profiling/config", nil)
+	req.Header.Set("X-BK-TOKEN", "other-token")
+	w = httptest.NewRecorder()
+	handleProfilingConfig(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"disabled":true`)
+}
+
+func TestHandler_KingeyeAllocationThreshold(t *testing.T) {
+	defer resetGlobal()
+
+	path, err := filepath.Abs(filepath.Join("testdata", "kingeye_allocation_threshold.yml"))
+	require.NoError(t, err)
+	conf, err := confengine.LoadConfigContent(`
+profiling:
+  disabled: true
+apm:
+  patterns:
+    - "` + path + `"
+`)
+	require.NoError(t, err)
+	require.NoError(t, New(conf))
+
+	req := httptest.NewRequest(http.MethodGet, "/profiling/config", nil)
+	req.Header.Set("X-BK-TOKEN", "kingeye-allocation-threshold")
+	w := httptest.NewRecorder()
+	handleProfilingConfig(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	// 直接校验响应键名，确保 CPU 频率和内存分配阈值分别下发，且没有多余的跨类型字段。
+	assert.JSONEq(t, `{
+		"disabled": false,
+		"cpu": {"enabled": true, "collection_period": "5m", "collection_window": "30s", "sampling_frequency": "99Hz"},
+		"memory": {"enabled": true, "collection_period": "15m", "collection_window": "1m", "allocation_threshold": "1MB"}
+	}`, w.Body.String())
 }

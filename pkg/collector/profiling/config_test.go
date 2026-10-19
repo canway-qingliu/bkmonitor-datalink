@@ -14,8 +14,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -25,7 +25,7 @@ import (
 
 const testDefaultYAML = `
 profiling:
-  enabled: true
+  disabled: false
   cpu:
     enabled: true
     collection_period: "10m"
@@ -35,11 +35,11 @@ profiling:
     enabled: true
     collection_period: "15m"
     collection_window: "1m"
-    sampling_frequency: "512KB"
+    allocation_threshold: "512KB"
 `
 
 // 存量配置的形态：只有 cpu/memory，没有总开关
-const testDefaultYAMLWithoutEnabled = `
+const testDefaultYAMLWithoutDisabled = `
 profiling:
   cpu:
     enabled: true
@@ -50,7 +50,7 @@ profiling:
     enabled: true
     collection_period: "15m"
     collection_window: "1m"
-    sampling_frequency: "512KB"
+    allocation_threshold: "512KB"
 `
 
 func newConf(t *testing.T, content string) *confengine.Config {
@@ -67,16 +67,16 @@ func TestLoadConfig_Default(t *testing.T) {
 	assert.NotNil(t, tier)
 
 	def := tier.GetGlobal().(*Config)
-	assert.True(t, def.Enabled)
+	assert.False(t, def.Disabled)
 	assert.True(t, def.CPU.Enabled)
-	assert.Equal(t, 10*time.Minute, def.CPU.CollectionPeriod)
-	assert.Equal(t, 30*time.Second, def.CPU.CollectionWindow)
+	assert.Equal(t, "10m", def.CPU.CollectionPeriod)
+	assert.Equal(t, "30s", def.CPU.CollectionWindow)
 	assert.Equal(t, "99Hz", def.CPU.SamplingFrequency)
 
 	assert.True(t, def.Memory.Enabled)
-	assert.Equal(t, 15*time.Minute, def.Memory.CollectionPeriod)
-	assert.Equal(t, time.Minute, def.Memory.CollectionWindow)
-	assert.Equal(t, "512KB", def.Memory.SamplingFrequency)
+	assert.Equal(t, "15m", def.Memory.CollectionPeriod)
+	assert.Equal(t, "1m", def.Memory.CollectionWindow)
+	assert.Equal(t, "512KB", def.Memory.AllocationThreshold)
 }
 
 func TestGetConfig_FallsBackToDefault(t *testing.T) {
@@ -105,7 +105,7 @@ profiling:
     enabled: false
     collection_period: "30m"
     collection_window: "2m"
-    sampling_frequency: "1MB"
+    allocation_threshold: "1MB"
 `
 	conf2 := newConf(t, updated)
 	assert.NoError(t, Reload(conf2))
@@ -114,9 +114,13 @@ profiling:
 	cfg := GetConfig("any")
 	assert.NotNil(t, cfg)
 	assert.False(t, cfg.CPU.Enabled)
-	assert.Equal(t, 20*time.Minute, cfg.CPU.CollectionPeriod)
-	assert.Equal(t, 45*time.Second, cfg.CPU.CollectionWindow)
+	assert.Equal(t, "20m", cfg.CPU.CollectionPeriod)
+	assert.Equal(t, "45s", cfg.CPU.CollectionWindow)
 	assert.Equal(t, "199Hz", cfg.CPU.SamplingFrequency)
+	assert.False(t, cfg.Memory.Enabled)
+	assert.Equal(t, "30m", cfg.Memory.CollectionPeriod)
+	assert.Equal(t, "2m", cfg.Memory.CollectionWindow)
+	assert.Equal(t, "1MB", cfg.Memory.AllocationThreshold)
 }
 
 func TestPerTokenOverrideFromSubconfig(t *testing.T) {
@@ -135,7 +139,7 @@ profiling:
     enabled: true
     collection_period: "15m"
     collection_window: "1m"
-    sampling_frequency: "512KB"
+    allocation_threshold: "1MB"
 `
 	assert.NoError(t, os.WriteFile(subPath, []byte(subContent), 0o644))
 
@@ -154,7 +158,7 @@ profiling:
     enabled: true
     collection_period: "15m"
     collection_window: "1m"
-    sampling_frequency: "512KB"
+    allocation_threshold: "512KB"
 `
 	conf := newConf(t, yaml)
 	assert.NoError(t, New(conf))
@@ -164,15 +168,18 @@ profiling:
 	cfgA := GetConfig("token-a")
 	assert.NotNil(t, cfgA)
 	assert.False(t, cfgA.CPU.Enabled)
-	assert.Equal(t, 20*time.Minute, cfgA.CPU.CollectionPeriod)
-	assert.Equal(t, 45*time.Second, cfgA.CPU.CollectionWindow)
+	assert.Equal(t, "20m", cfgA.CPU.CollectionPeriod)
+	assert.Equal(t, "45s", cfgA.CPU.CollectionWindow)
 	assert.Equal(t, "199Hz", cfgA.CPU.SamplingFrequency)
+	assert.Equal(t, "1MB", cfgA.Memory.AllocationThreshold)
 	// 未命中时回退默认
 	cfgB := GetConfig("token-b")
 	assert.NotNil(t, cfgB)
 	assert.True(t, cfgB.CPU.Enabled)
 	assert.Equal(t, "99Hz", cfgB.CPU.SamplingFrequency)
+	assert.Equal(t, "512KB", cfgB.Memory.AllocationThreshold)
 }
+
 // 回归：主配置缺少 profiling 块时，Reload 不应报错，且视为无配置（GetConfig 返回 nil）
 func TestReload_MissingBlockTreatedAsNoConfig(t *testing.T) {
 	defer resetGlobal()
@@ -182,34 +189,34 @@ func TestReload_MissingBlockTreatedAsNoConfig(t *testing.T) {
 	assert.Nil(t, GetConfig("any-token"))
 }
 
-// 回归：enabled 为 false 时仍正常加载配置，接口据此告知客户端不要采集
-func TestReload_EnabledFalseStillLoads(t *testing.T) {
+// 回归：disabled 为 true 时仍正常加载配置，接口据此告知客户端不要采集
+func TestReload_DisabledTrueStillLoads(t *testing.T) {
 	defer resetGlobal()
 
-	conf := newConf(t, testDefaultYAMLWithoutEnabled)
+	conf := newConf(t, strings.Replace(testDefaultYAML, "disabled: false", "disabled: true", 1))
 	assert.NoError(t, Reload(conf))
 
 	cfg := GetConfig("any-token")
 	assert.NotNil(t, cfg)
-	assert.False(t, cfg.Enabled)
+	assert.True(t, cfg.Disabled)
 	assert.Equal(t, "99Hz", cfg.CPU.SamplingFrequency)
 }
 
-// 总开关未声明时缺省为 false：存量配置不写 enabled，拉到的就是 enabled=false，由客户端自行决定不采
-func TestTotalSwitch_DefaultsToFalseWhenAbsent(t *testing.T) {
-	conf := newConf(t, testDefaultYAMLWithoutEnabled)
+// 总开关未声明时缺省为 disabled=true，由客户端停止采集。
+func TestTotalSwitch_DefaultsToDisabledWhenAbsent(t *testing.T) {
+	conf := newConf(t, testDefaultYAMLWithoutDisabled)
 	tier, err := LoadConfig(conf)
 	assert.NoError(t, err)
 
 	def := tier.GetGlobal().(*Config)
-	assert.False(t, def.Enabled)
+	assert.True(t, def.Disabled)
 }
 
-// 总开关为 false 时接口仍返回 200：它只告知客户端，不阻断配置下发（与 disabled 的 404 语义不同）
-func TestTotalSwitch_FalseStillServesConfig(t *testing.T) {
+// disabled 为 true 时接口仍返回 200：它只告知客户端，不阻断配置下发。
+func TestTotalSwitch_DisabledStillServesConfig(t *testing.T) {
 	defer resetGlobal()
 
-	conf := newConf(t, testDefaultYAMLWithoutEnabled)
+	conf := newConf(t, strings.Replace(testDefaultYAML, "disabled: false", "disabled: true", 1))
 	assert.NoError(t, New(conf))
 
 	req := httptest.NewRequest(http.MethodGet, "/profiling/config", nil)
@@ -217,15 +224,16 @@ func TestTotalSwitch_FalseStillServesConfig(t *testing.T) {
 	handleProfilingConfig(w, req)
 
 	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"disabled":true`)
 
 	var got Config
 	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
-	assert.False(t, got.Enabled)
+	assert.True(t, got.Disabled)
 	// 总开关关闭不影响其余参数下发
 	assert.Equal(t, "99Hz", got.CPU.SamplingFrequency)
 }
 
-// subconfig 未声明 enabled 时继承主配置，避免调整采样参数顺带把总开关抹成 false
+// subconfig 未声明 disabled 时继承主配置，避免调整采样参数改变总开关。
 func TestTotalSwitch_SubconfigInheritsWhenAbsent(t *testing.T) {
 	defer resetGlobal()
 
@@ -244,25 +252,37 @@ profiling:
     enabled: true
     collection_period: "15m"
     collection_window: "1m"
-    sampling_frequency: "512KB"
+    allocation_threshold: "512KB"
 `
 	assert.NoError(t, os.WriteFile(subPath, []byte(subContent), 0o644))
 
-	yaml := `
+	baseYAML := `
 apm:
   patterns:
     - "` + filepath.Join(dir, "*.yml") + `"
-` + testDefaultYAML
-	conf := newConf(t, yaml)
-	assert.NoError(t, New(conf))
+`
+	tests := []struct {
+		name     string
+		config   string
+		disabled bool
+	}{
+		{name: "enabled", config: testDefaultYAML, disabled: false},
+		{name: "disabled", config: strings.Replace(testDefaultYAML, "disabled: false", "disabled: true", 1), disabled: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conf := newConf(t, baseYAML+tt.config)
+			assert.NoError(t, New(conf))
 
-	cfg := GetConfig("token-a")
-	assert.NotNil(t, cfg)
-	assert.True(t, cfg.Enabled)
-	assert.Equal(t, "199Hz", cfg.CPU.SamplingFrequency)
+			cfg := GetConfig("token-a")
+			assert.NotNil(t, cfg)
+			assert.Equal(t, tt.disabled, cfg.Disabled)
+			assert.Equal(t, "199Hz", cfg.CPU.SamplingFrequency)
+		})
+	}
 }
 
-// subconfig 显式声明 enabled 时以子配置为准
+// subconfig 显式声明 disabled 时以子配置为准。
 func TestTotalSwitch_SubconfigOverridesWhenPresent(t *testing.T) {
 	defer resetGlobal()
 
@@ -272,7 +292,7 @@ func TestTotalSwitch_SubconfigOverridesWhenPresent(t *testing.T) {
 type: "subconfig"
 token: "token-a"
 profiling:
-  enabled: false
+  disabled: true
   cpu:
     enabled: true
     collection_period: "20m"
@@ -282,7 +302,7 @@ profiling:
     enabled: true
     collection_period: "15m"
     collection_window: "1m"
-    sampling_frequency: "512KB"
+    allocation_threshold: "512KB"
 `
 	assert.NoError(t, os.WriteFile(subPath, []byte(subContent), 0o644))
 
@@ -296,10 +316,10 @@ apm:
 
 	cfg := GetConfig("token-a")
 	assert.NotNil(t, cfg)
-	assert.False(t, cfg.Enabled)
+	assert.True(t, cfg.Disabled)
 
 	// 未命中 subconfig 的 token 仍取主配置
 	cfgB := GetConfig("token-b")
 	assert.NotNil(t, cfgB)
-	assert.True(t, cfgB.Enabled)
+	assert.False(t, cfgB.Disabled)
 }

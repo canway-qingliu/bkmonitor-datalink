@@ -157,8 +157,8 @@ func New(conf *confengine.Config, buildInfo define.BuildInfo) (*Controller, erro
 		return nil, err
 	}
 
-	// profiling 不再有模块级 disabled 开关：是否采集完全由配置中的 enabled 总开关决定，
-	// 接口始终可用，客户端据 enabled 自行判断
+	// profiling.disabled 仅控制客户端是否采集，配置接口始终可用，
+	// 主配置禁用采集时仍需加载应用子配置，以便按 token 覆盖。
 	if err = profiling.New(conf); err != nil {
 		return nil, err
 	}

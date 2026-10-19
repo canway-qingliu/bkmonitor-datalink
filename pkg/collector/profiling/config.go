@@ -10,8 +10,6 @@
 package profiling
 
 import (
-	"time"
-
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/confengine"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
@@ -22,26 +20,37 @@ import (
 const keyCollectorPrefix = "bk-collector"
 
 // Config 描述了 profiling 采集的完整参数
-// Enabled 是 profiling 总开关，随接口返回给客户端，由客户端自行决定是否采集；
-// 它为 false 时接口照常返回 200 并完整下发其余参数，不阻断配置获取
+// Disabled 与 Kingeye 下发的总开关一致：true 表示不采集，false 表示允许采集。
+// 无论是否禁用，接口均返回 200 并下发其余参数，由客户端决定是否采集。
 type Config struct {
-	Enabled bool          `config:"enabled" json:"enabled" mapstructure:"enabled"`
-	CPU     ProfileConfig `config:"cpu" json:"cpu"`
-	Memory  ProfileConfig `config:"memory" json:"memory"`
+	Disabled bool         `config:"disabled" json:"disabled" mapstructure:"disabled"`
+	CPU      CPUConfig    `config:"cpu" json:"cpu"`
+	Memory   MemoryConfig `config:"memory" json:"memory"`
 }
 
-// ProfileConfig 描述了单类 profiling 的采集参数；sampling_frequency 的单位由 CPU 或 Memory 类型决定。
-type ProfileConfig struct {
-	Enabled           bool          `config:"enabled" json:"enabled" mapstructure:"enabled"`
-	CollectionPeriod  time.Duration `config:"collection_period" json:"collection_period" mapstructure:"collection_period"`
-	CollectionWindow  time.Duration `config:"collection_window" json:"collection_window" mapstructure:"collection_window"`
-	SamplingFrequency string        `config:"sampling_frequency" json:"sampling_frequency" mapstructure:"sampling_frequency"`
+// CPUConfig 描述 CPU profiling 参数，sampling_frequency 为采样频率（如 "99Hz"）。
+// 三个参数均按不透明字符串保留 YAML 原文并通过 JSON 下发，由客户端解析。
+type CPUConfig struct {
+	Enabled           bool   `config:"enabled" json:"enabled" mapstructure:"enabled"`
+	CollectionPeriod  string `config:"collection_period" json:"collection_period" mapstructure:"collection_period"`
+	CollectionWindow  string `config:"collection_window" json:"collection_window" mapstructure:"collection_window"`
+	SamplingFrequency string `config:"sampling_frequency" json:"sampling_frequency" mapstructure:"sampling_frequency"`
+}
+
+// MemoryConfig 描述内存 profiling 参数，allocation_threshold 为分配阈值（如 "1MB"）。
+// 三个参数均按不透明字符串保留 YAML 原文并通过 JSON 下发，由客户端解析。
+type MemoryConfig struct {
+	Enabled             bool   `config:"enabled" json:"enabled" mapstructure:"enabled"`
+	CollectionPeriod    string `config:"collection_period" json:"collection_period" mapstructure:"collection_period"`
+	CollectionWindow    string `config:"collection_window" json:"collection_window" mapstructure:"collection_window"`
+	AllocationThreshold string `config:"allocation_threshold" json:"allocation_threshold" mapstructure:"allocation_threshold"`
 }
 
 // LoadConfig 解析主 profiling 块，并合并 subconfig 文件中的 per-token 覆盖
 // 默认配置通过 SetGlobal 落入 TierConfig；每条 type=subconfig 的文件以 token 为键覆盖默认
 func LoadConfig(conf *confengine.Config) (*confengine.TierConfig, error) {
-	var def Config
+	// 主配置未声明总开关时默认不采集；应用子配置可用 disabled: false 显式开启。
+	def := Config{Disabled: true}
 	if err := conf.UnpackChild(define.ConfigFieldProfiling, &def); err != nil {
 		return nil, err
 	}
@@ -85,10 +94,9 @@ func LoadConfig(conf *confengine.Config) (*confengine.TierConfig, error) {
 			logger.Warnf("profiling: failed to decode override for token %s: %v", sub.Token, err)
 			continue
 		}
-		// 总开关缺省继承主配置：override 虽整体替换主 profiling 块，但 enabled 未显式声明时
-		// 不应把主配置的开关值抹成 false，否则单 token 的采样参数调整会顺带关掉该应用的 profiling
-		if child, err := sc.Child("profiling"); err == nil && !child.Has("enabled") {
-			override.Enabled = def.Enabled
+		// 总开关缺省继承主配置；显式 disabled: false 必须覆盖主配置的关闭状态。
+		if child, err := sc.Child("profiling"); err == nil && !child.Has("disabled") {
+			override.Disabled = def.Disabled
 		}
 		tier.Set(sub.Token, define.SubConfigFieldDefault, "", &override)
 	}
