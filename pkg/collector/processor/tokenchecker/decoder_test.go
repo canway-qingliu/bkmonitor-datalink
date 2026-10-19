@@ -29,6 +29,7 @@ func TestFixedDecoder(t *testing.T) {
 
 	decoder := newFixedTokenDecoder(Config{
 		Type:          "fixed",
+		AppID:         123,
 		TracesDataId:  tracesDataId,
 		MetricsDataId: metricsDataId,
 		LogsDataId:    logsDataId,
@@ -41,6 +42,7 @@ func TestFixedDecoder(t *testing.T) {
 	assert.Equal(t, token.TracesDataId, tracesDataId)
 	assert.Equal(t, token.MetricsDataId, metricsDataId)
 	assert.Equal(t, token.LogsDataId, logsDataId)
+	assert.Equal(t, int64(123), token.AppID)
 }
 
 func TestDefaultDecoder(t *testing.T) {
@@ -140,11 +142,13 @@ func TestAes256WithMetaDecoder(t *testing.T) {
 
 	cache := metacache.New()
 	cache.Set(token1, define.Token{
+		AppID:          123,
 		ProfilesDataId: 10001,
 		ProxyDataId:    10002,
 		BeatDataId:     10003,
 	})
 	cache.Set(token3, define.Token{
+		AppID:          456,
 		AppName:        "foobar",
 		BizId:          10,
 		TracesDataId:   2001,
@@ -196,6 +200,7 @@ func TestAes256WithMetaDecoder(t *testing.T) {
 		{
 			Input: token3,
 			Token: define.Token{
+				AppID:          456,
 				AppName:        "foobar",
 				BizId:          10,
 				TracesDataId:   2001,

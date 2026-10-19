@@ -35,6 +35,7 @@ processor:
       type: "fixed"
       fixed_token: "token1"
       resource_key: "bk.data.token"
+      app_id: 123
       traces_dataid: 1000
       metrics_dataid: 1001
       logs_dataid: 1002
@@ -71,6 +72,10 @@ processor:
 	actualC1 := factory.configs.GetGlobal().(Config)
 	assert.Equal(t, c1, actualC1)
 	assert.Equal(t, []string{"bk.data.token"}, actualC1.resourceKeys)
+	assert.Equal(t, int64(123), actualC1.AppID)
+	decoded, err := factory.decoders.GetGlobal().(TokenDecoder).Decode("")
+	assert.NoError(t, err)
+	assert.Equal(t, int64(123), decoded.AppID)
 
 	var c2 Config
 	assert.NoError(t, mapstructure.Decode(customConf, &c2))
@@ -95,6 +100,91 @@ func makeTracesRecord(n int, resources map[string]string) ptrace.Traces {
 	opts := define.TracesOptions{SpanCount: n}
 	opts.Resources = resources
 	return generator.NewTracesGenerator(opts).Generate()
+}
+
+type traceTokenTestDecoder struct{}
+
+func (traceTokenTestDecoder) Type() string { return "test" }
+func (traceTokenTestDecoder) Skip() bool   { return false }
+func (traceTokenTestDecoder) Decode(value string) (define.Token, error) {
+	switch value {
+	case "token-a":
+		return define.Token{Original: value, BizId: 2, AppName: "app-a", TracesDataId: 1001}, nil
+	case "token-b":
+		return define.Token{Original: value, BizId: 2, AppName: "app-b", TracesDataId: 1001}, nil
+	default:
+		return define.Token{}, errors.New("unknown token")
+	}
+}
+
+func TestTracesRejectMixedTokens(t *testing.T) {
+	traces := ptrace.NewTraces()
+	for _, value := range []string{"token-a", "token-b"} {
+		resourceSpans := traces.ResourceSpans().AppendEmpty()
+		resourceSpans.Resource().Attributes().PutString("bk.data.token", value)
+		resourceSpans.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	}
+	record := define.Record{RecordType: define.RecordTraces, Data: traces}
+
+	checker := tokenChecker{}
+	err := checker.processTraces(traceTokenTestDecoder{}, Config{resourceKeys: []string{"bk.data.token"}}, &record)
+
+	assert.Error(t, err)
+	assert.Equal(t, 2, traces.ResourceSpans().Len(), "mixed-token request must not be partially accepted")
+}
+
+func TestTracesRejectResourceAndHeaderTokenMismatch(t *testing.T) {
+	traces := ptrace.NewTraces()
+	first := traces.ResourceSpans().AppendEmpty()
+	first.Resource().Attributes().PutString("bk.data.token", "token-a")
+	first.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	second := traces.ResourceSpans().AppendEmpty()
+	second.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	record := define.Record{
+		RecordType: define.RecordTraces,
+		Data:       traces,
+		Token:      define.Token{Original: "token-b"},
+	}
+
+	checker := tokenChecker{}
+	err := checker.processTraces(traceTokenTestDecoder{}, Config{resourceKeys: []string{"bk.data.token"}}, &record)
+
+	assert.Error(t, err)
+	assert.Equal(t, 2, traces.ResourceSpans().Len())
+}
+
+func TestTracesDoNotInheritEarlierResourceToken(t *testing.T) {
+	traces := ptrace.NewTraces()
+	first := traces.ResourceSpans().AppendEmpty()
+	first.Resource().Attributes().PutString("bk.data.token", "token-a")
+	first.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	second := traces.ResourceSpans().AppendEmpty()
+	second.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	record := define.Record{RecordType: define.RecordTraces, Data: traces}
+
+	checker := tokenChecker{}
+	err := checker.processTraces(traceTokenTestDecoder{}, Config{resourceKeys: []string{"bk.data.token"}}, &record)
+
+	assert.NoError(t, err)
+	assert.Equal(t, 1, traces.ResourceSpans().Len(), "untagged ResourceSpans must not inherit another resource's token")
+	assert.Equal(t, "app-a", record.Token.AppName)
+}
+
+func TestTracesAcceptRepeatedToken(t *testing.T) {
+	traces := ptrace.NewTraces()
+	for i := 0; i < 2; i++ {
+		resourceSpans := traces.ResourceSpans().AppendEmpty()
+		resourceSpans.Resource().Attributes().PutString("bk.data.token", "token-a")
+		resourceSpans.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	}
+	record := define.Record{RecordType: define.RecordTraces, Data: traces}
+
+	checker := tokenChecker{}
+	err := checker.processTraces(traceTokenTestDecoder{}, Config{resourceKeys: []string{"bk.data.token"}}, &record)
+
+	assert.NoError(t, err)
+	assert.Equal(t, 2, traces.ResourceSpans().Len())
+	assert.Equal(t, "app-a", record.Token.AppName)
 }
 
 func makeMetricsRecord(n int, resources map[string]string) pmetric.Metrics {

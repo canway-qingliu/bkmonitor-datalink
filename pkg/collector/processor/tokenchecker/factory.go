@@ -191,28 +191,45 @@ func (p *tokenChecker) processTraces(decoder TokenDecoder, config Config, record
 		return err
 	}
 
+	requestToken := record.Token.Original
 	var errs []error
+	var firstToken define.Token
+	var hasFirstToken bool
+	var mixedTokens bool
+	checkToken := func(token define.Token) {
+		if !hasFirstToken {
+			firstToken = token
+			hasFirstToken = true
+		} else if token != firstToken {
+			mixedTokens = true
+		}
+	}
 	pdTraces := record.Data.(ptrace.Traces)
 	pdTraces.ResourceSpans().RemoveIf(func(resourceSpans ptrace.ResourceSpans) bool {
 		rsToken := tokenFromAttrs(resourceSpans.Resource().Attributes(), config.resourceKeys)
 		if len(rsToken) > 0 {
-			record.Token, err = decodeToken(decoder, rsToken)
-			if err != nil {
-				errs = append(errs, err)
-				logger.Errorf("failed to parse pdTraces.rsToken (%s), err: %v", rsToken, err)
+			decodedToken, decodeErr := decodeToken(decoder, rsToken)
+			if decodeErr != nil {
+				errs = append(errs, decodeErr)
+				logger.Errorf("failed to parse pdTraces.rsToken (%s), err: %v", rsToken, decodeErr)
 				return true
 			}
+			checkToken(decodedToken)
 			return false
 		}
 
-		record.Token, err = decodeToken(decoder, record.Token.Original)
-		if err != nil {
-			errs = append(errs, err)
-			logger.Errorf("failed to parse pdTraces.original (%s), err: %v", record.Token.Original, err)
+		decodedToken, decodeErr := decodeToken(decoder, requestToken)
+		if decodeErr != nil {
+			errs = append(errs, decodeErr)
+			logger.Errorf("failed to parse pdTraces.original (%s), err: %v", requestToken, decodeErr)
 			return true
 		}
+		checkToken(decodedToken)
 		return false
 	})
+	if mixedTokens {
+		return errors.New("reject mixed trace tokens in one request")
+	}
 
 	// 当且仅当没有任何 spans 的情况下才算鉴权失败
 	if pdTraces.ResourceSpans().Len() == 0 {
@@ -221,6 +238,7 @@ func (p *tokenChecker) processTraces(decoder TokenDecoder, config Config, record
 		}
 		return define.ErrSkipEmptyRecord
 	}
+	record.Token = firstToken
 	return nil
 }
 

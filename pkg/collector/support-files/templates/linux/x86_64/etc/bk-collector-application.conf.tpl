@@ -2,6 +2,7 @@ type: 'subconfig'
 token: '{{ bk_data_token }}'
 bk_biz_id: {{ bk_biz_id }}
 bk_app_name: {{ bk_app_name }}
+app_id: {{ app_id | default(0) }}
 traces_dataid: {{ trace_data_id | default(0) }}
 metrics_dataid: {{ metric_data_id | default(0) }}
 logs_dataid: {{ log_data_id | default(0) }}

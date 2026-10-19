@@ -102,6 +102,24 @@ func TestTracesInjectTokenFields(t *testing.T) {
 	}
 }
 
+func TestTracesInjectTrustedAppID(t *testing.T) {
+	traces := ptrace.NewTraces()
+	resourceSpans := traces.ResourceSpans().AppendEmpty()
+	resourceSpans.Resource().Attributes().PutInt("app_id", 999)
+	resourceSpans.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	record := define.Record{
+		RecordType: define.RecordTraces,
+		Data:       traces,
+		Token:      define.Token{BizId: 2, AppName: "app-a", AppID: 123, TracesDataId: 1001},
+	}
+
+	var events []define.Event
+	tracesConverter{}.Convert(&record, func(evts ...define.Event) { events = append(events, evts...) })
+
+	assert.Len(t, events, 1)
+	assert.Equal(t, int64(123), events[0].Data()["app_id"])
+}
+
 func TestTracesInjectTokenFieldsZeroValue(t *testing.T) {
 	g := makeTracesGenerator(1)
 	traces := g.Generate()
@@ -122,6 +140,7 @@ func TestTracesInjectTokenFieldsZeroValue(t *testing.T) {
 	data := events[0].Data()
 	assert.Equal(t, int32(0), data["bk_biz_id"])
 	assert.Equal(t, "", data["app_name"])
+	assert.NotContains(t, data, "app_id")
 }
 
 func TestTracesTraceStateAsRaw(t *testing.T) {

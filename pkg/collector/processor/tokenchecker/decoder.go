@@ -127,6 +127,7 @@ func newFixedTokenDecoder(c Config) TokenDecoder {
 			LogsDataId:     c.LogsDataId,
 			BizId:          c.BizId,
 			AppName:        c.AppName,
+			AppID:          c.AppID,
 		},
 	}
 }
