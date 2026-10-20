@@ -553,7 +553,12 @@ func writeTraceProfileReject(ctx context.Context, c *gin.Context, span *trace.Sp
 //     只写服务端日志。
 func writeTraceProfileError(ctx context.Context, c *gin.Context, span *trace.Span, err error) error {
 	code := traceprofile.ErrorCode(err)
-	message := err.Error()
+	// 只回封闭文案：未分类错误不回原文。
+	message := "Trace 查询失败"
+	var rejected *traceprofile.RejectError
+	if errors.As(err, &rejected) {
+		message = rejected.Message
+	}
 	status := http.StatusBadRequest
 	switch {
 	case errors.Is(err, errTraceProfileReadTargetsUnavailable):

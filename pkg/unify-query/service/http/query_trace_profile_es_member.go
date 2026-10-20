@@ -44,7 +44,9 @@ func queryESMemberRawWithTimeField(ctx context.Context, query *structured.QueryT
 ) {
 	resolved, err := query.ToQueryReference(ctx)
 	if err != nil {
-		return 0, nil, nil, nil, esMemberReject(traceprofile.CodePartialFailure, "ES Summary RT 解析失败")
+		return 0, nil, nil, nil, &traceprofile.RejectError{
+			Code: traceprofile.CodePartialFailure, Message: "ES Summary RT 解析失败", Cause: err,
+		}
 	}
 	if resolved.Count() == 0 {
 		return 0, nil, nil, nil, esMemberReject(traceprofile.CodeRouteNotFound, "ES Summary RT 没有可用路由")

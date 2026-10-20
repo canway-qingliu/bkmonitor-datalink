@@ -12,6 +12,7 @@ package http
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -115,4 +116,23 @@ func TestTraceReadTargetsUnavailableIs503(t *testing.T) {
 	if recorder.Code != http.StatusBadRequest || spanErr != nil {
 		t.Fatalf("unpublished read targets returned HTTP %d span error %v", recorder.Code, spanErr)
 	}
+}
+
+// L2：响应文案只来自封闭的拒绝文案。
+func TestUnclassifiedErrorDoesNotLeakItsText(t *testing.T) {
+	recorder, _ := runTraceProfileWriteError(t, errors.New("dial tcp 10.0.0.1:9030: refused"))
+	if strings.Contains(recorder.Body.String(), "10.0.0.1") || recorder.Code != http.StatusBadGateway {
+		t.Fatalf("an unclassified error leaked its text: %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// runTraceProfileWriteError 直接写出一个错误，返回响应与交给 span 的错误。
+func runTraceProfileWriteError(t *testing.T, err error) (*httptest.ResponseRecorder, error) {
+	t.Helper()
+	metadata.InitMetadata()
+	ctx := metadata.InitHashID(context.Background())
+	recorder := httptest.NewRecorder()
+	ginContext, _ := gin.CreateTestContext(recorder)
+	ginContext.Request = httptest.NewRequest(http.MethodPost, "/query/ts/raw", nil).WithContext(ctx)
+	return recorder, writeTraceProfileError(ctx, ginContext, nil, err)
 }
