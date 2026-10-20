@@ -31,7 +31,7 @@ const (
 	redisTraceChannel    = "test:unify-query:data:trace:read_target:read_target_channel"
 )
 
-func setUpRedisTracePublication(t *testing.T) (context.Context, goRedis.UniversalClient) {
+func setUpRedisTracePublication(t *testing.T) (context.Context, goRedis.UniversalClient, *miniredis.Miniredis) {
 	t.Helper()
 	mr := miniredis.RunT(t)
 	ctx := context.Background()
@@ -44,6 +44,7 @@ func setUpRedisTracePublication(t *testing.T) (context.Context, goRedis.Universa
 	}
 	config := traceProfileRuntimeConfig()
 	config["single_tenant_id"] = "system"
+	config["read_target_source"] = "redis"
 	delete(config, "read_routes")
 	previousConfig, previousSource := viper.Get(TraceProfileConfigPath), viper.Get("storage.source")
 	previousBasePath := redisService.KVBasePath
@@ -65,13 +66,13 @@ func setUpRedisTracePublication(t *testing.T) (context.Context, goRedis.Universa
 		}
 		redis.Close()
 	})
-	return ctx, client
+	return ctx, client, mr
 }
 
-func TestTracePublishedRoutesLoadFromRedisWhenStorageSourceIsRedis(t *testing.T) {
-	_, _ = setUpRedisTracePublication(t)
+func TestTracePublishedRoutesLoadFromRedisWhenTraceSourceIsRedis(t *testing.T) {
+	_, _, _ = setUpRedisTracePublication(t)
 	if !traceProfileUsesPublishedRoutes() {
-		t.Fatal("Redis Trace publication was not enabled without Consul paths")
+		t.Fatal("Redis Trace publication was not enabled by trace_profile.read_target_source")
 	}
 	if err := reloadTraceProfilePublishedRuntime(); err != nil {
 		t.Fatalf("Redis publication was not loaded: %v", err)
@@ -99,7 +100,7 @@ func TestRedisStorageWithoutTraceProfileDoesNotEnableTraceLoader(t *testing.T) {
 }
 
 func TestTraceRedisInvalidPublicationRevokesOldRoute(t *testing.T) {
-	ctx, client := setUpRedisTracePublication(t)
+	ctx, client, _ := setUpRedisTracePublication(t)
 	if err := reloadTraceProfilePublishedRuntime(); err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +117,7 @@ func TestTraceRedisInvalidPublicationRevokesOldRoute(t *testing.T) {
 }
 
 func TestTraceRedisNotificationReloadsRoutes(t *testing.T) {
-	ctx, client := setUpRedisTracePublication(t)
+	ctx, client, _ := setUpRedisTracePublication(t)
 	watchCtx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	t.Cleanup(func() { cancel(); wg.Wait() })

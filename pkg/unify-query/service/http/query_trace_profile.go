@@ -12,6 +12,7 @@ package http
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -85,6 +86,7 @@ type traceProfileConfig struct {
 	RouteSnapshotVersion  int64                          `json:"route_snapshot_version"`
 	ReadTargetDataPath    string                         `json:"read_target_data_path,omitempty"`
 	ReadTargetVersionPath string                         `json:"read_target_version_path,omitempty"`
+	ReadTargetSource      string                         `json:"read_target_source,omitempty"`
 	MaxBodyBytes          int                            `json:"max_body_bytes"`
 	MaxLimit              int64                          `json:"max_limit"`
 	MaxOffset             int64                          `json:"max_offset"`
@@ -132,6 +134,8 @@ type traceProfileRuntime struct {
 	maxRangeUS     int64
 	routeVersion   int64
 	routeCount     int
+	// configDigest 是构建该快照时的本地 trace_profile 配置摘要，仅发布源模式使用。
+	configDigest [sha256.Size]byte
 
 	// 模式和数据租户在同一快照内，避免配置热更新时混用新旧值。
 	singleTenantID              string
@@ -167,8 +171,8 @@ func swapTraceProfileRuntime(runtime *traceProfileRuntime) {
 // loadTraceProfileConfig 由 http 配置加载钩子调用；任何一步失败都关闭直连读取而不是降级。
 func loadTraceProfileConfig() {
 	if traceProfileUsesPublishedRoutes() {
-		// 发布源实例由服务启动时建立；配置解析阶段先关闭直读，随后加载发布快照。
-		swapTraceProfileRuntime(nil)
+		// 发布源快照由服务启动与重载时加载；配置变化通过配置摘要触发重建，
+		// 这里不撤销已安装的快照，避免配置热更新与发布源读取之间出现空窗。
 		return
 	}
 	runtime, err := newTraceProfileRuntime(viper.Get(TraceProfileConfigPath))
@@ -206,6 +210,11 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 	}
 	if err := decoder.Decode(&config); err != nil {
 		return nil, fmt.Errorf("Trace profile 直连读取配置非法: %w", err)
+	}
+	switch config.ReadTargetSource {
+	case "", traceReadTargetSourceConsul, traceReadTargetSourceRedis:
+	default:
+		return nil, fmt.Errorf("Trace 读目标发布源只能是 consul 或 redis: %s", config.ReadTargetSource)
 	}
 	if len(config.ReadRoutes) == 0 && len(config.ReadonlyConnections) == 0 && len(config.ESSummaryTargets) == 0 {
 		return nil, nil

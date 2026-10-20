@@ -12,9 +12,11 @@ package http
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
+	goRedis "github.com/go-redis/redis/v8"
 	"github.com/hashicorp/consul/api"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/redis"
@@ -37,29 +39,68 @@ func traceProfileRedisGetPairs(prefix string) (api.KVPairs, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	// 每个租户一条 String key；SCAN 可能重复返回 key，读取后由原解析器校验完整文档。
-	pairs := make(api.KVPairs, 0)
+	// 每个租户一条 String key。SCAN 不是快照，所以：先列出键，再用一次 MGET 原子读取
+	// 所有值（扫描后被删除的键读到 nil，按已撤销跳过），最后重扫一次键集合；
+	// 两次键集合不一致说明加载期间有发布，本次按读取失败处理，保留上一份快照等待下次重载。
+	keys, err := traceProfileRedisScanKeys(ctx, client, prefix)
+	if err != nil {
+		return nil, err
+	}
+	pairs := make(api.KVPairs, 0, len(keys))
+	present := make(map[string]struct{}, len(keys))
+	if len(keys) > 0 {
+		values, err := client.MGet(ctx, keys...).Result()
+		if err != nil {
+			return nil, fmt.Errorf("Trace Redis 读目标读取失败: %w", err)
+		}
+		for index, value := range values {
+			if value == nil {
+				continue
+			}
+			text, ok := value.(string)
+			if !ok {
+				return nil, fmt.Errorf("Trace Redis 读目标 %s 不是字符串", keys[index])
+			}
+			present[keys[index]] = struct{}{}
+			pairs = append(pairs, &api.KVPair{Key: keys[index], Value: []byte(text)})
+		}
+	}
+	after, err := traceProfileRedisScanKeys(ctx, client, prefix)
+	if err != nil {
+		return nil, err
+	}
+	if len(after) != len(present) {
+		return nil, fmt.Errorf("Trace Redis 读目标在加载期间发生变化")
+	}
+	for _, key := range after {
+		if _, found := present[key]; !found {
+			return nil, fmt.Errorf("Trace Redis 读目标在加载期间发生变化")
+		}
+	}
+	return pairs, nil
+}
+
+// traceProfileRedisScanKeys 列出前缀下全部键，去重并排序；SCAN 可能重复返回同一个键。
+func traceProfileRedisScanKeys(ctx context.Context, client goRedis.UniversalClient, prefix string) ([]string, error) {
 	seen := make(map[string]struct{})
+	keys := make([]string, 0)
 	var cursor uint64
 	for {
-		keys, next, err := client.Scan(ctx, cursor, prefix+"*", 100).Result()
+		batch, next, err := client.Scan(ctx, cursor, prefix+"*", 100).Result()
 		if err != nil {
 			return nil, err
 		}
-		for _, key := range keys {
+		for _, key := range batch {
 			if _, duplicated := seen[key]; duplicated {
 				continue
 			}
 			seen[key] = struct{}{}
-			value, err := client.Get(ctx, key).Bytes()
-			if err != nil {
-				return nil, fmt.Errorf("Trace Redis 读目标 %s 读取失败: %w", key, err)
-			}
-			pairs = append(pairs, &api.KVPair{Key: key, Value: value})
+			keys = append(keys, key)
 		}
 		cursor = next
 		if cursor == 0 {
-			return pairs, nil
+			sort.Strings(keys)
+			return keys, nil
 		}
 	}
 }

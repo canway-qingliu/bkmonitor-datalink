@@ -39,9 +39,10 @@ func TestPublishedTraceTargetsInstallESSummaryCandidateIntoRuntime(t *testing.T)
 	prefix := "kingeye/metadata/unify-query/data/trace/read_target/"
 	publication := strings.Replace(publishedBusiness132, `"a3_targets":[]`,
 		`"a3_targets":[],"es_summary_targets":`+publishedESSummaryTargets, 1)
-	version, routes, esTargets, err := parsePublishedTraceTargets(prefix,
+	snapshot, err := parsePublishedTraceTargets(prefix,
 		api.KVPairs{&api.KVPair{Key: prefix + "system", Value: []byte(publication)}})
-	if err != nil || len(esTargets) != 1 {
+	version, routes, esTargets := snapshot.Version, snapshot.Routes, snapshot.ESTargets
+	if err != nil || len(snapshot.Invalid) != 0 || len(esTargets) != 1 {
 		t.Fatalf("ES Summary publication was lost: targets=%+v err=%v", esTargets, err)
 	}
 	config := traceProfileRuntimeConfig()
@@ -84,8 +85,9 @@ func TestESSummaryOnlyTenantCanLoadTrustedCandidateWithoutDorisConnection(t *tes
 func TestPublishedTraceTargetsBuildBusiness132Runtime(t *testing.T) {
 	prefix := "kingeye/metadata/unify-query/data/trace/read_target/"
 	pairs := api.KVPairs{&api.KVPair{Key: prefix + "system", Value: []byte(publishedBusiness132)}}
-	version, routes, _, err := parsePublishedTraceTargets(prefix, pairs)
-	if err != nil || version <= 0 || len(routes) != 2 {
+	snapshot, err := parsePublishedTraceTargets(prefix, pairs)
+	version, routes := snapshot.Version, snapshot.Routes
+	if err != nil || len(snapshot.Invalid) != 0 || version <= 0 || len(routes) != 2 {
 		t.Fatalf("failed to parse published routes: version=%d routes=%d err=%v", version, len(routes), err)
 	}
 	if routes[0].BkBizID != 132 || routes[0].Table != "otel_trace_span_132" || routes[0].ClusterID != "18" {
@@ -112,8 +114,9 @@ func TestPublishedTraceTargetsKeepVersionsPerTenant(t *testing.T) {
 		&api.KVPair{Key: prefix + "system", Value: []byte(publishedBusiness132)},
 		&api.KVPair{Key: prefix + "other", Value: []byte(other)},
 	}
-	aggregate, routes, _, err := parsePublishedTraceTargets(prefix, pairs)
-	if err != nil || aggregate <= 0 || len(routes) != 4 {
+	snapshot, err := parsePublishedTraceTargets(prefix, pairs)
+	aggregate, routes := snapshot.Version, snapshot.Routes
+	if err != nil || len(snapshot.Invalid) != 0 || aggregate <= 0 || len(routes) != 4 {
 		t.Fatalf("multi-tenant publication was rejected: version=%d routes=%d err=%v", aggregate, len(routes), err)
 	}
 	versions := map[string]int64{}
