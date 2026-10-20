@@ -93,8 +93,7 @@ func TestSourceSwitchFailsClosedUntilTheNewSourceReads(t *testing.T) {
 	redisService.KVBasePath = "test:unify-query"
 	t.Cleanup(func() { redisService.KVBasePath = previousBase; redis.Close() })
 	mr.SetError("LOADING")
-	config := viper.Get(TraceProfileConfigPath).(map[string]any)
-	config["read_target_source"] = "redis"
+	viper.Set("storage.source", "redis")
 	loadTraceProfileConfig()
 	if traceProfileRuntimeValue.Load() != nil {
 		t.Fatal("the old source's snapshot still serves after the source switch")

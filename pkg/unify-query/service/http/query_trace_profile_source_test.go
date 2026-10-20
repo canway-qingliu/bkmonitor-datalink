@@ -71,6 +71,7 @@ func withConsulTracePublication(t *testing.T, documents map[string]string) *cons
 	config["read_target_version_path"] = consulTraceVersionPath
 	previousConfig, previousStorage := viper.Get(TraceProfileConfigPath), viper.Get("storage.source")
 	viper.Set(TraceProfileConfigPath, config)
+	viper.Set("storage.source", "consul")
 	resetTraceProfileLoader(t)
 	previousRuntime := traceProfileRuntimeValue.Swap(nil)
 	previousPrefix, previousKey, previousWatch := consul.GetDataWithPrefixContext, consul.GetKVDataContext, consul.WatchChangeContext
@@ -129,32 +130,6 @@ func resolveTenantTarget(tenant string) error {
 	}
 	_, err := runtime.executor.ResolveESSummaryTarget(tenant, 132, 7, tenant+"_kapm")
 	return err
-}
-
-// 现网故障：Storage 切到 Redis 后 Trace 读目标也被带去 Redis。Trace 发布源未配置时必须仍读 Consul。
-func TestStorageSourceRedisLeavesTraceReadTargetsOnConsul(t *testing.T) {
-	withConsulTracePublication(t, map[string]string{"system": tracePublicationFor("system")})
-	viper.Set("storage.source", "redis")
-	if traceProfileUsesRedis() {
-		t.Fatal("storage.source=redis switched the Trace read target source")
-	}
-	if !traceProfileUsesPublishedRoutes() {
-		t.Fatal("Consul Trace publication was not enabled")
-	}
-	if err := reloadTraceProfilePublishedRuntime(); err != nil {
-		t.Fatalf("Consul publication did not load with storage.source=redis: %v", err)
-	}
-	if err := resolveTenantTarget("system"); err != nil {
-		t.Fatalf("published tenant is not served: %v", err)
-	}
-}
-
-func TestTraceReadTargetSourceRejectsUnknownValue(t *testing.T) {
-	config := traceProfileRuntimeConfig()
-	config["read_target_source"] = "storage"
-	if _, err := newTraceProfileRuntime(config); err == nil {
-		t.Fatal("unknown Trace read target source was accepted")
-	}
 }
 
 // F4：一次读取失败不能扔掉可用快照。

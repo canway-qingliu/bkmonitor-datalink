@@ -97,7 +97,6 @@ type traceProfileConfig struct {
 	RouteSnapshotVersion  int64                          `json:"route_snapshot_version"`
 	ReadTargetDataPath    string                         `json:"read_target_data_path,omitempty"`
 	ReadTargetVersionPath string                         `json:"read_target_version_path,omitempty"`
-	ReadTargetSource      string                         `json:"read_target_source,omitempty"`
 	MaxBodyBytes          int                            `json:"max_body_bytes"`
 	MaxLimit              int64                          `json:"max_limit"`
 	MaxOffset             int64                          `json:"max_offset"`
@@ -213,11 +212,6 @@ func newTraceProfileRuntimeFor(raw any, publishedTenants map[string]struct{}) (*
 	}
 	if err := decoder.Decode(&config); err != nil {
 		return nil, fmt.Errorf("Trace profile 直连读取配置非法: %w", err)
-	}
-	switch config.ReadTargetSource {
-	case "", traceReadTargetSourceConsul, traceReadTargetSourceRedis:
-	default:
-		return nil, fmt.Errorf("Trace 读目标发布源只能是 consul 或 redis: %s", config.ReadTargetSource)
 	}
 	if len(config.ReadRoutes) == 0 && len(config.ReadonlyConnections) == 0 && len(config.ESSummaryTargets) == 0 {
 		return nil, nil

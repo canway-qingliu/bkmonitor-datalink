@@ -76,14 +76,13 @@ const (
 // 与读取失败不同，直读随之关闭。
 var errTraceReadTargetsUnpublished = errors.New("Trace 读目标尚未发布")
 
-// traceProfileReadTargetSource 是 Trace 读目标的发布源，未配置时为 consul：
-// 当前发布方只写 Consul，切到 redis 必须显式配置，且应在发布方写入 Redis 之后。
+// traceProfileReadTargetSource 是 Trace 读目标的发布源：与 Storage 一样由 storage.source
+// 决定，它是部署唯一的后端选择。
 func traceProfileReadTargetSource() string {
-	source := viper.GetString(TraceProfileReadTargetSourceConfigPath)
-	if source == "" {
-		return traceReadTargetSourceConsul
+	if viper.GetString("storage.source") == traceReadTargetSourceRedis {
+		return traceReadTargetSourceRedis
 	}
-	return source
+	return traceReadTargetSourceConsul
 }
 
 func traceProfileUsesPublishedRoutes() bool {

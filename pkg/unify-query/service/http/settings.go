@@ -92,9 +92,6 @@ const (
 	TraceProfileConfigPath                      = "trace_profile"
 	TraceProfileReadTargetDataPathConfigPath    = "trace_profile.read_target_data_path"
 	TraceProfileReadTargetVersionPathConfigPath = "trace_profile.read_target_version_path"
-	// TraceProfileReadTargetSourceConfigPath 选择 Trace 读目标的发布源：consul（默认）或 redis。
-	// 与 storage.source 无关：Storage 的来源切换不改变 Trace 读目标从哪里读。
-	TraceProfileReadTargetSourceConfigPath = "trace_profile.read_target_source"
 
 	// LabelValuesDefaultLimitConfigPath label_values 接口返回值的默认数量，如果为空则使用该值，因为如果为空传到后端的话，bksql 会默认补上 100
 	LabelValuesDefaultLimitConfigPath = "http.label_values.default_limit"

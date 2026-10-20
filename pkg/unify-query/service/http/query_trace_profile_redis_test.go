@@ -12,6 +12,7 @@ package http
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	goRedis "github.com/go-redis/redis/v8"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/viper"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/consul"
@@ -44,7 +46,6 @@ func setUpRedisTracePublication(t *testing.T) (context.Context, goRedis.Universa
 	}
 	config := traceProfileRuntimeConfig()
 	config["single_tenant_id"] = "system"
-	config["read_target_source"] = "redis"
 	delete(config, "read_routes")
 	previousConfig, previousSource := viper.Get(TraceProfileConfigPath), viper.Get("storage.source")
 	previousBasePath := redisService.KVBasePath
@@ -70,10 +71,10 @@ func setUpRedisTracePublication(t *testing.T) (context.Context, goRedis.Universa
 	return ctx, client, mr
 }
 
-func TestTracePublishedRoutesLoadFromRedisWhenTraceSourceIsRedis(t *testing.T) {
+func TestTracePublishedRoutesLoadFromRedisWhenStorageSourceIsRedis(t *testing.T) {
 	_, _, _ = setUpRedisTracePublication(t)
 	if !traceProfileUsesPublishedRoutes() {
-		t.Fatal("Redis Trace publication was not enabled by trace_profile.read_target_source")
+		t.Fatal("Redis Trace publication was not enabled without Consul paths")
 	}
 	if err := reloadTraceProfilePublishedRuntime(); err != nil {
 		t.Fatalf("Redis publication was not loaded: %v", err)
@@ -151,4 +152,49 @@ func TestTraceRedisNotificationReloadsRoutes(t *testing.T) {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
+}
+
+// 鲸眼当前状态：storage.source=redis，Trace 前缀下没有任何键。应明确报告"未发布"（400，
+// 日志与指标可见），而不是清空成"读取失败"或 503。
+func TestRedisSourceWithNoTraceKeysIsUnpublished(t *testing.T) {
+	ctx, client, _ := setUpRedisTracePublication(t)
+	if err := client.Del(ctx, redisTraceDataPrefix+"system").Err(); err != nil {
+		t.Fatal(err)
+	}
+	before := traceProfileReloadCount(t, "redis", traceReloadUnpublished)
+	err := reloadTraceProfilePublishedRuntime()
+	if !errors.Is(err, errTraceReadTargetsUnpublished) || traceProfileRuntimeClosedReason() != traceRuntimeUnpublished {
+		t.Fatalf("no Redis keys was not reported as unpublished: err=%v reason=%q", err, traceProfileRuntimeClosedReason())
+	}
+	if after := traceProfileReloadCount(t, "redis", traceReloadUnpublished); after != before+1 {
+		t.Fatalf("unpublished was not counted for the redis source: %v -> %v", before, after)
+	}
+	recorder, spanErr := runTraceProfileHandler(t, typedTraceBody("trace_span", "system_kapm"))
+	if recorder.Code != http.StatusBadRequest || spanErr != nil ||
+		!strings.Contains(recorder.Body.String(), traceProfilePublishedEmptyMessage) {
+		t.Fatalf("unpublished answered HTTP %d (%s) span error %v", recorder.Code, recorder.Body.String(), spanErr)
+	}
+}
+
+func traceProfileReloadCount(t *testing.T, source, result string) float64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.GetName() != "unify_query_trace_profile_snapshot_reload_total" {
+			continue
+		}
+		for _, sample := range family.GetMetric() {
+			labels := map[string]string{}
+			for _, label := range sample.GetLabel() {
+				labels[label.GetName()] = label.GetValue()
+			}
+			if labels["source"] == source && labels["result"] == result {
+				return sample.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
 }
