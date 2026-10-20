@@ -179,6 +179,7 @@ func parsePublishedTraceTargets(prefix string, pairs api.KVPairs) (publishedTrac
 				ResultTableID:       target.ResultTableID,
 				StorageClusterID:    target.StorageClusterID,
 				RetentionDays:       target.RetentionDays,
+				EntryIndexVersion:   target.EntryIndexVersion,
 				PublishedVersion:    document.Version,
 			})
 		}

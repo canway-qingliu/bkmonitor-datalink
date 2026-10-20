@@ -67,7 +67,9 @@ type traceProfileESTargetConfig struct {
 	ResultTableID       string `json:"read_result_table_id"`
 	StorageClusterID    int64  `json:"storage_cluster_id"`
 	RetentionDays       int64  `json:"retention_days"`
-	PublishedVersion    int64  `json:"published_route_version,omitempty"`
+	// EntryIndexVersion 是发布方声明的入口索引版本；2 时跨应用父关系筛选与逐行复核才生效。
+	EntryIndexVersion int64 `json:"entry_index_version,omitempty"`
+	PublishedVersion  int64 `json:"published_route_version,omitempty"`
 }
 
 type traceProfileConnectionConfig struct {
@@ -298,6 +300,7 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 			ResultTableID:       target.ResultTableID,
 			StorageClusterID:    target.StorageClusterID,
 			RetentionDays:       target.RetentionDays,
+			EntryIndexVersion:   target.EntryIndexVersion,
 			PublishedVersion:    target.PublishedVersion,
 		})
 	}
