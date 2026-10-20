@@ -166,8 +166,8 @@ func swapTraceProfileRuntime(runtime *traceProfileRuntime) {
 
 // loadTraceProfileConfig 由 http 配置加载钩子调用；任何一步失败都关闭直连读取而不是降级。
 func loadTraceProfileConfig() {
-	if traceProfileUsesConsul() {
-		// Consul 实例由服务启动时建立；配置解析阶段先关闭直读，随后加载发布快照。
+	if traceProfileUsesPublishedRoutes() {
+		// 发布源实例由服务启动时建立；配置解析阶段先关闭直读，随后加载发布快照。
 		swapTraceProfileRuntime(nil)
 		return
 	}

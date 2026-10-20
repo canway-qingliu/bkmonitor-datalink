@@ -101,9 +101,11 @@ bk_data:
 
 # Trace profile 直连存储读取（T6.1）。未配置时保持 fail closed：带 Trace 信封的
 # /query/ts/raw 请求返回固定拒绝，绝不回落到老的 BKBase/ES 链路。
-# 生产读目标来自 Kingeye Metadata 的逐租户 Consul 发布物；发布物中的业务 ID
+# 生产读目标来自 Kingeye Metadata 的逐租户发布物；发布物中的业务 ID
 # 与 profile 必须对应 otel_trace_span_<bk_biz_id> / otel_trace_summary_<bk_biz_id>。
-# 发布路径由 Kingeye 的 CONSUL_PATH 派生，需按部署环境填写完整前缀。
+# 来源跟随 storage.source：consul 时使用下方 data_path/version_path；redis 时
+# 从 redis.kv_base_path 派生逐租户 String key 与通知 channel，不使用这两条 Consul 路径。
+# Redis 模式在配置 trace_profile 时启用发布物加载；两种模式均要求只读连接配置先就绪。
 trace_profile:
   # read_target_data_path: kingeye_<platform>_<environment>/metadata/unify-query/data/trace/read_target
   # read_target_version_path: kingeye_<platform>_<environment>/metadata/unify-query/version/trace/read_target
@@ -133,4 +135,4 @@ trace_profile:
   #   max_rows: 10000
 
 storage:
-  source: consul  # consul or redis，默认为 consul
+  source: consul  # consul or redis，默认为 consul；同时选择 Trace 读目标来源

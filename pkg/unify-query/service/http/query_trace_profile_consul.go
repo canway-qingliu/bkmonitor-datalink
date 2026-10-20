@@ -30,21 +30,30 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/traceprofile"
 )
 
-func traceProfileUsesConsul() bool {
+func traceProfileUsesPublishedRoutes() bool {
+	if traceProfileUsesRedis() {
+		return viper.IsSet(TraceProfileConfigPath)
+	}
 	return viper.GetString(TraceProfileReadTargetDataPathConfigPath) != ""
+}
+
+func traceProfileUsesRedis() bool {
+	return viper.GetString("storage.source") == "redis"
 }
 
 // parsePublishedTraceTargets 只接受 Kingeye 发布的单租户文档；快照版本由各
 // 租户文档的版本确定，任何缺失或错误文档都不能留下上一轮的物理目标。
 func parsePublishedTraceTargets(prefix string, pairs api.KVPairs) (int64, []traceProfileRouteConfig, []traceProfileESTargetConfig, error) {
-	prefix = strings.TrimSuffix(prefix, "/") + "/"
+	if !strings.HasSuffix(prefix, "/") && !strings.HasSuffix(prefix, ":") {
+		prefix += "/"
+	}
 	if len(pairs) == 0 {
 		return 0, nil, nil, fmt.Errorf("Trace 读目标尚未发布")
 	}
 	sorted := append(api.KVPairs(nil), pairs...)
 	for _, pair := range sorted {
 		if pair == nil {
-			return 0, nil, nil, fmt.Errorf("Trace 读目标 Consul 项为空")
+			return 0, nil, nil, fmt.Errorf("Trace 读目标发布项为空")
 		}
 	}
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Key < sorted[j].Key })
@@ -54,7 +63,7 @@ func parsePublishedTraceTargets(prefix string, pairs api.KVPairs) (int64, []trac
 	seen := make(map[string]struct{}, len(sorted))
 	for _, pair := range sorted {
 		if pair == nil || !strings.HasPrefix(pair.Key, prefix) || len(pair.Value) == 0 {
-			return 0, nil, nil, fmt.Errorf("Trace 读目标 Consul 项缺失或路径非法")
+			return 0, nil, nil, fmt.Errorf("Trace 读目标发布项缺失或路径非法")
 		}
 		tenantID := strings.TrimPrefix(pair.Key, prefix)
 		if tenantID == "" || strings.Contains(tenantID, "/") {
@@ -98,7 +107,7 @@ func parsePublishedTraceTargets(prefix string, pairs api.KVPairs) (int64, []trac
 	return version, routes, esTargets, nil
 }
 
-// reloadTraceProfilePublishedRuntime 从版本键触发的可信数据前缀加载完整快照。
+// reloadTraceProfilePublishedRuntime 按 storage.source 加载可信读目标快照。
 // 失败时撤销当前直读路由，避免使用可能已被撤销的旧物理目标。
 func reloadTraceProfilePublishedRuntime() (err error) {
 	defer func() {
@@ -106,30 +115,44 @@ func reloadTraceProfilePublishedRuntime() (err error) {
 			swapTraceProfileRuntime(nil)
 		}
 	}()
-	dataPath := strings.TrimSuffix(viper.GetString(TraceProfileReadTargetDataPathConfigPath), "/")
-	versionPath := viper.GetString(TraceProfileReadTargetVersionPathConfigPath)
-	if dataPath == "" || versionPath == "" {
-		return fmt.Errorf("Trace Consul 读目标路径或版本路径未配置")
+	var prefix string
+	var pairs api.KVPairs
+	if traceProfileUsesRedis() {
+		prefix, _, err = traceProfileRedisPaths()
+		if err != nil {
+			return err
+		}
+		pairs, err = traceProfileRedisGetPairs(prefix)
+		if err != nil {
+			return fmt.Errorf("Trace 读目标文档读取失败: %w", err)
+		}
+	} else {
+		dataPath := strings.TrimSuffix(viper.GetString(TraceProfileReadTargetDataPathConfigPath), "/")
+		versionPath := viper.GetString(TraceProfileReadTargetVersionPathConfigPath)
+		if dataPath == "" || versionPath == "" {
+			return fmt.Errorf("Trace Consul 读目标路径或版本路径未配置")
+		}
+		before, readErr := consul.GetKVData(versionPath)
+		if readErr != nil {
+			return fmt.Errorf("Trace 读目标版本键不可用: %w", readErr)
+		}
+		if len(before) == 0 {
+			return fmt.Errorf("Trace 读目标版本键不存在")
+		}
+		prefix = dataPath + "/"
+		pairs, err = consul.GetDataWithPrefix(prefix)
+		if err != nil {
+			return fmt.Errorf("Trace 读目标文档读取失败: %w", err)
+		}
+		after, readErr := consul.GetKVData(versionPath)
+		if readErr != nil {
+			return fmt.Errorf("Trace 读目标在加载期间发生变化: %w", readErr)
+		}
+		if !bytes.Equal(before, after) {
+			return fmt.Errorf("Trace 读目标在加载期间发生变化")
+		}
 	}
-	before, err := consul.GetKVData(versionPath)
-	if err != nil {
-		return fmt.Errorf("Trace 读目标版本键不可用: %w", err)
-	}
-	if len(before) == 0 {
-		return fmt.Errorf("Trace 读目标版本键不存在")
-	}
-	pairs, err := consul.GetDataWithPrefix(dataPath + "/")
-	if err != nil {
-		return fmt.Errorf("Trace 读目标文档读取失败: %w", err)
-	}
-	after, err := consul.GetKVData(versionPath)
-	if err != nil {
-		return fmt.Errorf("Trace 读目标在加载期间发生变化: %w", err)
-	}
-	if !bytes.Equal(before, after) {
-		return fmt.Errorf("Trace 读目标在加载期间发生变化")
-	}
-	version, routes, esTargets, err := parsePublishedTraceTargets(dataPath+"/", pairs)
+	version, routes, esTargets, err := parsePublishedTraceTargets(prefix, pairs)
 	if err != nil {
 		return err
 	}
@@ -145,7 +168,7 @@ func reloadTraceProfilePublishedRuntime() (err error) {
 		return fmt.Errorf("Trace 本地只读配置缺失或非法: %w", err)
 	}
 	if static, present := config["read_routes"]; present && static != nil {
-		return fmt.Errorf("Trace Consul 读目标不能与静态路由同时配置")
+		return fmt.Errorf("Trace 已发布读目标不能与静态路由同时配置")
 	}
 	config["route_snapshot_version"] = version
 	config["read_routes"] = routes
@@ -164,7 +187,16 @@ func reloadTraceProfilePublishedRuntime() (err error) {
 
 func startTraceProfileRouteWatch(ctx context.Context, wg *sync.WaitGroup) error {
 	versionPath := viper.GetString(TraceProfileReadTargetVersionPathConfigPath)
-	if versionPath == "" {
+	watchChange := consul.WatchChangeContext
+	if traceProfileUsesRedis() {
+		_, channel, err := traceProfileRedisPaths()
+		if err != nil {
+			swapTraceProfileRuntime(nil)
+			return err
+		}
+		versionPath = channel
+		watchChange = traceProfileRedisWatchChangeContext
+	} else if versionPath == "" {
 		swapTraceProfileRuntime(nil)
 		return fmt.Errorf("Trace 读目标版本路径未配置")
 	}
@@ -176,7 +208,7 @@ func startTraceProfileRouteWatch(ctx context.Context, wg *sync.WaitGroup) error 
 			if ctx.Err() != nil {
 				return
 			}
-			ch, err := consul.WatchChangeContext(ctx, versionPath)
+			ch, err := watchChange(ctx, versionPath)
 			if err != nil {
 				swapTraceProfileRuntime(nil)
 				log.Errorf(ctx, "watch trace profile published routes failed: %s", err)
