@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
@@ -24,6 +25,7 @@ import (
 	"github.com/hashicorp/consul/api"
 	"github.com/spf13/viper"
 
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/consul"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/traceprofile"
@@ -180,9 +182,7 @@ func TestAllTenantsRevokedIsNotALocalConfigError(t *testing.T) {
 		t.Fatal(err)
 	}
 	publication.set("system", strings.Replace(tracePublicationFor("system"), "otel_trace_span_132", "otel_trace_span_133", 1))
-	traceProfileLoader.mu.Lock()
-	result, _ := loadTraceProfilePublishedRuntimeLocked()
-	traceProfileLoader.mu.Unlock()
+	result, _, _ := loadTraceProfilePublishedRuntime()
 	if result == traceReloadInvalidConfig || traceProfileRuntimeValue.Load() != nil {
 		t.Fatalf("all tenants revoked was labelled %s", result)
 	}
@@ -247,4 +247,119 @@ func runTraceProfileRequestAs(t *testing.T, body, tenant string) *httptest.Respo
 	ginContext.Set(verifiedJWTAppCodeContextKey, "kingeye-apm")
 	HandlerQueryRaw(ginContext)
 	return recorder
+}
+
+// R1：切到静态配置后，旧监听的一次重载不能清掉静态运行时。
+func TestStaleWatcherAfterSwitchToStaticKeepsStatic(t *testing.T) {
+	withConsulTracePublication(t, map[string]string{"system": tracePublicationFor("system")})
+	if err := reloadTraceProfilePublishedRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	viper.Set(TraceProfileConfigPath, traceProfileRuntimeConfig())
+	loadTraceProfileConfig()
+	static := traceProfileRuntimeValue.Load()
+	if static == nil || static.published {
+		t.Fatalf("static runtime not installed: %+v", static)
+	}
+	_ = reloadTraceProfilePublishedRuntime()
+	if traceProfileRuntimeValue.Load() != static {
+		t.Fatal("a stale watcher reload replaced the static runtime")
+	}
+}
+
+// R1：关闭 Trace 后，旧监听的一次重载不能把 400 变成 503。
+func TestStaleWatcherAfterDisableKeepsUnwired(t *testing.T) {
+	withConsulTracePublication(t, map[string]string{"system": tracePublicationFor("system")})
+	if err := reloadTraceProfilePublishedRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	viper.Set(TraceProfileConfigPath, nil)
+	loadTraceProfileConfig()
+	_ = reloadTraceProfilePublishedRuntime()
+	recorder, _ := runTraceProfileHandler(t, typedTraceBody("trace_span", "system_kapm"))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("disabled Trace answered HTTP %d (reason %q)", recorder.Code, traceProfileRuntimeClosedReason())
+	}
+}
+
+// R1：读取期间配置钩子运行过，这次读取的结果作废，不覆盖钩子按新配置安装的运行时。
+func TestReadStartedBeforeConfigChangeIsDiscarded(t *testing.T) {
+	publication := withConsulTracePublication(t, map[string]string{"system": tracePublicationFor("system")})
+	if err := reloadTraceProfilePublishedRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	release, entered := make(chan struct{}), make(chan struct{})
+	reading := consul.GetDataWithPrefixContext
+	consul.GetDataWithPrefixContext = func(ctx context.Context, path string) (api.KVPairs, error) {
+		close(entered)
+		<-release
+		publication.set("system", strings.Replace(tracePublicationFor("system"), `"retention_days":30`, `"retention_days":7`, 1))
+		return reading(ctx, path)
+	}
+	t.Cleanup(func() { consul.GetDataWithPrefixContext = reading })
+	done := make(chan error)
+	go func() { done <- reloadTraceProfilePublishedRuntime() }()
+	<-entered
+	config := viper.Get(TraceProfileConfigPath).(map[string]any)
+	config["allowed_bk_app_codes"] = []string{"nobody"}
+	loadTraceProfileConfig()
+	hooked := traceProfileRuntimeValue.Load()
+	close(release)
+	<-done
+	if traceProfileRuntimeValue.Load() != hooked {
+		t.Fatal("a read that started before the config change replaced the hook's runtime")
+	}
+}
+
+// R2：发布源读取挂住时，配置钩子不能等它。
+func TestConfigHookDoesNotWaitForASourceRead(t *testing.T) {
+	withConsulTracePublication(t, map[string]string{"system": tracePublicationFor("system")})
+	if err := reloadTraceProfilePublishedRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	release, entered := make(chan struct{}), make(chan struct{})
+	reading := consul.GetDataWithPrefixContext
+	consul.GetDataWithPrefixContext = func(ctx context.Context, path string) (api.KVPairs, error) {
+		close(entered)
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return nil, errors.New("late")
+	}
+	t.Cleanup(func() { consul.GetDataWithPrefixContext = reading })
+	reloaded := make(chan struct{})
+	go func() { _ = reloadTraceProfilePublishedRuntime(); close(reloaded) }()
+	<-entered
+	hooked := make(chan struct{})
+	go func() { loadTraceProfileConfig(); close(hooked) }()
+	select {
+	case <-hooked:
+	case <-time.After(500 * time.Millisecond):
+		close(release)
+		<-reloaded
+		t.Fatal("the config hook waited for a source read")
+	}
+	close(release)
+	<-reloaded
+}
+
+// R3：读发布源所需的路径为空是本地配置错误，不是"发布源不可用"。
+func TestEmptyReadPathIsInvalidConfig(t *testing.T) {
+	withConsulTracePublication(t, map[string]string{"system": tracePublicationFor("system")})
+	viper.Set(TraceProfileReadTargetVersionPathConfigPath, "")
+	t.Cleanup(func() { viper.Set(TraceProfileReadTargetVersionPathConfigPath, nil) })
+	result, _, stale := loadTraceProfilePublishedRuntime()
+	if stale || result != traceReloadInvalidConfig || traceProfileRuntimeClosedReason() != traceRuntimeInvalidConfig {
+		t.Fatalf("an empty version path was reported as %q (stale=%v, reason %q)", result, stale, traceProfileRuntimeClosedReason())
+	}
+}
+
+// R4：全部租户被撤销时，重载结果不是 success。
+func TestAllTenantsRevokedReportsRevoked(t *testing.T) {
+	publication := withConsulTracePublication(t, map[string]string{"system": tracePublicationFor("system")})
+	publication.set("system", strings.Replace(tracePublicationFor("system"), "otel_trace_span_132", "otel_trace_span_133", 1))
+	if result, _, _ := loadTraceProfilePublishedRuntime(); result != traceReloadRevoked {
+		t.Fatalf("all tenants revoked reported %q", result)
+	}
 }

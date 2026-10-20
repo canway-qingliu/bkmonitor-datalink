@@ -39,9 +39,11 @@ const (
 
 // 读目标重载结果，作为指标标签的固定枚举。
 const (
-	traceReloadSuccess       = "success"
-	traceReloadUnchanged     = "unchanged"
-	traceReloadUnpublished   = "unpublished"
+	traceReloadSuccess     = "success"
+	traceReloadUnchanged   = "unchanged"
+	traceReloadUnpublished = "unpublished"
+	// traceReloadRevoked：读取成功，但每个租户都被撤销，没有安装任何运行时。
+	traceReloadRevoked       = "revoked"
 	traceReloadReadFailed    = "read_failed"
 	traceReloadWatchFailed   = "watch_failed"
 	traceReloadInvalidConfig = "invalid_config"
@@ -124,6 +126,8 @@ type publishedTraceSnapshot struct {
 	// Tenants 是发布源上出现的全部租户，合法与非法都算；单租户映射按它推导，
 	// 一个租户的文档变成非法不会改变映射。
 	Tenants map[string]struct{}
+	// Documents 是每个合法租户文档的键与版本，供撤销日志使用。
+	Documents map[string]invalidTraceDocument
 }
 
 // parsePublishedTraceTargets 逐个租户校验发布文档。非法文档只撤销它自己的租户：
@@ -153,6 +157,7 @@ func parsePublishedTraceTargets(prefix string, pairs api.KVPairs, unreadable map
 		Routes:    make([]traceProfileRouteConfig, 0),
 		ESTargets: make([]traceProfileESTargetConfig, 0),
 		Tenants:   make(map[string]struct{}, len(sorted)),
+		Documents: make(map[string]invalidTraceDocument, len(sorted)),
 	}
 	hasher := sha256.New()
 	for _, pair := range sorted {
@@ -184,6 +189,7 @@ func parsePublishedTraceTargets(prefix string, pairs api.KVPairs, unreadable map
 			snapshot.Invalid = append(snapshot.Invalid, invalid)
 			continue
 		}
+		snapshot.Documents[tenantID] = invalidTraceDocument{Key: pair.Key, TenantID: tenantID, Version: document.Version}
 		for _, route := range document.Routes {
 			snapshot.Routes = append(snapshot.Routes, traceProfileRouteConfig{
 				BkTenantID: route.BkTenantID, BkBizID: route.BkBizID,
@@ -267,8 +273,9 @@ func (snapshot publishedTraceSnapshot) withoutUnknownClusters(config map[string]
 	}
 	sort.Strings(tenants)
 	for _, tenant := range tenants {
+		document := snapshot.Documents[tenant]
 		result.Invalid = append(result.Invalid, invalidTraceDocument{
-			TenantID: tenant, Reason: traceDocumentUnknownCluster,
+			Key: document.Key, TenantID: tenant, Version: document.Version, Reason: traceDocumentUnknownCluster,
 			Err: fmt.Errorf("Trace 读路由的集群缺少只读连接: %s", revoked[tenant]),
 		})
 	}
@@ -296,7 +303,7 @@ func (s *traceProfileLoadState) record(result string, err error) {
 	previous := s.lastResult
 	s.lastResult = result
 	switch result {
-	case traceReloadSuccess, traceReloadUnchanged, traceReloadUnpublished:
+	case traceReloadSuccess, traceReloadUnchanged, traceReloadUnpublished, traceReloadRevoked:
 		if s.failures > 0 {
 			log.Infof(context.Background(), "trace profile read targets readable again after %d failures", s.failures)
 		}
@@ -328,6 +335,8 @@ type cachedTracePublication struct {
 var traceProfileLoader struct {
 	mu          sync.Mutex
 	publication *cachedTracePublication
+	// generation 每次配置钩子运行都加一；在它之前开始的读取结果作废。
+	generation uint64
 }
 
 // traceProfileRuntimeNilReason 是直读运行时为 nil 的原因（traceRuntime*）。
@@ -374,49 +383,82 @@ func traceProfileConfigDigest(encoded []byte) [sha256.Size]byte {
 	return digest
 }
 
+// traceProfileReadTimeout 限定一次发布源读取的总时长。读取在加载器锁之外进行，
+// 超时只影响这一次重载，不会卡住配置钩子或信号处理。
+const traceProfileReadTimeout = 10 * time.Second
+
+// errTraceSourceMisconfigured 表示本地配置不足以读发布源（路径或键前缀为空），属于本地配置错误。
+var errTraceSourceMisconfigured = errors.New("Trace 读目标发布源配置不完整")
+
 // reloadTraceProfilePublishedRuntime 从配置的读目标发布源加载可信快照。
 //
 //   - 读取或传输失败：当前发布源已有可用快照时保留它，并计入连续失败；发布源刚切换、
 //     还没有成功读取过时直读保持关闭；
 //   - 读取成功但没有任何读目标：发布方明确未发布，直读关闭；
 //   - 某个租户的文档非法，或它的路由指向本地没有只读连接的集群：只撤销该租户。
+//
+// 读取不持锁；安装时若配置钩子已经运行过（generation 变化），这次读取作废：它可能是
+// 旧监听在配置切换后发起的，结果不能覆盖新配置下的状态。
 func reloadTraceProfilePublishedRuntime() error {
-	traceProfileLoader.mu.Lock()
-	defer traceProfileLoader.mu.Unlock()
-	result, err := loadTraceProfilePublishedRuntimeLocked()
+	result, err, stale := loadTraceProfilePublishedRuntime()
+	if stale {
+		return nil
+	}
 	traceProfileLoad.record(result, err)
 	return err
 }
 
-func loadTraceProfilePublishedRuntimeLocked() (string, error) {
+func loadTraceProfilePublishedRuntime() (string, error, bool) {
+	traceProfileLoader.mu.Lock()
+	generation := traceProfileLoader.generation
+	published := traceProfileUsesPublishedRoutes()
 	source := traceProfileSourceIdentity()
-	pairs, unreadable, prefix, err := readPublishedTraceTargets()
-	if err != nil {
+	traceProfileLoader.mu.Unlock()
+	if !published {
+		// 配置已不是发布源模式：这是切换后残留的监听，什么都不做。
+		return "", nil, true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), traceProfileReadTimeout)
+	defer cancel()
+	pairs, unreadable, prefix, readErr := readPublishedTraceTargets(ctx)
+
+	traceProfileLoader.mu.Lock()
+	defer traceProfileLoader.mu.Unlock()
+	if traceProfileLoader.generation != generation || traceProfileSourceIdentity() != source {
+		return "", nil, true
+	}
+	if errors.Is(readErr, errTraceSourceMisconfigured) {
+		traceProfileLoader.publication = nil
+		installTraceProfileRuntime(nil, traceRuntimeInvalidConfig)
+		return traceReloadInvalidConfig, readErr, false
+	}
+	if readErr != nil {
 		if cached := traceProfileLoader.publication; cached == nil || cached.source != source {
 			// 当前发布源从未成功读取过：不能用另一个发布源的快照服务。
 			traceProfileLoader.publication = nil
 			installTraceProfileRuntime(nil, traceRuntimeUnavailable)
 		}
-		return traceReloadReadFailed, err
+		return traceReloadReadFailed, readErr, false
 	}
 	snapshot, err := parsePublishedTraceTargets(prefix, pairs, unreadable)
 	if errors.Is(err, errTraceReadTargetsUnpublished) {
 		traceProfileLoader.publication = &cachedTracePublication{source: source}
 		installTraceProfileRuntime(nil, traceRuntimeUnpublished)
-		return traceReloadUnpublished, err
+		return traceReloadUnpublished, err, false
 	}
 	traceProfileLoader.publication = &cachedTracePublication{source: source, snapshot: snapshot}
-	return buildPublishedTraceRuntimeLocked()
+	result, err := buildPublishedTraceRuntimeLocked()
+	return result, err, false
 }
 
-// readPublishedTraceTargets 从配置的发布源读出全部发布项。
-func readPublishedTraceTargets() (api.KVPairs, map[string]error, string, error) {
+// readPublishedTraceTargets 从配置的发布源读出全部发布项，读取受 ctx 限时。
+func readPublishedTraceTargets(ctx context.Context) (api.KVPairs, map[string]error, string, error) {
 	if traceProfileUsesRedis() {
 		prefix, _, err := traceProfileRedisPaths()
 		if err != nil {
-			return nil, nil, "", err
+			return nil, nil, "", fmt.Errorf("%w: %s", errTraceSourceMisconfigured, err)
 		}
-		pairs, unreadable, err := traceProfileRedisGetPairs(prefix)
+		pairs, unreadable, err := traceProfileRedisGetPairs(ctx, prefix)
 		if err != nil {
 			return nil, nil, "", fmt.Errorf("Trace 读目标文档读取失败: %w", err)
 		}
@@ -425,18 +467,18 @@ func readPublishedTraceTargets() (api.KVPairs, map[string]error, string, error) 
 	dataPath := strings.TrimSuffix(viper.GetString(TraceProfileReadTargetDataPathConfigPath), "/")
 	versionPath := viper.GetString(TraceProfileReadTargetVersionPathConfigPath)
 	if dataPath == "" || versionPath == "" {
-		return nil, nil, "", fmt.Errorf("Trace Consul 读目标路径或版本路径未配置")
+		return nil, nil, "", fmt.Errorf("%w: Consul 读目标路径或版本路径为空", errTraceSourceMisconfigured)
 	}
-	before, err := consul.GetKVData(versionPath)
+	before, err := consul.GetKVDataContext(ctx, versionPath)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("Trace 读目标版本键不可用: %w", err)
 	}
 	prefix := dataPath + "/"
-	pairs, err := consul.GetDataWithPrefix(prefix)
+	pairs, err := consul.GetDataWithPrefixContext(ctx, prefix)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("Trace 读目标文档读取失败: %w", err)
 	}
-	after, err := consul.GetKVData(versionPath)
+	after, err := consul.GetKVDataContext(ctx, versionPath)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("Trace 读目标版本键不可用: %w", err)
 	}
@@ -496,7 +538,7 @@ func buildPublishedTraceRuntimeLocked() (string, error) {
 	if len(snapshot.Routes) == 0 && len(snapshot.ESTargets) == 0 {
 		// 读取成功，每个租户都被撤销：发布侧的结果，不是本地配置的问题。
 		installTraceProfileRuntime(nil, traceRuntimeRevoked)
-		return traceReloadSuccess, revokedErr
+		return traceReloadRevoked, revokedErr
 	}
 	if len(snapshot.Routes) == 0 {
 		// 只有 ES Summary 目标时不需要 Doris 只读连接。
@@ -510,10 +552,6 @@ func buildPublishedTraceRuntimeLocked() (string, error) {
 		// 本地配置与已校验的租户文档组合失败：不能确认任何授权，直读关闭。
 		installTraceProfileRuntime(nil, traceRuntimeInvalidConfig)
 		return traceReloadInvalidConfig, err
-	}
-	if runtime == nil {
-		installTraceProfileRuntime(nil, traceRuntimeRevoked)
-		return traceReloadSuccess, revokedErr
 	}
 	runtime.configDigest, runtime.published = configDigest, true
 	installTraceProfileRuntime(runtime, "")
@@ -529,6 +567,7 @@ func buildPublishedTraceRuntimeLocked() (string, error) {
 func applyTraceProfilePublishedConfig() {
 	traceProfileLoader.mu.Lock()
 	defer traceProfileLoader.mu.Unlock()
+	traceProfileLoader.generation++
 	cached := traceProfileLoader.publication
 	if cached == nil || cached.source != traceProfileSourceIdentity() {
 		traceProfileLoader.publication = nil
@@ -545,6 +584,7 @@ func applyTraceProfilePublishedConfig() {
 func applyTraceProfileStaticConfig() {
 	traceProfileLoader.mu.Lock()
 	defer traceProfileLoader.mu.Unlock()
+	traceProfileLoader.generation++
 	traceProfileLoader.publication = nil
 	runtime, err := newTraceProfileRuntime(viper.Get(TraceProfileConfigPath))
 	if err != nil {

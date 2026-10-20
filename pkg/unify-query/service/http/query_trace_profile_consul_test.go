@@ -140,21 +140,21 @@ func TestReloadTraceProfileRuntimeConsumesPublishedConsulRoutes(t *testing.T) {
 	viper.Set(TraceProfileConfigPath, config)
 	resetTraceProfileLoader(t)
 	previousRuntime := traceProfileRuntimeValue.Swap(nil)
-	previousPrefixReader, previousKeyReader := consul.GetDataWithPrefix, consul.GetKVData
-	consul.GetDataWithPrefix = func(path string) (api.KVPairs, error) {
+	previousPrefixReader, previousKeyReader := consul.GetDataWithPrefixContext, consul.GetKVDataContext
+	consul.GetDataWithPrefixContext = func(_ context.Context, path string) (api.KVPairs, error) {
 		if path != prefix+"/" {
 			t.Fatalf("read wrong Consul prefix: %s", path)
 		}
 		return api.KVPairs{&api.KVPair{Key: path + "system", Value: []byte(publishedBusiness132)}}, nil
 	}
-	consul.GetKVData = func(path string) ([]byte, error) {
+	consul.GetKVDataContext = func(_ context.Context, path string) ([]byte, error) {
 		if path != versionPath {
 			t.Fatalf("read wrong Consul version key: %s", path)
 		}
 		return []byte(`{"time":1}`), nil
 	}
 	t.Cleanup(func() {
-		consul.GetDataWithPrefix, consul.GetKVData = previousPrefixReader, previousKeyReader
+		consul.GetDataWithPrefixContext, consul.GetKVDataContext = previousPrefixReader, previousKeyReader
 		viper.Set(TraceProfileConfigPath, previousConfig)
 		if current := traceProfileRuntimeValue.Swap(previousRuntime); current != nil {
 			current.close()
@@ -188,14 +188,14 @@ func TestReloadTraceProfileRuntimeRevokesOldRouteOnInvalidPublication(t *testing
 	viper.Set(TraceProfileConfigPath, config)
 	resetTraceProfileLoader(t)
 	previousRuntime := traceProfileRuntimeValue.Swap(old)
-	previousPrefixReader, previousKeyReader := consul.GetDataWithPrefix, consul.GetKVData
-	consul.GetDataWithPrefix = func(path string) (api.KVPairs, error) {
+	previousPrefixReader, previousKeyReader := consul.GetDataWithPrefixContext, consul.GetKVDataContext
+	consul.GetDataWithPrefixContext = func(_ context.Context, path string) (api.KVPairs, error) {
 		bad := strings.Replace(publishedBusiness132, "otel_trace_span_132", "otel_trace_span_133", 1)
 		return api.KVPairs{&api.KVPair{Key: path + "system", Value: []byte(bad)}}, nil
 	}
-	consul.GetKVData = func(string) ([]byte, error) { return []byte(`{"time":2}`), nil }
+	consul.GetKVDataContext = func(context.Context, string) ([]byte, error) { return []byte(`{"time":2}`), nil }
 	t.Cleanup(func() {
-		consul.GetDataWithPrefix, consul.GetKVData = previousPrefixReader, previousKeyReader
+		consul.GetDataWithPrefixContext, consul.GetKVDataContext = previousPrefixReader, previousKeyReader
 		viper.Set(TraceProfileConfigPath, previousConfig)
 		if current := traceProfileRuntimeValue.Swap(previousRuntime); current != nil {
 			current.close()
@@ -221,14 +221,14 @@ func TestTraceProfileVersionWatchLoadsNewBusinessSnapshot(t *testing.T) {
 	viper.Set(TraceProfileConfigPath, config)
 	resetTraceProfileLoader(t)
 	previousRuntime := traceProfileRuntimeValue.Swap(nil)
-	previousPrefixReader, previousKeyReader, previousWatch := consul.GetDataWithPrefix, consul.GetKVData, consul.WatchChangeContext
+	previousPrefixReader, previousKeyReader, previousWatch := consul.GetDataWithPrefixContext, consul.GetKVDataContext, consul.WatchChangeContext
 	var document, version atomic.Value
 	document.Store(publishedBusiness132)
 	version.Store(`{"time":1}`)
-	consul.GetDataWithPrefix = func(path string) (api.KVPairs, error) {
+	consul.GetDataWithPrefixContext = func(_ context.Context, path string) (api.KVPairs, error) {
 		return api.KVPairs{&api.KVPair{Key: path + "system", Value: []byte(document.Load().(string))}}, nil
 	}
-	consul.GetKVData = func(string) ([]byte, error) { return []byte(version.Load().(string)), nil }
+	consul.GetKVDataContext = func(context.Context, string) ([]byte, error) { return []byte(version.Load().(string)), nil }
 	watch := make(chan any, 1)
 	consul.WatchChangeContext = func(context.Context, string) (<-chan any, error) { return watch, nil }
 	ctx, cancel := context.WithCancel(context.Background())
@@ -236,7 +236,7 @@ func TestTraceProfileVersionWatchLoadsNewBusinessSnapshot(t *testing.T) {
 	t.Cleanup(func() {
 		cancel()
 		wg.Wait()
-		consul.GetDataWithPrefix, consul.GetKVData, consul.WatchChangeContext = previousPrefixReader, previousKeyReader, previousWatch
+		consul.GetDataWithPrefixContext, consul.GetKVDataContext, consul.WatchChangeContext = previousPrefixReader, previousKeyReader, previousWatch
 		viper.Set(TraceProfileConfigPath, previousConfig)
 		if current := traceProfileRuntimeValue.Swap(previousRuntime); current != nil {
 			current.close()

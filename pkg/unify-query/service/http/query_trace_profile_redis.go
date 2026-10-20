@@ -34,13 +34,11 @@ func traceProfileRedisPaths() (string, string, error) {
 
 // traceProfileRedisGetPairs 读出前缀下的全部发布项。unreadable 是存在、但不是字符串的键，
 // 由调用方按该键的非法文档处理。
-func traceProfileRedisGetPairs(prefix string) (api.KVPairs, map[string]error, error) {
+func traceProfileRedisGetPairs(ctx context.Context, prefix string) (api.KVPairs, map[string]error, error) {
 	client := redis.Client()
 	if client == nil {
 		return nil, nil, fmt.Errorf("Trace Redis 客户端未初始化")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 	// 每个租户一条 String key。SCAN 不是快照，所以：先列出键，再用一次 MGET 原子读取
 	// 所有值，最后重扫一次键集合。
 	//   - MGET 为 nil、重扫也没有的键：扫描后被删除，按已撤销跳过；

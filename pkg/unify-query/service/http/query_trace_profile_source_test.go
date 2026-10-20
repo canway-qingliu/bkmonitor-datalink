@@ -73,8 +73,8 @@ func withConsulTracePublication(t *testing.T, documents map[string]string) *cons
 	viper.Set(TraceProfileConfigPath, config)
 	resetTraceProfileLoader(t)
 	previousRuntime := traceProfileRuntimeValue.Swap(nil)
-	previousPrefix, previousKey, previousWatch := consul.GetDataWithPrefix, consul.GetKVData, consul.WatchChangeContext
-	consul.GetDataWithPrefix = func(path string) (api.KVPairs, error) {
+	previousPrefix, previousKey, previousWatch := consul.GetDataWithPrefixContext, consul.GetKVDataContext, consul.WatchChangeContext
+	consul.GetDataWithPrefixContext = func(_ context.Context, path string) (api.KVPairs, error) {
 		publication.mu.Lock()
 		defer publication.mu.Unlock()
 		if publication.readErr != nil {
@@ -87,7 +87,7 @@ func withConsulTracePublication(t *testing.T, documents map[string]string) *cons
 		sort.Slice(pairs, func(i, j int) bool { return pairs[i].Key < pairs[j].Key })
 		return pairs, nil
 	}
-	consul.GetKVData = func(path string) ([]byte, error) {
+	consul.GetKVDataContext = func(_ context.Context, path string) ([]byte, error) {
 		publication.mu.Lock()
 		defer publication.mu.Unlock()
 		if publication.readErr != nil {
@@ -96,7 +96,7 @@ func withConsulTracePublication(t *testing.T, documents map[string]string) *cons
 		return []byte(`{"time":1}`), nil
 	}
 	t.Cleanup(func() {
-		consul.GetDataWithPrefix, consul.GetKVData, consul.WatchChangeContext = previousPrefix, previousKey, previousWatch
+		consul.GetDataWithPrefixContext, consul.GetKVDataContext, consul.WatchChangeContext = previousPrefix, previousKey, previousWatch
 		viper.Set(TraceProfileConfigPath, previousConfig)
 		viper.Set("storage.source", previousStorage)
 		if current := traceProfileRuntimeValue.Swap(previousRuntime); current != nil {
