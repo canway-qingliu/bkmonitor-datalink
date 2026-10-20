@@ -235,7 +235,7 @@ func verifyMemberRows(rows []map[string]any, request Request, scope Scope) error
 }
 
 func queryFailure(err error) error {
-	return reject(CodePartialFailure, "Trace 存储查询失败或超时: %s", err)
+	return &RejectError{Code: CodePartialFailure, Message: "Trace 存储查询失败或超时", Cause: err}
 }
 
 func readTotal(result dorisclient.Result) (int64, error) {

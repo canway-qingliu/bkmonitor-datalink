@@ -168,9 +168,6 @@ func runTraceProfileRequest(t *testing.T, body string, verifiedAppCode string) *
 
 func decodeTraceProfileError(t *testing.T, recorder *httptest.ResponseRecorder) string {
 	t.Helper()
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d: %s", recorder.Code, recorder.Body.String())
-	}
 	var body map[string]any
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 		t.Fatalf("error body is not JSON: %s", recorder.Body.String())
@@ -179,6 +176,14 @@ func decodeTraceProfileError(t *testing.T, recorder *httptest.ResponseRecorder) 
 		t.Fatalf("error body must be closed to code/message: %s", recorder.Body.String())
 	}
 	code, _ := body["code"].(string)
+	// 后端失败是 502，其余拒绝是 400。
+	want := http.StatusBadRequest
+	if code == traceprofile.CodePartialFailure {
+		want = http.StatusBadGateway
+	}
+	if recorder.Code != want {
+		t.Fatalf("code %s expected HTTP %d, got %d: %s", code, want, recorder.Code, recorder.Body.String())
+	}
 	if _, present := body["message"]; !present {
 		t.Fatalf("error body missing message: %s", recorder.Body.String())
 	}

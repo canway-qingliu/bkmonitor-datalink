@@ -247,7 +247,7 @@ func HandlerQueryRaw(c *gin.Context) {
 
 	// typed Trace 信封走直连存储读取；未配置直连读取时保持既有拒绝行为。
 	if probeTraceEnvelope(c) {
-		handleTraceProfileQuery(c, ctx, span)
+		err = handleTraceProfileQuery(c, ctx, span)
 		return
 	}
 

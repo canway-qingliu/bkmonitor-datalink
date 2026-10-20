@@ -191,7 +191,9 @@ func executeESList(
 		if errors.As(err, &rejected) {
 			return traceprofile.Page{}, err
 		}
-		return traceprofile.Page{}, esMemberReject(traceprofile.CodePartialFailure, "ES Summary 列表原始查询失败")
+		return traceprofile.Page{}, &traceprofile.RejectError{
+			Code: traceprofile.CodePartialFailure, Message: "ES Summary 列表原始查询失败", Cause: err,
+		}
 	}
 	if status := metadata.GetStatus(ctx); status != nil && status.Code != "" {
 		return traceprofile.Page{}, esMemberReject(traceprofile.CodePartialFailure, "ES Summary 列表原始查询存在不完整路由")

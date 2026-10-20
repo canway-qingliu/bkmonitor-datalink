@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,6 +36,11 @@ import (
 
 // 未配置直连读取时的固定拒绝文案，与已上线的 fail-closed 行为保持一致。
 const traceProfileUnwiredMessage = "Trace profile 直连存储查询入口尚未完成"
+
+// 发布源读取失败且没有可用快照时的拒绝文案。
+const traceProfileUnavailableMessage = "Trace 读目标暂不可用"
+
+var errTraceProfileReadTargetsUnavailable = errors.New("Trace 读目标读取失败且没有可用快照")
 
 const (
 	defaultTraceProfileMaxBodyBytes = 65536
@@ -384,37 +390,40 @@ func prefixHasTraceEnvelope(probe []byte) bool {
 	}
 }
 
-func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Span) {
+// handleTraceProfileQuery 返回非 nil 时表示后端失败，调用方据此把请求 span 记为失败；
+// 请求被拒（4xx）不算 span 失败，已由拒绝日志与指标记录。
+func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Span) error {
 	runtime := traceProfileRuntimeValue.Load()
 	if runtime == nil {
-		writeTraceProfileReject(ctx, c, traceprofile.CodeRouteNotFound, traceProfileUnwiredMessage)
-		return
+		if traceProfileUsesPublishedRoutes() && traceProfileLoad.consecutiveFailures() > 0 {
+			// 读目标从未成功加载且发布源正在失败：这是服务端不可用，不是请求错误。
+			return writeTraceProfileError(ctx, c, span, &traceprofile.RejectError{
+				Code: traceprofile.CodeRouteNotFound, Message: traceProfileUnavailableMessage,
+				Cause: errTraceProfileReadTargetsUnavailable,
+			})
+		}
+		return writeTraceProfileReject(ctx, c, span, traceprofile.CodeRouteNotFound, traceProfileUnwiredMessage)
 	}
 	appCode, verified := middleware.VerifiedJWTAppCode(c)
 	if err := authorizeTraceProfile(verified, appCode, runtime.allowedAppCodes); err != nil {
-		writeTraceProfileReject(ctx, c, traceprofile.CodeUnauthorizedMember, err.Error())
-		return
+		return writeTraceProfileReject(ctx, c, span, traceprofile.CodeUnauthorizedMember, err.Error())
 	}
 
 	body, err := io.ReadAll(io.LimitReader(c.Request.Body, int64(runtime.maxBodyBytes)+1))
 	if err != nil {
-		writeTraceProfileReject(ctx, c, traceprofile.CodeUnsupportedSchemaCapability, "Trace profile 请求体读取失败")
-		return
+		return writeTraceProfileReject(ctx, c, span, traceprofile.CodeUnsupportedSchemaCapability, "Trace profile 请求体读取失败")
 	}
 	request, err := traceprofile.ParseRequest(body, runtime.maxBodyBytes, runtime.maxLimit)
 	if err != nil {
-		writeTraceProfileReject(ctx, c, traceprofile.CodeUnsupportedSchemaCapability, err.Error())
-		return
+		return writeTraceProfileReject(ctx, c, span, traceprofile.CodeUnsupportedSchemaCapability, err.Error())
 	}
 	// 时间预算属于 typed 合同，Doris 与 ES 成员读取必须在分流前一致校验。
 	if !traceprofile.WindowFits(request.StartUS, request.EndUS, runtime.maxRangeUS) {
-		writeTraceProfileReject(ctx, c, traceprofile.CodeUnboundedRange, "Trace 查询时间范围超过预算")
-		return
+		return writeTraceProfileReject(ctx, c, span, traceprofile.CodeUnboundedRange, "Trace 查询时间范围超过预算")
 	}
 	if request.MemberLookup != nil || request.ESSummaryList != nil {
 		if err := authorizeTraceProfile(verified, appCode, runtime.memberLookupAllowedAppCodes); err != nil {
-			writeTraceProfileReject(ctx, c, traceprofile.CodeUnauthorizedMember, err.Error())
-			return
+			return writeTraceProfileReject(ctx, c, span, traceprofile.CodeUnauthorizedMember, err.Error())
 		}
 	}
 	user := metadata.GetUser(ctx)
@@ -429,8 +438,7 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 	span.Set("trace-profile-data-tenant-id", dataTenantID)
 	scope, err := traceprofile.ResolveScope(dataTenantID, user.SpaceUID, request.ObservationDomainID)
 	if err != nil {
-		writeTraceProfileReject(ctx, c, traceprofile.ErrorCode(err), err.Error())
-		return
+		return writeTraceProfileError(ctx, c, span, err)
 	}
 	isESMember := request.MemberLookup != nil && request.MemberLookup.Backend == traceprofile.MemberBackendElasticsearch
 	isESList := request.ESSummaryList != nil
@@ -446,19 +454,16 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 			version = request.ESSummaryList.ExpectedRouteVersion
 		}
 		if pair.BkBizID != scope.BkBizID {
-			writeTraceProfileReject(ctx, c, traceprofile.CodeUnauthorizedMember, "ES Summary 成员业务不在受信空间内")
-			return
+			return writeTraceProfileReject(ctx, c, span, traceprofile.CodeUnauthorizedMember, "ES Summary 成员业务不在受信空间内")
 		}
 		target, targetErr := runtime.executor.ResolveESSummaryTarget(
 			scope.BkTenantID, pair.BkBizID, pair.AppID, scope.ObservationDomainID,
 		)
 		if targetErr != nil {
-			writeTraceProfileReject(ctx, c, traceprofile.ErrorCode(targetErr), targetErr.Error())
-			return
+			return writeTraceProfileError(ctx, c, span, targetErr)
 		}
 		if target.PublishedVersion == 0 || target.PublishedVersion != version {
-			writeTraceProfileReject(ctx, c, traceprofile.CodeScopePartial, "ES Summary 单租户发布版本尚未在 UQ 生效")
-			return
+			return writeTraceProfileReject(ctx, c, span, traceprofile.CodeScopePartial, "ES Summary 单租户发布版本尚未在 UQ 生效")
 		}
 		esTarget = target
 	}
@@ -468,13 +473,12 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 	if request.Aggregation != nil {
 		rows, aggregateErr := runtime.executor.ExecuteAggregate(ctx, request, scope)
 		if aggregateErr != nil {
-			writeTraceProfileReject(ctx, c, traceprofile.ErrorCode(aggregateErr), aggregateErr.Error())
-			return
+			return writeTraceProfileError(ctx, c, span, aggregateErr)
 		}
 		span.Set("trace-profile-aggregate-points", len(rows))
 		metric.APIRequestInc(ctx, c.Request.URL.Path, metric.StatusSuccess, user.SpaceUID, user.Source)
 		c.JSON(http.StatusOK, traceprofile.NewAggregateResponse(request, rows))
-		return
+		return nil
 	}
 	var page traceprofile.Page
 	if isESMember {
@@ -485,13 +489,13 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 		page, err = runtime.executor.Execute(ctx, request, scope)
 	}
 	if err != nil {
-		writeTraceProfileReject(ctx, c, traceprofile.ErrorCode(err), err.Error())
-		return
+		return writeTraceProfileError(ctx, c, span, err)
 	}
 	span.Set("trace-profile-total", page.Total)
 
 	metric.APIRequestInc(ctx, c.Request.URL.Path, metric.StatusSuccess, user.SpaceUID, user.Source)
 	c.JSON(http.StatusOK, traceprofile.NewResponse(request, page))
+	return nil
 }
 
 type traceProfileErrorResponse struct {
@@ -499,9 +503,48 @@ type traceProfileErrorResponse struct {
 	Message string `json:"message"`
 }
 
-func writeTraceProfileReject(ctx context.Context, c *gin.Context, code, message string) {
+// writeTraceProfileReject 以封闭错误码拒绝请求。
+func writeTraceProfileReject(ctx context.Context, c *gin.Context, span *trace.Span, code, message string) error {
+	return writeTraceProfileError(ctx, c, span, &traceprofile.RejectError{Code: code, Message: message})
+}
+
+// writeTraceProfileError 写出封闭错误体，并记录日志、按错误码计数、标记 span：
+//
+//   - 后端失败（存储读取、结果复核）返回 502，读目标不可用返回 503，其余为 400；
+//   - 响应体与 span 只带封闭错误码与文案；后端原因（可能含驱动错误原文与后端地址）
+//     只写服务端日志。
+func writeTraceProfileError(ctx context.Context, c *gin.Context, span *trace.Span, err error) error {
+	code := traceprofile.ErrorCode(err)
+	message := err.Error()
+	status := http.StatusBadRequest
+	switch {
+	case errors.Is(err, errTraceProfileReadTargetsUnavailable):
+		status = http.StatusServiceUnavailable
+	case traceprofile.IsBackendFailure(code):
+		status = http.StatusBadGateway
+	}
+	metricCode := code
+	if !traceprofile.IsKnownCode(metricCode) {
+		metricCode = "other"
+	}
 	user := metadata.GetUser(ctx)
 	metric.APIRequestInc(ctx, c.Request.URL.Path, metric.StatusFailed, user.SpaceUID, user.Source)
+	metric.TraceProfileRejection(metricCode, status)
+	if span != nil {
+		span.Set("trace-profile-error-code", code)
+		span.Set("trace-profile-http-status", status)
+	}
+	if cause := traceprofile.RejectCause(err); status >= http.StatusInternalServerError {
+		log.Errorf(ctx, "trace profile request failed: code=%s status=%d tenant=%s space=%s message=%s cause=%v",
+			code, status, user.TenantID, user.SpaceUID, message, cause)
+	} else {
+		log.Warnf(ctx, "trace profile request rejected: code=%s status=%d tenant=%s space=%s message=%s",
+			code, status, user.TenantID, user.SpaceUID, message)
+	}
 	// 错误体同样是封闭合同：只有 code 与 message。
-	c.JSON(http.StatusBadRequest, traceProfileErrorResponse{Code: code, Message: message})
+	c.JSON(status, traceProfileErrorResponse{Code: code, Message: message})
+	if status >= http.StatusInternalServerError {
+		return fmt.Errorf("%s: %s", code, message)
+	}
+	return nil
 }

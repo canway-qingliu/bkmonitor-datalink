@@ -31,13 +31,48 @@ const (
 
 // RejectError 是 Trace 直查的明确失败：要么拒绝请求，要么拒绝结果，
 // 不静默降级、不返回伪完整数据。
+//
+// Message 是返回给调用方的封闭文案；Cause 是服务端原因（驱动或后端错误原文，
+// 可能含后端地址），只写服务端日志，不进入响应体或 span。
 type RejectError struct {
 	Code    string
 	Message string
+	Cause   error
 }
 
 func (e *RejectError) Error() string {
 	return e.Message
+}
+
+func (e *RejectError) Unwrap() error {
+	return e.Cause
+}
+
+// RejectCause 返回 err 携带的服务端原因，没有时为 nil。
+func RejectCause(err error) error {
+	var rejected *RejectError
+	if errors.As(err, &rejected) {
+		return rejected.Cause
+	}
+	return err
+}
+
+// knownCodes 是封闭错误码集合，指标标签只取其中的值。
+var knownCodes = map[string]struct{}{
+	CodeUnauthorizedDomain: {}, CodeUnauthorizedMember: {}, CodeScopePartial: {}, CodePredicateConflict: {},
+	CodeUnboundedRange: {}, CodeLimitExceeded: {}, CodeRouteNotFound: {}, CodeUnsafeUnion: {},
+	CodeUnsupportedSchemaCapability: {}, CodePartialFailure: {}, CodeInvalidPageToken: {},
+}
+
+// IsKnownCode 报告 code 是否属于封闭错误码集合。
+func IsKnownCode(code string) bool {
+	_, known := knownCodes[code]
+	return known
+}
+
+// IsBackendFailure 报告该错误码是否表示后端（存储读取或结果复核）失败，而不是请求被拒。
+func IsBackendFailure(code string) bool {
+	return code == CodePartialFailure
 }
 
 func reject(code, format string, args ...any) error {
