@@ -63,13 +63,12 @@ func TestTraceProfileSingleTenantIDKeepsExistingSecurityChecks(t *testing.T) {
 		{name: "multi tenant disables alias", multiTenant: true, code: traceprofile.CodeUnauthorizedDomain},
 		{name: "single tenant runtime survives mode reload", reloadMode: true},
 		{name: "multi tenant runtime survives mode reload", multiTenant: true, reloadMode: true, code: traceprofile.CodeUnauthorizedDomain},
-		{name: "unconfigured", unconfigured: true, code: traceprofile.CodeUnauthorizedDomain},
+		{name: "unconfigured with one published tenant uses it", unconfigured: true},
 		{name: "unverified caller", unverified: true, code: traceprofile.CodeUnauthorizedMember},
 		{name: "unauthorized app", app: "other", code: traceprofile.CodeUnauthorizedMember},
 		{name: "space without published route", space: "bkcc__43", code: traceprofile.CodeRouteNotFound},
 		{name: "other incoming tenant", incoming: "foreign", code: traceprofile.CodeUnauthorizedDomain},
 		{name: "body cannot choose tenant", domain: "foreign_kapm", code: traceprofile.CodeUnauthorizedDomain},
-		{name: "invalid configured tenant", binding: "../system", code: traceprofile.CodeUnauthorizedMember},
 		{name: "stale target", binding: "tenant_new", domain: "tenant_new_kapm", code: traceprofile.CodeRouteNotFound},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -195,5 +194,37 @@ func TestTraceProfileSingleTenantIDKeepsExistingSecurityChecks(t *testing.T) {
 				t.Fatal("rejected request reached storage")
 			}
 		})
+	}
+}
+
+// F10：非法的 single_tenant_id 在加载时就是配置错误，而不是每个请求都报"调用方未授权"。
+func TestTraceInvalidSingleTenantIDFailsAtLoad(t *testing.T) {
+	config := traceProfileRuntimeConfig()
+	config["single_tenant_id"] = "../system"
+	if runtime, err := newTraceProfileRuntime(config); err == nil || !strings.Contains(err.Error(), "single_tenant_id") {
+		if runtime != nil {
+			runtime.close()
+		}
+		t.Fatalf("invalid single_tenant_id was accepted at load: %v", err)
+	}
+}
+
+// F10：未配置 single_tenant_id 时，多租户快照不猜测数据租户。
+func TestTraceSingleTenantIsNotDerivedFromSeveralTenants(t *testing.T) {
+	config := traceProfileRuntimeConfig()
+	routes := config["read_routes"].([]any)
+	other := map[string]any{}
+	for key, value := range routes[0].(map[string]any) {
+		other[key] = value
+	}
+	other["bk_tenant_id"], other["observation_domain_id"] = "other", "other_kapm"
+	config["read_routes"] = append(routes, other)
+	runtime, err := newTraceProfileRuntime(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.close()
+	if runtime.singleTenantID != "" {
+		t.Fatalf("a data tenant was guessed from several tenants: %s", runtime.singleTenantID)
 	}
 }

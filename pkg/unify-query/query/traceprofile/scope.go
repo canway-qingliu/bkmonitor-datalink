@@ -28,6 +28,11 @@ type Scope struct {
 
 var spaceUIDPattern = regexp.MustCompile(`^bkcc__([0-9]{1,18})$`)
 
+// ValidTenantID 报告 id 是否是 ResolveScope 接受的租户标识。
+func ValidTenantID(id string) bool {
+	return id != "" && physicalIdentifierPattern.MatchString(id)
+}
+
 // ResolveScope 是 fail closed 的唯一入口：作用域缺失或与冻结命名漂移即拒绝。
 func ResolveScope(tenantID, spaceUID, observationDomainID string) (Scope, error) {
 	if tenantID == "" || !physicalIdentifierPattern.MatchString(tenantID) {

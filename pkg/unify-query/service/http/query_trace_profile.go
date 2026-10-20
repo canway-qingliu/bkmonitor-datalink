@@ -104,7 +104,8 @@ type traceProfileConfig struct {
 	ReadonlyConnections   []traceProfileConnectionConfig `json:"readonly_connections"`
 
 	// 单租户 typed Trace 的真实数据租户；应用和空间权限沿用 JWT 鉴权。
-	// 未配置时沿用入站租户，不从请求参数猜测数据归属。
+	// 配置非法时加载即失败；未配置且读目标快照恰好只有一个租户时取该租户，
+	// 否则沿用入站租户。不从请求参数猜测数据归属。
 	SingleTenantID                string   `json:"single_tenant_id,omitempty"`
 	AllowedBkAppCodes             []string `json:"allowed_bk_app_codes"`
 	MemberLookupAllowedBkAppCodes []string `json:"member_lookup_allowed_bk_app_codes"`
@@ -311,6 +312,11 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 		closeConnections()
 		return nil, err
 	}
+	singleTenantID, err := traceProfileSingleTenantID(config.SingleTenantID, routes, esTargets)
+	if err != nil {
+		closeConnections()
+		return nil, err
+	}
 
 	queriers := make(map[string]traceprofile.Querier, len(connections))
 	for clusterID, instance := range connections {
@@ -336,11 +342,36 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 		routeVersion:   config.RouteSnapshotVersion,
 		routeCount:     len(routes),
 
-		singleTenantID:              config.SingleTenantID,
+		singleTenantID:              singleTenantID,
 		multiTenantMode:             viper.GetBool(influxdb.MultiTenantModeConfigPath),
 		allowedAppCodes:             config.AllowedBkAppCodes,
 		memberLookupAllowedAppCodes: config.MemberLookupAllowedBkAppCodes,
 	}, nil
+}
+
+// traceProfileSingleTenantID 是单租户网关请求（入站租户为 default）映射到的数据租户：
+// 配置值必须是合法租户标识，否则加载失败；未配置时，读目标恰好只有一个租户就取它。
+func traceProfileSingleTenantID(configured string, routes []traceprofile.ReadRoute, esTargets []traceprofile.ESSummaryTarget) (string, error) {
+	if configured != "" {
+		if !traceprofile.ValidTenantID(configured) {
+			return "", fmt.Errorf("Trace single_tenant_id 不是合法租户标识: %q", configured)
+		}
+		return configured, nil
+	}
+	tenants := make(map[string]struct{}, 1)
+	for _, route := range routes {
+		tenants[route.BkTenantID] = struct{}{}
+	}
+	for _, target := range esTargets {
+		tenants[target.BkTenantID] = struct{}{}
+	}
+	if len(tenants) != 1 {
+		return "", nil
+	}
+	for tenant := range tenants {
+		return tenant, nil
+	}
+	return "", nil
 }
 
 // probeTraceEnvelope 只读取前缀用于识别 typed Trace 信封；非 Trace 请求的 body 原样回填，
