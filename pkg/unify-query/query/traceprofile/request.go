@@ -93,6 +93,9 @@ type Request struct {
 	MemberLookup        *MemberLookup
 	ESSummaryList       *ESSummaryList
 	Aggregation         *CountAggregation
+
+	// esSummaryPredicate 是 ParseRequest 解析过的 ES Summary 列表入口筛选，避免重复解析。
+	esSummaryPredicate *ESSummaryListPredicate
 }
 
 // CountAggregation is a bounded, server-side count query over one trusted Trace profile.
@@ -253,10 +256,11 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 		memberLookup = &lookup
 	}
 	var esSummaryList *ESSummaryList
+	var esSummaryPredicate *ESSummaryListPredicate
 	if len(query.ESSummaryList) != 0 {
 		if bytes.Equal(query.ESSummaryList, []byte("null")) || memberLookup != nil || aggregation != nil ||
 			wire.TraceProfile != metadata.TraceProfileSummary || scene != "global" ||
-			endUS-startUS > 30*86_400_000_000+1000 {
+			!WindowFits(startUS, endUS, MaxWindowUS(MaxRangeDays)) {
 			return Request{}, fmt.Errorf("ES Summary 列表模式、场景或三十天上限非法")
 		}
 		listDecoder := json.NewDecoder(bytes.NewReader(query.ESSummaryList))
@@ -280,6 +284,7 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 			return Request{}, err
 		}
 		esSummaryList = &target
+		esSummaryPredicate = &predicate
 	}
 	for _, order := range query.OrderBy {
 		if !orderPattern.MatchString(order) {
@@ -294,6 +299,8 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 		MemberLookup:  memberLookup,
 		ESSummaryList: esSummaryList,
 		Aggregation:   aggregation,
+
+		esSummaryPredicate: esSummaryPredicate,
 	}, nil
 }
 

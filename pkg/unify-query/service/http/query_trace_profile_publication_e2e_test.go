@@ -12,8 +12,11 @@ package http
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/spf13/viper"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/structured"
@@ -61,5 +64,52 @@ func TestPublishedEntryIndexVersionReachesESListAtRuntime(t *testing.T) {
 	if recorder.Code != http.StatusOK || !ownerKeysPushed {
 		t.Fatalf("published entry index version 2 did not enable parent filtering: status=%d pushed=%v body=%s",
 			recorder.Code, ownerKeysPushed, recorder.Body.String())
+	}
+}
+
+// F3：处理入口与下游检查使用同一个窗口函数，产品最大窗口（30 天加 1 ms）不被入口拒绝。
+func TestESListAcceptsTheMaximumProductWindow(t *testing.T) {
+	document := strings.ReplaceAll(tracePublicationFor("system"), "132", "42")
+	withConsulTracePublication(t, map[string]string{"system": document})
+	config := viper.Get(TraceProfileConfigPath).(map[string]any)
+	config["max_range_days"] = 30
+	if err := reloadTraceProfilePublishedRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	withTraceProfileAuth(t, true, "kingeye-apm")
+	traceProfileRuntimeValue.Load().memberLookupAllowedAppCodes = []string{"kingeye-apm"}
+	called := false
+	traceProfileRuntimeValue.Load().esMemberReader = func(_ context.Context, query *structured.QueryTs) (
+		int64, []map[string]any, metadata.ResultTableOptions, []metadata.RouteInfo, error,
+	) {
+		called = true
+		return 0, nil, nil, []metadata.RouteInfo{{
+			TableID: "apm_global.trace_summary_v1_7", StorageType: metadata.ElasticsearchStorageType, StorageID: "9",
+		}}, nil
+	}
+	start := int64(1758585600000000)
+	end := start + 30*86_400_000_000 + 1000
+	body := esSummaryListBody(strconv.FormatInt(start, 10), strconv.FormatInt(end, 10),
+		`{"field_list":[],"condition_list":[]}`, "")
+	recorder := runTraceProfileRequest(t, body, "kingeye-apm")
+	if recorder.Code != http.StatusOK || !called {
+		t.Fatalf("the maximum product window was rejected: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// F9：ES Summary 的 offset 上限来自运行时配置预算，只在一处检查。
+func TestESListOffsetLimitComesFromRuntimeConfig(t *testing.T) {
+	document := strings.ReplaceAll(tracePublicationFor("system"), "132", "42")
+	withConsulTracePublication(t, map[string]string{"system": document})
+	if err := reloadTraceProfilePublishedRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	withTraceProfileAuth(t, true, "kingeye-apm")
+	traceProfileRuntimeValue.Load().memberLookupAllowedAppCodes = []string{"kingeye-apm"}
+	body := esSummaryListBody("1758585600000000", "1758672000000000", `{"field_list":[],"condition_list":[]}`, "")
+	body = strings.Replace(body, `"limit":2,`, `"limit":2,"offset":1001,`, 1)
+	recorder := runTraceProfileRequest(t, body, "kingeye-apm")
+	if code := decodeTraceProfileError(t, recorder); code != "TRACE_LIMIT_EXCEEDED" {
+		t.Fatalf("offset past the configured budget returned %s", code)
 	}
 }

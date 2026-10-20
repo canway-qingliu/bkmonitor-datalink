@@ -38,7 +38,7 @@ func CompileAggregate(
 	if err != nil || target.Table != expectedTable {
 		return CompiledAggregate{}, reject(CodeRouteNotFound, "Trace 聚合读目标与 profile 不匹配")
 	}
-	if request.EndUS <= request.StartUS || limits.MaxRangeUS > 0 && request.EndUS-request.StartUS > limits.MaxRangeUS {
+	if request.EndUS <= request.StartUS || limits.MaxRangeUS > 0 && !WindowFits(request.StartUS, request.EndUS, limits.MaxRangeUS) {
 		return CompiledAggregate{}, reject(CodeUnboundedRange, "Trace 聚合时间范围无效或超预算")
 	}
 	projection := projectionForProfile(profile)

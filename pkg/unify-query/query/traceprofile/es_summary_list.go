@@ -15,19 +15,26 @@ import (
 )
 
 // ShapeESSummaryListPage 拒绝截断页、越权行和不稳定排序；基础 Summary 字段沿用成员行合同。
-func ShapeESSummaryListPage(raw []map[string]any, total int64, request Request, scope Scope, target ESSummaryTarget) (Page, error) {
+func ShapeESSummaryListPage(
+	raw []map[string]any, total int64, request Request, scope Scope, target ESSummaryTarget, limits ESSummaryLimits,
+) (Page, error) {
 	list := request.ESSummaryList
 	if request.Profile != metadata.TraceProfileSummary || request.Scene != "global" || list == nil ||
 		request.MemberLookup != nil || request.Aggregation != nil ||
 		list.Backend != MemberBackendElasticsearch || list.AppID != target.AppID ||
 		list.BkBizID != target.BkBizID || list.BkBizID != scope.BkBizID ||
-		list.ExpectedRouteVersion <= 0 || list.ExpectedRouteVersion != target.PublishedVersion ||
-		target.RetentionDays < 1 || target.RetentionDays > 30 || target.BkTenantID != scope.BkTenantID ||
-		target.ObservationDomainID != scope.ObservationDomainID ||
-		request.Limit <= 0 || request.Limit > 1000 || request.StartUS >= request.EndUS ||
-		request.EndUS-request.StartUS > target.RetentionDays*86_400_000_000+1000 ||
-		!validESSummaryListOrder(request.OrderBy) {
-		return Page{}, reject(CodeUnauthorizedMember, "ES Summary 列表作用域或已发布保留期不一致")
+		target.BkTenantID != scope.BkTenantID || target.ObservationDomainID != scope.ObservationDomainID {
+		return Page{}, reject(CodeUnauthorizedMember, "ES Summary 列表作用域与发布目标不一致")
+	}
+	if list.ExpectedRouteVersion <= 0 || list.ExpectedRouteVersion != target.PublishedVersion {
+		return Page{}, reject(CodeScopePartial, "ES Summary 列表发布版本未生效")
+	}
+	predicate, err := request.ListPredicate()
+	if err != nil {
+		return Page{}, err
+	}
+	if err := ValidateESSummaryListRequest(request, predicate, target, limits); err != nil {
+		return Page{}, err
 	}
 	offset := int64(0)
 	if request.Offset != nil {
@@ -45,14 +52,6 @@ func ShapeESSummaryListPage(raw []map[string]any, total int64, request Request, 
 	}
 	if int64(len(raw)) != expected {
 		return Page{}, reject(CodePartialFailure, "ES Summary 列表页不完整")
-	}
-	predicate, err := ParseESSummaryListPredicate(request.Filters)
-	if err != nil {
-		return Page{}, err
-	}
-	if (predicate.ParentState == "observed" || predicate.ParentState == "missing") &&
-		(target.EntryIndexVersion != 2 || target.RetentionDays != 30) {
-		return Page{}, reject(CodeUnsupportedSchemaCapability, "ES Summary 跨应用父关系索引尚未发布")
 	}
 	allowedOwnerKeys, err := ESParentOwnerKeys(*list, predicate.ParentState)
 	if err != nil {

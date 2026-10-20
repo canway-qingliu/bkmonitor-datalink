@@ -62,7 +62,7 @@ func TestDefaultTraceProfileBudgetCoversThirtyDayInclusiveWindow(t *testing.T) {
 		ObservationDomainID: "system_kapm", Limit: 50,
 	}
 	target := traceprofile.DorisTarget{ClusterID: "18", Database: "system_kapm", Table: "otel_trace_span_42"}
-	limits := traceprofile.Limits{MaxRangeUS: traceProfileMaxRangeUS(defaultTraceProfileMaxRangeDays)}
+	limits := traceprofile.Limits{MaxRangeUS: traceprofile.MaxWindowUS(defaultTraceProfileMaxRangeDays)}
 	if _, err := traceprofile.CompileList(metadata.TraceProfileSpan, target, scope, request, limits); err != nil {
 		t.Fatalf("30-day inclusive product window was rejected: %v", err)
 	}

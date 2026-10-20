@@ -70,7 +70,7 @@ func queryESMemberRawWithTimeField(ctx context.Context, query *structured.QueryT
 // executeESMemberLookup 只在已发布目标上构造精确 raw ES 查询；实际路由和完整行再复核。
 func executeESMemberLookup(
 	ctx context.Context, request traceprofile.Request, scope traceprofile.Scope,
-	target traceprofile.ESSummaryTarget, reader esMemberRawReader,
+	target traceprofile.ESSummaryTarget, reader esMemberRawReader, limits traceprofile.ESSummaryLimits,
 ) (traceprofile.Page, error) {
 	lookup := request.MemberLookup
 	if reader == nil || lookup == nil || lookup.Backend != traceprofile.MemberBackendElasticsearch ||
@@ -82,7 +82,7 @@ func executeESMemberLookup(
 	if target.PublishedVersion <= 0 || target.PublishedVersion != lookup.ExpectedRouteVersion {
 		return traceprofile.Page{}, esMemberReject(traceprofile.CodeScopePartial, "ES Summary 发布版本未生效")
 	}
-	if request.Limit < 1 || request.Limit > 1000 || request.EndUS <= request.StartUS {
+	if request.Limit < 1 || request.Limit > limits.MaxRows || request.EndUS <= request.StartUS {
 		return traceprofile.Page{}, esMemberReject(traceprofile.CodeLimitExceeded, "ES Summary 成员时间或行预算非法")
 	}
 	fields := []structured.ConditionField{

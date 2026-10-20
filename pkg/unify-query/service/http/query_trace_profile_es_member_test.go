@@ -84,7 +84,7 @@ func TestESMemberExecutionBuildsClosedExactQueryAndChecksResolvedRoute(t *testin
 			StorageID: strconv.FormatInt(target.StorageClusterID, 10),
 		}}, nil
 	}
-	page, err := executeESMemberLookup(context.Background(), request, scope, target, reader)
+	page, err := executeESMemberLookup(context.Background(), request, scope, target, reader, traceprofile.DefaultESSummaryLimits())
 	if err != nil || !called || page.Total != 0 || len(page.Items) != 0 {
 		t.Fatalf("valid exact ES member query failed: called=%v page=%+v err=%v", called, page, err)
 	}
@@ -101,7 +101,7 @@ func TestESMemberExecutionRejectsDriftedOrPartialRawRoute(t *testing.T) {
 			reader := func(_ context.Context, _ *structured.QueryTs) (int64, []map[string]any, metadata.ResultTableOptions, []metadata.RouteInfo, error) {
 				return 0, nil, nil, []metadata.RouteInfo{route}, nil
 			}
-			if _, err := executeESMemberLookup(context.Background(), request, scope, target, reader); err == nil {
+			if _, err := executeESMemberLookup(context.Background(), request, scope, target, reader, traceprofile.DefaultESSummaryLimits()); err == nil {
 				t.Fatal("drifted ES storage route was accepted")
 			}
 		})
@@ -113,7 +113,7 @@ func TestESMemberExecutionRejectsDriftedOrPartialRawRoute(t *testing.T) {
 			TableID: target.ResultTableID, StorageType: metadata.ElasticsearchStorageType, StorageID: "9",
 		}}, nil
 	}
-	if _, err := executeESMemberLookup(ctx, request, scope, target, reader); traceprofile.ErrorCode(err) != traceprofile.CodePartialFailure {
+	if _, err := executeESMemberLookup(ctx, request, scope, target, reader, traceprofile.DefaultESSummaryLimits()); traceprofile.ErrorCode(err) != traceprofile.CodePartialFailure {
 		t.Fatalf("partial ES index read escaped as complete: %v", err)
 	}
 }
@@ -205,7 +205,7 @@ func TestESMemberExecutionTraversesRealRawRouterAndMockElasticsearch(t *testing.
 		executedQuery = query
 		return queryESMemberRawWithTimeField(ctx, query)
 	}
-	page, err := executeESMemberLookup(ctx, request, scope, target, reader)
+	page, err := executeESMemberLookup(ctx, request, scope, target, reader, traceprofile.DefaultESSummaryLimits())
 	require.NoError(t, err)
 	require.Equal(t, int64(1), page.Total)
 	require.Len(t, page.Items, 1)
@@ -221,7 +221,7 @@ func TestESMemberExecutionTraversesRealRawRouterAndMockElasticsearch(t *testing.
 	require.Equal(t, int64(1), total)
 	require.Len(t, rows, 1)
 	before := searches
-	_, err = executeESMemberLookup(ctx, request, scope, target, queryESMemberRawWithTimeField)
+	_, err = executeESMemberLookup(ctx, request, scope, target, queryESMemberRawWithTimeField, traceprofile.DefaultESSummaryLimits())
 	require.Equal(t, traceprofile.CodeScopePartial, traceprofile.ErrorCode(err))
 	require.Equal(t, before, searches, "wrong RT time field must fail before ES I/O")
 }

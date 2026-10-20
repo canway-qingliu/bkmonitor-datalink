@@ -26,6 +26,7 @@ import (
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/traceprofile"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/tsdb"
 	ir "github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/router/influxdb"
 )
@@ -158,7 +159,7 @@ func TestESSummaryMemberLookupAgainstLocalElasticsearch(t *testing.T) {
 		Type: metadata.ElasticsearchStorageType, Address: baseURL,
 		Username: username, Password: password,
 	})
-	page, err := executeESMemberLookup(ctx, request, scope, target, queryESMemberRawWithTimeField)
+	page, err := executeESMemberLookup(ctx, request, scope, target, queryESMemberRawWithTimeField, traceprofile.DefaultESSummaryLimits())
 	require.NoError(t, err)
 	require.Equal(t, int64(1), page.Total)
 	require.Len(t, page.Items, 1)

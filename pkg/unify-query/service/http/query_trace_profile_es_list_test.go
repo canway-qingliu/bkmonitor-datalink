@@ -60,7 +60,7 @@ func TestESListExecutionBuildsClosedExactPageAndChecksRoute(t *testing.T) {
 			StorageID: strconv.FormatInt(target.StorageClusterID, 10),
 		}}, nil
 	}
-	page, err := executeESList(context.Background(), request, scope, target, reader)
+	page, err := executeESList(context.Background(), request, scope, target, reader, traceprofile.DefaultESSummaryLimits())
 	if err != nil || page.Total != 1 || len(page.Items) != 0 {
 		t.Fatalf("valid ES list empty offset page failed: page=%+v err=%v", page, err)
 	}
@@ -81,7 +81,7 @@ func TestESListExecutionRejectsVersionDriftPartialAndWrongRoute(t *testing.T) {
 			reader := func(_ context.Context, _ *structured.QueryTs) (int64, []map[string]any, metadata.ResultTableOptions, []metadata.RouteInfo, error) {
 				return 1, nil, nil, []metadata.RouteInfo{route}, nil
 			}
-			if _, err := executeESList(context.Background(), request, scope, changedTarget, reader); err == nil {
+			if _, err := executeESList(context.Background(), request, scope, changedTarget, reader, traceprofile.DefaultESSummaryLimits()); err == nil {
 				t.Fatal("drifted ES list target or route was accepted")
 			}
 		})
@@ -91,7 +91,7 @@ func TestESListExecutionRejectsVersionDriftPartialAndWrongRoute(t *testing.T) {
 		metadata.SetStatus(ctx, metadata.QueryRawPartial, "shard failed")
 		return 1, nil, nil, []metadata.RouteInfo{goodRoute}, nil
 	}
-	if _, err := executeESList(ctx, request, scope, target, reader); traceprofile.ErrorCode(err) != traceprofile.CodePartialFailure {
+	if _, err := executeESList(ctx, request, scope, target, reader, traceprofile.DefaultESSummaryLimits()); traceprofile.ErrorCode(err) != traceprofile.CodePartialFailure {
 		t.Fatalf("partial ES list escaped as complete: %v", err)
 	}
 }
@@ -157,7 +157,7 @@ func TestESListExecutionRepeatsTrustedScopeAcrossMixedTypeBranches(t *testing.T)
 			StorageID: strconv.FormatInt(target.StorageClusterID, 10),
 		}}, nil
 	}
-	if _, err := executeESList(context.Background(), request, scope, target, reader); err != nil {
+	if _, err := executeESList(context.Background(), request, scope, target, reader, traceprofile.DefaultESSummaryLimits()); err != nil {
 		t.Fatalf("bounded mixed entry predicate failed: %v", err)
 	}
 }
@@ -214,7 +214,7 @@ func TestESListExecutionPushesAuthorizedParentIntersectionBeforePagination(t *te
 					StorageID: strconv.FormatInt(target.StorageClusterID, 10),
 				}}, nil
 			}
-			if _, err := executeESList(context.Background(), request, scope, target, reader); err != nil {
+			if _, err := executeESList(context.Background(), request, scope, target, reader, traceprofile.DefaultESSummaryLimits()); err != nil {
 				t.Fatalf("authorized cross-app relation query failed: %v", err)
 			}
 		})
@@ -253,7 +253,7 @@ func TestESListExecutionPushesEntryNameDurationAndErrorBeforeTotal(t *testing.T)
 			StorageID: strconv.FormatInt(target.StorageClusterID, 10),
 		}}, nil
 	}
-	if _, err := executeESList(context.Background(), request, scope, target, reader); err != nil {
+	if _, err := executeESList(context.Background(), request, scope, target, reader, traceprofile.DefaultESSummaryLimits()); err != nil {
 		t.Fatalf("indexed entry query failed: %v", err)
 	}
 }
@@ -285,7 +285,7 @@ func TestESListExecutionUsesV2ParentFlagForRoot(t *testing.T) {
 			StorageID: strconv.FormatInt(target.StorageClusterID, 10),
 		}}, nil
 	}
-	if _, err := executeESList(context.Background(), request, scope, target, reader); err != nil {
+	if _, err := executeESList(context.Background(), request, scope, target, reader, traceprofile.DefaultESSummaryLimits()); err != nil {
 		t.Fatalf("V2 root query failed: %v", err)
 	}
 }

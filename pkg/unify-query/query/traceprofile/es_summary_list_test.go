@@ -26,7 +26,7 @@ func esListFixture(t *testing.T) (Request, Scope, ESSummaryTarget, map[string]an
 
 func TestShapeESSummaryListPagePreservesEntryFieldsAndExactTotal(t *testing.T) {
 	request, scope, target, row := esListFixture(t)
-	page, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target)
+	page, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target, DefaultESSummaryLimits())
 	if err != nil || page.Total != 1 || len(page.Items) != 1 {
 		t.Fatalf("complete ES Summary list was rejected: page=%+v err=%v", page, err)
 	}
@@ -52,12 +52,12 @@ func TestShapeESSummaryListPageRejectsIncompleteOrForeignRows(t *testing.T) {
 				row[key] = value
 			}
 			mutate(row)
-			if _, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target); err == nil {
+			if _, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target, DefaultESSummaryLimits()); err == nil {
 				t.Fatal("incomplete or foreign ES Summary row was accepted")
 			}
 		})
 	}
-	if _, err := ShapeESSummaryListPage([]map[string]any{original}, 2, request, scope, target); err == nil {
+	if _, err := ShapeESSummaryListPage([]map[string]any{original}, 2, request, scope, target, DefaultESSummaryLimits()); err == nil {
 		t.Fatal("truncated ES Summary page was accepted")
 	}
 }
@@ -71,7 +71,7 @@ func TestShapeESSummaryListPageAppliesSubtypeOnlyToBackground(t *testing.T) {
 		},
 		ConditionList: []string{"and"},
 	}
-	if _, err := ShapeESSummaryListPage([]map[string]any{original}, 1, request, scope, target); err != nil {
+	if _, err := ShapeESSummaryListPage([]map[string]any{original}, 1, request, scope, target, DefaultESSummaryLimits()); err != nil {
 		t.Fatalf("request must remain visible when background subtype is selected: %v", err)
 	}
 	background := make(map[string]any, len(original))
@@ -80,11 +80,11 @@ func TestShapeESSummaryListPageAppliesSubtypeOnlyToBackground(t *testing.T) {
 	}
 	background["entry_type"] = "background"
 	background["entry_subtype"] = "scheduled"
-	if _, err := ShapeESSummaryListPage([]map[string]any{background}, 1, request, scope, target); err != nil {
+	if _, err := ShapeESSummaryListPage([]map[string]any{background}, 1, request, scope, target, DefaultESSummaryLimits()); err != nil {
 		t.Fatalf("selected scheduled background was rejected: %v", err)
 	}
 	background["entry_subtype"] = "async"
-	if _, err := ShapeESSummaryListPage([]map[string]any{background}, 1, request, scope, target); err == nil {
+	if _, err := ShapeESSummaryListPage([]map[string]any{background}, 1, request, scope, target, DefaultESSummaryLimits()); err == nil {
 		t.Fatal("unselected background subtype was accepted")
 	}
 }
@@ -93,20 +93,20 @@ func TestShapeESSummaryListPageUsesPublishedRetentionInsteadOfFixedSevenDays(t *
 	request, scope, target, row := esListFixture(t)
 	request.EndUS = request.StartUS + 10*86_400_000_000
 	target.RetentionDays = 14
-	if _, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target); err != nil {
+	if _, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target, DefaultESSummaryLimits()); err != nil {
 		t.Fatalf("published fourteen-day target rejected ten-day request: %v", err)
 	}
 	target.RetentionDays = 7
-	if _, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target); err == nil {
+	if _, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target, DefaultESSummaryLimits()); err == nil {
 		t.Fatal("seven-day published target accepted ten-day request")
 	}
 	target.RetentionDays = 30
 	request.EndUS = request.StartUS + 30*86_400_000_000 + 1000
-	if _, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target); err != nil {
+	if _, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target, DefaultESSummaryLimits()); err != nil {
 		t.Fatalf("inclusive thirty-day UI window was rejected: %v", err)
 	}
 	request.EndUS++
-	if _, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target); err == nil {
+	if _, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target, DefaultESSummaryLimits()); err == nil {
 		t.Fatal("window beyond inclusive thirty-day boundary was accepted")
 	}
 }
@@ -126,7 +126,7 @@ func TestShapeESSummaryListPageRechecksIndexedEntryNameDurationAndError(t *testi
 	original["entry_kind"] = int64(2)
 	original["trace_duration"] = int64(500)
 	original["error"] = false
-	if _, err := ShapeESSummaryListPage([]map[string]any{original}, 1, request, scope, target); err != nil {
+	if _, err := ShapeESSummaryListPage([]map[string]any{original}, 1, request, scope, target, DefaultESSummaryLimits()); err != nil {
 		t.Fatalf("supported entry attributes rejected: %v", err)
 	}
 	for _, mutation := range []func(map[string]any){
@@ -140,7 +140,7 @@ func TestShapeESSummaryListPageRechecksIndexedEntryNameDurationAndError(t *testi
 			row[key] = value
 		}
 		mutation(row)
-		if _, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target); err == nil {
+		if _, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target, DefaultESSummaryLimits()); err == nil {
 			t.Fatal("row not satisfying indexed entry filters was accepted")
 		}
 	}
@@ -156,10 +156,10 @@ func TestShapeESSummaryListPageAcceptsDurationOrderAndRejectsWrongPageOrder(t *t
 	}
 	second["trace_id"] = "ffffffffffffffffffffffffffffffff"
 	second["trace_duration"] = int64(500)
-	if _, err := ShapeESSummaryListPage([]map[string]any{first, second}, 2, request, scope, target); err != nil {
+	if _, err := ShapeESSummaryListPage([]map[string]any{first, second}, 2, request, scope, target, DefaultESSummaryLimits()); err != nil {
 		t.Fatalf("duration order rejected: %v", err)
 	}
-	if _, err := ShapeESSummaryListPage([]map[string]any{second, first}, 2, request, scope, target); err == nil {
+	if _, err := ShapeESSummaryListPage([]map[string]any{second, first}, 2, request, scope, target, DefaultESSummaryLimits()); err == nil {
 		t.Fatal("unstable duration page order was accepted")
 	}
 }
@@ -200,12 +200,12 @@ func TestShapeESSummaryListPageRechecksCrossAppParentOwnersAndRejectsOldRows(t *
 	original["entry_index_version"] = float64(2)
 	original["entry_parent_owner_keys"] = []any{"42:7", "99:99"}
 	original["entry_parent_owner_count"] = int64(2)
-	if _, err := ShapeESSummaryListPage([]map[string]any{original}, 1, request, scope, target); err != nil {
+	if _, err := ShapeESSummaryListPage([]map[string]any{original}, 1, request, scope, target, DefaultESSummaryLimits()); err != nil {
 		t.Fatalf("authorized parent owner was not accepted: %v", err)
 	}
 	oldTarget := target
 	oldTarget.EntryIndexVersion = 0
-	if _, err := ShapeESSummaryListPage([]map[string]any{original}, 1, request, scope, oldTarget); err == nil {
+	if _, err := ShapeESSummaryListPage([]map[string]any{original}, 1, request, scope, oldTarget, DefaultESSummaryLimits()); err == nil {
 		t.Fatal("unpublished entry index v2 accepted cross-app relation")
 	}
 	for name, mutate := range map[string]func(map[string]any){
@@ -224,7 +224,7 @@ func TestShapeESSummaryListPageRechecksCrossAppParentOwnersAndRejectsOldRows(t *
 				row[key] = value
 			}
 			mutate(row)
-			if _, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target); err == nil {
+			if _, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target, DefaultESSummaryLimits()); err == nil {
 				t.Fatal("ES Summary relation row escaped authorization or schema recheck")
 			}
 		})
@@ -240,11 +240,11 @@ func TestShapeESSummaryListPageV2RootRequiresExplicitNoParentFlag(t *testing.T) 
 	row["entry_has_parent"] = false
 	row["entry_parent_owner_keys"] = []any{}
 	row["entry_parent_owner_count"] = int64(0)
-	if _, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target); err != nil {
+	if _, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target, DefaultESSummaryLimits()); err != nil {
 		t.Fatalf("V2 root row rejected: %v", err)
 	}
 	row["entry_has_parent"] = true
-	if _, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target); err == nil {
+	if _, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target, DefaultESSummaryLimits()); err == nil {
 		t.Fatal("V2 root with parent flag was accepted")
 	}
 }

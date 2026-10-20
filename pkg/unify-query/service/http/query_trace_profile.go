@@ -134,6 +134,7 @@ type traceProfileRuntime struct {
 	maxLimit       int64
 	maxOffset      int64
 	maxRangeUS     int64
+	esLimits       traceprofile.ESSummaryLimits
 	routeVersion   int64
 	routeCount     int
 	// configDigest 是构建该快照时的本地 trace_profile 配置摘要，仅发布源模式使用。
@@ -144,11 +145,6 @@ type traceProfileRuntime struct {
 	multiTenantMode             bool
 	allowedAppCodes             []string
 	memberLookupAllowedAppCodes []string
-}
-
-func traceProfileMaxRangeUS(days int64) int64 {
-	// Kingeye 产品窗口的毫秒结束点是含端点，typed 读窗口为排他微秒终点。
-	return days*24*int64(time.Hour/time.Microsecond) + 1000
 }
 
 func (r *traceProfileRuntime) close() {
@@ -315,7 +311,7 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 		queriers[clusterID] = instance
 	}
 	executor, err := traceprofile.NewExecutor(snapshot, queriers, traceprofile.Limits{
-		MaxRangeUS: traceProfileMaxRangeUS(config.MaxRangeDays),
+		MaxRangeUS: traceprofile.MaxWindowUS(config.MaxRangeDays),
 		MaxOffset:  config.MaxOffset,
 	})
 	if err != nil {
@@ -329,7 +325,8 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 		maxBodyBytes:   config.MaxBodyBytes,
 		maxLimit:       config.MaxLimit,
 		maxOffset:      config.MaxOffset,
-		maxRangeUS:     traceProfileMaxRangeUS(config.MaxRangeDays),
+		maxRangeUS:     traceprofile.MaxWindowUS(config.MaxRangeDays),
+		esLimits:       traceprofile.NewESSummaryLimits(config.MaxLimit, config.MaxOffset),
 		routeVersion:   config.RouteSnapshotVersion,
 		routeCount:     len(routes),
 
@@ -410,7 +407,7 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 		return
 	}
 	// 时间预算属于 typed 合同，Doris 与 ES 成员读取必须在分流前一致校验。
-	if request.EndUS-request.StartUS > runtime.maxRangeUS {
+	if !traceprofile.WindowFits(request.StartUS, request.EndUS, runtime.maxRangeUS) {
 		writeTraceProfileReject(ctx, c, traceprofile.CodeUnboundedRange, "Trace 查询时间范围超过预算")
 		return
 	}
@@ -419,10 +416,6 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 			writeTraceProfileReject(ctx, c, traceprofile.CodeUnauthorizedMember, err.Error())
 			return
 		}
-	}
-	if request.ESSummaryList != nil && request.Offset != nil && *request.Offset > runtime.maxOffset {
-		writeTraceProfileReject(ctx, c, traceprofile.CodeLimitExceeded, "ES Summary 列表 offset 超出预算")
-		return
 	}
 	user := metadata.GetUser(ctx)
 	dataTenantID := user.TenantID
@@ -467,11 +460,6 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 			writeTraceProfileReject(ctx, c, traceprofile.CodeScopePartial, "ES Summary 单租户发布版本尚未在 UQ 生效")
 			return
 		}
-		if isESList && (target.RetentionDays < 1 || target.RetentionDays > 30 ||
-			request.EndUS-request.StartUS > target.RetentionDays*86_400_000_000) {
-			writeTraceProfileReject(ctx, c, traceprofile.CodeScopePartial, "ES Summary 已发布保留期不足以覆盖请求")
-			return
-		}
 		esTarget = target
 	}
 
@@ -490,9 +478,9 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 	}
 	var page traceprofile.Page
 	if isESMember {
-		page, err = executeESMemberLookup(ctx, request, scope, esTarget, runtime.esMemberReader)
+		page, err = executeESMemberLookup(ctx, request, scope, esTarget, runtime.esMemberReader, runtime.esLimits)
 	} else if isESList {
-		page, err = executeESList(ctx, request, scope, esTarget, runtime.esMemberReader)
+		page, err = executeESList(ctx, request, scope, esTarget, runtime.esMemberReader, runtime.esLimits)
 	} else {
 		page, err = runtime.executor.Execute(ctx, request, scope)
 	}

@@ -20,7 +20,7 @@ import (
 
 // Limits 是查询预算；超预算明确失败，不做截断或降级。
 type Limits struct {
-	// MaxRangeUS 是单次查询允许的最大时间跨度（微秒）。
+	// MaxRangeUS 是单次查询允许的最大时间跨度（微秒，含结束点余量，见 MaxWindowUS）。
 	MaxRangeUS int64
 	// MaxOffset 是 Summary 列表允许的最大偏移量。
 	MaxOffset int64
@@ -108,7 +108,7 @@ func CompileList(
 	if request.EndUS <= request.StartUS {
 		return CompiledList{}, reject(CodeUnboundedRange, "Trace 查询时间范围非法")
 	}
-	if limits.MaxRangeUS > 0 && request.EndUS-request.StartUS > limits.MaxRangeUS {
+	if limits.MaxRangeUS > 0 && !WindowFits(request.StartUS, request.EndUS, limits.MaxRangeUS) {
 		return CompiledList{}, reject(CodeUnboundedRange, "Trace 查询时间范围超过预算")
 	}
 	offset := int64(0)

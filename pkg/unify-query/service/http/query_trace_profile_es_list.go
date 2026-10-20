@@ -24,7 +24,7 @@ var esListColumns = append(append(structured.KeepColumns(nil), esMemberColumns..
 // executeESList 仅查询发布的单应用 Summary RT，并复核 raw ES 的完整路由与 total。
 func executeESList(
 	ctx context.Context, request traceprofile.Request, scope traceprofile.Scope,
-	target traceprofile.ESSummaryTarget, reader esMemberRawReader,
+	target traceprofile.ESSummaryTarget, reader esMemberRawReader, limits traceprofile.ESSummaryLimits,
 ) (traceprofile.Page, error) {
 	list := request.ESSummaryList
 	if reader == nil || list == nil || request.Profile != metadata.TraceProfileSummary || request.Scene != "global" ||
@@ -35,23 +35,19 @@ func executeESList(
 		target.ResultTableID == "" || target.StorageClusterID <= 0 {
 		return traceprofile.Page{}, esMemberReject(traceprofile.CodeUnauthorizedMember, "ES Summary 列表身份与发布目标不一致")
 	}
-	if target.PublishedVersion <= 0 || target.PublishedVersion != list.ExpectedRouteVersion ||
-		target.RetentionDays < 1 || target.RetentionDays > 30 {
-		return traceprofile.Page{}, esMemberReject(traceprofile.CodeScopePartial, "ES Summary 目标保留期或发布版本未生效")
+	if target.PublishedVersion <= 0 || target.PublishedVersion != list.ExpectedRouteVersion {
+		return traceprofile.Page{}, esMemberReject(traceprofile.CodeScopePartial, "ES Summary 目标发布版本未生效")
 	}
-	if request.Limit < 1 || request.Limit > 1000 || request.StartUS >= request.EndUS ||
-		request.EndUS-request.StartUS > target.RetentionDays*86_400_000_000+1000 ||
-		len(request.OrderBy) != 2 || request.OrderBy[1] != "trace_id" ||
-		request.OrderBy[0] != "-min_start_time" && request.OrderBy[0] != "min_start_time" &&
-			request.OrderBy[0] != "-trace_duration" && request.OrderBy[0] != "trace_duration" {
-		return traceprofile.Page{}, esMemberReject(traceprofile.CodeLimitExceeded, "ES Summary 列表时间、排序或行预算非法")
+	predicate, err := request.ListPredicate()
+	if err != nil {
+		return traceprofile.Page{}, err
+	}
+	if err := traceprofile.ValidateESSummaryListRequest(request, predicate, target, limits); err != nil {
+		return traceprofile.Page{}, err
 	}
 	offset := int64(0)
 	if request.Offset != nil {
 		offset = *request.Offset
-	}
-	if offset < 0 || offset > 100000 {
-		return traceprofile.Page{}, esMemberReject(traceprofile.CodeLimitExceeded, "ES Summary 列表 offset 超出预算")
 	}
 	baseFields := []structured.ConditionField{
 		{DimensionName: "bk_tenant_id", Value: []string{scope.BkTenantID}, Operator: "eq"},
@@ -67,15 +63,6 @@ func executeESList(
 		}, structured.ConditionField{
 			DimensionName: "entry_parent_owner_count", Value: []string{"0"}, Operator: structured.ConditionGte,
 		})
-	}
-	predicate, err := traceprofile.ParseESSummaryListPredicate(request.Filters)
-	if err != nil {
-		return traceprofile.Page{}, err
-	}
-	if (predicate.ParentState == "observed" || predicate.ParentState == "missing") &&
-		(target.EntryIndexVersion != 2 || target.RetentionDays != 30) {
-		return traceprofile.Page{}, esMemberReject(traceprofile.CodeUnsupportedSchemaCapability,
-			"ES Summary 跨应用父关系索引尚未发布")
 	}
 	parentOwnerKeys, err := traceprofile.ESParentOwnerKeys(*list, predicate.ParentState)
 	if err != nil {
@@ -218,5 +205,5 @@ func executeESList(
 			return traceprofile.Page{}, esMemberReject(traceprofile.CodeRouteNotFound, "ES Summary 列表 RT 或集群漂移")
 		}
 	}
-	return traceprofile.ShapeESSummaryListPage(rows, total, request, scope, target)
+	return traceprofile.ShapeESSummaryListPage(rows, total, request, scope, target, limits)
 }

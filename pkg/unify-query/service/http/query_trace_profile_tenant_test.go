@@ -156,7 +156,7 @@ func TestTraceProfileSingleTenantIDKeepsExistingSecurityChecks(t *testing.T) {
 				row["bk_biz_id"], row["space_uid"] = tc.bizID, fmt.Sprintf("bkcc__%d", tc.bizID)
 				return dorisclient.Result{Rows: []map[string]any{row}}, nil
 			})
-			executor, err := traceprofile.NewExecutor(snapshot, map[string]traceprofile.Querier{"18": querier}, traceprofile.Limits{MaxRangeUS: traceProfileMaxRangeUS(7), MaxOffset: 1000})
+			executor, err := traceprofile.NewExecutor(snapshot, map[string]traceprofile.Querier{"18": querier}, traceprofile.Limits{MaxRangeUS: traceprofile.MaxWindowUS(7), MaxOffset: 1000})
 			if err != nil {
 				t.Fatal(err)
 			}
