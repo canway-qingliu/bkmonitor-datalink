@@ -202,6 +202,52 @@ func TestRedisSourceWithNoTraceKeysIsUnpublished(t *testing.T) {
 	}
 }
 
+// 启动时 Redis 发布源没有任何键：和重载一样只记一条 Warn（未发布）、计数，不记 Error。
+func TestStartupWithNoTraceKeysLogsOneWarnAndNoError(t *testing.T) {
+	ctx, client, _ := setUpRedisTracePublication(t)
+	resetTraceProfileLoadState(t)
+	if err := client.Del(ctx, redisTraceDataPrefix+"system").Err(); err != nil {
+		t.Fatal(err)
+	}
+	logs := captureTraceLogs(t)
+	before := traceProfileReloadCount(t, "redis", traceReloadUnpublished)
+	loadTraceProfileOnStart()
+	if reason := traceProfileRuntimeClosedReason(); reason != traceRuntimeUnpublished {
+		t.Fatalf("startup with no keys closed direct read as %q, want unpublished", reason)
+	}
+	if warn, errorLines := logs.lines("warn", "尚未发布"), logs.lines("error", ""); warn != 1 || errorLines != 0 {
+		t.Fatalf("startup with no keys logged %d unpublished Warn and %d Error lines, want one Warn and no Error", warn, errorLines)
+	}
+	if after := traceProfileReloadCount(t, "redis", traceReloadUnpublished); after != before+1 {
+		t.Fatalf("startup unpublished was not counted: %v -> %v", before, after)
+	}
+}
+
+// 启动时发布源不可读、没有可用快照：仍是 Error，且同一次加载只记一条。
+func TestStartupReadFailureLogsOneError(t *testing.T) {
+	_, _, mr := setUpRedisTracePublication(t)
+	resetTraceProfileLoadState(t)
+	mr.Close()
+	logs := captureTraceLogs(t)
+	loadTraceProfileOnStart()
+	if errorLines := logs.lines("error", ""); errorLines != 1 {
+		t.Fatalf("startup read failure logged %d Error lines, want exactly one", errorLines)
+	}
+}
+
+func resetTraceProfileLoadState(t *testing.T) {
+	t.Helper()
+	traceProfileLoad.mu.Lock()
+	previousResult, previousFailures := traceProfileLoad.lastResult, traceProfileLoad.failures
+	traceProfileLoad.lastResult, traceProfileLoad.failures = "", 0
+	traceProfileLoad.mu.Unlock()
+	t.Cleanup(func() {
+		traceProfileLoad.mu.Lock()
+		traceProfileLoad.lastResult, traceProfileLoad.failures = previousResult, previousFailures
+		traceProfileLoad.mu.Unlock()
+	})
+}
+
 // traceLogBuffer collects log lines written during a test.
 type traceLogBuffer struct {
 	mu  sync.Mutex

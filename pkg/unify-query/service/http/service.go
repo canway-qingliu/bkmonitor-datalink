@@ -67,11 +67,7 @@ func (s *Service) Reload(ctx context.Context) {
 
 	log.Debugf(ctx, "waiting for http service close")
 	s.Wait()
-	if traceProfileUsesPublishedRoutes() {
-		if err := reloadTraceProfilePublishedRuntime(); err != nil {
-			log.Errorf(ctx, "load trace profile published routes failed: %s", err)
-		}
-	}
+	loadTraceProfileOnStart()
 
 	gin.SetMode(gin.ReleaseMode)
 	s.g = gin.New()
@@ -140,4 +136,14 @@ func (s *Service) Wait() {
 // Close
 func (s *Service) Close() {
 	s.cancelFunc()
+}
+
+// loadTraceProfileOnStart 在服务启动时加载 Trace 发布读目标。每次加载的结果由加载器按结果
+// 记一次日志并计数（traceProfileLoad.record）："未发布"是发布方的明确状态，记 Warn；读取
+// 失败在没有可用快照时记 Error；被撤销的租户在重建时逐个记 Error。这里不再按返回的错误另记，
+// 否则同一次加载会记两遍，"未发布"也会被当成错误。
+func loadTraceProfileOnStart() {
+	if traceProfileUsesPublishedRoutes() {
+		_ = reloadTraceProfilePublishedRuntime()
+	}
 }
