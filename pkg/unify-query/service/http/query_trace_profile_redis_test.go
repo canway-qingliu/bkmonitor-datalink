@@ -51,6 +51,7 @@ func setUpRedisTracePublication(t *testing.T) (context.Context, goRedis.Universa
 	viper.Set(TraceProfileConfigPath, config)
 	viper.Set("storage.source", "redis")
 	redisService.KVBasePath = "test:unify-query"
+	resetTraceProfileLoader(t)
 	previousRuntime := traceProfileRuntimeValue.Swap(nil)
 	previousConsulRead := consul.GetKVData
 	consul.GetKVData = func(string) ([]byte, error) {

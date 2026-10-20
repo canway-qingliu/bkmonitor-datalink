@@ -40,7 +40,7 @@ func TestPublishedTraceTargetsInstallESSummaryCandidateIntoRuntime(t *testing.T)
 	publication := strings.Replace(publishedBusiness132, `"a3_targets":[]`,
 		`"a3_targets":[],"es_summary_targets":`+publishedESSummaryTargets, 1)
 	snapshot, err := parsePublishedTraceTargets(prefix,
-		api.KVPairs{&api.KVPair{Key: prefix + "system", Value: []byte(publication)}})
+		api.KVPairs{&api.KVPair{Key: prefix + "system", Value: []byte(publication)}}, nil)
 	version, routes, esTargets := snapshot.Version, snapshot.Routes, snapshot.ESTargets
 	if err != nil || len(snapshot.Invalid) != 0 || len(esTargets) != 1 {
 		t.Fatalf("ES Summary publication was lost: targets=%+v err=%v", esTargets, err)
@@ -85,7 +85,7 @@ func TestESSummaryOnlyTenantCanLoadTrustedCandidateWithoutDorisConnection(t *tes
 func TestPublishedTraceTargetsBuildBusiness132Runtime(t *testing.T) {
 	prefix := "kingeye/metadata/unify-query/data/trace/read_target/"
 	pairs := api.KVPairs{&api.KVPair{Key: prefix + "system", Value: []byte(publishedBusiness132)}}
-	snapshot, err := parsePublishedTraceTargets(prefix, pairs)
+	snapshot, err := parsePublishedTraceTargets(prefix, pairs, nil)
 	version, routes := snapshot.Version, snapshot.Routes
 	if err != nil || len(snapshot.Invalid) != 0 || version <= 0 || len(routes) != 2 {
 		t.Fatalf("failed to parse published routes: version=%d routes=%d err=%v", version, len(routes), err)
@@ -114,7 +114,7 @@ func TestPublishedTraceTargetsKeepVersionsPerTenant(t *testing.T) {
 		&api.KVPair{Key: prefix + "system", Value: []byte(publishedBusiness132)},
 		&api.KVPair{Key: prefix + "other", Value: []byte(other)},
 	}
-	snapshot, err := parsePublishedTraceTargets(prefix, pairs)
+	snapshot, err := parsePublishedTraceTargets(prefix, pairs, nil)
 	aggregate, routes := snapshot.Version, snapshot.Routes
 	if err != nil || len(snapshot.Invalid) != 0 || aggregate <= 0 || len(routes) != 4 {
 		t.Fatalf("multi-tenant publication was rejected: version=%d routes=%d err=%v", aggregate, len(routes), err)
@@ -138,6 +138,7 @@ func TestReloadTraceProfileRuntimeConsumesPublishedConsulRoutes(t *testing.T) {
 	config["read_target_version_path"] = versionPath
 	previousConfig := viper.Get(TraceProfileConfigPath)
 	viper.Set(TraceProfileConfigPath, config)
+	resetTraceProfileLoader(t)
 	previousRuntime := traceProfileRuntimeValue.Swap(nil)
 	previousPrefixReader, previousKeyReader := consul.GetDataWithPrefix, consul.GetKVData
 	consul.GetDataWithPrefix = func(path string) (api.KVPairs, error) {
@@ -185,6 +186,7 @@ func TestReloadTraceProfileRuntimeRevokesOldRouteOnInvalidPublication(t *testing
 	config["read_target_version_path"] = versionPath
 	previousConfig := viper.Get(TraceProfileConfigPath)
 	viper.Set(TraceProfileConfigPath, config)
+	resetTraceProfileLoader(t)
 	previousRuntime := traceProfileRuntimeValue.Swap(old)
 	previousPrefixReader, previousKeyReader := consul.GetDataWithPrefix, consul.GetKVData
 	consul.GetDataWithPrefix = func(path string) (api.KVPairs, error) {
@@ -217,6 +219,7 @@ func TestTraceProfileVersionWatchLoadsNewBusinessSnapshot(t *testing.T) {
 	config["read_target_version_path"] = versionPath
 	previousConfig := viper.Get(TraceProfileConfigPath)
 	viper.Set(TraceProfileConfigPath, config)
+	resetTraceProfileLoader(t)
 	previousRuntime := traceProfileRuntimeValue.Swap(nil)
 	previousPrefixReader, previousKeyReader, previousWatch := consul.GetDataWithPrefix, consul.GetKVData, consul.WatchChangeContext
 	var document, version atomic.Value

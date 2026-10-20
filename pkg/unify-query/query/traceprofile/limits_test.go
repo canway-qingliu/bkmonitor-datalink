@@ -32,19 +32,19 @@ func TestESSummaryLimitsTakeTheSmallerOfConfigAndBackendCap(t *testing.T) {
 func TestESSummaryListLimitAndSortErrorsAreNotAuthorizationErrors(t *testing.T) {
 	request, scope, target, row := esListFixture(t)
 	request.Limit = ESSummaryMaxRows + 1
-	_, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target, DefaultESSummaryLimits())
+	_, err := ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target, NewESSummaryLimits(ESSummaryMaxRows, ESSummaryMaxOffset))
 	if ErrorCode(err) != CodeLimitExceeded {
 		t.Fatalf("row budget error code = %s, want %s", ErrorCode(err), CodeLimitExceeded)
 	}
 	request, scope, target, row = esListFixture(t)
 	request.OrderBy = []string{"-trace_id", "min_start_time"}
-	_, err = ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target, DefaultESSummaryLimits())
+	_, err = ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target, NewESSummaryLimits(ESSummaryMaxRows, ESSummaryMaxOffset))
 	if ErrorCode(err) != CodeUnsupportedSchemaCapability {
 		t.Fatalf("sort error code = %s, want %s", ErrorCode(err), CodeUnsupportedSchemaCapability)
 	}
 	request, scope, target, row = esListFixture(t)
 	request.EndUS = request.StartUS + MaxWindowUS(target.RetentionDays) + 1
-	_, err = ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target, DefaultESSummaryLimits())
+	_, err = ShapeESSummaryListPage([]map[string]any{row}, 1, request, scope, target, NewESSummaryLimits(ESSummaryMaxRows, ESSummaryMaxOffset))
 	if ErrorCode(err) != CodeScopePartial {
 		t.Fatalf("retention window error code = %s, want %s", ErrorCode(err), CodeScopePartial)
 	}

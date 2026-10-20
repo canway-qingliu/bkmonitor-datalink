@@ -46,11 +46,6 @@ func NewESSummaryLimits(maxLimit, maxOffset int64) ESSummaryLimits {
 	return ESSummaryLimits{MaxRows: min(maxLimit, ESSummaryMaxRows), MaxOffset: min(maxOffset, ESSummaryMaxOffset)}
 }
 
-// DefaultESSummaryLimits 是没有本地配置预算时的 ES Summary 上限。
-func DefaultESSummaryLimits() ESSummaryLimits {
-	return ESSummaryLimits{MaxRows: ESSummaryMaxRows, MaxOffset: ESSummaryMaxOffset}
-}
-
 // ValidateESSummaryListRequest 是 ES Summary 列表的全部预算、窗口、排序与父关系能力检查，
 // 查询前与成页时共用，按原因给出封闭错误码。身份与发布版本由调用方另行校验。
 func ValidateESSummaryListRequest(request Request, predicate ESSummaryListPredicate, target ESSummaryTarget, limits ESSummaryLimits) error {

@@ -32,52 +32,73 @@ func traceProfileRedisPaths() (string, string, error) {
 	return prefix, prefix + "read_target_channel", nil
 }
 
-func traceProfileRedisGetPairs(prefix string) (api.KVPairs, error) {
+// traceProfileRedisGetPairs 读出前缀下的全部发布项。unreadable 是存在、但不是字符串的键，
+// 由调用方按该键的非法文档处理。
+func traceProfileRedisGetPairs(prefix string) (api.KVPairs, map[string]error, error) {
 	client := redis.Client()
 	if client == nil {
-		return nil, fmt.Errorf("Trace Redis 客户端未初始化")
+		return nil, nil, fmt.Errorf("Trace Redis 客户端未初始化")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	// 每个租户一条 String key。SCAN 不是快照，所以：先列出键，再用一次 MGET 原子读取
-	// 所有值（扫描后被删除的键读到 nil，按已撤销跳过），最后重扫一次键集合；
-	// 两次键集合不一致说明加载期间有发布，本次按读取失败处理，保留上一份快照等待下次重载。
+	// 所有值，最后重扫一次键集合。
+	//   - MGET 为 nil、重扫也没有的键：扫描后被删除，按已撤销跳过；
+	//   - MGET 为 nil、重扫仍有的键：不是字符串（TYPE 确认），按该键的非法文档处理；
+	//   - 两次键集合有其它差异：加载期间有发布，本次按读取失败处理，保留上一份快照。
 	keys, err := traceProfileRedisScanKeys(ctx, client, prefix)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	pairs := make(api.KVPairs, 0, len(keys))
-	present := make(map[string]struct{}, len(keys))
+	missing := make(map[string]struct{})
 	if len(keys) > 0 {
 		values, err := client.MGet(ctx, keys...).Result()
 		if err != nil {
-			return nil, fmt.Errorf("Trace Redis 读目标读取失败: %w", err)
+			return nil, nil, fmt.Errorf("Trace Redis 读目标读取失败: %w", err)
 		}
 		for index, value := range values {
-			if value == nil {
-				continue
-			}
 			text, ok := value.(string)
 			if !ok {
-				return nil, fmt.Errorf("Trace Redis 读目标 %s 不是字符串", keys[index])
+				missing[keys[index]] = struct{}{}
+				continue
 			}
-			present[keys[index]] = struct{}{}
 			pairs = append(pairs, &api.KVPair{Key: keys[index], Value: []byte(text)})
 		}
 	}
 	after, err := traceProfileRedisScanKeys(ctx, client, prefix)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if len(after) != len(present) {
-		return nil, fmt.Errorf("Trace Redis 读目标在加载期间发生变化")
+	read := make(map[string]struct{}, len(pairs))
+	for _, pair := range pairs {
+		read[pair.Key] = struct{}{}
 	}
+	changed := fmt.Errorf("Trace Redis 读目标在加载期间发生变化")
+	unreadable := make(map[string]error)
+	seen := 0
 	for _, key := range after {
-		if _, found := present[key]; !found {
-			return nil, fmt.Errorf("Trace Redis 读目标在加载期间发生变化")
+		if _, ok := read[key]; ok {
+			seen++
+			continue
 		}
+		if _, ok := missing[key]; !ok {
+			return nil, nil, changed
+		}
+		kind, err := client.Type(ctx, key).Result()
+		if err != nil {
+			return nil, nil, fmt.Errorf("Trace Redis 读目标读取失败: %w", err)
+		}
+		if kind == "string" || kind == "none" {
+			// MGET 之后被重建或删除：加载期间有发布。
+			return nil, nil, changed
+		}
+		unreadable[key] = fmt.Errorf("Trace Redis 读目标不是字符串（%s）", kind)
 	}
-	return pairs, nil
+	if seen != len(pairs) {
+		return nil, nil, changed
+	}
+	return pairs, unreadable, nil
 }
 
 // traceProfileRedisScanKeys 列出前缀下全部键，去重并排序；SCAN 可能重复返回同一个键。

@@ -71,6 +71,7 @@ func withConsulTracePublication(t *testing.T, documents map[string]string) *cons
 	config["read_target_version_path"] = consulTraceVersionPath
 	previousConfig, previousStorage := viper.Get(TraceProfileConfigPath), viper.Get("storage.source")
 	viper.Set(TraceProfileConfigPath, config)
+	resetTraceProfileLoader(t)
 	previousRuntime := traceProfileRuntimeValue.Swap(nil)
 	previousPrefix, previousKey, previousWatch := consul.GetDataWithPrefix, consul.GetKVData, consul.WatchChangeContext
 	consul.GetDataWithPrefix = func(path string) (api.KVPairs, error) {
@@ -103,6 +104,22 @@ func withConsulTracePublication(t *testing.T, documents map[string]string) *cons
 		}
 	})
 	return publication
+}
+
+// resetTraceProfileLoader 清空加载器缓存的发布快照与关闭原因，测试结束时恢复。
+func resetTraceProfileLoader(t *testing.T) {
+	t.Helper()
+	traceProfileLoader.mu.Lock()
+	previous := traceProfileLoader.publication
+	traceProfileLoader.publication = nil
+	traceProfileLoader.mu.Unlock()
+	previousReason := traceProfileRuntimeClosedReason()
+	t.Cleanup(func() {
+		traceProfileLoader.mu.Lock()
+		traceProfileLoader.publication = previous
+		traceProfileLoader.mu.Unlock()
+		setTraceProfileRuntimeNilReason(previousReason)
+	})
 }
 
 func resolveTenantTarget(tenant string) error {

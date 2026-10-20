@@ -159,7 +159,7 @@ func TestESSummaryMemberLookupAgainstLocalElasticsearch(t *testing.T) {
 		Type: metadata.ElasticsearchStorageType, Address: baseURL,
 		Username: username, Password: password,
 	})
-	page, err := executeESMemberLookup(ctx, request, scope, target, queryESMemberRawWithTimeField, traceprofile.DefaultESSummaryLimits())
+	page, err := executeESMemberLookup(ctx, request, scope, target, queryESMemberRawWithTimeField, traceprofile.NewESSummaryLimits(traceprofile.ESSummaryMaxRows, traceprofile.ESSummaryMaxOffset))
 	require.NoError(t, err)
 	require.Equal(t, int64(1), page.Total)
 	require.Len(t, page.Items, 1)

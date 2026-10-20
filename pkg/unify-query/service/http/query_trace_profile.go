@@ -37,10 +37,13 @@ import (
 // 未配置直连读取时的固定拒绝文案，与已上线的 fail-closed 行为保持一致。
 const traceProfileUnwiredMessage = "Trace profile 直连存储查询入口尚未完成"
 
-// 发布源读取失败且没有可用快照时的拒绝文案。
+// 发布源尚未成功读取或本地配置非法时的拒绝文案。
 const traceProfileUnavailableMessage = "Trace 读目标暂不可用"
 
-var errTraceProfileReadTargetsUnavailable = errors.New("Trace 读目标读取失败且没有可用快照")
+// 发布源读取成功、但没有可服务的读目标（未发布或全部租户被撤销）时的拒绝文案。
+const traceProfilePublishedEmptyMessage = "Trace 读目标尚未发布或已撤销"
+
+var errTraceProfileReadTargetsUnavailable = errors.New("Trace 读目标不可用")
 
 const (
 	defaultTraceProfileMaxBodyBytes = 65536
@@ -139,12 +142,13 @@ type traceProfileRuntime struct {
 	connections    map[string]*dorisclient.Instance
 	maxBodyBytes   int
 	maxLimit       int64
-	maxOffset      int64
 	maxRangeUS     int64
 	esLimits       traceprofile.ESSummaryLimits
 	routeVersion   int64
 	routeCount     int
-	// configDigest 是构建该快照时的本地 trace_profile 配置摘要，仅发布源模式使用。
+	// published 与 configDigest 仅发布源模式使用：configDigest 是构建该快照时的本地输入摘要
+	// （traceProfileConfigDigest）。
+	published    bool
 	configDigest [sha256.Size]byte
 
 	// 模式和数据租户在同一快照内，避免配置热更新时混用新旧值。
@@ -173,30 +177,24 @@ func swapTraceProfileRuntime(runtime *traceProfileRuntime) {
 	time.AfterFunc(time.Minute, previous.close)
 }
 
-// loadTraceProfileConfig 由 http 配置加载钩子调用；任何一步失败都关闭直连读取而不是降级。
+// loadTraceProfileConfig 由 http 配置加载钩子调用。本地配置变化立即生效：静态模式按配置重建，
+// 发布源模式用缓存的发布快照重建；静态配置非法或发布源变化时关闭直读而不是降级。
 func loadTraceProfileConfig() {
 	if traceProfileUsesPublishedRoutes() {
-		// 发布源快照由服务启动与重载时加载；配置变化通过配置摘要触发重建，
-		// 这里不撤销已安装的快照，避免配置热更新与发布源读取之间出现空窗。
+		applyTraceProfilePublishedConfig()
 		return
 	}
-	runtime, err := newTraceProfileRuntime(viper.Get(TraceProfileConfigPath))
-	if err != nil {
-		log.Errorf(context.Background(), "load trace profile direct read config failed: %s", err)
-		swapTraceProfileRuntime(nil)
-		return
-	}
-	swapTraceProfileRuntime(runtime)
-	if runtime == nil {
-		return
-	}
-	log.Infof(
-		context.Background(), "trace profile direct read enabled: route-version=%d routes=%d clusters=%d",
-		runtime.routeVersion, runtime.routeCount, len(runtime.connections),
-	)
+	applyTraceProfileStaticConfig()
 }
 
+// newTraceProfileRuntime 按静态配置构建运行时；单租户映射从配置自身的读目标推导。
 func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
+	return newTraceProfileRuntimeFor(raw, nil)
+}
+
+// newTraceProfileRuntimeFor 构建运行时。publishedTenants 非 nil 时是发布源上出现的全部租户，
+// 单租户映射按它推导，而不是只按校验通过的租户。
+func newTraceProfileRuntimeFor(raw any, publishedTenants map[string]struct{}) (*traceProfileRuntime, error) {
 	if raw == nil {
 		return nil, nil
 	}
@@ -312,7 +310,7 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 		closeConnections()
 		return nil, err
 	}
-	singleTenantID, err := traceProfileSingleTenantID(config.SingleTenantID, routes, esTargets)
+	singleTenantID, err := traceProfileSingleTenantID(config.SingleTenantID, routes, esTargets, publishedTenants)
 	if err != nil {
 		closeConnections()
 		return nil, err
@@ -336,7 +334,6 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 		connections:    connections,
 		maxBodyBytes:   config.MaxBodyBytes,
 		maxLimit:       config.MaxLimit,
-		maxOffset:      config.MaxOffset,
 		maxRangeUS:     traceprofile.MaxWindowUS(config.MaxRangeDays),
 		esLimits:       traceprofile.NewESSummaryLimits(config.MaxLimit, config.MaxOffset),
 		routeVersion:   config.RouteSnapshotVersion,
@@ -351,19 +348,26 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 
 // traceProfileSingleTenantID 是单租户网关请求（入站租户为 default）映射到的数据租户：
 // 配置值必须是合法租户标识，否则加载失败；未配置时，读目标恰好只有一个租户就取它。
-func traceProfileSingleTenantID(configured string, routes []traceprofile.ReadRoute, esTargets []traceprofile.ESSummaryTarget) (string, error) {
+// publishedTenants 非 nil 时按发布源上的全部租户计数，一个租户被撤销不会改变映射。
+func traceProfileSingleTenantID(
+	configured string, routes []traceprofile.ReadRoute, esTargets []traceprofile.ESSummaryTarget,
+	publishedTenants map[string]struct{},
+) (string, error) {
 	if configured != "" {
 		if !traceprofile.ValidTenantID(configured) {
 			return "", fmt.Errorf("Trace single_tenant_id 不是合法租户标识: %q", configured)
 		}
 		return configured, nil
 	}
-	tenants := make(map[string]struct{}, 1)
-	for _, route := range routes {
-		tenants[route.BkTenantID] = struct{}{}
-	}
-	for _, target := range esTargets {
-		tenants[target.BkTenantID] = struct{}{}
+	tenants := publishedTenants
+	if tenants == nil {
+		tenants = make(map[string]struct{}, 1)
+		for _, route := range routes {
+			tenants[route.BkTenantID] = struct{}{}
+		}
+		for _, target := range esTargets {
+			tenants[target.BkTenantID] = struct{}{}
+		}
 	}
 	if len(tenants) != 1 {
 		return "", nil
@@ -426,12 +430,15 @@ func prefixHasTraceEnvelope(probe []byte) bool {
 func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Span) error {
 	runtime := traceProfileRuntimeValue.Load()
 	if runtime == nil {
-		if traceProfileUsesPublishedRoutes() && traceProfileLoad.consecutiveFailures() > 0 {
-			// 读目标从未成功加载且发布源正在失败：这是服务端不可用，不是请求错误。
+		switch reason := traceProfileRuntimeClosedReason(); reason {
+		case traceRuntimeUnavailable, traceRuntimeInvalidConfig:
+			// 发布源还没有成功读取，或本地配置非法：服务端不可用，不是请求错误。
 			return writeTraceProfileError(ctx, c, span, &traceprofile.RejectError{
 				Code: traceprofile.CodeRouteNotFound, Message: traceProfileUnavailableMessage,
-				Cause: errTraceProfileReadTargetsUnavailable,
+				Cause: fmt.Errorf("%w: %s", errTraceProfileReadTargetsUnavailable, reason),
 			})
+		case traceRuntimeUnpublished, traceRuntimeRevoked:
+			return writeTraceProfileReject(ctx, c, span, traceprofile.CodeRouteNotFound, traceProfilePublishedEmptyMessage)
 		}
 		return writeTraceProfileReject(ctx, c, span, traceprofile.CodeRouteNotFound, traceProfileUnwiredMessage)
 	}
