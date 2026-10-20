@@ -10,6 +10,7 @@
 package http
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -24,6 +25,7 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/consul"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/redis"
 	redisService "github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/service/redis"
 )
@@ -154,26 +156,83 @@ func TestTraceRedisNotificationReloadsRoutes(t *testing.T) {
 	}
 }
 
-// 鲸眼当前状态：storage.source=redis，Trace 前缀下没有任何键。应明确报告"未发布"（400，
-// 日志与指标可见），而不是清空成"读取失败"或 503。
+// Redis 发布源、Trace 前缀下没有任何键（读方已切到 Redis、写方尚未写入）：明确报告"未发布"
+// （400、只在进入该状态时记一条 Warn、按发布源计数），不计为读取失败、不返回 503；键出现后可加载。
 func TestRedisSourceWithNoTraceKeysIsUnpublished(t *testing.T) {
 	ctx, client, _ := setUpRedisTracePublication(t)
+	traceProfileLoad.mu.Lock()
+	previous := traceProfileLoad.lastResult
+	traceProfileLoad.lastResult = ""
+	traceProfileLoad.mu.Unlock()
+	t.Cleanup(func() {
+		traceProfileLoad.mu.Lock()
+		traceProfileLoad.lastResult = previous
+		traceProfileLoad.mu.Unlock()
+	})
 	if err := client.Del(ctx, redisTraceDataPrefix+"system").Err(); err != nil {
 		t.Fatal(err)
 	}
+	logs := captureTraceLogs(t)
 	before := traceProfileReloadCount(t, "redis", traceReloadUnpublished)
-	err := reloadTraceProfilePublishedRuntime()
-	if !errors.Is(err, errTraceReadTargetsUnpublished) || traceProfileRuntimeClosedReason() != traceRuntimeUnpublished {
-		t.Fatalf("no Redis keys was not reported as unpublished: err=%v reason=%q", err, traceProfileRuntimeClosedReason())
+	for range 3 {
+		err := reloadTraceProfilePublishedRuntime()
+		if !errors.Is(err, errTraceReadTargetsUnpublished) || traceProfileRuntimeClosedReason() != traceRuntimeUnpublished {
+			t.Fatalf("no Redis keys was not reported as unpublished: err=%v reason=%q", err, traceProfileRuntimeClosedReason())
+		}
 	}
-	if after := traceProfileReloadCount(t, "redis", traceReloadUnpublished); after != before+1 {
+	if failures := traceProfileLoad.consecutiveFailures(); failures != 0 {
+		t.Fatalf("an unpublished source was counted as %d read failures", failures)
+	}
+	if after := traceProfileReloadCount(t, "redis", traceReloadUnpublished); after != before+3 {
 		t.Fatalf("unpublished was not counted for the redis source: %v -> %v", before, after)
+	}
+	if warn, errorLines := logs.lines("warn", "尚未发布"), logs.lines("error", "尚未发布"); warn != 1 || errorLines != 0 {
+		t.Fatalf("unpublished logged %d Warn and %d Error lines over three reloads, want one Warn", warn, errorLines)
 	}
 	recorder, spanErr := runTraceProfileHandler(t, typedTraceBody("trace_span", "system_kapm"))
 	if recorder.Code != http.StatusBadRequest || spanErr != nil ||
 		!strings.Contains(recorder.Body.String(), traceProfilePublishedEmptyMessage) {
 		t.Fatalf("unpublished answered HTTP %d (%s) span error %v", recorder.Code, recorder.Body.String(), spanErr)
 	}
+	if err := client.Set(ctx, redisTraceDataPrefix+"system", publishedBusiness132, 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reloadTraceProfilePublishedRuntime(); err != nil || traceProfileRuntimeValue.Load() == nil {
+		t.Fatalf("publication after an empty start was not loaded: %v", err)
+	}
+}
+
+// traceLogBuffer collects log lines written during a test.
+type traceLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *traceLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *traceLogBuffer) lines(level, substr string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := 0
+	for _, line := range strings.Split(b.buf.String(), "\n") {
+		if strings.Contains(line, "\t"+level+"\t") && strings.Contains(line, substr) {
+			n++
+		}
+	}
+	return n
+}
+
+func captureTraceLogs(t *testing.T) *traceLogBuffer {
+	t.Helper()
+	logs := &traceLogBuffer{}
+	log.SetOutput(logs)
+	log.InitTestLogger()
+	t.Cleanup(func() { log.SetOutput(nil); log.InitTestLogger() })
+	return logs
 }
 
 func traceProfileReloadCount(t *testing.T, source, result string) float64 {

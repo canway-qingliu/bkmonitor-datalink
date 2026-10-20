@@ -31,7 +31,7 @@ Storage、空间及表路由由配置发布端写入 Redis，Redis 连接、认�
 
 未指定 Storage 来源时保留旧 Consul Storage 加载和监听。`consul.enabled` 已不再控制行为；遗留字段会被忽略。Redis 模式显式配置空 `redis.kv_base_path` 会在启动或重载前被拒绝，重载失败保留上一份配置。
 
-`storage.source` 同时选择 Trace profile 发布物来源。`consul` 模式沿用 `trace_profile.read_target_data_path`、`read_target_version_path`；`redis` 模式在配置了 `trace_profile` 时直接从 `redis.kv_base_path` 派生 `<kv_base_path>:data:trace:read_target:<bk_tenant_id>`，无需单独的 `read_target_enabled` 开关。每个租户一个无 TTL 的 String key，值为原单租户 JSON 文档。写方更新租户 key 后向 `<kv_base_path>:data:trace:read_target:read_target_channel` 发布通知。UQ 启动订阅后扫描全部租户 key，收到通知及每分钟定期重读，沿用原文档的租户、物理目标和版本校验；读取或校验失败时撤销 Trace 直读路由，不回退 Consul。只读存储连接凭据仍仅在 UQ 本地配置中。
+`storage.source` 同时选择 Trace profile 发布物来源。`consul` 模式沿用 `trace_profile.read_target_data_path`、`read_target_version_path`；`redis` 模式在配置了 `trace_profile` 时直接从 `redis.kv_base_path` 派生 `<kv_base_path>:data:trace:read_target:<bk_tenant_id>`，无需单独的 `read_target_enabled` 开关。每个租户一个无 TTL 的 String key，值为原单租户 JSON 文档。写方更新租户 key 后向 `<kv_base_path>:data:trace:read_target:read_target_channel` 发布通知。UQ 启动订阅后扫描全部租户 key，收到通知及每分钟定期重读，沿用原文档的租户、物理目标和版本校验，不回退 Consul。读取或传输失败（含监听出错或关闭、加载期间发布变化）保留上一份可用快照；某个租户的文档非法或其路由指向本地没有只读连接的集群时只撤销该租户；读取成功但没有任何读目标时直读关闭并报告"未发布"。只读存储连接凭据仍仅在 UQ 本地配置中。
 
 ### 设置 Feature Flag
 

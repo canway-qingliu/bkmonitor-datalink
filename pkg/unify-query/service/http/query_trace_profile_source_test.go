@@ -255,27 +255,6 @@ func TestTraceWatchErrorAndCloseKeepLastGoodSnapshot(t *testing.T) {
 	}
 }
 
-// 现网故障形态：redis 发布源、启动时没有任何键。应报告"未发布"而不是读取失败，键出现后可加载。
-func TestTraceRedisSourceStartingWithZeroKeys(t *testing.T) {
-	ctx, client, _ := setUpRedisTracePublication(t)
-	if err := client.Del(ctx, redisTraceDataPrefix+"system").Err(); err != nil {
-		t.Fatal(err)
-	}
-	err := reloadTraceProfilePublishedRuntime()
-	if !errors.Is(err, errTraceReadTargetsUnpublished) {
-		t.Fatalf("zero Redis keys was not reported as unpublished: %v", err)
-	}
-	if traceProfileLoad.consecutiveFailures() != 0 {
-		t.Fatal("an unpublished source was counted as a read failure")
-	}
-	if err := client.Set(ctx, redisTraceDataPrefix+"system", publishedBusiness132, 0).Err(); err != nil {
-		t.Fatal(err)
-	}
-	if err := reloadTraceProfilePublishedRuntime(); err != nil || traceProfileRuntimeValue.Load() == nil {
-		t.Fatalf("publication after an empty start was not loaded: %v", err)
-	}
-}
-
 func TestTraceTransientRedisReadErrorKeepsLastGoodSnapshot(t *testing.T) {
 	_, _, mr := setUpRedisTracePublication(t)
 	if err := reloadTraceProfilePublishedRuntime(); err != nil {
