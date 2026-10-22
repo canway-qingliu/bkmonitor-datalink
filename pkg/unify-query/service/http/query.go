@@ -239,6 +239,7 @@ func queryRawWithResolvedInstance(ctx context.Context, queryTs *structured.Query
 		errCh     = make(chan error)
 
 		errorMessage   strings.Builder
+		routeErrors    []error
 		successedPaths atomic.Uint32
 		skippedRoutes  atomic.Uint32
 		lock           sync.Mutex
@@ -277,6 +278,7 @@ func queryRawWithResolvedInstance(ctx context.Context, queryTs *structured.Query
 		defer receiveWg.Done()
 		for e := range errCh {
 			errorMessage.WriteString(fmt.Sprintf("query error: %s ", e.Error()))
+			routeErrors = append(routeErrors, e)
 		}
 	}()
 
@@ -422,7 +424,7 @@ func queryRawWithResolvedInstance(ctx context.Context, queryTs *structured.Query
 				err = metadata.NewMessage(
 					metadata.MsgQueryRaw,
 					"查询原始数据报错",
-				).Error(ctx, errors.New(partialDetail))
+				).Error(ctx, metadata.ErrorWithCauses(partialDetail, routeErrors...))
 			}
 		}
 		return total, list, resultTableOptions, routeInfo, err
@@ -539,7 +541,7 @@ func queryRawWithResolvedInstance(ctx context.Context, queryTs *structured.Query
 			err = metadata.NewMessage(
 				metadata.MsgQueryRaw,
 				"查询原始数据报错",
-			).Error(ctx, errors.New(partialDetail))
+			).Error(ctx, metadata.ErrorWithCauses(partialDetail, routeErrors...))
 		}
 	}
 
@@ -612,16 +614,20 @@ func queryRawWithScroll(ctx context.Context, queryTs *structured.QueryTs, sessio
 	go func() {
 		defer receiveWg.Done()
 
-		var msg strings.Builder
+		var (
+			msg    strings.Builder
+			causes []error
+		)
 		for e := range errCh {
 			msg.WriteString(e.Error())
+			causes = append(causes, e)
 		}
 
 		if msg.Len() > 0 {
 			err = metadata.NewMessage(
 				metadata.MsgQueryRawScroll,
 				"下载接口调用失败",
-			).Error(ctx, errors.New(msg.String()))
+			).Error(ctx, metadata.ErrorWithCauses(msg.String(), causes...))
 		}
 	}()
 
