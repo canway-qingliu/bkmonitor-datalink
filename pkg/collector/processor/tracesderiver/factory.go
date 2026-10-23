@@ -10,6 +10,7 @@
 package tracesderiver
 
 import (
+	"errors"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/confengine"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/mapstructure"
@@ -109,6 +110,9 @@ func (p *tracesDeriver) Clean() {
 func (p *tracesDeriver) Process(record *define.Record) (*define.Record, error) {
 	switch record.RecordType {
 	case define.RecordTraces:
+		if record.Token.MetricsShared && !record.Token.HasSharedMetricIdentity() {
+			return nil, errors.New("shared metric token requires trusted identity")
+		}
 		operator := p.operators.GetByToken(record.Token.Original).(Operator)
 		r := operator.Operate(record)
 		return r, nil

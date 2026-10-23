@@ -17,6 +17,10 @@ processor:
       type: "fixed"
       fixed_token: "token1"
       resource_key: "bk.data.token"
+      bk_tenant_id: tenant-a
+      bk_biz_id: 2
+      bk_app_name: app-a
+      app_id: 123
       traces_dataid: 1000
       metrics_dataid: 1001
       logs_dataid: 1002
@@ -60,6 +64,23 @@ processor:
       metrics_dataid: 1001
       logs_dataid: 1002
       profiles_dataid: 1002
+
+Trace 原 Flat item 的 bk_tenant_id、bk_biz_id 和 app_id 来自已校验的 Token，
+不采用客户端 Span/Resource 属性。AES v0/v1 Token 不编码租户和 app_id；
+aes256WithMeta 从同一 Token 的受信应用配置补齐它们。
+receiver 在校验成功后给 Trace Record 固定首次接收时间和请求 ID；
+converter 按请求内 Span 顺序生成稳定 source_event_id，原队列重试不改写。
+
+租户共享 Trace DataID 的受信 Token 子配置须显式设置 traces_shared: true，
+并携带正数 app_id、bk_biz_id、traces_dataid，以及非空 bk_tenant_id、bk_app_name。
+共享请求内任何 Resource Token 无法解码或成员身份不完整时整体拒绝；
+converter 仅在共享 Trace 模式下用受信业务 ID 派生顶层 space_uid，覆盖客户端同名值；
+旧独占 Trace Token 不设置此开关，继续沿用原有缺失 Resource 的处理方式。
+
+租户共享 Metric DataID 的受信 Token 子配置须显式设置 metrics_shared: true，
+并携带正数 app_id、bk_biz_id、metrics_dataid，以及非空 bk_tenant_id、bk_app_name。
+缺少身份、混合不同共享成员 Token，或共享 Metric 请求含无法解码的 Resource Token 时整体拒绝。
+旧独占 Token 不设置此开关，派生指标维度保持原样。
 */
 
 package tokenchecker

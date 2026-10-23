@@ -10,6 +10,7 @@
 package tracesderiver
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -74,6 +75,12 @@ func TestOperator(t *testing.T) {
 		for n := 0; n < dataPoints.Len(); n++ {
 			dp := dataPoints.At(n)
 			attrs := dp.Attributes()
+			_, hasTenant := attrs.Get("bk_tenant_id")
+			_, hasBiz := attrs.Get("bk_biz_id")
+			_, hasAppID := attrs.Get("app_id")
+			assert.False(t, hasTenant)
+			assert.False(t, hasBiz)
+			assert.False(t, hasAppID)
 			testkits.AssertAttrsStringKeyVal(t, attrs,
 				"http.uri", "/api/v1/healthz",
 				"service.name", "echo",
@@ -137,4 +144,47 @@ func TestOperatorDuration(t *testing.T) {
 		assert.Equal(t, float64(100), metric.Gauge().DataPoints().At(0).DoubleValue())
 		assert.Equal(t, float64(0), metric.Gauge().DataPoints().At(1).DoubleValue())
 	})
+}
+
+func TestOperatorSharedMetricDimensionsUseTrustedTokenIdentity(t *testing.T) {
+	c := Config{Operations: []OperationConfig{{
+		Type:       "duration",
+		MetricName: "bk_apm_duration",
+		Rules: []RuleConfig{{
+			Kind: "SPAN_KIND_CLIENT",
+			Dimensions: []string{
+				"attributes.bk_tenant_id", "attributes.bk_biz_id", "attributes.app_id", "attributes.app_name",
+			},
+		}},
+	}}}
+	g := generator.NewTracesGenerator(define.TracesOptions{
+		GeneratorOptions: define.GeneratorOptions{Attributes: map[string]string{
+			"bk_tenant_id": "forged", "bk_biz_id": "999", "app_id": "999", "app_name": "forged",
+		}},
+		SpanCount: 1,
+		SpanKind:  3,
+	})
+	operator := NewOperator(c)
+	defer operator.Clean()
+
+	for _, token := range []define.Token{
+		{TenantID: "tenant-a", BizId: 2, AppID: 101, AppName: "same-app", MetricsDataId: 9001, MetricsShared: true},
+		{TenantID: "tenant-a", BizId: 3, AppID: 202, AppName: "same-app", MetricsDataId: 9001, MetricsShared: true},
+	} {
+		derived := operator.Operate(&define.Record{RecordType: define.RecordTraces, Token: token, Data: g.Generate()})
+		metrics := derived.Data.(pmetric.Metrics)
+		attrs := metrics.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints().At(0).Attributes()
+		value, ok := attrs.Get("bk_tenant_id")
+		assert.True(t, ok)
+		assert.Equal(t, token.TenantID, value.Str())
+		value, ok = attrs.Get("bk_biz_id")
+		assert.True(t, ok)
+		assert.Equal(t, fmt.Sprint(token.BizId), value.Str())
+		value, ok = attrs.Get("app_id")
+		assert.True(t, ok)
+		assert.Equal(t, fmt.Sprint(token.AppID), value.Str())
+		value, ok = attrs.Get("app_name")
+		assert.True(t, ok)
+		assert.Equal(t, token.AppName, value.Str())
+	}
 }

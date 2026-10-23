@@ -23,6 +23,7 @@ import (
 	"github.com/TarsCloud/TarsGo/tars/util/tools"
 	"github.com/elastic/beats/libbeat/common/transport/tlscommon"
 	"github.com/elastic/beats/libbeat/outputs/transport"
+	"github.com/google/uuid"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 	_ "google.golang.org/grpc/encoding/gzip"
@@ -69,6 +70,14 @@ type Publisher struct {
 }
 
 func (p Publisher) Publish(r *define.Record) {
+	if r.RecordType == define.RecordTraces {
+		if r.TraceAcceptedAtMs == 0 {
+			r.TraceAcceptedAtMs = time.Now().UnixMilli()
+		}
+		if r.TraceRequestID == "" {
+			r.TraceRequestID = uuid.NewString()
+		}
+	}
 	if p.Func != nil {
 		p.Func(r)
 		return

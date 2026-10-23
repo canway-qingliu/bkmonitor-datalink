@@ -122,10 +122,13 @@ func newFixedTokenDecoder(c Config) TokenDecoder {
 		token: define.Token{
 			Original:       c.FixedToken,
 			TracesDataId:   c.TracesDataId,
+			TracesShared:   c.TracesShared,
 			MetricsDataId:  c.MetricsDataId,
+			MetricsShared:  c.MetricsShared,
 			ProfilesDataId: c.ProfilesDataId,
 			LogsDataId:     c.LogsDataId,
 			BizId:          c.BizId,
+			TenantID:       c.TenantID,
 			AppName:        c.AppName,
 			AppID:          c.AppID,
 		},
@@ -198,17 +201,31 @@ func (d *aes256WithMetaTokenDecoder) Decode(s string) (define.Token, error) {
 	}
 
 	// 2) cache 中存在 则需要补充
+	// 新的租户/应用身份来自受信配置；它不能与已签名 Token 的业务身份拼成混合身份。
+	if (meta.TenantID != "" || meta.AppID > 0) &&
+		meta.BizId > 0 && token.BizId > 0 && meta.BizId != token.BizId {
+		return define.Token{}, errors.New("business identity conflict between signed token and trusted metadata")
+	}
 	return mergeToken(meta, token), nil
 }
 
 // mergeToken 合并 token 优先以 dst 为主
 func mergeToken(cache, dst define.Token) define.Token {
 	token := dst
+	// Shared modes are only authorized by the trusted per-token configuration.
+	token.TracesShared = cache.TracesShared
+	token.MetricsShared = cache.MetricsShared
 	if len(dst.AppName) == 0 && len(cache.AppName) > 0 {
 		token.AppName = cache.AppName
 	}
 	if dst.BizId <= 0 && cache.BizId > 0 {
 		token.BizId = cache.BizId
+	}
+	if dst.TenantID == "" && cache.TenantID != "" {
+		token.TenantID = cache.TenantID
+	}
+	if dst.AppID <= 0 && cache.AppID > 0 {
+		token.AppID = cache.AppID
 	}
 	if dst.MetricsDataId <= 0 && cache.MetricsDataId > 0 {
 		token.MetricsDataId = cache.MetricsDataId

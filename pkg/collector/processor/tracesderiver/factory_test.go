@@ -98,3 +98,19 @@ processor:
 	assert.Equal(t, mainConf, factory.MainConfig())
 	factory.Clean()
 }
+
+func TestProcessRejectsSharedMetricWithoutTrustedAppID(t *testing.T) {
+	deriver, err := newFactory(map[string]any{}, nil)
+	assert.NoError(t, err)
+	defer deriver.Clean()
+	record := &define.Record{
+		RecordType: define.RecordTraces,
+		Token: define.Token{
+			TenantID: "tenant-a", BizId: 2, AppName: "same-app", MetricsDataId: 9001, MetricsShared: true,
+		},
+		Data: ptrace.NewTraces(),
+	}
+	derived, err := deriver.Process(record)
+	assert.Nil(t, derived)
+	assert.ErrorContains(t, err, "shared metric token requires trusted identity")
+}

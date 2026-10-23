@@ -59,6 +59,10 @@ processor:
                   - "span_name"
                   - "kind"
                   - "status.code"
+
+共享 Metric DataID 的 Span 派生指标在 extractor 和 accumulator 之前，
+用已校验 Token 的 bk_tenant_id、bk_biz_id、app_id、bk_app_name 覆盖客户端同名维度。
+普通应用仍沿用原有 app_name 维度，不追加租户共享标签。
 */
 
 package tracesderiver

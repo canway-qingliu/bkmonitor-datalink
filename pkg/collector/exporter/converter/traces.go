@@ -10,6 +10,8 @@
 package converter
 
 import (
+	"strconv"
+
 	"github.com/elastic/beats/libbeat/common"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -44,6 +46,7 @@ func (c tracesConverter) Convert(record *define.Record, f define.GatherFunc) {
 		return
 	}
 	dataId := c.ToDataID(record)
+	eventIndex := 0
 
 	for i := 0; i < resourceSpansSlice.Len(); i++ {
 		resourceSpans := resourceSpansSlice.At(i)
@@ -56,9 +59,20 @@ func (c tracesConverter) Convert(record *define.Record, f define.GatherFunc) {
 				content, kind := c.Extract(record.RequestClient.IP, spans.At(k), rs)
 				content["bk_biz_id"] = record.Token.BizId
 				content["app_name"] = record.Token.AppName
+				if record.Token.TenantID != "" {
+					content["bk_tenant_id"] = record.Token.TenantID
+				}
 				if record.Token.AppID > 0 {
 					content["app_id"] = record.Token.AppID
 				}
+				if record.Token.TracesShared {
+					content["space_uid"] = "bkcc__" + strconv.FormatInt(int64(record.Token.BizId), 10)
+				}
+				if record.TraceAcceptedAtMs > 0 && record.TraceRequestID != "" {
+					content["platform_received_at_ms"] = record.TraceAcceptedAtMs
+					content["source_event_id"] = record.TraceRequestID + ":" + strconv.Itoa(eventIndex)
+				}
+				eventIndex++
 				DefaultMetricMonitor.IncConverterSpanKindCounter(dataId, kind)
 				events = append(events, c.ToEvent(record.Token, dataId, content))
 			}

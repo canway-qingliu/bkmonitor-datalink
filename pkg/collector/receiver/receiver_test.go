@@ -104,6 +104,30 @@ func TestPublisher(t *testing.T) {
 	wg.Wait()
 }
 
+func TestPublisherStampsTraceAcceptanceOnce(t *testing.T) {
+	var published *define.Record
+	pub := Publisher{Func: func(record *define.Record) { published = record }}
+	record := &define.Record{RecordType: define.RecordTraces}
+	before := time.Now().UnixMilli()
+	pub.Publish(record)
+	after := time.Now().UnixMilli()
+
+	assert.Same(t, record, published)
+	assert.GreaterOrEqual(t, record.TraceAcceptedAtMs, before)
+	assert.LessOrEqual(t, record.TraceAcceptedAtMs, after)
+	assert.NotEmpty(t, record.TraceRequestID)
+
+	acceptedAt, requestID := record.TraceAcceptedAtMs, record.TraceRequestID
+	pub.Publish(record)
+	assert.Equal(t, acceptedAt, record.TraceAcceptedAtMs)
+	assert.Equal(t, requestID, record.TraceRequestID)
+
+	metric := &define.Record{RecordType: define.RecordMetrics}
+	pub.Publish(metric)
+	assert.Zero(t, metric.TraceAcceptedAtMs)
+	assert.Empty(t, metric.TraceRequestID)
+}
+
 func TestRegisterDuplicateRoutes(t *testing.T) {
 	assert.Panics(t, func() {
 		RegisterRecvHttpRoute("test", []RouteWithFunc{

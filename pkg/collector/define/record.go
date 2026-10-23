@@ -150,6 +150,10 @@ type Record struct {
 	Token         Token
 	Metadata      map[string]string
 	Data          any
+	// TraceAcceptedAtMs and TraceRequestID are stamped once after receiver validation.
+	// They travel with the record so queue retries keep the original identity and time.
+	TraceAcceptedAtMs int64
+	TraceRequestID    string
 }
 
 func (r *Record) Unwrap() {
@@ -304,10 +308,13 @@ type Token struct {
 	Type           string `config:"type"`
 	Original       string `config:"token"`
 	BizId          int32  `config:"bk_biz_id"`
+	TenantID       string `config:"bk_tenant_id"`
 	AppName        string `config:"bk_app_name"`
 	AppID          int64  `config:"app_id"`
 	MetricsDataId  int32  `config:"metrics_dataid"`
+	MetricsShared  bool   `config:"metrics_shared"`
 	TracesDataId   int32  `config:"traces_dataid"`
+	TracesShared   bool   `config:"traces_shared"`
 	ProfilesDataId int32  `config:"profiles_dataid"`
 	LogsDataId     int32  `config:"logs_dataid"`
 	ProxyDataId    int32  `config:"proxy_dataid"`
@@ -338,6 +345,14 @@ func SetTokenInfo(token Token) {
 
 func (t Token) BizApp() string {
 	return fmt.Sprintf("%d-%s", t.BizId, t.AppName)
+}
+
+func (t Token) HasSharedMetricIdentity() bool {
+	return t.TenantID != "" && t.BizId > 0 && t.AppID > 0 && t.AppName != "" && t.MetricsDataId > 0
+}
+
+func (t Token) HasSharedTraceIdentity() bool {
+	return t.TenantID != "" && t.BizId > 0 && t.AppID > 0 && t.AppName != "" && t.TracesDataId > 0
 }
 
 func (t Token) GetDataID(rtype RecordType) int32 {

@@ -65,6 +65,48 @@ func TestConvertGaugeMetrics(t *testing.T) {
 	assert.Equal(t, event.RecordType(), define.RecordMetrics)
 }
 
+func TestConvertSharedMetricOverwritesUntrustedIdentity(t *testing.T) {
+	g := generator.NewMetricsGenerator(define.MetricsOptions{
+		GaugeCount: 1,
+		MetricName: "bk_apm_count",
+		GeneratorOptions: define.GeneratorOptions{
+			Attributes: map[string]string{
+				"bk_tenant_id": "forged", "bk_biz_id": "999", "app_id": "999", "app_name": "forged",
+			},
+			Resources: map[string]string{
+				"bk_tenant_id": "other", "bk_biz_id": "888", "app_id": "888", "app_name": "other",
+			},
+		},
+	})
+	metrics := g.Generate()
+	token := define.Token{
+		TenantID: "tenant-a", BizId: 2, AppID: 101, AppName: "same-app", MetricsDataId: 9001, MetricsShared: true,
+	}
+	var events []define.Event
+	metricsConverter{}.Convert(
+		&define.Record{RecordType: define.RecordMetrics, Token: token, Data: metrics},
+		func(items ...define.Event) { events = append(events, items...) },
+	)
+	assert.Len(t, events, 1)
+	dimensions := events[0].Data()["dimension"].(map[string]string)
+	assert.Equal(t, "tenant-a", dimensions["bk_tenant_id"])
+	assert.Equal(t, "2", dimensions["bk_biz_id"])
+	assert.Equal(t, "101", dimensions["app_id"])
+	assert.Equal(t, "same-app", dimensions["app_name"])
+}
+
+func TestConvertSharedMetricRejectsMissingTrustedAppID(t *testing.T) {
+	metrics := generator.NewMetricsGenerator(define.MetricsOptions{GaugeCount: 1, MetricName: "bk_apm_count"}).Generate()
+	var events []define.Event
+	metricsConverter{}.Convert(
+		&define.Record{RecordType: define.RecordMetrics, Token: define.Token{
+			TenantID: "tenant-a", BizId: 2, AppName: "same-app", MetricsDataId: 9001, MetricsShared: true,
+		}, Data: metrics},
+		func(items ...define.Event) { events = append(events, items...) },
+	)
+	assert.Empty(t, events)
+}
+
 func TestConvertHistogramMetrics(t *testing.T) {
 	opts := define.MetricsOptions{
 		HistogramCount: 1,

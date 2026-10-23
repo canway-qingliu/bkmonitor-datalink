@@ -36,8 +36,11 @@ processor:
       fixed_token: "token1"
       resource_key: "bk.data.token"
       app_id: 123
+      bk_tenant_id: tenant-a
       traces_dataid: 1000
+      traces_shared: true
       metrics_dataid: 1001
+      metrics_shared: true
       logs_dataid: 1002
 `
 	mainConf := processor.MustLoadConfigs(content)[0].Config
@@ -73,9 +76,14 @@ processor:
 	assert.Equal(t, c1, actualC1)
 	assert.Equal(t, []string{"bk.data.token"}, actualC1.resourceKeys)
 	assert.Equal(t, int64(123), actualC1.AppID)
+	assert.True(t, actualC1.TracesShared)
+	assert.True(t, actualC1.MetricsShared)
 	decoded, err := factory.decoders.GetGlobal().(TokenDecoder).Decode("")
 	assert.NoError(t, err)
 	assert.Equal(t, int64(123), decoded.AppID)
+	assert.Equal(t, "tenant-a", decoded.TenantID)
+	assert.True(t, decoded.TracesShared)
+	assert.True(t, decoded.MetricsShared)
 
 	var c2 Config
 	assert.NoError(t, mapstructure.Decode(customConf, &c2))
@@ -115,6 +123,136 @@ func (traceTokenTestDecoder) Decode(value string) (define.Token, error) {
 	default:
 		return define.Token{}, errors.New("unknown token")
 	}
+}
+
+type sharedMetricTokenTestDecoder struct{}
+
+func (sharedMetricTokenTestDecoder) Type() string { return "test-shared-metric" }
+func (sharedMetricTokenTestDecoder) Skip() bool   { return false }
+func (sharedMetricTokenTestDecoder) Decode(value string) (define.Token, error) {
+	switch value {
+	case "shared-a":
+		return define.Token{Original: value, TenantID: "tenant-a", BizId: 2, AppID: 101, AppName: "same-app", MetricsDataId: 9001, MetricsShared: true}, nil
+	case "shared-b":
+		return define.Token{Original: value, TenantID: "tenant-a", BizId: 3, AppID: 202, AppName: "same-app", MetricsDataId: 9001, MetricsShared: true}, nil
+	case "shared-invalid":
+		return define.Token{Original: value, TenantID: "tenant-a", BizId: 2, AppName: "same-app", MetricsDataId: 9001, MetricsShared: true}, nil
+	default:
+		return define.Token{}, errors.New("unknown token")
+	}
+}
+
+type sharedTraceTokenTestDecoder struct{}
+
+func (sharedTraceTokenTestDecoder) Type() string { return "test-shared-trace" }
+func (sharedTraceTokenTestDecoder) Skip() bool   { return false }
+func (sharedTraceTokenTestDecoder) Decode(value string) (define.Token, error) {
+	switch value {
+	case "shared-a":
+		return define.Token{Original: value, TenantID: "tenant-a", BizId: 2, AppID: 101, AppName: "app-a", TracesDataId: 9001, TracesShared: true}, nil
+	case "shared-invalid":
+		return define.Token{Original: value, TenantID: "tenant-a", BizId: 2, AppName: "app-a", TracesDataId: 9001, TracesShared: true}, nil
+	default:
+		return define.Token{}, errors.New("unknown token")
+	}
+}
+
+func TestTracesRejectSharedTokenWithoutTrustedAppID(t *testing.T) {
+	record := define.Record{
+		RecordType: define.RecordTraces,
+		Data:       makeTracesRecord(1, map[string]string{"bk.data.token": "shared-invalid"}),
+	}
+	checker := tokenChecker{}
+	err := checker.processTraces(sharedTraceTokenTestDecoder{}, Config{resourceKeys: []string{"bk.data.token"}}, &record)
+	assert.ErrorContains(t, err, "shared trace token requires trusted identity")
+}
+
+func TestTracesRejectSharedFixedTokenWithoutTrustedIdentity(t *testing.T) {
+	decoder := newFixedTokenDecoder(Config{Type: "fixed", TracesDataId: 9001, TracesShared: true})
+	record := define.Record{RecordType: define.RecordTraces, Data: makeTracesRecord(1, nil)}
+	checker := tokenChecker{}
+	err := checker.processTraces(decoder, Config{}, &record)
+	assert.ErrorContains(t, err, "shared trace token requires trusted identity")
+}
+
+func TestTracesRejectUndecodableResourceAlongsideSharedMember(t *testing.T) {
+	traces := ptrace.NewTraces()
+	for _, value := range []string{"shared-a", "unknown"} {
+		resourceSpans := traces.ResourceSpans().AppendEmpty()
+		resourceSpans.Resource().Attributes().PutString("bk.data.token", value)
+		resourceSpans.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	}
+	record := define.Record{RecordType: define.RecordTraces, Data: traces}
+	checker := tokenChecker{}
+	err := checker.processTraces(sharedTraceTokenTestDecoder{}, Config{resourceKeys: []string{"bk.data.token"}}, &record)
+	assert.ErrorContains(t, err, "incomplete shared trace request")
+}
+
+func TestTracesRejectSharedMetricTokenWithoutTrustedAppID(t *testing.T) {
+	record := define.Record{
+		RecordType: define.RecordTraces,
+		Data:       makeTracesRecord(1, map[string]string{"bk.data.token": "shared-invalid"}),
+	}
+	checker := tokenChecker{}
+	err := checker.processTraces(sharedMetricTokenTestDecoder{}, Config{resourceKeys: []string{"bk.data.token"}}, &record)
+	assert.ErrorContains(t, err, "shared metric token requires trusted identity")
+}
+
+func TestMetricsRejectMixedSharedMemberTokens(t *testing.T) {
+	metrics := pmetric.NewMetrics()
+	for _, value := range []string{"shared-a", "shared-b"} {
+		rm := metrics.ResourceMetrics().AppendEmpty()
+		rm.Resource().Attributes().PutString("bk.data.token", value)
+		rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().SetName("bk_apm_count")
+	}
+	record := define.Record{RecordType: define.RecordMetrics, Data: metrics}
+	checker := tokenChecker{}
+	err := checker.processMetrics(sharedMetricTokenTestDecoder{}, Config{resourceKeys: []string{"bk.data.token"}}, &record)
+	assert.ErrorContains(t, err, "mixed shared metric tokens")
+	assert.Equal(t, 2, metrics.ResourceMetrics().Len(), "mixed members must not be partially accepted")
+}
+
+func TestMetricsRejectInvalidSharedMemberInMixedRequest(t *testing.T) {
+	metrics := pmetric.NewMetrics()
+	for _, value := range []string{"shared-a", "shared-invalid"} {
+		rm := metrics.ResourceMetrics().AppendEmpty()
+		rm.Resource().Attributes().PutString("bk.data.token", value)
+		rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().SetName("bk_apm_count")
+	}
+	record := define.Record{RecordType: define.RecordMetrics, Data: metrics}
+	checker := tokenChecker{}
+	err := checker.processMetrics(sharedMetricTokenTestDecoder{}, Config{resourceKeys: []string{"bk.data.token"}}, &record)
+	assert.ErrorContains(t, err, "shared metric token requires trusted identity")
+}
+
+func TestMetricsRejectUndecodableResourceAlongsideSharedMember(t *testing.T) {
+	metrics := pmetric.NewMetrics()
+	for _, value := range []string{"shared-a", "unknown"} {
+		rm := metrics.ResourceMetrics().AppendEmpty()
+		rm.Resource().Attributes().PutString("bk.data.token", value)
+		rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().SetName("bk_apm_count")
+	}
+	record := define.Record{RecordType: define.RecordMetrics, Data: metrics}
+	checker := tokenChecker{}
+	err := checker.processMetrics(sharedMetricTokenTestDecoder{}, Config{resourceKeys: []string{"bk.data.token"}}, &record)
+	assert.ErrorContains(t, err, "incomplete shared metric request")
+}
+
+func TestMetricsDoNotInheritFirstResourceTokenInsteadOfHeader(t *testing.T) {
+	metrics := pmetric.NewMetrics()
+	first := metrics.ResourceMetrics().AppendEmpty()
+	first.Resource().Attributes().PutString("bk.data.token", "shared-a")
+	first.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().SetName("bk_apm_count")
+	second := metrics.ResourceMetrics().AppendEmpty()
+	second.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().SetName("bk_apm_count")
+	record := define.Record{
+		RecordType: define.RecordMetrics,
+		Token:      define.Token{Original: "shared-b"},
+		Data:       metrics,
+	}
+	checker := tokenChecker{}
+	err := checker.processMetrics(sharedMetricTokenTestDecoder{}, Config{resourceKeys: []string{"bk.data.token"}}, &record)
+	assert.ErrorContains(t, err, "mixed shared metric tokens")
 }
 
 func TestTracesRejectMixedTokens(t *testing.T) {

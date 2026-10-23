@@ -10,6 +10,8 @@
 package tracesderiver
 
 import (
+	"strconv"
+
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
@@ -87,6 +89,12 @@ func (to tracesOperator) Operate(record *define.Record) *define.Record {
 
 					// 派生指标补充 token app_name 维度 (´･_･) 此处硬编码
 					dim[define.TokenAppName] = record.Token.AppName
+					if record.Token.MetricsShared {
+						// Shared Metric DataID must separate members before extraction and accumulation.
+						dim["bk_tenant_id"] = record.Token.TenantID
+						dim["bk_biz_id"] = strconv.FormatInt(int64(record.Token.BizId), 10)
+						dim["app_id"] = strconv.FormatInt(record.Token.AppID, 10)
+					}
 
 					// extractor 处理
 					if to.extractor != nil {

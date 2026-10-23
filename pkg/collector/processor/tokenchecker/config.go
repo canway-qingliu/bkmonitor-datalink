@@ -28,10 +28,13 @@ type Config struct {
 	MustEmptyToken bool   `config:"must_empty_token" mapstructure:"must_empty_token"`
 	FixedToken     string `config:"fixed_token" mapstructure:"fixed_token"`
 	TracesDataId   int32  `config:"traces_dataid" mapstructure:"traces_dataid"`
+	TracesShared   bool   `config:"traces_shared" mapstructure:"traces_shared"`
 	MetricsDataId  int32  `config:"metrics_dataid" mapstructure:"metrics_dataid"`
+	MetricsShared  bool   `config:"metrics_shared" mapstructure:"metrics_shared"`
 	LogsDataId     int32  `config:"logs_dataid" mapstructure:"logs_dataid"`
 	ProfilesDataId int32  `config:"profiles_dataid" mapstructure:"profiles_dataid"`
 	BizId          int32  `config:"bk_biz_id" mapstructure:"bk_biz_id"`
+	TenantID       string `config:"bk_tenant_id" mapstructure:"bk_tenant_id"`
 	AppName        string `config:"bk_app_name" mapstructure:"bk_app_name"`
 	AppID          int64  `config:"app_id" mapstructure:"app_id"`
 

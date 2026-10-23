@@ -3,8 +3,14 @@ token: '{{ bk_data_token }}'
 bk_biz_id: {{ bk_biz_id }}
 bk_app_name: {{ bk_app_name }}
 app_id: {{ app_id | default(0) }}
-traces_dataid: {{ trace_data_id | default(0) }}
-metrics_dataid: {{ metric_data_id | default(0) }}
+traces_dataid: {{ trace_data_id | default(0) }}{% if traces_shared is defined and traces_shared %}
+traces_shared: true
+{% endif %}
+metrics_dataid: {{ metric_data_id | default(0) }}{% if metrics_shared is defined and metrics_shared %}
+metrics_shared: true
+{% endif %}{% if (traces_shared is defined and traces_shared) or (metrics_shared is defined and metrics_shared) %}
+bk_tenant_id: {{ bk_tenant_id | default('') | tojson }}
+{% endif %}
 logs_dataid: {{ log_data_id | default(0) }}
 profiles_dataid: {{ profile_data_id | default(0) }}
 

@@ -30,6 +30,8 @@ func TestFixedDecoder(t *testing.T) {
 	decoder := newFixedTokenDecoder(Config{
 		Type:          "fixed",
 		AppID:         123,
+		TracesShared:  true,
+		MetricsShared: true,
 		TracesDataId:  tracesDataId,
 		MetricsDataId: metricsDataId,
 		LogsDataId:    logsDataId,
@@ -43,6 +45,20 @@ func TestFixedDecoder(t *testing.T) {
 	assert.Equal(t, token.MetricsDataId, metricsDataId)
 	assert.Equal(t, token.LogsDataId, logsDataId)
 	assert.Equal(t, int64(123), token.AppID)
+	assert.True(t, token.TracesShared)
+	assert.True(t, token.MetricsShared)
+}
+
+func TestMergeTokenKeepsTrustedSharedTraceMarker(t *testing.T) {
+	got := mergeToken(define.Token{TracesShared: true}, define.Token{})
+	assert.True(t, got.TracesShared)
+	forged := mergeToken(define.Token{}, define.Token{TracesShared: true})
+	assert.False(t, forged.TracesShared)
+}
+
+func TestMergeTokenKeepsTrustedSharedMetricMarker(t *testing.T) {
+	got := mergeToken(define.Token{MetricsShared: true}, define.Token{})
+	assert.True(t, got.MetricsShared)
 }
 
 func TestDefaultDecoder(t *testing.T) {
@@ -143,6 +159,7 @@ func TestAes256WithMetaDecoder(t *testing.T) {
 	cache := metacache.New()
 	cache.Set(token1, define.Token{
 		AppID:          123,
+		TenantID:       "tenant-a",
 		ProfilesDataId: 10001,
 		ProxyDataId:    10002,
 		BeatDataId:     10003,
@@ -170,6 +187,8 @@ func TestAes256WithMetaDecoder(t *testing.T) {
 			Input: token1,
 			Token: define.Token{
 				Original:       token1,
+				AppID:          123,
+				TenantID:       "tenant-a",
 				TracesDataId:   1001,
 				MetricsDataId:  1002,
 				LogsDataId:     1003,
@@ -222,6 +241,31 @@ func TestAes256WithMetaDecoder(t *testing.T) {
 
 		assert.Equal(t, tt.Token, token)
 	}
+}
+
+func TestAes256WithMetaDecoderRejectsConflictingTrustedBusiness(t *testing.T) {
+	const signedToken = "Ymtia2JrYmtia2JrYmtiaxUtdLzrldhHtlcjc1Cwfo1u99rVk5HGe8EjT761brGtKm3H4Ran78rWl85HwzfRgw=="
+	cache := metacache.New()
+	cache.Set(signedToken, define.Token{BizId: 3, AppID: 456, TenantID: "tenant-b"})
+	decoder := newAes256WithMetaTokenDecoder(Config{
+		Type:       "aes256WithMeta",
+		Salt:       "bk",
+		DecodedIv:  "bkbkbkbkbkbkbkbk",
+		DecodedKey: "81be7fc6-5476-4934-9417-6d4d593728db",
+	}, cache)
+
+	token, err := decoder.Decode(signedToken)
+	if assert.Error(t, err) {
+		assert.Contains(t, err.Error(), "business identity conflict")
+	}
+	assert.Equal(t, define.Token{}, token)
+
+	cache.Set(signedToken, define.Token{BizId: 2, AppID: 456, TenantID: "tenant-b"})
+	token, err = decoder.Decode(signedToken)
+	assert.NoError(t, err)
+	assert.Equal(t, int32(2), token.BizId)
+	assert.Equal(t, int64(456), token.AppID)
+	assert.Equal(t, "tenant-b", token.TenantID)
 }
 
 func TestAes256WithMetaDecoderAndFixedBackup(t *testing.T) {

@@ -21,6 +21,7 @@ import (
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/utils"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
 )
 
 type metricsEvent struct {
@@ -44,6 +45,10 @@ func (c metricsConverter) ToDataID(record *define.Record) int32 {
 }
 
 func (c metricsConverter) Convert(record *define.Record, f define.GatherFunc) {
+	if record.Token.MetricsShared && !record.Token.HasSharedMetricIdentity() {
+		logger.Errorf("drop shared metric record without trusted tenant, business and application identity")
+		return
+	}
 	pdMetrics := record.Data.(pmetric.Metrics)
 	resourceMetricsSlice := pdMetrics.ResourceMetrics()
 	if resourceMetricsSlice.Len() == 0 {
@@ -64,6 +69,17 @@ func (c metricsConverter) Convert(record *define.Record, f define.GatherFunc) {
 			metrics := scopeMetric.Metrics()
 			for k := 0; k < metrics.Len(); k++ {
 				for _, dp := range c.Extract(metrics.At(k), dimensions) {
+					if record.Token.MetricsShared {
+						// Override Resource and data-point attributes only after they have been merged.
+						identity, ok := dp["dimension"].(map[string]string)
+						if !ok {
+							continue
+						}
+						identity["bk_tenant_id"] = record.Token.TenantID
+						identity["bk_biz_id"] = strconv.FormatInt(int64(record.Token.BizId), 10)
+						identity["app_id"] = strconv.FormatInt(record.Token.AppID, 10)
+						identity["app_name"] = record.Token.AppName
+					}
 					events = append(events, c.ToEvent(record.Token, dataId, dp))
 				}
 			}

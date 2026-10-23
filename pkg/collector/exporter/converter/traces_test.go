@@ -120,6 +120,58 @@ func TestTracesInjectTrustedAppID(t *testing.T) {
 	assert.Equal(t, int64(123), events[0].Data()["app_id"])
 }
 
+func TestTracesPreserveTrustedIdentityAndAcceptanceAcrossConversion(t *testing.T) {
+	traces := ptrace.NewTraces()
+	resourceSpans := traces.ResourceSpans().AppendEmpty()
+	resourceSpans.Resource().Attributes().PutString("bk_tenant_id", "forged")
+	resourceSpans.Resource().Attributes().PutInt("app_id", 999)
+	spans := resourceSpans.ScopeSpans().AppendEmpty().Spans()
+	spans.AppendEmpty()
+	spans.AppendEmpty()
+	record := define.Record{
+		RecordType:        define.RecordTraces,
+		Data:              traces,
+		Token:             define.Token{TenantID: "tenant-a", BizId: 2, AppName: "app-a", AppID: 123, TracesDataId: 1001},
+		TraceAcceptedAtMs: 1234567890123,
+		TraceRequestID:    "trusted-request-id",
+	}
+
+	convert := func() []define.Event {
+		var events []define.Event
+		tracesConverter{}.Convert(&record, func(evts ...define.Event) { events = append(events, evts...) })
+		return events
+	}
+	first, replay := convert(), convert()
+	assert.Len(t, first, 2)
+	assert.Len(t, replay, 2)
+	for i := range first {
+		data := first[i].Data()
+		assert.Equal(t, "tenant-a", data["bk_tenant_id"])
+		assert.Equal(t, int32(2), data["bk_biz_id"])
+		assert.Equal(t, int64(123), data["app_id"])
+		assert.Equal(t, int64(1234567890123), data["platform_received_at_ms"])
+		assert.NotEmpty(t, data["source_event_id"])
+		assert.Equal(t, data["source_event_id"], replay[i].Data()["source_event_id"])
+	}
+	assert.NotEqual(t, first[0].Data()["source_event_id"], first[1].Data()["source_event_id"])
+}
+
+func TestSharedTracesDeriveSpaceUIDFromTrustedBusiness(t *testing.T) {
+	traces := ptrace.NewTraces()
+	resourceSpans := traces.ResourceSpans().AppendEmpty()
+	resourceSpans.Resource().Attributes().PutString("space_uid", "forged")
+	resourceSpans.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	record := define.Record{
+		RecordType: define.RecordTraces,
+		Data:       traces,
+		Token:      define.Token{TenantID: "tenant-a", BizId: 2, AppName: "app-a", AppID: 123, TracesDataId: 1001, TracesShared: true},
+	}
+	var events []define.Event
+	tracesConverter{}.Convert(&record, func(evts ...define.Event) { events = append(events, evts...) })
+	assert.Len(t, events, 1)
+	assert.Equal(t, "bkcc__2", events[0].Data()["space_uid"])
+}
+
 func TestTracesInjectTokenFieldsZeroValue(t *testing.T) {
 	g := makeTracesGenerator(1)
 	traces := g.Generate()
@@ -141,6 +193,9 @@ func TestTracesInjectTokenFieldsZeroValue(t *testing.T) {
 	assert.Equal(t, int32(0), data["bk_biz_id"])
 	assert.Equal(t, "", data["app_name"])
 	assert.NotContains(t, data, "app_id")
+	assert.NotContains(t, data, "bk_tenant_id")
+	assert.NotContains(t, data, "platform_received_at_ms")
+	assert.NotContains(t, data, "source_event_id")
 }
 
 func TestTracesTraceStateAsRaw(t *testing.T) {

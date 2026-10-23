@@ -184,11 +184,28 @@ func decodeToken(decoder TokenDecoder, src ...string) (define.Token, error) {
 	return token, errors.New("no token source")
 }
 
+func validateSharedMetricToken(token define.Token) error {
+	if token.MetricsShared && !token.HasSharedMetricIdentity() {
+		return errors.New("shared metric token requires trusted identity")
+	}
+	return nil
+}
+
+func validateTraceToken(token define.Token) error {
+	if token.TracesShared && !token.HasSharedTraceIdentity() {
+		return errors.New("shared trace token requires trusted identity")
+	}
+	return validateSharedMetricToken(token)
+}
+
 func (p *tokenChecker) processTraces(decoder TokenDecoder, config Config, record *define.Record) error {
 	var err error
 	if decoder.Skip() {
 		record.Token, err = decoder.Decode("")
-		return err
+		if err != nil {
+			return err
+		}
+		return validateTraceToken(record.Token)
 	}
 
 	requestToken := record.Token.Original
@@ -196,7 +213,10 @@ func (p *tokenChecker) processTraces(decoder TokenDecoder, config Config, record
 	var firstToken define.Token
 	var hasFirstToken bool
 	var mixedTokens bool
+	var sharedTraceToken bool
+	var sharedIdentityErr error
 	checkToken := func(token define.Token) {
+		sharedTraceToken = sharedTraceToken || token.TracesShared
 		if !hasFirstToken {
 			firstToken = token
 			hasFirstToken = true
@@ -214,6 +234,11 @@ func (p *tokenChecker) processTraces(decoder TokenDecoder, config Config, record
 				logger.Errorf("failed to parse pdTraces.rsToken (%s), err: %v", rsToken, decodeErr)
 				return true
 			}
+			if identityErr := validateTraceToken(decodedToken); identityErr != nil {
+				errs = append(errs, identityErr)
+				sharedIdentityErr = identityErr
+				return true
+			}
 			checkToken(decodedToken)
 			return false
 		}
@@ -224,9 +249,20 @@ func (p *tokenChecker) processTraces(decoder TokenDecoder, config Config, record
 			logger.Errorf("failed to parse pdTraces.original (%s), err: %v", requestToken, decodeErr)
 			return true
 		}
+		if identityErr := validateTraceToken(decodedToken); identityErr != nil {
+			errs = append(errs, identityErr)
+			sharedIdentityErr = identityErr
+			return true
+		}
 		checkToken(decodedToken)
 		return false
 	})
+	if sharedIdentityErr != nil {
+		return sharedIdentityErr
+	}
+	if sharedTraceToken && len(errs) > 0 {
+		return errors.New("reject incomplete shared trace request")
+	}
 	if mixedTokens {
 		return errors.New("reject mixed trace tokens in one request")
 	}
@@ -246,10 +282,26 @@ func (p *tokenChecker) processMetrics(decoder TokenDecoder, config Config, recor
 	var err error
 	if decoder.Skip() {
 		record.Token, err = decoder.Decode("")
-		return err
+		if err != nil {
+			return err
+		}
+		return validateSharedMetricToken(record.Token)
 	}
 
 	var errs []error
+	var sharedIdentityErr error
+	requestToken := record.Token.Original
+	var firstToken define.Token
+	var hasFirstToken bool
+	var mixedSharedTokens bool
+	checkToken := func(token define.Token) {
+		if !hasFirstToken {
+			firstToken = token
+			hasFirstToken = true
+		} else if (firstToken.MetricsShared || token.MetricsShared) && token != firstToken {
+			mixedSharedTokens = true
+		}
+	}
 	pdMetrics := record.Data.(pmetric.Metrics)
 	pdMetrics.ResourceMetrics().RemoveIf(func(resourceMetrics pmetric.ResourceMetrics) bool {
 		rsToken := tokenFromAttrs(resourceMetrics.Resource().Attributes(), config.resourceKeys)
@@ -260,17 +312,38 @@ func (p *tokenChecker) processMetrics(decoder TokenDecoder, config Config, recor
 				logger.Errorf("failed to parse pdMetrics.rsToken (%s), err: %v", rsToken, err)
 				return true
 			}
+			if identityErr := validateSharedMetricToken(record.Token); identityErr != nil {
+				errs = append(errs, identityErr)
+				sharedIdentityErr = identityErr
+				return true
+			}
+			checkToken(record.Token)
 			return false
 		}
 
-		record.Token, err = decodeToken(decoder, record.Token.Original)
+		record.Token, err = decodeToken(decoder, requestToken)
 		if err != nil {
 			errs = append(errs, err)
-			logger.Errorf("failed to parse pdMetrics.original (%s), err: %v", record.Token.Original, err)
+			logger.Errorf("failed to parse pdMetrics.original (%s), err: %v", requestToken, err)
 			return true
 		}
+		if identityErr := validateSharedMetricToken(record.Token); identityErr != nil {
+			errs = append(errs, identityErr)
+			sharedIdentityErr = identityErr
+			return true
+		}
+		checkToken(record.Token)
 		return false
 	})
+	if sharedIdentityErr != nil {
+		return sharedIdentityErr
+	}
+	if hasFirstToken && firstToken.MetricsShared && len(errs) > 0 {
+		return errors.New("reject incomplete shared metric request")
+	}
+	if mixedSharedTokens {
+		return errors.New("reject mixed shared metric tokens in one request")
+	}
 
 	// 当且仅当没有任何 metrics 的情况下才算鉴权失败
 	if pdMetrics.ResourceMetrics().Len() == 0 {
