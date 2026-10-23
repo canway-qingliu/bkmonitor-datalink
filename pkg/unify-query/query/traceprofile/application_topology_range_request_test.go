@@ -48,6 +48,21 @@ func TestApplicationTopologyEnvelopeUsesDomainContractAndFingerprint(t *testing.
 	}
 }
 
+func TestApplicationTopologyObservedEdgesV2Fingerprint(t *testing.T) {
+	const expected = "dd338a45f464d3c05abf26d6106b6ce61b476dc50552a8d561f5a3deedc224fd"
+	body := strings.ReplaceAll(string(legacyPanoramaRequestJSON(expected)),
+		"a3_contract_version", "application_topology_contract_version")
+	body = strings.ReplaceAll(body, "a3_request", "application_topology_request")
+	body = strings.ReplaceAll(body, "a3_panorama_range_v1", "application_topology_range_v2")
+	query, err := ParseApplicationTopologyRangeRequest([]byte(body), 65536)
+	if err != nil || query.Request.ContractVersion != "application_topology_range_v2" {
+		t.Fatalf("observed edge request rejected: %+v %v", query, err)
+	}
+	if got := ApplicationTopologyRangeFingerprint("tenant_a", query); got != expected {
+		t.Fatalf("V2 scope fingerprint mismatch: %s", got)
+	}
+}
+
 func TestApplicationTopologyRangeRequestRejectsUnknownAndDuplicateFields(t *testing.T) {
 	const expected = "90215fae3664992ddaa312247d35b6c183020a30a72e6ac01005b08b59c192e3"
 	for _, body := range [][]byte{

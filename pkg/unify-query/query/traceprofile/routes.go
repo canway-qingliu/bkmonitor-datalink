@@ -198,6 +198,11 @@ func NewRouteSnapshotWithAllTargets(version int64, routes []ReadRoute, esTargets
 		snapshot.applicationTopologyRoutes[key] = target
 	}
 	for _, target := range topologyTargets {
+		if target.Label == "application_edge" {
+			if _, found := snapshot.applicationTopologyRoutes[applicationTopologyRouteKey(target.BkTenantID, "application_coverage")]; !found {
+				continue
+			}
+		}
 		other := "application_edge"
 		if target.Label == "application_edge" {
 			other = "application_coverage"

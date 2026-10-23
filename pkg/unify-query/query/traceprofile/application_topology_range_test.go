@@ -100,6 +100,43 @@ func TestApplicationTopologyReadsPublishedPairAndChecksRows(t *testing.T) {
 	}
 }
 
+func TestApplicationTopologyV2ReadsOnlyObservedEdges(t *testing.T) {
+	reader := &applicationTopologyReader{}
+	request := applicationTopologyInput()
+	request.ContractVersion = "application_topology_range_v2"
+	result, err := applicationTopologyExecutor(t, reader).QueryApplicationTopologyRange(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reader.queries != 1 || len(result.Edges) != 1 || len(result.Coverage) != 0 {
+		t.Fatalf("V2 must read edges only: %+v, queries=%d", result, reader.queries)
+	}
+}
+
+func TestApplicationTopologyV2ReadsEdgeOnlyPublication(t *testing.T) {
+	reader := &applicationTopologyReader{}
+	target := ApplicationTopologyTarget{BkTenantID: "tenant_a", Label: "application_edge", Database: "tenant_a_kapm",
+		Table: "kapm_application_edge_observed_1m", ClusterID: "7", ClusterName: "doris",
+		SchemaVersion: "sha256:19617e34c53d393e", RetentionDays: 30, PublishedVersion: 4}
+	snapshot, err := NewRouteSnapshotWithAllTargets(7, nil, nil, []ApplicationTopologyTarget{target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := NewExecutor(snapshot, map[string]Querier{"7": reader}, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := applicationTopologyInput()
+	request.ContractVersion = "application_topology_range_v2"
+	if _, err := executor.QueryApplicationTopologyRange(context.Background(), request); err != nil || reader.queries != 1 {
+		t.Fatalf("V2 edge-only read failed: %v, queries=%d", err, reader.queries)
+	}
+	request.ContractVersion = "application_topology_range_v1"
+	if _, err := executor.QueryApplicationTopologyRange(context.Background(), request); err == nil || reader.queries != 1 {
+		t.Fatalf("V1 must fail closed without coverage: %v, queries=%d", err, reader.queries)
+	}
+}
+
 func TestApplicationTopologyRejectsStaleVersionAndForeignRowsBeforePublishing(t *testing.T) {
 	reader := &applicationTopologyReader{}
 	executor := applicationTopologyExecutor(t, reader)
@@ -145,7 +182,7 @@ func TestApplicationTopologyRejectsUnknownNamespaceWithZeroBiz(t *testing.T) {
 		"unobserved_count": int64(0), "beyond_watermark": int64(0),
 		"min_resolution": "stable", "max_resolution": "stable",
 	}
-	if _, err := decodeApplicationTopologyEdge(edge, allowed, 15); err == nil {
+	if _, err := decodeApplicationTopologyEdge(edge, allowed, 15, true); err == nil {
 		t.Fatal("zero business ID cannot make a foreign edge look authorized")
 	}
 }

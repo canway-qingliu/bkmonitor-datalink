@@ -24,6 +24,7 @@ type ApplicationTopologyApplication struct {
 
 type ApplicationTopologyRangeRequest struct {
 	TenantID        string
+	ContractVersion string
 	ExpectedVersion int64
 	StartMS         int64
 	EndMS           int64
@@ -84,14 +85,19 @@ func (e *Executor) QueryApplicationTopologyRange(ctx context.Context, request Ap
 	if err != nil {
 		return ApplicationTopologyRangeResult{}, err
 	}
-	coverageTarget, err := e.snapshot.ResolveApplicationTopologyTarget(request.TenantID, "application_coverage")
-	if err != nil {
-		return ApplicationTopologyRangeResult{}, err
+	if edgeTarget.PublishedVersion != request.ExpectedVersion {
+		return ApplicationTopologyRangeResult{}, reject(CodeScopePartial, "应用拓扑 边表发布版本不一致")
 	}
-	if edgeTarget.PublishedVersion != coverageTarget.PublishedVersion ||
-		edgeTarget.ClusterID != coverageTarget.ClusterID ||
-		edgeTarget.PublishedVersion != request.ExpectedVersion {
-		return ApplicationTopologyRangeResult{}, reject(CodeScopePartial, "应用拓扑 边与覆盖发布目标不一致")
+	observedOnly := request.ContractVersion == "application_topology_range_v2"
+	var coverageTarget ApplicationTopologyTarget
+	if !observedOnly {
+		coverageTarget, err = e.snapshot.ResolveApplicationTopologyTarget(request.TenantID, "application_coverage")
+		if err != nil {
+			return ApplicationTopologyRangeResult{}, err
+		}
+		if edgeTarget.PublishedVersion != coverageTarget.PublishedVersion || edgeTarget.ClusterID != coverageTarget.ClusterID {
+			return ApplicationTopologyRangeResult{}, reject(CodeScopePartial, "应用拓扑 边与覆盖发布目标不一致")
+		}
 	}
 	connection := e.connections[edgeTarget.ClusterID]
 	if connection == nil {
@@ -102,52 +108,71 @@ func (e *Executor) QueryApplicationTopologyRange(ctx context.Context, request Ap
 	marks := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
 	args := []any{request.TenantID, startDate, endDate, request.StartMS, request.EndMS}
 	args = append(args, ids...)
-	coverageSQL := fmt.Sprintf(
-		"SELECT source_namespace_id, source_bk_biz_id, COUNT(*) AS observed_minutes, "+
-			"SUM(CASE WHEN status = 'complete' AND unresolved_peer_count = 0 AND config_revision > 0 "+
-			"AND input_fence_hash IS NOT NULL THEN 1 ELSE 0 END) AS complete_minutes, "+
-			"SUM(CASE WHEN status = 'partial' THEN 1 ELSE 0 END) AS partial_minutes, "+
-			"SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_minutes, "+
-			"SUM(unresolved_peer_count) AS unresolved_peers, MAX(as_of_ms) AS as_of_ms "+
-			"FROM %s.%s WHERE bk_tenant_id = ? AND coverage_date >= ? AND coverage_date <= ? "+
-			"AND minute_start_ms >= ? AND minute_start_ms < ? AND source_namespace_id IN (%s) "+
-			"GROUP BY source_namespace_id, source_bk_biz_id ORDER BY source_namespace_id LIMIT 130",
-		quoteIdentifier(coverageTarget.Database), quoteIdentifier(coverageTarget.Table), marks,
-	)
-	coverageRows, err := connection.Query(ctx, coverageSQL, args...)
-	if err != nil {
-		return ApplicationTopologyRangeResult{}, queryFailure(err)
-	}
-	if len(coverageRows.Rows) > len(allowed) {
-		return ApplicationTopologyRangeResult{}, reject(CodePartialFailure, "应用拓扑 覆盖源集合超出当前应用目录")
-	}
-	coverage := make([]ApplicationTopologyCoverage, 0, len(coverageRows.Rows))
-	for _, row := range coverageRows.Rows {
-		item, decodeErr := decodeApplicationTopologyCoverage(row, allowed, (request.EndMS-request.StartMS)/60000)
-		if decodeErr != nil {
-			return ApplicationTopologyRangeResult{}, decodeErr
+	coverage := make([]ApplicationTopologyCoverage, 0)
+	if !observedOnly {
+		coverageSQL := fmt.Sprintf(
+			"SELECT source_namespace_id, source_bk_biz_id, COUNT(*) AS observed_minutes, "+
+				"SUM(CASE WHEN status = 'complete' AND unresolved_peer_count = 0 AND config_revision > 0 "+
+				"AND input_fence_hash IS NOT NULL THEN 1 ELSE 0 END) AS complete_minutes, "+
+				"SUM(CASE WHEN status = 'partial' THEN 1 ELSE 0 END) AS partial_minutes, "+
+				"SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_minutes, "+
+				"SUM(unresolved_peer_count) AS unresolved_peers, MAX(as_of_ms) AS as_of_ms "+
+				"FROM %s.%s WHERE bk_tenant_id = ? AND coverage_date >= ? AND coverage_date <= ? "+
+				"AND minute_start_ms >= ? AND minute_start_ms < ? AND source_namespace_id IN (%s) "+
+				"GROUP BY source_namespace_id, source_bk_biz_id ORDER BY source_namespace_id LIMIT 130",
+			quoteIdentifier(coverageTarget.Database), quoteIdentifier(coverageTarget.Table), marks,
+		)
+		coverageRows, queryErr := connection.Query(ctx, coverageSQL, args...)
+		if queryErr != nil {
+			return ApplicationTopologyRangeResult{}, queryFailure(queryErr)
 		}
-		coverage = append(coverage, item)
+		if len(coverageRows.Rows) > len(allowed) {
+			return ApplicationTopologyRangeResult{}, reject(CodePartialFailure, "应用拓扑 覆盖源集合超出当前应用目录")
+		}
+		for _, row := range coverageRows.Rows {
+			item, decodeErr := decodeApplicationTopologyCoverage(row, allowed, (request.EndMS-request.StartMS)/60000)
+			if decodeErr != nil {
+				return ApplicationTopologyRangeResult{}, decodeErr
+			}
+			coverage = append(coverage, item)
+		}
 	}
-	edgeSQL := fmt.Sprintf(
-		"SELECT e.source_namespace_id, e.source_bk_biz_id, e.target_namespace_id, e.target_bk_biz_id, "+
-			"MIN(e.resolution) AS min_resolution, MAX(e.resolution) AS max_resolution, "+
-			"COUNT(*) AS observed_minutes, MAX(e.as_of_ms) AS as_of_ms, "+
-			"SUM(CASE WHEN e.observed THEN 0 ELSE 1 END) AS unobserved_count, "+
-			"SUM(CASE WHEN c.status = 'complete' AND (c.edge_visible_version_ms IS NULL "+
-			"OR e.computed_at_ms > c.edge_visible_version_ms) THEN 1 ELSE 0 END) AS beyond_watermark "+
-			"FROM %s.%s e LEFT JOIN %s.%s c ON c.bk_tenant_id = e.bk_tenant_id "+
-			"AND c.coverage_date = e.edge_date AND c.minute_start_ms = e.minute_start_ms "+
-			"AND c.source_namespace_id = e.source_namespace_id AND c.source_bk_biz_id = e.source_bk_biz_id "+
-			"WHERE e.bk_tenant_id = ? AND e.edge_date >= ? AND e.edge_date <= ? "+
-			"AND e.minute_start_ms >= ? AND e.minute_start_ms < ? "+
-			"AND e.source_namespace_id IN (%s) AND e.target_namespace_id IN (%s) "+
-			"GROUP BY e.source_namespace_id, e.source_bk_biz_id, e.target_namespace_id, e.target_bk_biz_id "+
-			"ORDER BY e.source_namespace_id, e.target_namespace_id LIMIT %d",
-		quoteIdentifier(edgeTarget.Database), quoteIdentifier(edgeTarget.Table),
-		quoteIdentifier(coverageTarget.Database), quoteIdentifier(coverageTarget.Table),
-		marks, marks, request.MaxPairs,
-	)
+	var edgeSQL string
+	if !observedOnly {
+		edgeSQL = fmt.Sprintf(
+			"SELECT e.source_namespace_id, e.source_bk_biz_id, e.target_namespace_id, e.target_bk_biz_id, "+
+				"MIN(e.resolution) AS min_resolution, MAX(e.resolution) AS max_resolution, "+
+				"COUNT(*) AS observed_minutes, MAX(e.as_of_ms) AS as_of_ms, "+
+				"SUM(CASE WHEN e.observed THEN 0 ELSE 1 END) AS unobserved_count, "+
+				"SUM(CASE WHEN c.status = 'complete' AND (c.edge_visible_version_ms IS NULL "+
+				"OR e.computed_at_ms > c.edge_visible_version_ms) THEN 1 ELSE 0 END) AS beyond_watermark "+
+				"FROM %s.%s e LEFT JOIN %s.%s c ON c.bk_tenant_id = e.bk_tenant_id "+
+				"AND c.coverage_date = e.edge_date AND c.minute_start_ms = e.minute_start_ms "+
+				"AND c.source_namespace_id = e.source_namespace_id AND c.source_bk_biz_id = e.source_bk_biz_id "+
+				"WHERE e.bk_tenant_id = ? AND e.edge_date >= ? AND e.edge_date <= ? "+
+				"AND e.minute_start_ms >= ? AND e.minute_start_ms < ? "+
+				"AND e.source_namespace_id IN (%s) AND e.target_namespace_id IN (%s) "+
+				"GROUP BY e.source_namespace_id, e.source_bk_biz_id, e.target_namespace_id, e.target_bk_biz_id "+
+				"ORDER BY e.source_namespace_id, e.target_namespace_id LIMIT %d",
+			quoteIdentifier(edgeTarget.Database), quoteIdentifier(edgeTarget.Table),
+			quoteIdentifier(coverageTarget.Database), quoteIdentifier(coverageTarget.Table),
+			marks, marks, request.MaxPairs,
+		)
+	} else {
+		edgeSQL = fmt.Sprintf(
+			"SELECT e.source_namespace_id, e.source_bk_biz_id, e.target_namespace_id, e.target_bk_biz_id, "+
+				"MIN(e.resolution) AS min_resolution, MAX(e.resolution) AS max_resolution, "+
+				"COUNT(*) AS observed_minutes, MAX(e.as_of_ms) AS as_of_ms, "+
+				"SUM(CASE WHEN e.observed THEN 0 ELSE 1 END) AS unobserved_count "+
+				"FROM %s.%s e "+
+				"WHERE e.bk_tenant_id = ? AND e.edge_date >= ? AND e.edge_date <= ? "+
+				"AND e.minute_start_ms >= ? AND e.minute_start_ms < ? "+
+				"AND e.source_namespace_id IN (%s) AND e.target_namespace_id IN (%s) "+
+				"GROUP BY e.source_namespace_id, e.source_bk_biz_id, e.target_namespace_id, e.target_bk_biz_id "+
+				"ORDER BY e.source_namespace_id, e.target_namespace_id LIMIT %d",
+			quoteIdentifier(edgeTarget.Database), quoteIdentifier(edgeTarget.Table), marks, marks, request.MaxPairs,
+		)
+	}
 	edgeArgs := append(append([]any{}, args...), ids...)
 	edgeRows, err := connection.Query(ctx, edgeSQL, edgeArgs...)
 	if err != nil {
@@ -158,7 +183,7 @@ func (e *Executor) QueryApplicationTopologyRange(ctx context.Context, request Ap
 	}
 	edges := make([]ApplicationTopologyEdge, 0, len(edgeRows.Rows))
 	for _, row := range edgeRows.Rows {
-		item, decodeErr := decodeApplicationTopologyEdge(row, allowed, (request.EndMS-request.StartMS)/60000)
+		item, decodeErr := decodeApplicationTopologyEdge(row, allowed, (request.EndMS-request.StartMS)/60000, !observedOnly)
 		if decodeErr != nil {
 			return ApplicationTopologyRangeResult{}, decodeErr
 		}
@@ -213,8 +238,11 @@ func decodeApplicationTopologyCoverage(row map[string]any, allowed map[int64]int
 	}, nil
 }
 
-func decodeApplicationTopologyEdge(row map[string]any, allowed map[int64]int64, expectedMinutes int64) (ApplicationTopologyEdge, error) {
-	fields := []string{"source_namespace_id", "source_bk_biz_id", "target_namespace_id", "target_bk_biz_id", "observed_minutes", "as_of_ms", "unobserved_count", "beyond_watermark"}
+func decodeApplicationTopologyEdge(row map[string]any, allowed map[int64]int64, expectedMinutes int64, checkWatermark bool) (ApplicationTopologyEdge, error) {
+	fields := []string{"source_namespace_id", "source_bk_biz_id", "target_namespace_id", "target_bk_biz_id", "observed_minutes", "as_of_ms", "unobserved_count"}
+	if checkWatermark {
+		fields = append(fields, "beyond_watermark")
+	}
 	values := make([]int64, len(fields))
 	var err error
 	for i, field := range fields {
@@ -230,7 +258,8 @@ func decodeApplicationTopologyEdge(row map[string]any, allowed map[int64]int64, 
 	targetBiz, targetFound := allowed[values[2]]
 	if !sourceFound || !targetFound || values[0] == values[2] ||
 		values[1] <= 0 || values[3] <= 0 || sourceBiz != values[1] || targetBiz != values[3] ||
-		values[4] <= 0 || values[4] > expectedMinutes || values[5] <= 0 || values[6] != 0 || values[7] != 0 ||
+		values[4] <= 0 || values[4] > expectedMinutes || values[5] <= 0 || values[6] != 0 ||
+		checkWatermark && values[7] != 0 ||
 		!validResolution(resolution) || !validResolution(maximum) {
 		return ApplicationTopologyEdge{}, reject(CodeUnauthorizedMember, "应用拓扑 有向边身份或解析证据非法")
 	}

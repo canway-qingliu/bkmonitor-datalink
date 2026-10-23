@@ -173,18 +173,22 @@ func ParsePublishedDocument(body []byte, keyTenant string) (PublishedDocument, e
 		if parseErr != nil {
 			return PublishedDocument{}, parseErr
 		}
-		if wire.LegacyA3Targets != nil {
+		if len(newTargets) == 0 && len(topologyTargets) != 0 {
+			newTargets = topologyTargets
+		}
+		if len(topologyTargets) != 0 {
 			legacyByLabel := make(map[string]ApplicationTopologyTarget, len(topologyTargets))
 			for _, target := range topologyTargets {
 				legacyByLabel[target.Label] = target
-			}
-			if len(newTargets) != len(topologyTargets) {
-				return PublishedDocument{}, fmt.Errorf("应用拓扑新旧读目标不一致")
 			}
 			for _, target := range newTargets {
 				if legacyByLabel[target.Label] != target {
 					return PublishedDocument{}, fmt.Errorf("应用拓扑新旧读目标不一致")
 				}
+			}
+			// 新字段可以只发布边；旧字段仍保留覆盖读目标供 v1 滚动升级使用。
+			if len(newTargets) == 1 {
+				newTargets = append(newTargets, legacyByLabel["application_coverage"])
 			}
 		}
 		topologyTargets = newTargets
@@ -202,8 +206,8 @@ func parsePublishedApplicationTopologyTargets(wire []publishedApplicationTopolog
 	if len(wire) == 0 {
 		return nil, nil
 	}
-	if len(wire) != 2 {
-		return nil, fmt.Errorf("应用拓扑 边与覆盖读目标必须成对发布")
+	if len(wire) != 2 && (!descriptiveLabels || len(wire) != 1) {
+		return nil, fmt.Errorf("应用拓扑读目标必须包含边表；旧版边/覆盖仍须成对发布")
 	}
 	targets := make([]ApplicationTopologyTarget, 0, 2)
 	seen := make(map[string]bool, 2)
@@ -239,7 +243,10 @@ func parsePublishedApplicationTopologyTargets(wire []publishedApplicationTopolog
 			PublishedVersion: version,
 		})
 	}
-	if targets[0].ClusterID != targets[1].ClusterID || targets[0].ClusterName != targets[1].ClusterName {
+	if !seen["application_edge"] || len(targets) == 2 && !seen["application_coverage"] {
+		return nil, fmt.Errorf("应用拓扑读目标缺少边表")
+	}
+	if len(targets) == 2 && (targets[0].ClusterID != targets[1].ClusterID || targets[0].ClusterName != targets[1].ClusterName) {
 		return nil, fmt.Errorf("应用拓扑 边与覆盖读目标集群不一致")
 	}
 	return targets, nil

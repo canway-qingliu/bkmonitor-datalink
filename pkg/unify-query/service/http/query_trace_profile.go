@@ -100,6 +100,8 @@ func normalizeApplicationTopologyTargetConfigs(
 		return nil, nil
 	}
 	legacyNormalized := make([]traceProfileApplicationTopologyTargetConfig, 0, len(legacy))
+	legacyByKey := make(map[[2]string]traceProfileApplicationTopologyTargetConfig, len(legacy))
+	legacyLabels := make(map[string]uint8)
 	for _, target := range legacy {
 		switch target.Label {
 		case "a3_edge":
@@ -109,31 +111,48 @@ func normalizeApplicationTopologyTargetConfigs(
 		default:
 			return nil, fmt.Errorf("旧版应用拓扑读目标标签非法")
 		}
+		key := [2]string{target.BkTenantID, target.Label}
+		if _, exists := legacyByKey[key]; exists {
+			return nil, fmt.Errorf("旧版应用拓扑读目标重复")
+		}
+		legacyByKey[key] = target
+		if target.Label == "application_edge" {
+			legacyLabels[target.BkTenantID] |= 1
+		} else {
+			legacyLabels[target.BkTenantID] |= 2
+		}
 		legacyNormalized = append(legacyNormalized, target)
+	}
+	for _, labels := range legacyLabels {
+		if labels != 3 {
+			return nil, fmt.Errorf("旧版应用拓扑边与覆盖读目标必须成对发布")
+		}
 	}
 	if descriptive == nil {
 		return legacyNormalized, nil
 	}
+	merged := make([]traceProfileApplicationTopologyTargetConfig, 0, len(legacyNormalized)+len(descriptive))
+	seen := make(map[[2]string]bool, len(descriptive))
 	for _, target := range descriptive {
 		if target.Label != "application_edge" && target.Label != "application_coverage" {
 			return nil, fmt.Errorf("应用拓扑读目标标签非法")
 		}
-	}
-	if legacy != nil {
-		if len(legacyNormalized) != len(descriptive) {
+		key := [2]string{target.BkTenantID, target.Label}
+		if seen[key] {
+			return nil, fmt.Errorf("应用拓扑读目标重复")
+		}
+		if previous, exists := legacyByKey[key]; exists && previous != target {
 			return nil, fmt.Errorf("应用拓扑新旧读目标不一致")
 		}
-		byLabel := make(map[string]traceProfileApplicationTopologyTargetConfig, len(legacyNormalized))
-		for _, target := range legacyNormalized {
-			byLabel[target.Label] = target
-		}
-		for _, target := range descriptive {
-			if byLabel[target.Label] != target {
-				return nil, fmt.Errorf("应用拓扑新旧读目标不一致")
-			}
+		seen[key] = true
+		merged = append(merged, target)
+	}
+	for _, target := range legacyNormalized {
+		if !seen[[2]string{target.BkTenantID, target.Label}] {
+			merged = append(merged, target)
 		}
 	}
-	return descriptive, nil
+	return merged, nil
 }
 
 type traceProfileConnectionConfig struct {

@@ -279,6 +279,61 @@ func TestTraceStaticApplicationTopologyTargetsAcceptDescriptivePublicationField(
 	}
 }
 
+func TestTraceStaticApplicationTopologyKeepsLegacyCoverageWithNewEdge(t *testing.T) {
+	config := traceProfileRuntimeConfig()
+	legacyEdge := map[string]any{
+		"bk_tenant_id": "system", "label": "a3_edge", "database": "system_kapm",
+		"table": "kapm_application_edge_observed_1m", "cluster_id": "18", "cluster_name": "doris",
+		"schema_version": "sha256:19617e34c53d393e", "retention_days": 30, "published_route_version": 7,
+	}
+	legacyCoverage := map[string]any{
+		"bk_tenant_id": "system", "label": "a3_coverage", "database": "system_kapm",
+		"table": "kapm_application_edge_coverage_1m", "cluster_id": "18", "cluster_name": "doris",
+		"schema_version": "sha256:06c86fab2f251999", "retention_days": 30, "published_route_version": 7,
+	}
+	newEdge := map[string]any{}
+	for key, value := range legacyEdge {
+		newEdge[key] = value
+	}
+	newEdge["label"] = "application_edge"
+	config["a3_targets"] = []any{legacyEdge, legacyCoverage}
+	config["application_topology_targets"] = []any{newEdge}
+	runtime, err := newTraceProfileRuntime(config)
+	if err != nil {
+		t.Fatalf("matching new edge and legacy pair must coexist: %v", err)
+	}
+	defer runtime.close()
+}
+
+func TestTraceStaticLegacyApplicationTopologyStillRequiresCoverage(t *testing.T) {
+	config := traceProfileRuntimeConfig()
+	config["a3_targets"] = []any{map[string]any{
+		"bk_tenant_id": "system", "label": "a3_edge", "database": "system_kapm",
+		"table": "kapm_application_edge_observed_1m", "cluster_id": "18", "cluster_name": "doris",
+		"schema_version": "sha256:19617e34c53d393e", "retention_days": 30, "published_route_version": 7,
+	}}
+	runtime, err := newTraceProfileRuntime(config)
+	if err == nil {
+		runtime.close()
+		t.Fatal("legacy A3 target without coverage must remain invalid")
+	}
+}
+
+func TestNormalizeApplicationTopologyTargetsRetainsLegacyCoverage(t *testing.T) {
+	edge := traceProfileApplicationTopologyTargetConfig{BkTenantID: "system", Label: "a3_edge", ClusterID: "18"}
+	coverage := edge
+	coverage.Label = "a3_coverage"
+	newEdge := edge
+	newEdge.Label = "application_edge"
+	targets, err := normalizeApplicationTopologyTargetConfigs(
+		[]traceProfileApplicationTopologyTargetConfig{edge, coverage},
+		[]traceProfileApplicationTopologyTargetConfig{newEdge},
+	)
+	if err != nil || len(targets) != 2 || targets[0].Label != "application_edge" || targets[1].Label != "application_coverage" {
+		t.Fatalf("legacy coverage must remain available during the v2 cutover: %+v, %v", targets, err)
+	}
+}
+
 func TestApplicationTopologyQueryRespondsWithDescriptiveContract(t *testing.T) {
 	config := traceProfileRuntimeConfig()
 	withTraceProfileRuntime(t, config)

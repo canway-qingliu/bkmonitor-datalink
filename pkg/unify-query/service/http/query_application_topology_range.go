@@ -29,7 +29,7 @@ func isApplicationTopologyRangeEnvelope(body []byte) bool {
 		Version       string `json:"application_topology_contract_version"`
 	}
 	return json.Unmarshal(body, &probe) == nil &&
-		(probe.LegacyVersion == "a3_panorama_range_v1" || probe.Version == "application_topology_range_v1")
+		(probe.LegacyVersion == "a3_panorama_range_v1" || probe.Version == "application_topology_range_v1" || probe.Version == "application_topology_range_v2")
 }
 
 func handleApplicationTopologyRangeQuery(c *gin.Context, ctx context.Context, span *trace.Span,
@@ -62,7 +62,7 @@ func handleApplicationTopologyRangeQuery(c *gin.Context, ctx context.Context, sp
 		return writeTraceProfileReject(ctx, c, span, traceprofile.CodeUnauthorizedMember, "应用拓扑 全景租户范围摘要不匹配")
 	}
 	query.Request.TenantID = tenantID
-	// 2. 只查询同版本已发布的租户边/覆盖目标；请求不能选择库、表或集群。
+	// 2. v2 只读已发布边表；旧版继续读取成对目标以兼容滚动升级。
 	result, err := runtime.executor.QueryApplicationTopologyRange(ctx, query.Request)
 	if err != nil {
 		return writeTraceProfileError(ctx, c, span, err)
@@ -82,12 +82,14 @@ func handleApplicationTopologyRangeQuery(c *gin.Context, ctx context.Context, sp
 		"published_route_version": result.PublishedRouteVersion,
 		"expected_minutes":        result.ExpectedMinutes,
 		"edges":                   result.Edges,
-		"coverage":                result.Coverage,
 	}
-	if query.ProtocolVersion == "application_topology_range_v1" {
+	if query.ProtocolVersion == "application_topology_range_v1" || query.ProtocolVersion == "application_topology_range_v2" {
 		response["application_topology_contract_version"] = query.ProtocolVersion
 	} else {
 		response["a3_contract_version"] = query.ProtocolVersion
+	}
+	if query.ProtocolVersion != "application_topology_range_v2" {
+		response["coverage"] = result.Coverage
 	}
 	c.JSON(http.StatusOK, response)
 	return nil

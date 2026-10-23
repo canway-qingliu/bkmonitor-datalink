@@ -36,6 +36,7 @@ type applicationTopologyEnvelope struct {
 }
 
 const applicationTopologyRangeVersion = "application_topology_range_v1"
+const observedApplicationTopologyRangeVersion = "application_topology_range_v2"
 const legacyA3PanoramaRangeVersion = "a3_panorama_range_v1"
 
 type applicationTopologyInputWire struct {
@@ -67,7 +68,7 @@ func ParseApplicationTopologyRangeRequest(body []byte, maxBodyBytes int) (Applic
 		return ApplicationTopologyRangeQuery{}, fmt.Errorf("应用拓扑 全景请求包含多余内容")
 	}
 	version, item := envelope.Version, envelope.Request
-	if version == applicationTopologyRangeVersion {
+	if version == applicationTopologyRangeVersion || version == observedApplicationTopologyRangeVersion {
 		if envelope.LegacyVersion != "" || envelope.LegacyRequest != nil {
 			return ApplicationTopologyRangeQuery{}, fmt.Errorf("应用拓扑请求混用了新旧协议")
 		}
@@ -96,7 +97,7 @@ func ParseApplicationTopologyRangeRequest(body []byte, maxBodyBytes int) (Applic
 		previous = app.NamespaceID
 	}
 	return ApplicationTopologyRangeQuery{
-		Request:              ApplicationTopologyRangeRequest{ExpectedVersion: item.ExpectedRouteVersion, StartMS: item.StartMS, EndMS: item.EndMS, Applications: item.Applications, MaxPairs: item.MaxPairs},
+		Request:              ApplicationTopologyRangeRequest{ContractVersion: version, ExpectedVersion: item.ExpectedRouteVersion, StartMS: item.StartMS, EndMS: item.EndMS, Applications: item.Applications, MaxPairs: item.MaxPairs},
 		ObservationDomainID:  item.ObservationDomainID,
 		ExpectedRouteVersion: item.ExpectedRouteVersion,
 		ScopeFingerprint:     item.ScopeFingerprint,
@@ -109,6 +110,8 @@ func ApplicationTopologyRangeFingerprint(tenantID string, query ApplicationTopol
 	scopeVersion := "a3-panorama-range-v1"
 	if query.ProtocolVersion == applicationTopologyRangeVersion {
 		scopeVersion = "application-topology-range-v1"
+	} else if query.ProtocolVersion == observedApplicationTopologyRangeVersion {
+		scopeVersion = "application-topology-range-v2"
 	}
 	parts := []string{scopeVersion, tenantID, query.ObservationDomainID,
 		strconv.FormatInt(query.ExpectedRouteVersion, 10),

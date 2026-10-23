@@ -76,6 +76,46 @@ func TestPublishedApplicationTopologyTargetsAcceptNewOnlyAndMatchingDualPublicat
 	}
 }
 
+func TestPublishedApplicationTopologyAcceptsEdgeOnly(t *testing.T) {
+	targets := strings.Split(panoramaApplicationTopologyTargets, ",\n{")[0] + "]"
+	for _, replacement := range []string{`"application_topology_targets":` + targets,
+		`"a3_targets":[],"application_topology_targets":` + targets} {
+		body := strings.Replace(business132Document, `"a3_targets":[]`, replacement, 1)
+		document, err := ParsePublishedDocument([]byte(body), "system")
+		if err != nil || len(document.ApplicationTopologyTargets) != 1 {
+			t.Fatalf("edge-only topology publication rejected: %+v, %v", document.ApplicationTopologyTargets, err)
+		}
+	}
+}
+
+func TestPublishedApplicationTopologyKeepsLegacyCoverageForOldRequests(t *testing.T) {
+	edge := strings.Split(panoramaApplicationTopologyTargets, ",\n{")[0] + "]"
+	body := strings.Replace(business132Document, `"a3_targets":[]`,
+		`"a3_targets":`+legacyA3TargetsJSON+`,"application_topology_targets":`+edge, 1)
+	document, err := ParsePublishedDocument([]byte(body), "system")
+	if err != nil || len(document.ApplicationTopologyTargets) != 2 {
+		t.Fatalf("legacy coverage target lost: %+v, %v", document.ApplicationTopologyTargets, err)
+	}
+}
+
+func TestApplicationTopologyRouteSnapshotAcceptsMixedTenantTargets(t *testing.T) {
+	edge := ApplicationTopologyTarget{BkTenantID: "tenant_a", Label: "application_edge", Database: "tenant_a_kapm",
+		Table: "kapm_application_edge_observed_1m", ClusterID: "7", ClusterName: "doris",
+		SchemaVersion: "sha256:19617e34c53d393e", RetentionDays: 30, PublishedVersion: 4}
+	other := edge
+	other.BkTenantID = "tenant_b"
+	other.Database = "tenant_b_kapm"
+	other.PublishedVersion = 5
+	legacyCoverage := ApplicationTopologyTarget{BkTenantID: "tenant_a", Label: "application_coverage", Database: "tenant_a_kapm",
+		Table: "kapm_application_edge_coverage_1m", ClusterID: "7", ClusterName: "doris",
+		SchemaVersion: "sha256:06c86fab2f251999", RetentionDays: 30, PublishedVersion: 4}
+	for _, targets := range [][]ApplicationTopologyTarget{{edge, other}, {edge, legacyCoverage, other}} {
+		if _, err := NewRouteSnapshotWithAllTargets(9, nil, nil, targets); err != nil {
+			t.Fatalf("mixed tenant topology routes rejected: %v", err)
+		}
+	}
+}
+
 func TestPublishedApplicationTopologyTargetsRejectsDualPublicationDrift(t *testing.T) {
 	changed := strings.Replace(panoramaApplicationTopologyTargets, `"cluster_id":18`, `"cluster_id":19`, 1)
 	body := strings.Replace(business132Document, `"a3_targets":[]`,
