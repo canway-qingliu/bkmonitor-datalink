@@ -81,6 +81,61 @@ type traceProfileESTargetConfig struct {
 	PublishedVersion  int64 `json:"published_route_version,omitempty"`
 }
 
+type traceProfileApplicationTopologyTargetConfig struct {
+	BkTenantID       string `json:"bk_tenant_id"`
+	Label            string `json:"label"`
+	Database         string `json:"database"`
+	Table            string `json:"table"`
+	ClusterID        string `json:"cluster_id"`
+	ClusterName      string `json:"cluster_name"`
+	SchemaVersion    string `json:"schema_version"`
+	RetentionDays    int64  `json:"retention_days"`
+	PublishedVersion int64  `json:"published_route_version"`
+}
+
+func normalizeApplicationTopologyTargetConfigs(
+	legacy, descriptive []traceProfileApplicationTopologyTargetConfig,
+) ([]traceProfileApplicationTopologyTargetConfig, error) {
+	if legacy == nil && descriptive == nil {
+		return nil, nil
+	}
+	legacyNormalized := make([]traceProfileApplicationTopologyTargetConfig, 0, len(legacy))
+	for _, target := range legacy {
+		switch target.Label {
+		case "a3_edge":
+			target.Label = "application_edge"
+		case "a3_coverage":
+			target.Label = "application_coverage"
+		default:
+			return nil, fmt.Errorf("旧版应用拓扑读目标标签非法")
+		}
+		legacyNormalized = append(legacyNormalized, target)
+	}
+	if descriptive == nil {
+		return legacyNormalized, nil
+	}
+	for _, target := range descriptive {
+		if target.Label != "application_edge" && target.Label != "application_coverage" {
+			return nil, fmt.Errorf("应用拓扑读目标标签非法")
+		}
+	}
+	if legacy != nil {
+		if len(legacyNormalized) != len(descriptive) {
+			return nil, fmt.Errorf("应用拓扑新旧读目标不一致")
+		}
+		byLabel := make(map[string]traceProfileApplicationTopologyTargetConfig, len(legacyNormalized))
+		for _, target := range legacyNormalized {
+			byLabel[target.Label] = target
+		}
+		for _, target := range descriptive {
+			if byLabel[target.Label] != target {
+				return nil, fmt.Errorf("应用拓扑新旧读目标不一致")
+			}
+		}
+	}
+	return descriptive, nil
+}
+
 type traceProfileConnectionConfig struct {
 	ClusterID      string       `json:"cluster_id"`
 	Host           string       `json:"host"`
@@ -94,16 +149,18 @@ type traceProfileConnectionConfig struct {
 }
 
 type traceProfileConfig struct {
-	RouteSnapshotVersion  int64                          `json:"route_snapshot_version"`
-	ReadTargetDataPath    string                         `json:"read_target_data_path,omitempty"`
-	ReadTargetVersionPath string                         `json:"read_target_version_path,omitempty"`
-	MaxBodyBytes          int                            `json:"max_body_bytes"`
-	MaxLimit              int64                          `json:"max_limit"`
-	MaxOffset             int64                          `json:"max_offset"`
-	MaxRangeDays          int64                          `json:"max_range_days"`
-	ReadRoutes            []traceProfileRouteConfig      `json:"read_routes"`
-	ESSummaryTargets      []traceProfileESTargetConfig   `json:"es_summary_targets,omitempty"`
-	ReadonlyConnections   []traceProfileConnectionConfig `json:"readonly_connections"`
+	RouteSnapshotVersion       int64                                         `json:"route_snapshot_version"`
+	ReadTargetDataPath         string                                        `json:"read_target_data_path,omitempty"`
+	ReadTargetVersionPath      string                                        `json:"read_target_version_path,omitempty"`
+	MaxBodyBytes               int                                           `json:"max_body_bytes"`
+	MaxLimit                   int64                                         `json:"max_limit"`
+	MaxOffset                  int64                                         `json:"max_offset"`
+	MaxRangeDays               int64                                         `json:"max_range_days"`
+	ReadRoutes                 []traceProfileRouteConfig                     `json:"read_routes"`
+	ESSummaryTargets           []traceProfileESTargetConfig                  `json:"es_summary_targets,omitempty"`
+	LegacyA3Targets            []traceProfileApplicationTopologyTargetConfig `json:"a3_targets,omitempty"`
+	ApplicationTopologyTargets []traceProfileApplicationTopologyTargetConfig `json:"application_topology_targets,omitempty"`
+	ReadonlyConnections        []traceProfileConnectionConfig                `json:"readonly_connections"`
 
 	// 单租户 typed Trace 的真实数据租户；应用和空间权限沿用 JWT 鉴权。
 	// 配置非法时加载即失败；未配置且读目标快照恰好只有一个租户时取该租户，
@@ -213,10 +270,15 @@ func newTraceProfileRuntimeFor(raw any, publishedTenants map[string]struct{}) (*
 	if err := decoder.Decode(&config); err != nil {
 		return nil, fmt.Errorf("Trace profile 直连读取配置非法: %w", err)
 	}
-	if len(config.ReadRoutes) == 0 && len(config.ReadonlyConnections) == 0 && len(config.ESSummaryTargets) == 0 {
+	topologyTargetConfigs, err := normalizeApplicationTopologyTargetConfigs(config.LegacyA3Targets, config.ApplicationTopologyTargets)
+	if err != nil {
+		return nil, err
+	}
+	if len(config.ReadRoutes) == 0 && len(config.ReadonlyConnections) == 0 &&
+		len(config.ESSummaryTargets) == 0 && len(topologyTargetConfigs) == 0 {
 		return nil, nil
 	}
-	if (len(config.ReadRoutes) == 0) != (len(config.ReadonlyConnections) == 0) {
+	if (len(config.ReadRoutes) == 0 && len(topologyTargetConfigs) == 0) != (len(config.ReadonlyConnections) == 0) {
 		return nil, fmt.Errorf("Trace profile 直连读取必须同时提供读路由与只读连接")
 	}
 	if config.MaxBodyBytes <= 0 || config.MaxLimit <= 0 || config.MaxOffset <= 0 ||
@@ -299,12 +361,25 @@ func newTraceProfileRuntimeFor(raw any, publishedTenants map[string]struct{}) (*
 			PublishedVersion:    target.PublishedVersion,
 		})
 	}
-	snapshot, err := traceprofile.NewRouteSnapshotWithESTargets(config.RouteSnapshotVersion, routes, esTargets)
+	topologyTargets := make([]traceprofile.ApplicationTopologyTarget, 0, len(topologyTargetConfigs))
+	for _, target := range topologyTargetConfigs {
+		if _, connected := connections[target.ClusterID]; !connected {
+			closeConnections()
+			return nil, fmt.Errorf("应用拓扑 读目标的集群缺少只读连接")
+		}
+		topologyTargets = append(topologyTargets, traceprofile.ApplicationTopologyTarget{
+			BkTenantID: target.BkTenantID, Label: target.Label,
+			Database: target.Database, Table: target.Table, ClusterID: target.ClusterID,
+			ClusterName: target.ClusterName, SchemaVersion: target.SchemaVersion,
+			RetentionDays: target.RetentionDays, PublishedVersion: target.PublishedVersion,
+		})
+	}
+	snapshot, err := traceprofile.NewRouteSnapshotWithAllTargets(config.RouteSnapshotVersion, routes, esTargets, topologyTargets)
 	if err != nil {
 		closeConnections()
 		return nil, err
 	}
-	singleTenantID, err := traceProfileSingleTenantID(config.SingleTenantID, routes, esTargets, publishedTenants)
+	singleTenantID, err := traceProfileSingleTenantID(config.SingleTenantID, routes, esTargets, topologyTargets, publishedTenants)
 	if err != nil {
 		closeConnections()
 		return nil, err
@@ -345,6 +420,7 @@ func newTraceProfileRuntimeFor(raw any, publishedTenants map[string]struct{}) (*
 // publishedTenants 非 nil 时按发布源上的全部租户计数，一个租户被撤销不会改变映射。
 func traceProfileSingleTenantID(
 	configured string, routes []traceprofile.ReadRoute, esTargets []traceprofile.ESSummaryTarget,
+	topologyTargets []traceprofile.ApplicationTopologyTarget,
 	publishedTenants map[string]struct{},
 ) (string, error) {
 	if configured != "" {
@@ -360,6 +436,9 @@ func traceProfileSingleTenantID(
 			tenants[route.BkTenantID] = struct{}{}
 		}
 		for _, target := range esTargets {
+			tenants[target.BkTenantID] = struct{}{}
+		}
+		for _, target := range topologyTargets {
 			tenants[target.BkTenantID] = struct{}{}
 		}
 	}
@@ -408,7 +487,8 @@ func prefixHasTraceEnvelope(probe []byte) bool {
 		if depth == 1 && expectKey {
 			if key, isKey := token.(string); isKey {
 				switch key {
-				case "trace_profile", "trace_contract_version", "trace_request":
+				case "trace_profile", "trace_contract_version", "trace_request", "a3_contract_version", "a3_request",
+					"application_topology_contract_version", "application_topology_request":
 					return true
 				}
 			}
@@ -444,6 +524,9 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 	body, err := io.ReadAll(io.LimitReader(c.Request.Body, int64(runtime.maxBodyBytes)+1))
 	if err != nil {
 		return writeTraceProfileReject(ctx, c, span, traceprofile.CodeUnsupportedSchemaCapability, "Trace profile 请求体读取失败")
+	}
+	if isApplicationTopologyRangeEnvelope(body) {
+		return handleApplicationTopologyRangeQuery(c, ctx, span, runtime, verified, appCode, body)
 	}
 	request, err := traceprofile.ParseRequest(body, runtime.maxBodyBytes, runtime.maxLimit)
 	if err != nil {

@@ -934,6 +934,29 @@ func TestAllConditions_VMString(t *testing.T) {
 	}
 }
 
+func TestSharedAPMTagValuesIdentityUsesExactVMMatchers(t *testing.T) {
+	for _, operator := range []string{ConditionEqual, ConditionContains} {
+		t.Run(operator, func(t *testing.T) {
+			identity := AllConditions{{
+				{DimensionName: "bk_tenant_id", Value: []string{"tenant-a"}, Operator: operator},
+				{DimensionName: "bk_biz_id", Value: []string{"2"}, Operator: operator},
+				{DimensionName: "app_id", Value: []string{"17"}, Operator: operator},
+			}}
+
+			selector, count := identity.VMString("42_bkapm_tenant_metric_9.__default__", "bk_apm_count", false)
+			assert.Equal(t, `bk_tenant_id="tenant-a", bk_biz_id="2", app_id="17", result_table_id="42_bkapm_tenant_metric_9.__default__", __name__="bk_apm_count"`, string(selector))
+			assert.Equal(t, 5, count)
+
+			appID := ConditionField{DimensionName: "app_id", Value: []string{"17"}, Operator: operator}
+			appID.ContainsToPromReg()
+			matcher, err := labels.NewMatcher(appID.ToPromOperator(), appID.DimensionName, appID.Value[0])
+			require.NoError(t, err)
+			assert.True(t, matcher.Matches("17"))
+			assert.False(t, matcher.Matches("117"))
+		})
+	}
+}
+
 // TestAllConditions_MatchResultTableLabels 表标签匹配：空条件、单 eq、缺 key、OR 组、AND 组（表标签路由统一使用 AllConditions.MatchResultTableLabels）
 func TestAllConditions_MatchResultTableLabels(t *testing.T) {
 	t.Run("nil_empty", func(t *testing.T) {

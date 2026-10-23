@@ -55,9 +55,13 @@ type QueryOutput struct {
 
 type QueryTs struct {
 	// 以下字段只检测外部 Trace 信封是否出现，不能设置内部 TraceProfile。
-	TraceProfileEnvelope         stdjson.RawMessage `json:"trace_profile,omitempty" swaggerignore:"true"`
-	TraceContractVersionEnvelope stdjson.RawMessage `json:"trace_contract_version,omitempty" swaggerignore:"true"`
-	TraceRequestEnvelope         stdjson.RawMessage `json:"trace_request,omitempty" swaggerignore:"true"`
+	TraceProfileEnvelope               stdjson.RawMessage `json:"trace_profile,omitempty" swaggerignore:"true"`
+	TraceContractVersionEnvelope       stdjson.RawMessage `json:"trace_contract_version,omitempty" swaggerignore:"true"`
+	LegacyA3ContractVersionEnvelope    stdjson.RawMessage `json:"a3_contract_version,omitempty" swaggerignore:"true"`
+	LegacyA3RequestEnvelope            stdjson.RawMessage `json:"a3_request,omitempty" swaggerignore:"true"`
+	ApplicationTopologyVersionEnvelope stdjson.RawMessage `json:"application_topology_contract_version,omitempty" swaggerignore:"true"`
+	ApplicationTopologyRequestEnvelope stdjson.RawMessage `json:"application_topology_request,omitempty" swaggerignore:"true"`
+	TraceRequestEnvelope               stdjson.RawMessage `json:"trace_request,omitempty" swaggerignore:"true"`
 	// TsDBMap 查询路由匹配中的 tsDB 列表 key:reference_name
 	TsDBMap map[string]TsDBs `json:"tsdb_map,omitempty"`
 	// SpaceUid 空间ID
@@ -139,7 +143,9 @@ type QueryTs struct {
 }
 
 func (q *QueryTs) HasTraceEnvelope() bool {
-	return q != nil && (q.TraceProfileEnvelope != nil || q.TraceContractVersionEnvelope != nil || q.TraceRequestEnvelope != nil)
+	return q != nil && (q.TraceProfileEnvelope != nil || q.TraceContractVersionEnvelope != nil ||
+		q.TraceRequestEnvelope != nil || q.LegacyA3ContractVersionEnvelope != nil || q.LegacyA3RequestEnvelope != nil ||
+		q.ApplicationTopologyVersionEnvelope != nil || q.ApplicationTopologyRequestEnvelope != nil)
 }
 
 // ValidateNamedOutputs 在任何路由和存储 I/O 前校验命名多输出契约。

@@ -29,20 +29,38 @@ var supportedPublishedSchemaVersion = map[string]string{
 	"trace_summary": "sha256:281052267ec373fc",
 }
 
+var supportedApplicationTopologyTargets = map[string]struct{ table, schema string }{
+	"application_edge":     {"kapm_application_edge_observed_1m", "sha256:19617e34c53d393e"},
+	"application_coverage": {"kapm_application_edge_coverage_1m", "sha256:06c86fab2f251999"},
+}
+
 // PublishedDocument 是 Kingeye 在 Consul 发布的单租户、带版本只读目标。
 type PublishedDocument struct {
-	TenantID         string
-	Version          int64
-	Routes           []ReadRoute
-	ESSummaryTargets []ESSummaryTarget
+	TenantID                   string
+	Version                    int64
+	Routes                     []ReadRoute
+	ESSummaryTargets           []ESSummaryTarget
+	ApplicationTopologyTargets []ApplicationTopologyTarget
 }
 
 type publishedDocumentWire struct {
-	Version          int64                          `json:"route_snapshot_version"`
-	TenantID         string                         `json:"bk_tenant_id"`
-	Routes           []publishedRouteWire           `json:"read_routes"`
-	A3Targets        json.RawMessage                `json:"a3_targets"`
-	ESSummaryTargets []publishedESSummaryTargetWire `json:"es_summary_targets,omitempty"`
+	Version                    int64                                    `json:"route_snapshot_version"`
+	TenantID                   string                                   `json:"bk_tenant_id"`
+	Routes                     []publishedRouteWire                     `json:"read_routes"`
+	LegacyA3Targets            []publishedApplicationTopologyTargetWire `json:"a3_targets"`
+	ApplicationTopologyTargets []publishedApplicationTopologyTargetWire `json:"application_topology_targets"`
+	ESSummaryTargets           []publishedESSummaryTargetWire           `json:"es_summary_targets,omitempty"`
+}
+
+type publishedApplicationTopologyTargetWire struct {
+	Label               string          `json:"label"`
+	ObservationDomainID string          `json:"observation_domain_id"`
+	Database            string          `json:"database"`
+	Table               string          `json:"table"`
+	ClusterID           json.RawMessage `json:"cluster_id"`
+	ClusterName         string          `json:"cluster_name"`
+	SchemaVersion       string          `json:"schema_version"`
+	RetentionDays       int64           `json:"retention_days"`
 }
 
 type publishedESSummaryTargetWire struct {
@@ -91,9 +109,8 @@ func ParsePublishedDocument(body []byte, keyTenant string) (PublishedDocument, e
 	if wire.TenantID != keyTenant || wire.Version <= 0 || wire.Routes == nil {
 		return PublishedDocument{}, fmt.Errorf("Trace 发布文档租户、版本或路由缺失")
 	}
-	var a3 []json.RawMessage
-	if len(wire.A3Targets) == 0 || json.Unmarshal(wire.A3Targets, &a3) != nil || a3 == nil {
-		return PublishedDocument{}, fmt.Errorf("Trace 发布文档 A3 段非法")
+	if wire.LegacyA3Targets == nil && wire.ApplicationTopologyTargets == nil {
+		return PublishedDocument{}, fmt.Errorf("Trace 发布文档 应用拓扑 段非法")
 	}
 	routes := make([]ReadRoute, 0, len(wire.Routes))
 	profilesByBiz := make(map[int64]uint8)
@@ -147,8 +164,83 @@ func ParsePublishedDocument(body []byte, keyTenant string) (PublishedDocument, e
 			PublishedVersion: wire.Version,
 		})
 	}
-	if _, err := NewRouteSnapshotWithESTargets(wire.Version, routes, esTargets); err != nil {
+	topologyTargets, err := parsePublishedApplicationTopologyTargets(wire.LegacyA3Targets, keyTenant, wire.Version, false)
+	if err != nil {
 		return PublishedDocument{}, err
 	}
-	return PublishedDocument{TenantID: keyTenant, Version: wire.Version, Routes: routes, ESSummaryTargets: esTargets}, nil
+	if wire.ApplicationTopologyTargets != nil {
+		newTargets, parseErr := parsePublishedApplicationTopologyTargets(wire.ApplicationTopologyTargets, keyTenant, wire.Version, true)
+		if parseErr != nil {
+			return PublishedDocument{}, parseErr
+		}
+		if wire.LegacyA3Targets != nil {
+			legacyByLabel := make(map[string]ApplicationTopologyTarget, len(topologyTargets))
+			for _, target := range topologyTargets {
+				legacyByLabel[target.Label] = target
+			}
+			if len(newTargets) != len(topologyTargets) {
+				return PublishedDocument{}, fmt.Errorf("应用拓扑新旧读目标不一致")
+			}
+			for _, target := range newTargets {
+				if legacyByLabel[target.Label] != target {
+					return PublishedDocument{}, fmt.Errorf("应用拓扑新旧读目标不一致")
+				}
+			}
+		}
+		topologyTargets = newTargets
+	}
+	if _, err := NewRouteSnapshotWithAllTargets(wire.Version, routes, esTargets, topologyTargets); err != nil {
+		return PublishedDocument{}, err
+	}
+	return PublishedDocument{
+		TenantID: keyTenant, Version: wire.Version, Routes: routes,
+		ESSummaryTargets: esTargets, ApplicationTopologyTargets: topologyTargets,
+	}, nil
+}
+
+func parsePublishedApplicationTopologyTargets(wire []publishedApplicationTopologyTargetWire, tenantID string, version int64, descriptiveLabels bool) ([]ApplicationTopologyTarget, error) {
+	if len(wire) == 0 {
+		return nil, nil
+	}
+	if len(wire) != 2 {
+		return nil, fmt.Errorf("应用拓扑 边与覆盖读目标必须成对发布")
+	}
+	targets := make([]ApplicationTopologyTarget, 0, 2)
+	seen := make(map[string]bool, 2)
+	for _, item := range wire {
+		label := item.Label
+		if descriptiveLabels {
+			if label != "application_edge" && label != "application_coverage" {
+				return nil, fmt.Errorf("应用拓扑读目标标签非法")
+			}
+		} else {
+			switch item.Label {
+			case "a3_edge":
+				label = "application_edge"
+			case "a3_coverage":
+				label = "application_coverage"
+			default:
+				return nil, fmt.Errorf("旧版应用拓扑读目标标签非法")
+			}
+		}
+		identity, known := supportedApplicationTopologyTargets[label]
+		var clusterID int64
+		if !known || seen[label] || item.ObservationDomainID != tenantID+"_kapm" ||
+			item.Database != item.ObservationDomainID || item.Table != identity.table ||
+			item.SchemaVersion != identity.schema || item.RetentionDays != 30 ||
+			item.ClusterName == "" || json.Unmarshal(item.ClusterID, &clusterID) != nil || clusterID <= 0 {
+			return nil, fmt.Errorf("应用拓扑 读目标身份、物理表、集群或 Schema 非法")
+		}
+		seen[label] = true
+		targets = append(targets, ApplicationTopologyTarget{
+			BkTenantID: tenantID, Label: label, Database: item.Database, Table: item.Table,
+			ClusterID: strconv.FormatInt(clusterID, 10), ClusterName: item.ClusterName,
+			SchemaVersion: item.SchemaVersion, RetentionDays: item.RetentionDays,
+			PublishedVersion: version,
+		})
+	}
+	if targets[0].ClusterID != targets[1].ClusterID || targets[0].ClusterName != targets[1].ClusterName {
+		return nil, fmt.Errorf("应用拓扑 边与覆盖读目标集群不一致")
+	}
+	return targets, nil
 }

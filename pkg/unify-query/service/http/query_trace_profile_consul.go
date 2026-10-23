@@ -118,10 +118,11 @@ type invalidTraceDocument struct {
 
 // publishedTraceSnapshot 是一次成功读取得到的读目标快照。
 type publishedTraceSnapshot struct {
-	Version   int64
-	Routes    []traceProfileRouteConfig
-	ESTargets []traceProfileESTargetConfig
-	Invalid   []invalidTraceDocument
+	Version                    int64
+	Routes                     []traceProfileRouteConfig
+	ESTargets                  []traceProfileESTargetConfig
+	ApplicationTopologyTargets []traceProfileApplicationTopologyTargetConfig
+	Invalid                    []invalidTraceDocument
 	// Tenants 是发布源上出现的全部租户，合法与非法都算；单租户映射按它推导，
 	// 一个租户的文档变成非法不会改变映射。
 	Tenants map[string]struct{}
@@ -153,10 +154,11 @@ func parsePublishedTraceTargets(prefix string, pairs api.KVPairs, unreadable map
 	}
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Key < sorted[j].Key })
 	snapshot := publishedTraceSnapshot{
-		Routes:    make([]traceProfileRouteConfig, 0),
-		ESTargets: make([]traceProfileESTargetConfig, 0),
-		Tenants:   make(map[string]struct{}, len(sorted)),
-		Documents: make(map[string]invalidTraceDocument, len(sorted)),
+		Routes:                     make([]traceProfileRouteConfig, 0),
+		ESTargets:                  make([]traceProfileESTargetConfig, 0),
+		ApplicationTopologyTargets: make([]traceProfileApplicationTopologyTargetConfig, 0),
+		Tenants:                    make(map[string]struct{}, len(sorted)),
+		Documents:                  make(map[string]invalidTraceDocument, len(sorted)),
 	}
 	hasher := sha256.New()
 	for _, pair := range sorted {
@@ -210,6 +212,14 @@ func parsePublishedTraceTargets(prefix string, pairs api.KVPairs, unreadable map
 				PublishedVersion:    document.Version,
 			})
 		}
+		for _, target := range document.ApplicationTopologyTargets {
+			snapshot.ApplicationTopologyTargets = append(snapshot.ApplicationTopologyTargets, traceProfileApplicationTopologyTargetConfig{
+				BkTenantID: target.BkTenantID, Label: target.Label,
+				Database: target.Database, Table: target.Table, ClusterID: target.ClusterID,
+				ClusterName: target.ClusterName, SchemaVersion: target.SchemaVersion,
+				RetentionDays: target.RetentionDays, PublishedVersion: target.PublishedVersion,
+			})
+		}
 	}
 	digest := hasher.Sum(nil)
 	snapshot.Version = int64(binary.BigEndian.Uint64(digest[:8]) & uint64(^uint64(0)>>1))
@@ -249,6 +259,11 @@ func (snapshot publishedTraceSnapshot) withoutUnknownClusters(config map[string]
 			}
 		}
 	}
+	for _, target := range snapshot.ApplicationTopologyTargets {
+		if _, ok := known[target.ClusterID]; !ok {
+			revoked[target.BkTenantID] = target.ClusterID
+		}
+	}
 	if len(revoked) == 0 {
 		return snapshot
 	}
@@ -263,6 +278,12 @@ func (snapshot publishedTraceSnapshot) withoutUnknownClusters(config map[string]
 	for _, target := range snapshot.ESTargets {
 		if _, out := revoked[target.BkTenantID]; !out {
 			result.ESTargets = append(result.ESTargets, target)
+		}
+	}
+	result.ApplicationTopologyTargets = make([]traceProfileApplicationTopologyTargetConfig, 0, len(snapshot.ApplicationTopologyTargets))
+	for _, target := range snapshot.ApplicationTopologyTargets {
+		if _, out := revoked[target.BkTenantID]; !out {
+			result.ApplicationTopologyTargets = append(result.ApplicationTopologyTargets, target)
 		}
 	}
 	result.Invalid = append([]invalidTraceDocument(nil), snapshot.Invalid...)
@@ -534,18 +555,19 @@ func buildPublishedTraceRuntimeLocked() (string, error) {
 			invalid.TenantID, invalid.Key, invalid.Version, invalid.Reason, invalid.Err)
 		revokedErr = errors.Join(revokedErr, fmt.Errorf("租户 %s 的 Trace 读目标被撤销: %w", invalid.TenantID, invalid.Err))
 	}
-	if len(snapshot.Routes) == 0 && len(snapshot.ESTargets) == 0 {
+	if len(snapshot.Routes) == 0 && len(snapshot.ESTargets) == 0 && len(snapshot.ApplicationTopologyTargets) == 0 {
 		// 读取成功，每个租户都被撤销：发布侧的结果，不是本地配置的问题。
 		installTraceProfileRuntime(nil, traceRuntimeRevoked)
 		return traceReloadRevoked, revokedErr
 	}
-	if len(snapshot.Routes) == 0 {
+	if len(snapshot.Routes) == 0 && len(snapshot.ApplicationTopologyTargets) == 0 {
 		// 只有 ES Summary 目标时不需要 Doris 只读连接。
 		delete(config, "readonly_connections")
 	}
 	config["route_snapshot_version"] = snapshot.Version
 	config["read_routes"] = snapshot.Routes
 	config["es_summary_targets"] = snapshot.ESTargets
+	config["application_topology_targets"] = snapshot.ApplicationTopologyTargets
 	runtime, err := newTraceProfileRuntimeFor(config, snapshot.Tenants)
 	if err != nil {
 		// 本地配置与已校验的租户文档组合失败：不能确认任何授权，直读关闭。
