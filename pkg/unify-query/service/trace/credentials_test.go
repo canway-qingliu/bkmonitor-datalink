@@ -116,7 +116,8 @@ func TestOTelCredentialProtocols(t *testing.T) {
 				})
 				t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "authorization=env-secret")
 				t.Setenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "authorization=traces-env-secret")
-				t.Setenv("UQ_POD_UID", "9bc96f1a-c77d-4a31-86dd-a1f5db176365")
+				t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "service.instance.id=kingeye.unify-query-0.unify-query,"+
+					"k8s.namespace.name=kingeye,k8s.pod.name=unify-query-0,k8s.pod.uid=9bc96f1a-c77d-4a31-86dd-a1f5db176365,k8s.container.name=unify-query")
 				viper.Set("kms.enabled", enabled)
 				viper.Set("trace.otlp.headers", map[string]string{"authorization": "kms-header-secret"})
 				otlpToken, ServiceName = "trace-token-secret", "test-uq"
@@ -142,6 +143,7 @@ func TestOTelCredentialProtocols(t *testing.T) {
 					}
 					require.Equal(t, want, result.Header)
 					var token, instanceID, sdkLanguage, sdkName, sdkVersion string
+					k8s := map[string]string{}
 					for _, attr := range result.Request.ResourceSpans[0].Resource.Attributes {
 						switch attr.Key {
 						case "bk.data.token":
@@ -154,10 +156,14 @@ func TestOTelCredentialProtocols(t *testing.T) {
 							sdkName = attr.Value.GetStringValue()
 						case "telemetry.sdk.version":
 							sdkVersion = attr.Value.GetStringValue()
+						case "k8s.namespace.name", "k8s.pod.name", "k8s.pod.uid", "k8s.container.name":
+							k8s[attr.Key] = attr.Value.GetStringValue()
 						}
 					}
 					require.Equal(t, "trace-token-secret", token, "existing legitimate telemetry authentication must remain")
-					require.Equal(t, "k8s_9bc96f1a-c77d-4a31-86dd-a1f5db176365", instanceID)
+					require.Equal(t, "kingeye.unify-query-0.unify-query", instanceID, "the deployment-given instance id is exported as given")
+					require.Equal(t, map[string]string{"k8s.namespace.name": "kingeye", "k8s.pod.name": "unify-query-0",
+						"k8s.pod.uid": "9bc96f1a-c77d-4a31-86dd-a1f5db176365", "k8s.container.name": "unify-query"}, k8s)
 					require.Equal(t, "go", sdkLanguage)
 					require.Equal(t, "opentelemetry", sdkName)
 					require.NotEmpty(t, sdkVersion)

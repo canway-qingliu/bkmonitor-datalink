@@ -22,15 +22,7 @@ func TestInstanceIdentityValue(t *testing.T) {
 		want   string
 	}{
 		{
-			name: "kubernetes pod uid wins over docker and ip",
-			source: instanceIdentity{
-				podUID: "9bc96f1a-c77d-4a31-86dd-a1f5db176365", containerID: "abcdef123456",
-				hostname: "abcdef123456", ip: "10.0.28.136", inKubernetes: true, inDocker: true,
-			},
-			want: "k8s_9bc96f1a-c77d-4a31-86dd-a1f5db176365",
-		},
-		{
-			name: "old kubernetes chart keeps ip during rollout",
+			name: "kubernetes without a deployment-given id uses ip",
 			source: instanceIdentity{
 				hostname: "abcdef123456", ip: "10.0.28.136", inKubernetes: true, inDocker: true,
 			},
@@ -80,7 +72,7 @@ func TestDockerCustomHostnameRequiresContainerID(t *testing.T) {
 }
 
 func TestNewResourceUsesDockerContainerIDOverride(t *testing.T) {
-	t.Setenv("UQ_POD_UID", "")
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "")
 	t.Setenv("KUBERNETES_SERVICE_HOST", "")
 	t.Setenv("UQ_CONTAINER_ID", "abcdef1234567890")
 
@@ -91,4 +83,37 @@ func TestNewResourceUsesDockerContainerIDOverride(t *testing.T) {
 		}
 	}
 	require.Equal(t, "docker_abcdef1234567890", instanceID)
+}
+
+func resourceInstanceID(t *testing.T) (string, bool) {
+	t.Helper()
+	for _, item := range new(Service).newResource().Attributes() {
+		if item.Key == serviceInstanceIDKey {
+			return item.Value.AsString(), true
+		}
+	}
+	return "", false
+}
+
+// The deployment's service.instance.id decides: the code resource leaves the
+// key out so that the environment resource WithResource merges under it
+// keeps it.
+func TestNewResourceLeavesTheDeploymentGivenInstanceID(t *testing.T) {
+	t.Setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "service.instance.id=kingeye.unify-query-0.unify-query,k8s.pod.name=unify-query-0")
+	_, carried := resourceInstanceID(t)
+	require.False(t, carried, "a deployment-given service.instance.id must not be overridden by the code resource")
+}
+
+// Without one, or with an empty one, the code still names the instance.
+func TestNewResourceFallsBackWithoutADeploymentGivenInstanceID(t *testing.T) {
+	for _, env := range []string{"k8s.pod.name=unify-query-0", "service.instance.id=,k8s.pod.name=unify-query-0"} {
+		t.Run(env, func(t *testing.T) {
+			t.Setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
+			t.Setenv("OTEL_RESOURCE_ATTRIBUTES", env)
+			instanceID, carried := resourceInstanceID(t)
+			require.True(t, carried)
+			require.Contains(t, instanceID, ServiceName+"@")
+		})
+	}
 }

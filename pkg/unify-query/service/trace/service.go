@@ -40,15 +40,13 @@ type Service struct {
 	cancelFunc context.CancelFunc
 }
 
+// instanceIdentity 是部署没有给出 service.instance.id 时的兜底来源。
 type instanceIdentity struct {
-	podUID, containerID, hostname, ip string
-	inKubernetes, inDocker            bool
+	containerID, hostname, ip string
+	inKubernetes, inDocker    bool
 }
 
 func (identity instanceIdentity) value(serviceName string) string {
-	if podUID := strings.TrimSpace(identity.podUID); podUID != "" {
-		return "k8s_" + podUID
-	}
 	containerID := strings.TrimSpace(identity.containerID)
 	if !identity.inKubernetes && (identity.inDocker || isDockerContainerID(containerID)) {
 		if isDockerContainerID(containerID) {
@@ -67,6 +65,8 @@ func (identity instanceIdentity) value(serviceName string) string {
 	}
 	return ""
 }
+
+const serviceInstanceIDKey = attribute.Key("service.instance.id")
 
 func isDockerContainerID(value string) bool {
 	if len(value) < 12 || len(value) > 64 {
@@ -123,21 +123,25 @@ func (s *Service) newResource() *resource.Resource {
 		semconv.ServiceNameKey.String(ServiceName),
 		attribute.Key("bk.data.token").String(otlpToken),
 	}
-	hostname, ip := metadata.GetLocalHost()
-	_, dockerErr := os.Stat("/.dockerenv")
-	identity := instanceIdentity{
-		// UQ_POD_UID 由 Kubernetes Downward API 注入；自定义 Docker hostname 时需显式提供 UQ_CONTAINER_ID。
-		podUID:       os.Getenv("UQ_POD_UID"),
-		containerID:  os.Getenv("UQ_CONTAINER_ID"),
-		hostname:     hostname,
-		ip:           ip,
-		inKubernetes: os.Getenv("KUBERNETES_SERVICE_HOST") != "",
-		inDocker:     dockerErr == nil,
-	}
-	if instanceID := identity.value(ServiceName); instanceID != "" {
-		attributes = append(attributes, attribute.String("service.instance.id", instanceID))
-	} else if identity.inDocker && !identity.inKubernetes {
-		log.Errorf(context.TODO(), "Docker container ID unavailable; set UQ_CONTAINER_ID when hostname is customized")
+	// 部署经 OTEL_RESOURCE_ATTRIBUTES 给出 service.instance.id 时以它为准（K8s 按
+	// <namespace>.<Pod 名>.<容器名>，与 k8s.* 资源属性一起由 chart 注入）；WithResource
+	// 合并环境资源时代码属性优先，所以代码只在部署没给（或给了空值）时兜底。
+	if given, ok := resource.Environment().Set().Value(serviceInstanceIDKey); !ok || given.AsString() == "" {
+		hostname, ip := metadata.GetLocalHost()
+		_, dockerErr := os.Stat("/.dockerenv")
+		identity := instanceIdentity{
+			// 自定义 Docker hostname 时需显式提供 UQ_CONTAINER_ID。
+			containerID:  os.Getenv("UQ_CONTAINER_ID"),
+			hostname:     hostname,
+			ip:           ip,
+			inKubernetes: os.Getenv("KUBERNETES_SERVICE_HOST") != "",
+			inDocker:     dockerErr == nil,
+		}
+		if instanceID := identity.value(ServiceName); instanceID != "" {
+			attributes = append(attributes, attribute.String(string(serviceInstanceIDKey), instanceID))
+		} else if identity.inDocker && !identity.inKubernetes {
+			log.Errorf(context.TODO(), "Docker container ID unavailable; set UQ_CONTAINER_ID when hostname is customized")
+		}
 	}
 	// WithResource 不保留 SDK 默认 Resource；显式纳入 SDK 身份及现有服务属性。
 	res, err := resource.New(
