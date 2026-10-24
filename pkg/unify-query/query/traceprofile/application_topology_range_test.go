@@ -11,6 +11,8 @@ package traceprofile
 
 import (
 	"context"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -22,7 +24,16 @@ type applicationTopologyReader struct {
 	badBiz          bool
 	badWatermark    bool
 	mixedResolution bool
+	// pairs, when set, is how many distinct pairs the edge table holds; the
+	// reader returns no more of them than the statement's LIMIT asks for.
+	pairs int
 }
+
+var statementLimit = regexp.MustCompile(`LIMIT (\d+)$`)
+
+// storedApplicationPairs are the distinct directed pairs between the two
+// applications of applicationTopologyInput.
+var storedApplicationPairs = [][4]int64{{11, 2, 12, 3}, {12, 3, 11, 2}}
 
 func (reader *applicationTopologyReader) Query(_ context.Context, statement string, args ...any) (dorisclient.Result, error) {
 	reader.queries++
@@ -51,6 +62,27 @@ func (reader *applicationTopologyReader) Query(_ context.Context, statement stri
 	maximum := "stable"
 	if reader.mixedResolution {
 		maximum = "unique_service_name"
+	}
+	if reader.pairs > 0 {
+		match := statementLimit.FindStringSubmatch(statement)
+		if match == nil {
+			return dorisclient.Result{}, nil
+		}
+		limit, _ := strconv.Atoi(match[1])
+		rows := []map[string]any{}
+		for _, pair := range storedApplicationPairs[:reader.pairs] {
+			if len(rows) == limit {
+				break
+			}
+			rows = append(rows, map[string]any{
+				"source_namespace_id": pair[0], "source_bk_biz_id": pair[1],
+				"target_namespace_id": pair[2], "target_bk_biz_id": pair[3],
+				"min_resolution": "stable", "max_resolution": "stable",
+				"observed_minutes": int64(1), "as_of_ms": int64(1760573700000),
+				"unobserved_count": int64(0), "beyond_watermark": int64(0),
+			})
+		}
+		return dorisclient.Result{Rows: rows}, nil
 	}
 	return dorisclient.Result{Rows: []map[string]any{{
 		"source_namespace_id": int64(11), "source_bk_biz_id": int64(2),
@@ -134,6 +166,42 @@ func TestApplicationTopologyV2ReadsEdgeOnlyPublication(t *testing.T) {
 	request.ContractVersion = "application_topology_range_v1"
 	if _, err := executor.QueryApplicationTopologyRange(context.Background(), request); err == nil || reader.queries != 1 {
 		t.Fatalf("V1 must fail closed without coverage: %v, queries=%d", err, reader.queries)
+	}
+}
+
+// max_pairs is the most pairs a window may hold: a window with exactly that
+// many is answered, one with more is refused.
+func TestApplicationTopologyPairBudgetAdmitsExactlyMaxPairs(t *testing.T) {
+	for _, version := range []string{"application_topology_range_v1", "application_topology_range_v2"} {
+		for _, test := range []struct {
+			name           string
+			stored         int
+			maxPairs       int64
+			wantEdges      int
+			wantOverBudget bool
+		}{
+			{name: "exactly max pairs is answered", stored: 2, maxPairs: 2, wantEdges: 2},
+			{name: "fewer than max pairs is answered", stored: 1, maxPairs: 2, wantEdges: 1},
+			{name: "one pair at a budget of one is answered", stored: 1, maxPairs: 1, wantEdges: 1},
+			{name: "more than max pairs is refused", stored: 2, maxPairs: 1, wantOverBudget: true},
+		} {
+			t.Run(version+"/"+test.name, func(t *testing.T) {
+				request := applicationTopologyInput()
+				request.ContractVersion = version
+				request.MaxPairs = test.maxPairs
+				result, err := applicationTopologyExecutor(t, &applicationTopologyReader{pairs: test.stored}).
+					QueryApplicationTopologyRange(context.Background(), request)
+				if test.wantOverBudget {
+					if err == nil || !strings.Contains(err.Error(), "应用对超过行预算") {
+						t.Fatalf("%d pairs at max_pairs %d must be refused as over budget, got %+v, %v", test.stored, test.maxPairs, result, err)
+					}
+					return
+				}
+				if err != nil || len(result.Edges) != test.wantEdges {
+					t.Fatalf("%d pairs at max_pairs %d must be answered with %d edges, got %+v, %v", test.stored, test.maxPairs, test.wantEdges, result, err)
+				}
+			})
+		}
 	}
 }
 

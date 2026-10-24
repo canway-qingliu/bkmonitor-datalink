@@ -156,7 +156,7 @@ func (e *Executor) QueryApplicationTopologyRange(ctx context.Context, request Ap
 				"ORDER BY e.source_namespace_id, e.target_namespace_id LIMIT %d",
 			quoteIdentifier(edgeTarget.Database), quoteIdentifier(edgeTarget.Table),
 			quoteIdentifier(coverageTarget.Database), quoteIdentifier(coverageTarget.Table),
-			marks, marks, request.MaxPairs,
+			marks, marks, request.MaxPairs+1,
 		)
 	} else {
 		edgeSQL = fmt.Sprintf(
@@ -170,7 +170,7 @@ func (e *Executor) QueryApplicationTopologyRange(ctx context.Context, request Ap
 				"AND e.source_namespace_id IN (%s) AND e.target_namespace_id IN (%s) "+
 				"GROUP BY e.source_namespace_id, e.source_bk_biz_id, e.target_namespace_id, e.target_bk_biz_id "+
 				"ORDER BY e.source_namespace_id, e.target_namespace_id LIMIT %d",
-			quoteIdentifier(edgeTarget.Database), quoteIdentifier(edgeTarget.Table), marks, marks, request.MaxPairs,
+			quoteIdentifier(edgeTarget.Database), quoteIdentifier(edgeTarget.Table), marks, marks, request.MaxPairs+1,
 		)
 	}
 	edgeArgs := append(append([]any{}, args...), ids...)
@@ -178,7 +178,7 @@ func (e *Executor) QueryApplicationTopologyRange(ctx context.Context, request Ap
 	if err != nil {
 		return ApplicationTopologyRangeResult{}, queryFailure(err)
 	}
-	if int64(len(edgeRows.Rows)) >= request.MaxPairs {
+	if int64(len(edgeRows.Rows)) > request.MaxPairs {
 		return ApplicationTopologyRangeResult{}, reject(CodeUnboundedRange, "应用拓扑 应用对超过行预算")
 	}
 	edges := make([]ApplicationTopologyEdge, 0, len(edgeRows.Rows))
