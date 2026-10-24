@@ -139,7 +139,16 @@ func (s *Service) newResource() *resource.Resource {
 	} else if identity.inDocker && !identity.inKubernetes {
 		log.Errorf(context.TODO(), "Docker container ID unavailable; set UQ_CONTAINER_ID when hostname is customized")
 	}
-	return resource.NewWithAttributes(semconv.SchemaURL, attributes...)
+	// WithResource 不保留 SDK 默认 Resource；显式纳入 SDK 身份及现有服务属性。
+	res, err := resource.New(
+		context.Background(),
+		resource.WithTelemetrySDK(),
+		resource.WithAttributes(attributes...),
+	)
+	if err != nil {
+		otel.Handle(err)
+	}
+	return res
 }
 
 // Start

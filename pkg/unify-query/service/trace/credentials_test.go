@@ -141,17 +141,26 @@ func TestOTelCredentialProtocols(t *testing.T) {
 						want = "kms-header-secret"
 					}
 					require.Equal(t, want, result.Header)
-					var token, instanceID string
+					var token, instanceID, sdkLanguage, sdkName, sdkVersion string
 					for _, attr := range result.Request.ResourceSpans[0].Resource.Attributes {
 						switch attr.Key {
 						case "bk.data.token":
 							token = attr.Value.GetStringValue()
 						case "service.instance.id":
 							instanceID = attr.Value.GetStringValue()
+						case "telemetry.sdk.language":
+							sdkLanguage = attr.Value.GetStringValue()
+						case "telemetry.sdk.name":
+							sdkName = attr.Value.GetStringValue()
+						case "telemetry.sdk.version":
+							sdkVersion = attr.Value.GetStringValue()
 						}
 					}
 					require.Equal(t, "trace-token-secret", token, "existing legitimate telemetry authentication must remain")
 					require.Equal(t, "k8s_9bc96f1a-c77d-4a31-86dd-a1f5db176365", instanceID)
+					require.Equal(t, "go", sdkLanguage)
+					require.Equal(t, "opentelemetry", sdkName)
+					require.NotEmpty(t, sdkVersion)
 				case <-ctx.Done():
 					t.Fatal("exporter did not send the authenticated request")
 				}
