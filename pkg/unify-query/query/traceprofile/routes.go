@@ -10,6 +10,7 @@
 package traceprofile
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"regexp"
 
@@ -29,6 +30,7 @@ type DorisTarget struct {
 type ReadRoute struct {
 	BkTenantID          string
 	BkBizID             int64
+	AppID               int64 // 0 保留旧业务路由；正数只用于新 Span 应用目标。
 	Profile             metadata.TraceProfile
 	ObservationDomainID string
 	// PublishedVersion 是 Kingeye 单租户文档版本；快照 Version 是所有租户的合成版本。
@@ -97,6 +99,15 @@ func routeKey(tenantID string, bizID int64, profile metadata.TraceProfile) strin
 	return fmt.Sprintf("%s\x00%d\x00%s", tenantID, bizID, profile)
 }
 
+func appRouteKey(tenantID string, bizID, appID int64, profile metadata.TraceProfile) string {
+	return fmt.Sprintf("%s\x00%d\x00%d\x00%s", tenantID, bizID, appID, profile)
+}
+
+func tenantSpanDatabase(tenantID string) string {
+	digest := sha256.Sum256([]byte(tenantID))
+	return fmt.Sprintf("tenant_%x_kapm", digest[:8])
+}
+
 func esSummaryRouteKey(tenantID string, bizID, appID int64) string {
 	return fmt.Sprintf("%s\x00%d\x00%d", tenantID, bizID, appID)
 }
@@ -109,6 +120,18 @@ func businessPhysicalTable(profile metadata.TraceProfile, bizID int64) (string, 
 		return "", fmt.Errorf("Trace profile 或业务 ID 不受支持")
 	}
 	return fmt.Sprintf("%s_%d", base, bizID), nil
+}
+
+func matchesPublishedPhysicalTable(profile metadata.TraceProfile, target DorisTarget, scope Scope, request Request) bool {
+	expected, err := physicalTableForSchema(profile, scope.BkBizID, target.SchemaVersion)
+	if err == nil && target.Table == expected && target.Database == scope.ObservationDomainID {
+		return true
+	}
+	appID := exactSpanRouteAppID(request)
+	return profile == metadata.TraceProfileSpan && appID > 0 &&
+		target.Database == tenantSpanDatabase(scope.BkTenantID) &&
+		target.Database == scope.ObservationDomainID &&
+		(target.Table == "otel_trace_span" || target.Table == fmt.Sprintf("otel_trace_span_app_%d", appID))
 }
 
 // ParseProfile 把配置或线路上的 profile 文本解析成闭合枚举。
@@ -165,6 +188,9 @@ func NewRouteSnapshotWithAllTargets(version int64, routes []ReadRoute, esTargets
 			return nil, fmt.Errorf("Trace 读路由第 %d 条非法: %w", index, err)
 		}
 		key := routeKey(route.BkTenantID, route.BkBizID, route.Profile)
+		if route.AppID > 0 {
+			key = appRouteKey(route.BkTenantID, route.BkBizID, route.AppID, route.Profile)
+		}
 		if _, duplicated := snapshot.routes[key]; duplicated {
 			return nil, fmt.Errorf("Trace 读路由重复: 租户 %s / 业务 %d / profile %s", route.BkTenantID, route.BkBizID, route.Profile)
 		}
@@ -252,19 +278,34 @@ func validateReadRoute(route ReadRoute) error {
 	if route.PublishedVersion < 0 {
 		return fmt.Errorf("Trace 单租户发布版本非法")
 	}
-	if route.BkTenantID == "" || !physicalIdentifierPattern.MatchString(route.BkTenantID) {
+	if !ValidTenantID(route.BkTenantID) || route.AppID < 0 {
 		return fmt.Errorf("租户标识非法")
 	}
 	if route.Doris == nil {
 		return fmt.Errorf("缺少 Doris 物理目标")
 	}
-	table, err := physicalTableForSchema(route.Profile, route.BkBizID, route.Doris.SchemaVersion)
-	if err != nil {
-		return err
-	}
-	// 观测域与物理库名同源（裁定 A）：<bk_tenant_id>_kapm，两处漂移即拒绝。
-	if route.ObservationDomainID != route.BkTenantID+"_kapm" {
-		return fmt.Errorf("观测域与租户不匹配")
+	var table string
+	if route.AppID > 0 {
+		if route.Profile != metadata.TraceProfileSpan || route.BkBizID <= 0 {
+			return fmt.Errorf("应用级读路由仅支持 Span")
+		}
+		sharedTable, exclusiveTable := "otel_trace_span", fmt.Sprintf("otel_trace_span_app_%d", route.AppID)
+		if route.Doris.Table != sharedTable && route.Doris.Table != exclusiveTable {
+			return fmt.Errorf("应用 Span 物理表名非法")
+		}
+		table = route.Doris.Table
+		if route.ObservationDomainID != tenantSpanDatabase(route.BkTenantID) {
+			return fmt.Errorf("应用 Span 观测域与租户不匹配")
+		}
+	} else {
+		var err error
+		table, err = physicalTableForSchema(route.Profile, route.BkBizID, route.Doris.SchemaVersion)
+		if err != nil {
+			return err
+		}
+		if route.ObservationDomainID != route.BkTenantID+"_kapm" || !physicalIdentifierPattern.MatchString(route.ObservationDomainID) {
+			return fmt.Errorf("观测域与租户不匹配")
+		}
 	}
 	if route.Doris.Database != route.ObservationDomainID {
 		return fmt.Errorf("物理库与观测域不匹配")
@@ -305,6 +346,29 @@ func (s *RouteSnapshot) Resolve(
 		)
 	}
 	return route, nil
+}
+
+// ResolveForApplication 优先取受信应用 Span 目标；旧业务路由只在旧观测域下回退。
+func (s *RouteSnapshot) ResolveForApplication(
+	tenantID string, bizID, appID int64, profile metadata.TraceProfile, observationDomainID string,
+) (ReadRoute, error) {
+	if s == nil {
+		return ReadRoute{}, reject(CodeRouteNotFound, "Trace 读路由尚未配置")
+	}
+	if profile == metadata.TraceProfileSpan && appID > 0 {
+		if route, found := s.routes[appRouteKey(tenantID, bizID, appID, profile)]; found {
+			if route.ObservationDomainID == observationDomainID {
+				return route, nil
+			}
+			if observationDomainID != tenantID+"_kapm" {
+				return ReadRoute{}, reject(CodeUnauthorizedDomain, "Trace 应用观测域不在可信路由内")
+			}
+		}
+		if observationDomainID == tenantSpanDatabase(tenantID) {
+			return ReadRoute{}, reject(CodeRouteNotFound, "Trace 应用 Span 读目标未发布")
+		}
+	}
+	return s.Resolve(tenantID, bizID, profile, observationDomainID)
 }
 
 // ResolveESSummary 用成对业务/应用身份解析受信新 ES Summary 逻辑 RT。

@@ -34,8 +34,7 @@ func CompileAggregate(
 		len(aggregation.GroupBy) > 5 {
 		return CompiledAggregate{}, reject(CodePredicateConflict, "Trace 聚合参数不符合闭合合同")
 	}
-	expectedTable, err := physicalTableForSchema(profile, scope.BkBizID, target.SchemaVersion)
-	if err != nil || target.Table != expectedTable {
+	if !matchesPublishedPhysicalTable(profile, target, scope, request) {
 		return CompiledAggregate{}, reject(CodeRouteNotFound, "Trace 聚合读目标与 profile 不匹配")
 	}
 	if request.EndUS <= request.StartUS || limits.MaxRangeUS > 0 && !WindowFits(request.StartUS, request.EndUS, limits.MaxRangeUS) {

@@ -57,6 +57,7 @@ const (
 type traceProfileRouteConfig struct {
 	BkTenantID          string `json:"bk_tenant_id"`
 	BkBizID             int64  `json:"bk_biz_id"`
+	AppID               int64  `json:"app_id,omitempty"`
 	Profile             string `json:"profile"`
 	ObservationDomainID string `json:"observation_domain_id"`
 	Database            string `json:"database,omitempty"`
@@ -341,13 +342,22 @@ func newTraceProfileRuntimeFor(raw any, publishedTenants map[string]struct{}) (*
 			closeConnections()
 			return nil, err
 		}
-		// 物理库/表由冻结命名派生，配置只能提供集群与 schema 版本。
-		target, err := traceprofile.NewDorisTarget(
-			route.ClusterID, route.ObservationDomainID, route.BkBizID, profile, route.SchemaVersion,
-		)
-		if err != nil {
-			closeConnections()
-			return nil, err
+		var target traceprofile.DorisTarget
+		if route.AppID > 0 {
+			// 应用 Span 的物理名只来自已校验发布物，快照构造还会逐项验证应用 ID 与表名。
+			target = traceprofile.DorisTarget{
+				ClusterID: route.ClusterID, Database: route.Database,
+				Table: route.Table, SchemaVersion: route.SchemaVersion,
+			}
+		} else {
+			var err error
+			target, err = traceprofile.NewDorisTarget(
+				route.ClusterID, route.ObservationDomainID, route.BkBizID, profile, route.SchemaVersion,
+			)
+			if err != nil {
+				closeConnections()
+				return nil, err
+			}
 		}
 		if route.Database != "" && route.Database != target.Database || route.Table != "" && route.Table != target.Table {
 			closeConnections()
@@ -361,6 +371,7 @@ func newTraceProfileRuntimeFor(raw any, publishedTenants map[string]struct{}) (*
 		routes = append(routes, traceprofile.ReadRoute{
 			BkTenantID:          route.BkTenantID,
 			BkBizID:             route.BkBizID,
+			AppID:               route.AppID,
 			Profile:             profile,
 			ObservationDomainID: route.ObservationDomainID,
 			PublishedVersion:    route.PublishedVersion,

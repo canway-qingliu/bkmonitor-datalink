@@ -104,6 +104,54 @@ func testExecutor(t *testing.T, querier Querier, profiles ...metadata.TraceProfi
 	return executor
 }
 
+func TestExecutorSelectsExactApplicationSpanRouteFromConjunctiveAppFilter(t *testing.T) {
+	const database = "tenant_bbc5e661e106c6dc_kapm"
+	route := ReadRoute{
+		BkTenantID: "system", BkBizID: 132, AppID: 7, Profile: metadata.TraceProfileSpan,
+		ObservationDomainID: database,
+		Doris:               &DorisTarget{ClusterID: "18", Database: database, Table: "otel_trace_span", SchemaVersion: "sha256:e6e9af09d86b396e"},
+	}
+	snapshot, err := NewRouteSnapshot(7, []ReadRoute{route})
+	if err != nil {
+		t.Fatal(err)
+	}
+	querier := &fakeQuerier{}
+	executor, err := NewExecutor(snapshot, map[string]Querier{"18": querier}, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := Scope{BkTenantID: "system", BkBizID: 132, SpaceUID: "bkcc__132", ObservationDomainID: database}
+	request := Request{
+		Profile: metadata.TraceProfileSpan, StartUS: 1721024820000000, EndUS: 1721024880000000, Limit: 1,
+		Filters: Filters{FieldList: []FilterField{{FieldName: "app_id", Value: []string{"7"}, Operator: "eq"}}},
+	}
+	if _, err := executor.Execute(context.Background(), request, scope); err != nil {
+		t.Fatal(err)
+	}
+	if len(querier.statements) == 0 || !strings.Contains(querier.statements[0], "`"+database+"`.`otel_trace_span`") {
+		t.Fatalf("application Span query used another table: %v", querier.statements)
+	}
+	querier.statements = nil
+	request.Filters = Filters{
+		FieldList: []FilterField{
+			{FieldName: "data_id", Value: []string{"901"}, Operator: "eq"},
+			{FieldName: "app_id", Value: []string{"7"}, Operator: "eq"},
+		},
+		ConditionList: []string{"and"},
+	}
+	if _, err := executor.Execute(context.Background(), request, scope); err != nil {
+		t.Fatalf("conjunctive app_id after another filter was rejected: %v", err)
+	}
+	querier.statements = nil
+	request.Filters = Filters{}
+	if _, err := executor.Execute(context.Background(), request, scope); ErrorCode(err) != CodeRouteNotFound {
+		t.Fatalf("missing app_id reached shared table: %v", err)
+	}
+	if len(querier.statements) != 0 {
+		t.Fatal("unscoped Span query reached Doris")
+	}
+}
+
 func validTraceRow(profile metadata.TraceProfile) map[string]any {
 	row := make(map[string]any, len(projectionForProfile(profile)))
 	for _, field := range projectionForProfile(profile) {

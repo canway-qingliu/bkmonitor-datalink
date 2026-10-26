@@ -71,12 +71,41 @@ func (e *Executor) ResolveESSummaryTarget(tenantID string, bizID, appID int64, o
 	return e.snapshot.ResolveESSummary(tenantID, bizID, appID, observationDomainID)
 }
 
+// exactSpanRouteAppID 只从闭合的单应用 AND 条件选路；其他请求保留旧业务路由。
+func exactSpanRouteAppID(request Request) int64 {
+	if request.Profile != metadata.TraceProfileSpan || request.MemberLookup != nil || len(request.Filters.FieldList) == 0 {
+		return 0
+	}
+	for _, connector := range request.Filters.ConditionList {
+		if connector != "and" {
+			return 0
+		}
+	}
+	var appID int64
+	for _, filter := range request.Filters.FieldList {
+		if filter.FieldName != "app_id" {
+			continue
+		}
+		if appID != 0 || filter.Operator != "eq" || len(filter.Value) != 1 {
+			return 0
+		}
+		parsed, err := strconv.ParseInt(filter.Value[0], 10, 64)
+		if err != nil || parsed <= 0 {
+			return 0
+		}
+		appID = parsed
+	}
+	return appID
+}
+
 // Execute 执行一次列表查询。
 func (e *Executor) Execute(ctx context.Context, request Request, scope Scope) (Page, error) {
 	if request.MemberLookup != nil && request.MemberLookup.Backend == MemberBackendElasticsearch {
 		return Page{}, reject(CodeUnsupportedSchemaCapability, "ES Summary 成员查询不得进入 Doris 执行器")
 	}
-	route, err := e.snapshot.Resolve(scope.BkTenantID, scope.BkBizID, request.Profile, scope.ObservationDomainID)
+	route, err := e.snapshot.ResolveForApplication(
+		scope.BkTenantID, scope.BkBizID, exactSpanRouteAppID(request), request.Profile, scope.ObservationDomainID,
+	)
 	if err != nil {
 		return Page{}, err
 	}

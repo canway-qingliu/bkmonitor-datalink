@@ -53,3 +53,51 @@ func TestRouteSnapshotKeepsBusinessesOnSeparateTables(t *testing.T) {
 		}
 	}
 }
+
+func TestRouteSnapshotSelectsPublishedSpanTableByApplication(t *testing.T) {
+	legacy := ReadRoute{
+		BkTenantID: "system", BkBizID: 132, Profile: metadata.TraceProfileSpan,
+		ObservationDomainID: "system_kapm",
+		Doris:               &DorisTarget{ClusterID: "18", Database: "system_kapm", Table: "otel_trace_span_132", SchemaVersion: "sha256:e6e9af09d86b396e"},
+	}
+	shared := ReadRoute{
+		BkTenantID: "system", BkBizID: 132, AppID: 7, Profile: metadata.TraceProfileSpan,
+		ObservationDomainID: "tenant_bbc5e661e106c6dc_kapm",
+		Doris:               &DorisTarget{ClusterID: "18", Database: "tenant_bbc5e661e106c6dc_kapm", Table: "otel_trace_span", SchemaVersion: "sha256:e6e9af09d86b396e"},
+	}
+	exclusive := ReadRoute{
+		BkTenantID: "system", BkBizID: 132, AppID: 8, Profile: metadata.TraceProfileSpan,
+		ObservationDomainID: "tenant_bbc5e661e106c6dc_kapm",
+		Doris:               &DorisTarget{ClusterID: "18", Database: "tenant_bbc5e661e106c6dc_kapm", Table: "otel_trace_span_app_8", SchemaVersion: "sha256:e6e9af09d86b396e"},
+	}
+	snapshot, err := NewRouteSnapshot(7, []ReadRoute{legacy, shared, exclusive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for appID, want := range map[int64]string{7: "otel_trace_span", 8: "otel_trace_span_app_8"} {
+		route, resolveErr := snapshot.ResolveForApplication("system", 132, appID, metadata.TraceProfileSpan, "tenant_bbc5e661e106c6dc_kapm")
+		if resolveErr != nil || route.Doris.Table != want {
+			t.Fatalf("app %d route=%+v err=%v", appID, route, resolveErr)
+		}
+	}
+	old, err := snapshot.ResolveForApplication("system", 132, 7, metadata.TraceProfileSpan, "system_kapm")
+	if err != nil || old.Doris.Table != "otel_trace_span_132" {
+		t.Fatalf("old-window business route was lost: %+v %v", old, err)
+	}
+	if _, err := snapshot.ResolveForApplication("system", 132, 9, metadata.TraceProfileSpan, "tenant_bbc5e661e106c6dc_kapm"); ErrorCode(err) != CodeRouteNotFound {
+		t.Fatalf("unknown app reached another Span table: %v", err)
+	}
+	if _, err := NewRouteSnapshot(7, []ReadRoute{shared, shared}); err == nil {
+		t.Fatal("duplicate app route accepted")
+	}
+}
+
+func TestResolveScopeAcceptsHashedSpanDatabaseForHyphenTenant(t *testing.T) {
+	scope, err := ResolveScope("tenant-a", "bkcc__132", "tenant_80a707af7dc77ee1_kapm")
+	if err != nil || scope.ObservationDomainID != "tenant_80a707af7dc77ee1_kapm" {
+		t.Fatalf("valid tenant Span scope rejected: %+v %v", scope, err)
+	}
+	if _, err := ResolveScope("tenant-a", "bkcc__132", "tenant_bbc5e661e106c6dc_kapm"); ErrorCode(err) != CodeUnauthorizedDomain {
+		t.Fatalf("another tenant's database accepted: %v", err)
+	}
+}

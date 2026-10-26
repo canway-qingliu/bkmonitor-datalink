@@ -106,6 +106,29 @@ func TestPublishedTraceTargetsBuildBusiness132Runtime(t *testing.T) {
 	defer runtime.close()
 }
 
+func TestPublishedApplicationSpanRouteSurvivesRuntimeReload(t *testing.T) {
+	const database = "tenant_bbc5e661e106c6dc_kapm"
+	appRoute := `,{"bk_tenant_id":"system","bk_biz_id":132,"app_id":7,"profile":"trace_span",` +
+		`"observation_domain_id":"` + database + `","database":"` + database + `",` +
+		`"table":"otel_trace_span","cluster_id":18,"cluster_name":"doris4_test",` +
+		`"schema_version":"sha256:e6e9af09d86b396e"}`
+	body := strings.Replace(publishedBusiness132, `],"a3_targets":[]`, appRoute+`],"a3_targets":[]`, 1)
+	prefix := "kingeye/metadata/unify-query/data/trace/read_target/"
+	pairs := api.KVPairs{&api.KVPair{Key: prefix + "system", Value: []byte(body)}}
+	snapshot, err := parsePublishedTraceTargets(prefix, pairs, nil)
+	if err != nil || len(snapshot.Routes) != 3 || snapshot.Routes[2].AppID != 7 {
+		t.Fatalf("application route lost while loading publication: %+v err=%v", snapshot.Routes, err)
+	}
+	config := traceProfileRuntimeConfig()
+	config["route_snapshot_version"] = snapshot.Version
+	config["read_routes"] = snapshot.Routes
+	runtime, err := newTraceProfileRuntime(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.close()
+}
+
 func TestPublishedTraceTargetsKeepVersionsPerTenant(t *testing.T) {
 	prefix := "kingeye/metadata/unify-query/data/trace/read_target/"
 	other := strings.ReplaceAll(publishedBusiness132, "system", "other")

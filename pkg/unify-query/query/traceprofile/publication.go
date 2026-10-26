@@ -78,6 +78,7 @@ type publishedESSummaryTargetWire struct {
 type publishedRouteWire struct {
 	TenantID            string          `json:"bk_tenant_id"`
 	BizID               int64           `json:"bk_biz_id"`
+	AppID               int64           `json:"app_id,omitempty"`
 	Profile             string          `json:"profile"`
 	ObservationDomainID string          `json:"observation_domain_id"`
 	Database            string          `json:"database"`
@@ -90,7 +91,7 @@ type publishedRouteWire struct {
 // ParsePublishedDocument 校验 Consul key、完整业务双 profile 与物理坐标。
 // 客户端请求不能通过此入口指定库、表或集群。
 func ParsePublishedDocument(body []byte, keyTenant string) (PublishedDocument, error) {
-	if keyTenant == "" || !physicalIdentifierPattern.MatchString(keyTenant) {
+	if !ValidTenantID(keyTenant) {
 		return PublishedDocument{}, fmt.Errorf("Trace 发布路径缺少可信租户")
 	}
 	if err := rejectDuplicateKeys(body); err != nil {
@@ -129,21 +130,32 @@ func ParsePublishedDocument(body []byte, keyTenant string) (PublishedDocument, e
 		if len(item.ClusterID) == 0 || json.Unmarshal(item.ClusterID, &clusterID) != nil || clusterID <= 0 {
 			return PublishedDocument{}, fmt.Errorf("Trace 发布路由 %d 的集群 ID 非法", index)
 		}
-		target, err := NewDorisTarget(strconv.FormatInt(clusterID, 10), item.ObservationDomainID, item.BizID, profile, item.SchemaVersion)
-		if err != nil {
-			return PublishedDocument{}, err
-		}
-		if item.Database != target.Database || item.Table != target.Table {
-			return PublishedDocument{}, fmt.Errorf("Trace 发布路由 %d 的物理库表漂移", index)
+		var target DorisTarget
+		if item.AppID > 0 {
+			target = DorisTarget{
+				ClusterID: strconv.FormatInt(clusterID, 10), Database: item.Database,
+				Table: item.Table, SchemaVersion: item.SchemaVersion,
+			}
+		} else {
+			var err error
+			target, err = NewDorisTarget(strconv.FormatInt(clusterID, 10), item.ObservationDomainID, item.BizID, profile, item.SchemaVersion)
+			if err != nil {
+				return PublishedDocument{}, err
+			}
+			if item.Database != target.Database || item.Table != target.Table {
+				return PublishedDocument{}, fmt.Errorf("Trace 发布路由 %d 的物理库表漂移", index)
+			}
 		}
 		routes = append(routes, ReadRoute{
-			BkTenantID: keyTenant, BkBizID: item.BizID, Profile: profile,
+			BkTenantID: keyTenant, BkBizID: item.BizID, AppID: item.AppID, Profile: profile,
 			ObservationDomainID: item.ObservationDomainID, PublishedVersion: wire.Version, Doris: &target,
 		})
-		if item.Profile == "trace_span" {
-			profilesByBiz[item.BizID] |= 1
-		} else {
-			profilesByBiz[item.BizID] |= 2
+		if item.AppID == 0 {
+			if item.Profile == "trace_span" {
+				profilesByBiz[item.BizID] |= 1
+			} else {
+				profilesByBiz[item.BizID] |= 2
+			}
 		}
 	}
 	for bizID, profiles := range profilesByBiz {

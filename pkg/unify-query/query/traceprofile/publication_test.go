@@ -28,6 +28,48 @@ const publishedESSummaryTargets = `[{"bk_tenant_id":"system","bk_biz_id":132,"ap
 	`"app_name":"checkout","observation_domain_id":"system_kapm",` +
 	`"read_result_table_id":"apm_global.trace_summary_v1_7","storage_cluster_id":9,"retention_days":30}]`
 
+func TestPublishedApplicationSpanRoutesCoexistWithLegacyBusinessRoute(t *testing.T) {
+	extra := `,{"bk_tenant_id":"system","bk_biz_id":132,"app_id":7,"profile":"trace_span",` +
+		`"observation_domain_id":"tenant_bbc5e661e106c6dc_kapm","database":"tenant_bbc5e661e106c6dc_kapm",` +
+		`"table":"otel_trace_span","cluster_id":18,"cluster_name":"doris4_test",` +
+		`"schema_version":"sha256:e6e9af09d86b396e"},` +
+		`{"bk_tenant_id":"system","bk_biz_id":132,"app_id":8,"profile":"trace_span",` +
+		`"observation_domain_id":"tenant_bbc5e661e106c6dc_kapm","database":"tenant_bbc5e661e106c6dc_kapm",` +
+		`"table":"otel_trace_span_app_8","cluster_id":18,"cluster_name":"doris4_test",` +
+		`"schema_version":"sha256:e6e9af09d86b396e"}`
+	body := strings.Replace(business132Document, `],"a3_targets":[]`, extra+`],"a3_targets":[]`, 1)
+	document, err := ParsePublishedDocument([]byte(body), "system")
+	if err != nil || len(document.Routes) != 4 {
+		t.Fatalf("mixed routes rejected: %+v %v", document.Routes, err)
+	}
+	snapshot, err := NewRouteSnapshot(7, document.Routes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for appID, table := range map[int64]string{7: "otel_trace_span", 8: "otel_trace_span_app_8"} {
+		route, resolveErr := snapshot.ResolveForApplication("system", 132, appID, metadata.TraceProfileSpan, "tenant_bbc5e661e106c6dc_kapm")
+		if resolveErr != nil || route.Doris.Table != table {
+			t.Fatalf("app %d route=%+v err=%v", appID, route, resolveErr)
+		}
+	}
+	if _, err := ParsePublishedDocument([]byte(strings.Replace(body, `"otel_trace_span_app_8"`, `"otel_trace_span_app_9"`, 1)), "system"); err == nil {
+		t.Fatal("application route accepted another application's table")
+	}
+}
+
+func TestPublishedApplicationSpanRouteAcceptsHyphenTenantWithHashedDatabase(t *testing.T) {
+	const document = `{"route_snapshot_version":7,"bk_tenant_id":"tenant-a","read_routes":[` +
+		`{"bk_tenant_id":"tenant-a","bk_biz_id":132,"app_id":7,"profile":"trace_span",` +
+		`"observation_domain_id":"tenant_80a707af7dc77ee1_kapm",` +
+		`"database":"tenant_80a707af7dc77ee1_kapm","table":"otel_trace_span",` +
+		`"cluster_id":18,"cluster_name":"doris4_test","schema_version":"sha256:e6e9af09d86b396e"}],` +
+		`"a3_targets":[]}`
+	parsed, err := ParsePublishedDocument([]byte(document), "tenant-a")
+	if err != nil || len(parsed.Routes) != 1 || parsed.Routes[0].AppID != 7 {
+		t.Fatalf("valid hyphen tenant route rejected: %+v %v", parsed.Routes, err)
+	}
+}
+
 func TestPublishedTenantSummaryRouteKeepsBusinessScopeInSharedTable(t *testing.T) {
 	body := strings.Replace(business132Document, `"table":"otel_trace_summary_132"`,
 		`"table":"otel_trace_summary"`, 1)

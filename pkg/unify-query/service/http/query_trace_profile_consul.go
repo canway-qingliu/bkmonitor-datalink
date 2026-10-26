@@ -193,7 +193,7 @@ func parsePublishedTraceTargets(prefix string, pairs api.KVPairs, unreadable map
 		snapshot.Documents[tenantID] = invalidTraceDocument{Key: pair.Key, TenantID: tenantID, Version: document.Version}
 		for _, route := range document.Routes {
 			snapshot.Routes = append(snapshot.Routes, traceProfileRouteConfig{
-				BkTenantID: route.BkTenantID, BkBizID: route.BkBizID,
+				BkTenantID: route.BkTenantID, BkBizID: route.BkBizID, AppID: route.AppID,
 				Profile: string(route.Profile), ObservationDomainID: route.ObservationDomainID,
 				Database: route.Doris.Database, Table: route.Doris.Table,
 				ClusterID: route.Doris.ClusterID, SchemaVersion: route.Doris.SchemaVersion,

@@ -33,6 +33,8 @@ Storage、空间及表路由由配置发布端写入 Redis，Redis 连接、认�
 
 `storage.source` 同时选择 Trace profile 发布物来源。`consul` 模式沿用 `trace_profile.read_target_data_path`、`read_target_version_path`；`redis` 模式在配置了 `trace_profile` 时直接从 `redis.kv_base_path` 派生 `<kv_base_path>:data:trace:read_target:<bk_tenant_id>`，无需单独的 `read_target_enabled` 开关。每个租户一个无 TTL 的 String key，值为原单租户 JSON 文档。写方更新租户 key 后向 `<kv_base_path>:data:trace:read_target:read_target_channel` 发布通知。UQ 启动订阅后扫描全部租户 key，收到通知及每分钟定期重读，沿用原文档的租户、物理目标和版本校验，不回退 Consul。读取或传输失败（含监听出错或关闭、加载期间发布变化）保留上一份可用快照；某个租户的文档非法或其路由指向本地没有只读连接的集群时只撤销该租户；读取成功但没有任何读目标时直读关闭并报告"未发布"。只读存储连接凭据仍仅在 UQ 本地配置中。
 
+Trace `read_routes` 中不带 `app_id` 的旧业务 Span/Summary 路由保持原样；带正整数 `app_id` 的新路由只用于 Span，按 `(租户, 业务, app_id)` 从已发布目标选 `tenant_<租户 ID SHA-256 前 16 位>_kapm.otel_trace_span` 或 `otel_trace_span_app_<app_id>`。查询必须含单个精确 `app_id` 和 AND 条件，缺路由时拒绝，不回查旧业务表。Kingeye 应在发布含 `app_id` 的租户文档前先升级 UQ；旧 UQ 的闭合 JSON 解析会拒绝新字段并撤销该租户读目标。
+
 ### 设置 Feature Flag
 
 Feature Flag 与 Storage 来源独立：优先读取 Redis，只有 Key 不存在时读取 Consul，校验成功后自动回填 Redis，无需手工迁移。回填采用 `SET NX`，不设 TTL，已有或并发写入的 Redis 配置优先；回填失败会继续使用本次有效的 Consul 快照，并在后续调和时重试。回填后以 Redis 为准，后续 Consul 修改不再同步。Redis 读取失败或已有快照非法时保留最后有效配置，不重新读取 Consul。变更通过 Redis Pub/Sub 通知，通知丢失时由每分钟全量调和恢复。

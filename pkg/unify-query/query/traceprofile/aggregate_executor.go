@@ -27,7 +27,9 @@ func (e *Executor) ExecuteAggregate(ctx context.Context, request Request, scope 
 	if e == nil || e.snapshot == nil || request.Aggregation == nil {
 		return nil, reject(CodeRouteNotFound, "Trace 聚合读路由或请求未就绪")
 	}
-	route, err := e.snapshot.Resolve(scope.BkTenantID, scope.BkBizID, request.Profile, scope.ObservationDomainID)
+	route, err := e.snapshot.ResolveForApplication(
+		scope.BkTenantID, scope.BkBizID, exactSpanRouteAppID(request), request.Profile, scope.ObservationDomainID,
+	)
 	if err != nil {
 		return nil, err
 	}

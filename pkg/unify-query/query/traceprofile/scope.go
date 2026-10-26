@@ -27,15 +27,16 @@ type Scope struct {
 }
 
 var spaceUIDPattern = regexp.MustCompile(`^bkcc__([0-9]{1,18})$`)
+var tenantIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 // ValidTenantID 报告 id 是否是 ResolveScope 接受的租户标识。
 func ValidTenantID(id string) bool {
-	return id != "" && physicalIdentifierPattern.MatchString(id)
+	return tenantIDPattern.MatchString(id)
 }
 
 // ResolveScope 是 fail closed 的唯一入口：作用域缺失或与冻结命名漂移即拒绝。
 func ResolveScope(tenantID, spaceUID, observationDomainID string) (Scope, error) {
-	if tenantID == "" || !physicalIdentifierPattern.MatchString(tenantID) {
+	if !ValidTenantID(tenantID) {
 		return Scope{}, reject(CodeUnauthorizedMember, "Trace 请求缺少可信租户")
 	}
 	if !physicalIdentifierPattern.MatchString(spaceUID) {
@@ -49,8 +50,10 @@ func ResolveScope(tenantID, spaceUID, observationDomainID string) (Scope, error)
 	if err != nil || bizID < 0 {
 		return Scope{}, reject(CodeUnauthorizedMember, "Trace 请求空间标识非法: %s", spaceUID)
 	}
-	// 观测域 = 共享物理库名 <bk_tenant_id>_kapm（裁定 A），与行合同同源。
-	if observationDomainID != tenantID+"_kapm" {
+	// 旧业务库与新租户 Span 库都必须由当前租户确定性派生。
+	legacyDomain := tenantID + "_kapm"
+	if observationDomainID != tenantSpanDatabase(tenantID) &&
+		(observationDomainID != legacyDomain || !physicalIdentifierPattern.MatchString(legacyDomain)) {
 		return Scope{}, reject(CodeUnauthorizedDomain, "Trace 观测域与租户不匹配: %s", observationDomainID)
 	}
 	return Scope{BkTenantID: tenantID, SpaceUID: spaceUID, BkBizID: bizID, ObservationDomainID: observationDomainID}, nil
