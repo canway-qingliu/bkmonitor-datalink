@@ -15,9 +15,11 @@ import (
 	"time"
 
 	"github.com/elastic/beats/libbeat/common"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/appmonitor"
 )
 
 type testMetricsEvent struct {
@@ -38,6 +40,78 @@ func (t testTracesEvent) RecordType() define.RecordType {
 
 type testLogsEvent struct {
 	define.CommonEvent
+}
+
+func TestQueueFlushPreservesApplicationCountsAcrossSharedDataID(t *testing.T) {
+	q := NewBatchQueue(Config{TracesBatchSize: 2, FlushInterval: time.Minute}, func(string) Config { return Config{} })
+	defer q.Close()
+	a := define.Token{Original: "queue-monitor-a", TenantID: "tenant-a", BizId: 2, AppID: 74001, AppName: "a"}
+	b := define.Token{Original: "queue-monitor-b", TenantID: "tenant-a", BizId: 2, AppID: 74002, AppName: "b"}
+	q.Put(
+		&testTracesEvent{CommonEvent: define.NewCommonEvent(a, 9001, common.MapStr{"item": "a"})},
+		&testTracesEvent{CommonEvent: define.NewCommonEvent(b, 9001, common.MapStr{"item": "b"})},
+	)
+	select {
+	case <-q.Pop():
+	case <-time.After(3 * time.Second):
+		t.Fatal("the full batch did not flush")
+	}
+	for _, token := range []define.Token{a, b} {
+		id, ok := appmonitor.IdentityFromToken(token)
+		assert.True(t, ok)
+		assert.Equal(t, float64(1), queueAppCounter(t, id.AppID, id.TokenFingerprint))
+	}
+}
+
+func TestQueueFlushSkipsApplicationMetricForNonAPMRecord(t *testing.T) {
+	q := NewBatchQueue(Config{LogsBatchSize: 1, FlushInterval: time.Minute}, func(string) Config { return Config{} })
+	defer q.Close()
+	token := define.Token{Original: "queue-monitor-log", TenantID: "tenant-a", BizId: 2, AppID: 98902, AppName: "other"}
+	q.Put(&testLogsEvent{CommonEvent: define.NewCommonEvent(token, 9002, common.MapStr{"item": "log"})})
+	select {
+	case <-q.Pop():
+	case <-time.After(3 * time.Second):
+		t.Fatal("the full batch did not flush")
+	}
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.GetName() != "bk_collector_app_exporter_events_total" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			for _, label := range metric.GetLabel() {
+				if label.GetName() == "app_id" && label.GetValue() == "98902" {
+					t.Fatal("log flush must not create an application-level metric series")
+				}
+			}
+		}
+	}
+}
+
+func queueAppCounter(t *testing.T, appID, fingerprint string) float64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.GetName() != "bk_collector_app_exporter_events_total" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			labels := map[string]string{}
+			for _, label := range metric.GetLabel() {
+				labels[label.GetName()] = label.GetValue()
+			}
+			if labels["app_id"] == appID && labels["token_fingerprint"] == fingerprint && labels["stage"] == "flushed" && labels["record_type"] == "traces" {
+				return metric.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
 }
 
 func (t testLogsEvent) RecordType() define.RecordType {

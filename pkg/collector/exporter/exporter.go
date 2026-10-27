@@ -18,6 +18,7 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/exporter/converter"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/exporter/queue"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/appmonitor"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/json"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/wait"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/libgse/beat"
@@ -109,6 +110,10 @@ func (e *Exporter) consumeEvents() {
 			event := events[0]
 			DefaultMetricMonitor.AddHandledEventCounter(len(events), event.RecordType(), event.DataId())
 			e.queue.Put(events...)
+			if appmonitor.Tracks(event.RecordType()) {
+				// Trace and Metric converters publish one Record's Token per event slice.
+				appmonitor.ObserveExporter(event.Token(), event.RecordType(), "enqueued", len(events))
+			}
 
 		case <-e.ctx.Done():
 			return

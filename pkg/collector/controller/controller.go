@@ -21,6 +21,7 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/confengine"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/exporter"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/appmonitor"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/hook"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/wait"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/pingserver"
@@ -447,16 +448,19 @@ loop:
 				derivedRecord, err := c.pipelineMgr.GetProcessor(stage).Process(task.Record())
 				if errors.Is(err, define.ErrSkipEmptyRecord) {
 					DefaultMetricMonitor.IncSkippedCounter(task.PipelineName(), rtype, token.GetDataID(rtype), stage, token.Original)
+					appmonitor.ObservePipeline(token, rtype, "skipped")
 					logger.Warnf("skip empty record '%s' at stage: %v, token: %+v, err: %v", rtype, stage, token, err)
 					goto loop
 				}
 				if errors.Is(err, define.ErrEndOfPipeline) {
+					appmonitor.ObservePipeline(token, rtype, "ended")
 					goto loop
 				}
 
 				if err != nil {
 					logger.Errorf("failed to process task: %v", err)
 					DefaultMetricMonitor.IncDroppedCounter(task.PipelineName(), rtype, token.GetDataID(rtype), stage)
+					appmonitor.ObservePipeline(token, rtype, "dropped")
 					goto loop
 				}
 
@@ -471,6 +475,7 @@ loop:
 
 			t0 := time.Now()
 			exporter.PublishRecord(task.Record())
+			appmonitor.ObservePipeline(token, rtype, "handled")
 
 			// no processors
 			if task.StageCount() == 0 {
@@ -509,15 +514,18 @@ loop:
 				if errors.Is(err, define.ErrSkipEmptyRecord) {
 					logger.Warnf("skip empty record '%s' at stage: %v, token: %+v, err: %v", rtype, stage, token, err)
 					DefaultMetricMonitor.IncSkippedCounter(task.PipelineName(), rtype, token.GetDataID(rtype), stage, token.Original)
+					appmonitor.ObservePipeline(token, rtype, "skipped")
 					goto loop
 				}
 				if errors.Is(err, define.ErrEndOfPipeline) {
+					appmonitor.ObservePipeline(token, rtype, "ended")
 					goto loop
 				}
 
 				if err != nil {
 					logger.Errorf("failed to process task: %v", err)
 					DefaultMetricMonitor.IncDroppedCounter(task.PipelineName(), rtype, token.GetDataID(rtype), stage)
+					appmonitor.ObservePipeline(token, rtype, "dropped")
 					goto loop
 				}
 			}
@@ -526,6 +534,7 @@ loop:
 
 			t0 := time.Now()
 			exporter.PublishRecord(task.Record())
+			appmonitor.ObservePipeline(token, rtype, "handled")
 
 			// no processors
 			if task.StageCount() == 0 {

@@ -20,6 +20,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/appmonitor"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
 )
 
@@ -157,6 +158,10 @@ func (bq *BatchQueue) compact(dc DataIDChan) {
 
 	var total int
 	data := make([]common.MapStr, 0, dynamicBatch)
+	var applicationCounts map[define.Token]int
+	if appmonitor.Tracks(dc.rtype) {
+		applicationCounts = make(map[define.Token]int)
+	}
 
 	sentOut := func() {
 		DefaultMetricMonitor.ObserveQueuePopBatchSizeDistribution(len(data), dc.dataID, dc.rtype)
@@ -176,10 +181,14 @@ func (bq *BatchQueue) compact(dc DataIDChan) {
 				bq.out <- item
 			}
 		}
+		for token, count := range applicationCounts {
+			appmonitor.ObserveExporter(token, dc.rtype, "flushed", count)
+		}
 
 		// 状态置零
 		total = 0
 		data = make([]common.MapStr, 0, dynamicBatch)
+		clear(applicationCounts)
 	}
 
 	for {
@@ -187,6 +196,9 @@ func (bq *BatchQueue) compact(dc DataIDChan) {
 		case events := <-dc.ch:
 			for _, event := range events {
 				data = append(data, event.Data())
+				if applicationCounts != nil {
+					applicationCounts[event.Token()]++
+				}
 
 				total++
 				if total >= dynamicBatch {

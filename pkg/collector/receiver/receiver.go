@@ -25,11 +25,14 @@ import (
 	"github.com/elastic/beats/libbeat/outputs/transport"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/grpc"
 	_ "google.golang.org/grpc/encoding/gzip"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/confengine"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/appmonitor"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/grpcmiddleware"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/httpmiddleware"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/throttle"
@@ -76,6 +79,13 @@ func (p Publisher) Publish(r *define.Record) {
 		}
 		if r.TraceRequestID == "" {
 			r.TraceRequestID = uuid.NewString()
+		}
+		if traces, ok := r.Data.(ptrace.Traces); ok {
+			appmonitor.ObserveReceiver(r.Token, r.RecordType, traces.SpanCount())
+		}
+	} else if r.RecordType == define.RecordMetrics {
+		if metrics, ok := r.Data.(pmetric.Metrics); ok {
+			appmonitor.ObserveReceiver(r.Token, r.RecordType, metrics.DataPointCount())
 		}
 	}
 	if p.Func != nil {

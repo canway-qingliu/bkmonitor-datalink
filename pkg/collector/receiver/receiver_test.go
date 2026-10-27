@@ -16,10 +16,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/confengine"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/appmonitor"
 )
 
 func TestReceiver(t *testing.T) {
@@ -126,6 +130,47 @@ func TestPublisherStampsTraceAcceptanceOnce(t *testing.T) {
 	pub.Publish(metric)
 	assert.Zero(t, metric.TraceAcceptedAtMs)
 	assert.Empty(t, metric.TraceRequestID)
+}
+
+func TestPublisherCountsAuthenticatedApplicationItems(t *testing.T) {
+	token := define.Token{Original: "receiver-app-monitor-test", TenantID: "tenant-a", BizId: 2, AppID: 73, AppName: "orders"}
+	id, ok := appmonitor.IdentityFromToken(token)
+	assert.True(t, ok)
+	traces := ptrace.NewTraces()
+	spans := traces.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans()
+	spans.AppendEmpty()
+	spans.AppendEmpty()
+	metrics := pmetric.NewMetrics()
+	metrics.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().SetEmptyGauge().DataPoints().AppendEmpty()
+	pub := Publisher{Func: func(*define.Record) {}}
+	pub.Publish(&define.Record{RecordType: define.RecordTraces, Token: token, Data: traces})
+	pub.Publish(&define.Record{RecordType: define.RecordMetrics, Token: token, Data: metrics})
+
+	assert.Equal(t, float64(2), gatheredCounter(t, "bk_collector_app_receiver_items_total", id.AppID, "traces"))
+	assert.Equal(t, float64(1), gatheredCounter(t, "bk_collector_app_receiver_items_total", id.AppID, "metrics"))
+}
+
+func gatheredCounter(t *testing.T, name, appID, rtype string) float64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			labels := map[string]string{}
+			for _, label := range metric.GetLabel() {
+				labels[label.GetName()] = label.GetValue()
+			}
+			if labels["app_id"] == appID && labels["record_type"] == rtype {
+				return metric.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
 }
 
 func TestRegisterDuplicateRoutes(t *testing.T) {
