@@ -223,22 +223,6 @@ func NewRouteSnapshotWithAllTargets(version int64, routes []ReadRoute, esTargets
 		}
 		snapshot.applicationTopologyRoutes[key] = target
 	}
-	for _, target := range topologyTargets {
-		if target.Label == "application_edge" {
-			if _, found := snapshot.applicationTopologyRoutes[applicationTopologyRouteKey(target.BkTenantID, "application_coverage")]; !found {
-				continue
-			}
-		}
-		other := "application_edge"
-		if target.Label == "application_edge" {
-			other = "application_coverage"
-		}
-		pair, found := snapshot.applicationTopologyRoutes[applicationTopologyRouteKey(target.BkTenantID, other)]
-		if !found || pair.ClusterID != target.ClusterID || pair.ClusterName != target.ClusterName ||
-			pair.PublishedVersion != target.PublishedVersion {
-			return nil, fmt.Errorf("应用拓扑 已发布边/覆盖目标不成对")
-		}
-	}
 	return snapshot, nil
 }
 
@@ -246,12 +230,6 @@ func NewRouteSnapshotWithAllTargets(version int64, routes []ReadRoute, esTargets
 func (s *RouteSnapshot) ResolveApplicationTopologyTarget(tenantID, label string) (ApplicationTopologyTarget, error) {
 	if s == nil {
 		return ApplicationTopologyTarget{}, reject(CodeRouteNotFound, "应用拓扑 读路由尚未配置")
-	}
-	switch label {
-	case "a3_edge":
-		label = "application_edge"
-	case "a3_coverage":
-		label = "application_coverage"
 	}
 	target, found := s.applicationTopologyRoutes[applicationTopologyRouteKey(tenantID, label)]
 	if !found {

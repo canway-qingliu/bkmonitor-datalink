@@ -22,8 +22,8 @@ import (
 type applicationTopologyReader struct {
 	queries         int
 	badBiz          bool
-	badWatermark    bool
 	mixedResolution bool
+	uniqueOnly      bool
 	// pairs, when set, is how many distinct pairs the edge table holds; the
 	// reader returns no more of them than the statement's LIMIT asks for.
 	pairs int
@@ -43,24 +43,15 @@ func (reader *applicationTopologyReader) Query(_ context.Context, statement stri
 	if len(args) < 6 || args[0] != "tenant_a" || !strings.Contains(statement, "LIMIT") {
 		return dorisclient.Result{}, nil
 	}
-	if strings.HasPrefix(statement, "SELECT source_namespace_id") {
-		biz := int64(2)
-		if reader.badBiz {
-			biz = 3
-		}
-		return dorisclient.Result{Rows: []map[string]any{{
-			"source_namespace_id": int64(11), "source_bk_biz_id": biz,
-			"observed_minutes": int64(15), "complete_minutes": int64(15),
-			"partial_minutes": int64(0), "pending_minutes": int64(0),
-			"unresolved_peers": int64(0), "as_of_ms": int64(1760573700000),
-		}}}, nil
+	if reader.uniqueOnly && strings.Contains(statement, "e.resolution = 'stable'") {
+		return dorisclient.Result{Rows: []map[string]any{}}, nil
 	}
-	beyond := int64(0)
-	if reader.badWatermark {
-		beyond = 1
+	biz := int64(2)
+	if reader.badBiz {
+		biz = 3
 	}
 	maximum := "stable"
-	if reader.mixedResolution {
+	if reader.mixedResolution || reader.uniqueOnly {
 		maximum = "unique_service_name"
 	}
 	if reader.pairs > 0 {
@@ -74,22 +65,26 @@ func (reader *applicationTopologyReader) Query(_ context.Context, statement stri
 			if len(rows) == limit {
 				break
 			}
+			sourceBiz := pair[1]
+			if reader.badBiz {
+				sourceBiz = 99
+			}
 			rows = append(rows, map[string]any{
-				"source_namespace_id": pair[0], "source_bk_biz_id": pair[1],
+				"source_namespace_id": pair[0], "source_bk_biz_id": sourceBiz,
 				"target_namespace_id": pair[2], "target_bk_biz_id": pair[3],
 				"min_resolution": "stable", "max_resolution": "stable",
 				"observed_minutes": int64(1), "as_of_ms": int64(1760573700000),
-				"unobserved_count": int64(0), "beyond_watermark": int64(0),
+				"unobserved_count": int64(0),
 			})
 		}
 		return dorisclient.Result{Rows: rows}, nil
 	}
 	return dorisclient.Result{Rows: []map[string]any{{
-		"source_namespace_id": int64(11), "source_bk_biz_id": int64(2),
+		"source_namespace_id": int64(11), "source_bk_biz_id": biz,
 		"target_namespace_id": int64(12), "target_bk_biz_id": int64(3),
 		"min_resolution": "stable", "max_resolution": maximum,
 		"observed_minutes": int64(1), "as_of_ms": int64(1760573700000),
-		"unobserved_count": int64(0), "beyond_watermark": beyond,
+		"unobserved_count": int64(0),
 	}}}, nil
 }
 
@@ -99,9 +94,6 @@ func applicationTopologyExecutor(t *testing.T, reader *applicationTopologyReader
 		{BkTenantID: "tenant_a", Label: "application_edge", Database: "tenant_a_kapm",
 			Table: "kapm_application_edge_observed_1m", ClusterID: "7", ClusterName: "doris",
 			SchemaVersion: "sha256:19617e34c53d393e", RetentionDays: 30, PublishedVersion: 4},
-		{BkTenantID: "tenant_a", Label: "application_coverage", Database: "tenant_a_kapm",
-			Table: "kapm_application_edge_coverage_1m", ClusterID: "7", ClusterName: "doris",
-			SchemaVersion: "sha256:06c86fab2f251999", RetentionDays: 30, PublishedVersion: 4},
 	}
 	snapshot, err := NewRouteSnapshotWithAllTargets(7, nil, nil, targets)
 	if err != nil {
@@ -115,18 +107,18 @@ func applicationTopologyExecutor(t *testing.T, reader *applicationTopologyReader
 }
 
 func applicationTopologyInput() ApplicationTopologyRangeRequest {
-	return ApplicationTopologyRangeRequest{TenantID: "tenant_a", ExpectedVersion: 4,
+	return ApplicationTopologyRangeRequest{TenantID: "tenant_a", ContractVersion: "application_topology_range_v2", ExpectedVersion: 4,
 		StartMS: 1760572800000, EndMS: 1760573700000, MaxPairs: 100,
 		Applications: []ApplicationTopologyApplication{{NamespaceID: 11, BkBizID: 2}, {NamespaceID: 12, BkBizID: 3}}}
 }
 
-func TestApplicationTopologyReadsPublishedPairAndChecksRows(t *testing.T) {
+func TestApplicationTopologyReadsPublishedEdgeAndChecksRows(t *testing.T) {
 	reader := &applicationTopologyReader{}
 	result, err := applicationTopologyExecutor(t, reader).QueryApplicationTopologyRange(context.Background(), applicationTopologyInput())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reader.queries != 2 || result.ExpectedMinutes != 15 || result.Coverage[0].CompleteMinutes != 15 ||
+	if reader.queries != 1 || result.ExpectedMinutes != 15 ||
 		len(result.Edges) != 1 || result.Edges[0].TargetNamespaceID != 12 {
 		t.Fatalf("unexpected bounded application topology read: %+v, queries=%d", result, reader.queries)
 	}
@@ -140,8 +132,18 @@ func TestApplicationTopologyV2ReadsOnlyObservedEdges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reader.queries != 1 || len(result.Edges) != 1 || len(result.Coverage) != 0 {
+	if reader.queries != 1 || len(result.Edges) != 1 {
 		t.Fatalf("V2 must read edges only: %+v, queries=%d", result, reader.queries)
+	}
+}
+
+func TestApplicationTopologyV2ExcludesNameOnlyEdges(t *testing.T) {
+	reader := &applicationTopologyReader{uniqueOnly: true}
+	request := applicationTopologyInput()
+	request.ContractVersion = "application_topology_range_v2"
+	result, err := applicationTopologyExecutor(t, reader).QueryApplicationTopologyRange(context.Background(), request)
+	if err != nil || len(result.Edges) != 0 || reader.queries != 1 {
+		t.Fatalf("observed topology must exclude name-only edges: %+v, %v, queries=%d", result, err, reader.queries)
 	}
 }
 
@@ -163,16 +165,12 @@ func TestApplicationTopologyV2ReadsEdgeOnlyPublication(t *testing.T) {
 	if _, err := executor.QueryApplicationTopologyRange(context.Background(), request); err != nil || reader.queries != 1 {
 		t.Fatalf("V2 edge-only read failed: %v, queries=%d", err, reader.queries)
 	}
-	request.ContractVersion = "application_topology_range_v1"
-	if _, err := executor.QueryApplicationTopologyRange(context.Background(), request); err == nil || reader.queries != 1 {
-		t.Fatalf("V1 must fail closed without coverage: %v, queries=%d", err, reader.queries)
-	}
 }
 
 // max_pairs is the most pairs a window may hold: a window with exactly that
 // many is answered, one with more is refused.
 func TestApplicationTopologyPairBudgetAdmitsExactlyMaxPairs(t *testing.T) {
-	for _, version := range []string{"application_topology_range_v1", "application_topology_range_v2"} {
+	for _, version := range []string{"application_topology_range_v2"} {
 		for _, test := range []struct {
 			name           string
 			stored         int
@@ -215,48 +213,33 @@ func TestApplicationTopologyRejectsStaleVersionAndForeignRowsBeforePublishing(t 
 	}
 	reader.badBiz = true
 	if _, err := executor.QueryApplicationTopologyRange(context.Background(), applicationTopologyInput()); err == nil {
-		t.Fatal("coverage business identity must be checked")
-	}
-	reader.badBiz = false
-	reader.badWatermark = true
-	if _, err := executor.QueryApplicationTopologyRange(context.Background(), applicationTopologyInput()); err == nil {
-		t.Fatal("edge newer than complete coverage watermark must be rejected")
+		t.Fatal("edge business identity must be checked")
 	}
 }
 
-func TestApplicationTopologyMixedResolutionUsesConservativePairLabel(t *testing.T) {
+func TestApplicationTopologyRejectsNameOnlyResolution(t *testing.T) {
 	reader := &applicationTopologyReader{mixedResolution: true}
-	result, err := applicationTopologyExecutor(t, reader).QueryApplicationTopologyRange(context.Background(), applicationTopologyInput())
-	if err != nil || result.Edges[0].Resolution != "unique_service_name" {
-		t.Fatalf("mixed valid evidence must keep weaker resolution: %+v %v", result, err)
+	if _, err := applicationTopologyExecutor(t, reader).QueryApplicationTopologyRange(context.Background(), applicationTopologyInput()); err == nil {
+		t.Fatal("name-only evidence cannot become a stable application edge")
 	}
 }
 
 func TestApplicationTopologyRejectsUnknownNamespaceWithZeroBiz(t *testing.T) {
 	allowed := map[int64]int64{11: 2, 12: 3}
-	coverage := map[string]any{
-		"source_namespace_id": int64(99), "source_bk_biz_id": int64(0),
-		"observed_minutes": int64(15), "complete_minutes": int64(15),
-		"partial_minutes": int64(0), "pending_minutes": int64(0),
-		"unresolved_peers": int64(0), "as_of_ms": int64(1760573700000),
-	}
-	if _, err := decodeApplicationTopologyCoverage(coverage, allowed, 15); err == nil {
-		t.Fatal("zero business ID cannot make a foreign source look authorized")
-	}
 	edge := map[string]any{
 		"source_namespace_id": int64(99), "source_bk_biz_id": int64(0),
 		"target_namespace_id": int64(12), "target_bk_biz_id": int64(3),
 		"observed_minutes": int64(1), "as_of_ms": int64(1760573700000),
-		"unobserved_count": int64(0), "beyond_watermark": int64(0),
-		"min_resolution": "stable", "max_resolution": "stable",
+		"unobserved_count": int64(0),
+		"min_resolution":   "stable", "max_resolution": "stable",
 	}
-	if _, err := decodeApplicationTopologyEdge(edge, allowed, 15, true); err == nil {
+	if _, err := decodeObservedApplicationTopologyEdge(edge, allowed, 15); err == nil {
 		t.Fatal("zero business ID cannot make a foreign edge look authorized")
 	}
 }
 
 func TestApplicationTopologyRejectsDuplicateAndUnboundedRequest(t *testing.T) {
-	request := []byte(`{"a3_contract_version":"a3_panorama_range_v1","a3_request":{"start_time_ms":1760572800000,"start_time_ms":1760572800000}}`)
+	request := []byte(`{"application_topology_contract_version":"application_topology_range_v2","application_topology_request":{"start_time_ms":1760572800000,"start_time_ms":1760572800000}}`)
 	if _, err := ParseApplicationTopologyRangeRequest(request, 65536); err == nil {
 		t.Fatal("duplicate JSON key must be rejected")
 	}

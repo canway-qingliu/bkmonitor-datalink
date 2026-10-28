@@ -95,65 +95,22 @@ type traceProfileApplicationTopologyTargetConfig struct {
 }
 
 func normalizeApplicationTopologyTargetConfigs(
-	legacy, descriptive []traceProfileApplicationTopologyTargetConfig,
+	targets []traceProfileApplicationTopologyTargetConfig,
 ) ([]traceProfileApplicationTopologyTargetConfig, error) {
-	if legacy == nil && descriptive == nil {
+	if targets == nil {
 		return nil, nil
 	}
-	legacyNormalized := make([]traceProfileApplicationTopologyTargetConfig, 0, len(legacy))
-	legacyByKey := make(map[[2]string]traceProfileApplicationTopologyTargetConfig, len(legacy))
-	legacyLabels := make(map[string]uint8)
-	for _, target := range legacy {
-		switch target.Label {
-		case "a3_edge":
-			target.Label = "application_edge"
-		case "a3_coverage":
-			target.Label = "application_coverage"
-		default:
-			return nil, fmt.Errorf("旧版应用拓扑读目标标签非法")
-		}
-		key := [2]string{target.BkTenantID, target.Label}
-		if _, exists := legacyByKey[key]; exists {
-			return nil, fmt.Errorf("旧版应用拓扑读目标重复")
-		}
-		legacyByKey[key] = target
-		if target.Label == "application_edge" {
-			legacyLabels[target.BkTenantID] |= 1
-		} else {
-			legacyLabels[target.BkTenantID] |= 2
-		}
-		legacyNormalized = append(legacyNormalized, target)
-	}
-	for _, labels := range legacyLabels {
-		if labels != 3 {
-			return nil, fmt.Errorf("旧版应用拓扑边与覆盖读目标必须成对发布")
-		}
-	}
-	if descriptive == nil {
-		return legacyNormalized, nil
-	}
-	merged := make([]traceProfileApplicationTopologyTargetConfig, 0, len(legacyNormalized)+len(descriptive))
-	seen := make(map[[2]string]bool, len(descriptive))
-	for _, target := range descriptive {
-		if target.Label != "application_edge" && target.Label != "application_coverage" {
+	seen := make(map[string]bool, len(targets))
+	for _, target := range targets {
+		if target.Label != "application_edge" {
 			return nil, fmt.Errorf("应用拓扑读目标标签非法")
 		}
-		key := [2]string{target.BkTenantID, target.Label}
-		if seen[key] {
+		if seen[target.BkTenantID] {
 			return nil, fmt.Errorf("应用拓扑读目标重复")
 		}
-		if previous, exists := legacyByKey[key]; exists && previous != target {
-			return nil, fmt.Errorf("应用拓扑新旧读目标不一致")
-		}
-		seen[key] = true
-		merged = append(merged, target)
+		seen[target.BkTenantID] = true
 	}
-	for _, target := range legacyNormalized {
-		if !seen[[2]string{target.BkTenantID, target.Label}] {
-			merged = append(merged, target)
-		}
-	}
-	return merged, nil
+	return targets, nil
 }
 
 type traceProfileConnectionConfig struct {
@@ -169,18 +126,19 @@ type traceProfileConnectionConfig struct {
 }
 
 type traceProfileConfig struct {
-	RouteSnapshotVersion       int64                                         `json:"route_snapshot_version"`
-	ReadTargetDataPath         string                                        `json:"read_target_data_path,omitempty"`
-	ReadTargetVersionPath      string                                        `json:"read_target_version_path,omitempty"`
-	MaxBodyBytes               int                                           `json:"max_body_bytes"`
-	MaxLimit                   int64                                         `json:"max_limit"`
-	MaxOffset                  int64                                         `json:"max_offset"`
-	MaxRangeDays               int64                                         `json:"max_range_days"`
-	ReadRoutes                 []traceProfileRouteConfig                     `json:"read_routes"`
-	ESSummaryTargets           []traceProfileESTargetConfig                  `json:"es_summary_targets,omitempty"`
-	LegacyA3Targets            []traceProfileApplicationTopologyTargetConfig `json:"a3_targets,omitempty"`
-	ApplicationTopologyTargets []traceProfileApplicationTopologyTargetConfig `json:"application_topology_targets,omitempty"`
-	ReadonlyConnections        []traceProfileConnectionConfig                `json:"readonly_connections"`
+	RouteSnapshotVersion  int64                        `json:"route_snapshot_version"`
+	ReadTargetDataPath    string                       `json:"read_target_data_path,omitempty"`
+	ReadTargetVersionPath string                       `json:"read_target_version_path,omitempty"`
+	MaxBodyBytes          int                          `json:"max_body_bytes"`
+	MaxLimit              int64                        `json:"max_limit"`
+	MaxOffset             int64                        `json:"max_offset"`
+	MaxRangeDays          int64                        `json:"max_range_days"`
+	ReadRoutes            []traceProfileRouteConfig    `json:"read_routes"`
+	ESSummaryTargets      []traceProfileESTargetConfig `json:"es_summary_targets,omitempty"`
+	// 只接受旧部署配置的字段形状，不把旧目标用于当前应用拓扑查询。
+	LegacyApplicationTopologyTargets []traceProfileApplicationTopologyTargetConfig `json:"a3_targets,omitempty"`
+	ApplicationTopologyTargets       []traceProfileApplicationTopologyTargetConfig `json:"application_topology_targets,omitempty"`
+	ReadonlyConnections              []traceProfileConnectionConfig                `json:"readonly_connections"`
 
 	// 单租户 typed Trace 的真实数据租户；应用和空间权限沿用 JWT 鉴权。
 	// 配置非法时加载即失败；未配置且读目标快照恰好只有一个租户时取该租户，
@@ -290,7 +248,7 @@ func newTraceProfileRuntimeFor(raw any, publishedTenants map[string]struct{}) (*
 	if err := decoder.Decode(&config); err != nil {
 		return nil, fmt.Errorf("Trace profile 直连读取配置非法: %w", err)
 	}
-	topologyTargetConfigs, err := normalizeApplicationTopologyTargetConfigs(config.LegacyA3Targets, config.ApplicationTopologyTargets)
+	topologyTargetConfigs, err := normalizeApplicationTopologyTargetConfigs(config.ApplicationTopologyTargets)
 	if err != nil {
 		return nil, err
 	}
@@ -517,7 +475,7 @@ func prefixHasTraceEnvelope(probe []byte) bool {
 		if depth == 1 && expectKey {
 			if key, isKey := token.(string); isKey {
 				switch key {
-				case "trace_profile", "trace_contract_version", "trace_request", "a3_contract_version", "a3_request",
+				case "trace_profile", "trace_contract_version", "trace_request",
 					"application_topology_contract_version", "application_topology_request":
 					return true
 				}

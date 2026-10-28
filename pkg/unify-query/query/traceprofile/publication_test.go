@@ -22,11 +22,24 @@ const business132Document = `{"route_snapshot_version":7,"bk_tenant_id":"system"
 	`"schema_version":"sha256:e6e9af09d86b396e"},` +
 	`{"bk_tenant_id":"system","bk_biz_id":132,"profile":"trace_summary","observation_domain_id":"system_kapm",` +
 	`"database":"system_kapm","table":"otel_trace_summary_132","cluster_id":18,"cluster_name":"doris4_test",` +
-	`"schema_version":"sha256:281052267ec373fc"}],"a3_targets":[]}`
+	`"schema_version":"sha256:281052267ec373fc"}],"application_topology_targets":[]}`
 
 const publishedESSummaryTargets = `[{"bk_tenant_id":"system","bk_biz_id":132,"app_id":7,` +
 	`"app_name":"checkout","observation_domain_id":"system_kapm",` +
 	`"read_result_table_id":"apm_global.trace_summary_v1_7","storage_cluster_id":9,"retention_days":30}]`
+
+func TestLegacyPublishedTopologyFieldKeepsSpanAndSummaryReadable(t *testing.T) {
+	legacy := strings.Replace(business132Document, `"application_topology_targets":[]`,
+		`"a3_targets":[{"label":"a3_edge","observation_domain_id":"system_kapm",`+
+			`"database":"system_kapm","table":"kapm_application_edge_observed_1m",`+
+			`"cluster_id":18,"cluster_name":"doris4_test",`+
+			`"schema_version":"sha256:19617e34c53d393e","retention_days":30}]`, 1)
+	parsed, err := ParsePublishedDocument([]byte(legacy), "system")
+	if err != nil || len(parsed.Routes) != 2 || len(parsed.ApplicationTopologyTargets) != 0 {
+		t.Fatalf("legacy publication blocked ordinary Trace routes: routes=%d topology=%d err=%v",
+			len(parsed.Routes), len(parsed.ApplicationTopologyTargets), err)
+	}
+}
 
 func TestPublishedApplicationSpanRoutesCoexistWithLegacyBusinessRoute(t *testing.T) {
 	extra := `,{"bk_tenant_id":"system","bk_biz_id":132,"app_id":7,"profile":"trace_span",` +
@@ -37,7 +50,7 @@ func TestPublishedApplicationSpanRoutesCoexistWithLegacyBusinessRoute(t *testing
 		`"observation_domain_id":"tenant_bbc5e661e106c6dc_kapm","database":"tenant_bbc5e661e106c6dc_kapm",` +
 		`"table":"otel_trace_span_app_8","cluster_id":18,"cluster_name":"doris4_test",` +
 		`"schema_version":"sha256:e6e9af09d86b396e"}`
-	body := strings.Replace(business132Document, `],"a3_targets":[]`, extra+`],"a3_targets":[]`, 1)
+	body := strings.Replace(business132Document, `],"application_topology_targets":[]`, extra+`],"application_topology_targets":[]`, 1)
 	document, err := ParsePublishedDocument([]byte(body), "system")
 	if err != nil || len(document.Routes) != 4 {
 		t.Fatalf("mixed routes rejected: %+v %v", document.Routes, err)
@@ -63,7 +76,7 @@ func TestPublishedApplicationSpanRouteAcceptsHyphenTenantWithHashedDatabase(t *t
 		`"observation_domain_id":"tenant_80a707af7dc77ee1_kapm",` +
 		`"database":"tenant_80a707af7dc77ee1_kapm","table":"otel_trace_span",` +
 		`"cluster_id":18,"cluster_name":"doris4_test","schema_version":"sha256:e6e9af09d86b396e"}],` +
-		`"a3_targets":[]}`
+		`"application_topology_targets":[]}`
 	parsed, err := ParsePublishedDocument([]byte(document), "tenant-a")
 	if err != nil || len(parsed.Routes) != 1 || parsed.Routes[0].AppID != 7 {
 		t.Fatalf("valid hyphen tenant route rejected: %+v %v", parsed.Routes, err)
@@ -101,8 +114,8 @@ func TestPublishedTenantSummaryRouteKeepsBusinessScopeInSharedTable(t *testing.T
 }
 
 func TestPublishedESSummaryTargetsAreVersionedAndScoped(t *testing.T) {
-	body := strings.Replace(business132Document, `"a3_targets":[]`,
-		`"a3_targets":[],"es_summary_targets":`+publishedESSummaryTargets, 1)
+	body := strings.Replace(business132Document, `"application_topology_targets":[]`,
+		`"application_topology_targets":[],"es_summary_targets":`+publishedESSummaryTargets, 1)
 	document, err := ParsePublishedDocument([]byte(body), "system")
 	if err != nil || len(document.ESSummaryTargets) != 1 {
 		t.Fatalf("trusted ES Summary target was lost: targets=%+v err=%v", document.ESSummaryTargets, err)
@@ -127,8 +140,8 @@ func TestPublishedESSummaryTargetsAreVersionedAndScoped(t *testing.T) {
 func TestPublishedESSummaryEntryV2RequiresThirtyDayTarget(t *testing.T) {
 	v2 := strings.Replace(publishedESSummaryTargets, `"retention_days":30`,
 		`"retention_days":30,"entry_index_version":2`, 1)
-	body := strings.Replace(business132Document, `"a3_targets":[]`,
-		`"a3_targets":[],"es_summary_targets":`+v2, 1)
+	body := strings.Replace(business132Document, `"application_topology_targets":[]`,
+		`"application_topology_targets":[],"es_summary_targets":`+v2, 1)
 	document, err := ParsePublishedDocument([]byte(body), "system")
 	if err != nil || document.ESSummaryTargets[0].EntryIndexVersion != 2 {
 		t.Fatalf("published entry v2 capability missing: %+v err=%v", document.ESSummaryTargets, err)
@@ -153,8 +166,8 @@ func TestPublishedESSummaryTargetsRejectIdentityAndMetadataDrift(t *testing.T) {
 		"duplicate":       publishedESSummaryTargets[:len(publishedESSummaryTargets)-1] + `,` + publishedESSummaryTargets[1:],
 	} {
 		t.Run(name, func(t *testing.T) {
-			body := strings.Replace(business132Document, `"a3_targets":[]`,
-				`"a3_targets":[],"es_summary_targets":`+target, 1)
+			body := strings.Replace(business132Document, `"application_topology_targets":[]`,
+				`"application_topology_targets":[],"es_summary_targets":`+target, 1)
 			if _, err := ParsePublishedDocument([]byte(body), "system"); err == nil {
 				t.Fatal("ES Summary target drift was accepted")
 			}

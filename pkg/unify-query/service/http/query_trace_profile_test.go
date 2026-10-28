@@ -239,8 +239,7 @@ func TestProbeTraceEnvelopeDetectsOnlyTypedTopLevelKeys(t *testing.T) {
 	}{
 		{name: "typed span envelope", body: typedTraceBody("trace_span", "system_kapm"), want: true},
 		{name: "typed summary envelope", body: typedTraceBody("trace_summary", "system_kapm"), want: true},
-		{name: "typed A3 panorama envelope", body: `{"a3_contract_version":"a3_panorama_range_v1","a3_request":{}}`, want: true},
-		{name: "typed application topology envelope", body: `{"application_topology_contract_version":"application_topology_range_v1","application_topology_request":{}}`, want: true},
+		{name: "typed application topology envelope", body: `{"application_topology_contract_version":"application_topology_range_v2","application_topology_request":{}}`, want: true},
 		{name: "nested key", body: `{"query_list":[{"trace_request":{}}]}`, want: false},
 		{name: "value named like the key", body: `{"table_id":"trace_profile"}`, want: false},
 		{name: "legacy body", body: `{"query_list":[{"table_id":"t1"}],"space_uid":"bkcc__42"}`, want: false},

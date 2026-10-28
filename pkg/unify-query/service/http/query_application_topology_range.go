@@ -25,11 +25,9 @@ import (
 
 func isApplicationTopologyRangeEnvelope(body []byte) bool {
 	var probe struct {
-		LegacyVersion string `json:"a3_contract_version"`
-		Version       string `json:"application_topology_contract_version"`
+		Version string `json:"application_topology_contract_version"`
 	}
-	return json.Unmarshal(body, &probe) == nil &&
-		(probe.LegacyVersion == "a3_panorama_range_v1" || probe.Version == "application_topology_range_v1" || probe.Version == "application_topology_range_v2")
+	return json.Unmarshal(body, &probe) == nil && probe.Version == "application_topology_range_v2"
 }
 
 func handleApplicationTopologyRangeQuery(c *gin.Context, ctx context.Context, span *trace.Span,
@@ -62,7 +60,7 @@ func handleApplicationTopologyRangeQuery(c *gin.Context, ctx context.Context, sp
 		return writeTraceProfileReject(ctx, c, span, traceprofile.CodeUnauthorizedMember, "应用拓扑 全景租户范围摘要不匹配")
 	}
 	query.Request.TenantID = tenantID
-	// 2. v2 只读已发布边表；旧版继续读取成对目标以兼容滚动升级。
+	// 2. 只读已发布的稳定应用边，不将空结果解释为完整零调用。
 	result, err := runtime.executor.QueryApplicationTopologyRange(ctx, query.Request)
 	if err != nil {
 		return writeTraceProfileError(ctx, c, span, err)
@@ -70,26 +68,15 @@ func handleApplicationTopologyRangeQuery(c *gin.Context, ctx context.Context, sp
 	if result.PublishedRouteVersion != query.ExpectedRouteVersion {
 		return writeTraceProfileReject(ctx, c, span, traceprofile.CodeScopePartial, "应用拓扑 全景发布版本尚未生效")
 	}
-	traceProfile := "application_topology_range"
-	if query.ProtocolVersion == "a3_panorama_range_v1" {
-		traceProfile = "a3_panorama_range"
-	}
-	span.Set("trace-profile", traceProfile)
+	span.Set("trace-profile", "application_topology_range")
 	span.Set("trace-profile-route-version", runtime.routeVersion)
 	metric.APIRequestInc(ctx, c.Request.URL.Path, metric.StatusSuccess, user.SpaceUID, user.Source)
 	response := gin.H{
-		"scope_fingerprint":       query.ScopeFingerprint,
-		"published_route_version": result.PublishedRouteVersion,
-		"expected_minutes":        result.ExpectedMinutes,
-		"edges":                   result.Edges,
-	}
-	if query.ProtocolVersion == "application_topology_range_v1" || query.ProtocolVersion == "application_topology_range_v2" {
-		response["application_topology_contract_version"] = query.ProtocolVersion
-	} else {
-		response["a3_contract_version"] = query.ProtocolVersion
-	}
-	if query.ProtocolVersion != "application_topology_range_v2" {
-		response["coverage"] = result.Coverage
+		"application_topology_contract_version": query.ProtocolVersion,
+		"scope_fingerprint":                     query.ScopeFingerprint,
+		"published_route_version":               result.PublishedRouteVersion,
+		"expected_minutes":                      result.ExpectedMinutes,
+		"edges":                                 result.Edges,
 	}
 	c.JSON(http.StatusOK, response)
 	return nil

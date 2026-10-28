@@ -29,15 +29,11 @@ type ApplicationTopologyRangeQuery struct {
 }
 
 type applicationTopologyEnvelope struct {
-	LegacyVersion string                        `json:"a3_contract_version"`
-	LegacyRequest *applicationTopologyInputWire `json:"a3_request"`
-	Version       string                        `json:"application_topology_contract_version"`
-	Request       *applicationTopologyInputWire `json:"application_topology_request"`
+	Version string                        `json:"application_topology_contract_version"`
+	Request *applicationTopologyInputWire `json:"application_topology_request"`
 }
 
-const applicationTopologyRangeVersion = "application_topology_range_v1"
 const observedApplicationTopologyRangeVersion = "application_topology_range_v2"
-const legacyA3PanoramaRangeVersion = "a3_panorama_range_v1"
 
 type applicationTopologyInputWire struct {
 	ScopeFingerprint     string                           `json:"expected_scope_fingerprint"`
@@ -68,14 +64,7 @@ func ParseApplicationTopologyRangeRequest(body []byte, maxBodyBytes int) (Applic
 		return ApplicationTopologyRangeQuery{}, fmt.Errorf("应用拓扑 全景请求包含多余内容")
 	}
 	version, item := envelope.Version, envelope.Request
-	if version == applicationTopologyRangeVersion || version == observedApplicationTopologyRangeVersion {
-		if envelope.LegacyVersion != "" || envelope.LegacyRequest != nil {
-			return ApplicationTopologyRangeQuery{}, fmt.Errorf("应用拓扑请求混用了新旧协议")
-		}
-	} else if envelope.LegacyVersion == legacyA3PanoramaRangeVersion &&
-		envelope.Version == "" && envelope.Request == nil {
-		version, item = envelope.LegacyVersion, envelope.LegacyRequest
-	} else {
+	if version != observedApplicationTopologyRangeVersion {
 		return ApplicationTopologyRangeQuery{}, fmt.Errorf("应用拓扑合同版本不受支持")
 	}
 	if item == nil {
@@ -107,13 +96,7 @@ func ParseApplicationTopologyRangeRequest(body []byte, maxBodyBytes int) (Applic
 
 // ApplicationTopologyRangeFingerprint 是 Python/Go 共用的固定 ASCII 摘要输入，不依赖 JSON 键顺序。
 func ApplicationTopologyRangeFingerprint(tenantID string, query ApplicationTopologyRangeQuery) string {
-	scopeVersion := "a3-panorama-range-v1"
-	if query.ProtocolVersion == applicationTopologyRangeVersion {
-		scopeVersion = "application-topology-range-v1"
-	} else if query.ProtocolVersion == observedApplicationTopologyRangeVersion {
-		scopeVersion = "application-topology-range-v2"
-	}
-	parts := []string{scopeVersion, tenantID, query.ObservationDomainID,
+	parts := []string{"application-topology-range-v2", tenantID, query.ObservationDomainID,
 		strconv.FormatInt(query.ExpectedRouteVersion, 10),
 		strconv.FormatInt(query.Request.StartMS, 10), strconv.FormatInt(query.Request.EndMS, 10),
 		strconv.FormatInt(query.Request.MaxPairs, 10)}

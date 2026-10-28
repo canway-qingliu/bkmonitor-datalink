@@ -15,62 +15,34 @@ import (
 	"testing"
 )
 
-func legacyPanoramaRequestJSON(fingerprint string) []byte {
-	return []byte(fmt.Sprintf(`{"a3_contract_version":"a3_panorama_range_v1","a3_request":{
+func observedApplicationTopologyRequestJSON(fingerprint string) []byte {
+	return []byte(fmt.Sprintf(`{"application_topology_contract_version":"application_topology_range_v2","application_topology_request":{
 "expected_scope_fingerprint":"%s","observation_domain_id":"tenant_a_kapm",
 "expected_route_version":4,"start_time_ms":1760572800000,"end_time_ms":1760573700000,
 "applications":[{"namespace_id":11,"bk_biz_id":2},{"namespace_id":12,"bk_biz_id":3}],"max_pairs":10000}}`, fingerprint))
 }
 
-func TestApplicationTopologyRangeRequestFingerprintMatchesPythonContract(t *testing.T) {
-	const expected = "90215fae3664992ddaa312247d35b6c183020a30a72e6ac01005b08b59c192e3"
-	query, err := ParseApplicationTopologyRangeRequest(legacyPanoramaRequestJSON(expected), 65536)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := ApplicationTopologyRangeFingerprint("tenant_a", query); got != expected {
-		t.Fatalf("scope drifted: %s", got)
-	}
-}
-
-func TestApplicationTopologyEnvelopeUsesDomainContractAndFingerprint(t *testing.T) {
-	const expected = "87bb338c01c6a7c6b6248a58f71af244fa4e4da815d98d5badb181c8ff4a8b82"
-	body := strings.ReplaceAll(string(legacyPanoramaRequestJSON(expected)),
-		"a3_contract_version", "application_topology_contract_version")
-	body = strings.ReplaceAll(body, "a3_request", "application_topology_request")
-	body = strings.ReplaceAll(body, "a3_panorama_range_v1", "application_topology_range_v1")
-	query, err := ParseApplicationTopologyRangeRequest([]byte(body), 65536)
-	if err != nil {
-		t.Fatalf("application topology request rejected: %v", err)
+func TestApplicationTopologyObservedEdgesFingerprintMatchesPythonContract(t *testing.T) {
+	const expected = "dd338a45f464d3c05abf26d6106b6ce61b476dc50552a8d561f5a3deedc224fd"
+	query, err := ParseApplicationTopologyRangeRequest(observedApplicationTopologyRequestJSON(expected), 65536)
+	if err != nil || query.Request.ContractVersion != observedApplicationTopologyRangeVersion {
+		t.Fatalf("observed edge request rejected: %+v, %v", query, err)
 	}
 	if got := ApplicationTopologyRangeFingerprint("tenant_a", query); got != expected {
 		t.Fatalf("application topology scope fingerprint mismatch: %s", got)
 	}
 }
 
-func TestApplicationTopologyObservedEdgesV2Fingerprint(t *testing.T) {
-	const expected = "dd338a45f464d3c05abf26d6106b6ce61b476dc50552a8d561f5a3deedc224fd"
-	body := strings.ReplaceAll(string(legacyPanoramaRequestJSON(expected)),
-		"a3_contract_version", "application_topology_contract_version")
-	body = strings.ReplaceAll(body, "a3_request", "application_topology_request")
-	body = strings.ReplaceAll(body, "a3_panorama_range_v1", "application_topology_range_v2")
-	query, err := ParseApplicationTopologyRangeRequest([]byte(body), 65536)
-	if err != nil || query.Request.ContractVersion != "application_topology_range_v2" {
-		t.Fatalf("observed edge request rejected: %+v %v", query, err)
-	}
-	if got := ApplicationTopologyRangeFingerprint("tenant_a", query); got != expected {
-		t.Fatalf("V2 scope fingerprint mismatch: %s", got)
-	}
-}
-
 func TestApplicationTopologyRangeRequestRejectsUnknownAndDuplicateFields(t *testing.T) {
-	const expected = "90215fae3664992ddaa312247d35b6c183020a30a72e6ac01005b08b59c192e3"
+	const expected = "dd338a45f464d3c05abf26d6106b6ce61b476dc50552a8d561f5a3deedc224fd"
 	for _, body := range [][]byte{
-		[]byte(strings.Replace(string(legacyPanoramaRequestJSON(expected)), `"max_pairs":10000`, `"max_pairs":10000,"database":"private"`, 1)),
-		[]byte(strings.Replace(string(legacyPanoramaRequestJSON(expected)), `"max_pairs":10000`, `"max_pairs":10000,"max_pairs":10000`, 1)),
+		[]byte(strings.Replace(string(observedApplicationTopologyRequestJSON(expected)),
+			`"max_pairs":10000`, `"max_pairs":10000,"database":"private"`, 1)),
+		[]byte(strings.Replace(string(observedApplicationTopologyRequestJSON(expected)),
+			`"max_pairs":10000`, `"max_pairs":10000,"max_pairs":10000`, 1)),
 	} {
 		if _, err := ParseApplicationTopologyRangeRequest(body, 65536); err == nil {
-			t.Fatal("unsafe request accepted")
+			t.Fatal("unsafe application topology request accepted")
 		}
 	}
 }

@@ -6,9 +6,9 @@ Kingeye 全景图按选定时间窗直接展示已有的跨应用有向边。合
 
 ## 怎么改
 
-新请求使用 `application_topology_contract_version: "application_topology_range_v2"` 和 `application_topology_request`。范围指纹与 v1 同字段、同 NUL 分隔算法，但前缀改为 `application-topology-range-v2`。UQ 从当前租户已发布的 `application_topology_targets` 中解析 `application_edge`，只查 `kapm_application_edge_observed_1m`；按 `[start,end)`、租户及升序 Namespace/业务允许集汇总有向应用对。回包包含指纹、发布版本、`expected_minutes` 和 `edges`，不包含 `coverage`。查询最多 30 天、129 个应用和 10,000 个有向应用对，超预算或身份不符拒绝。
+请求使用 `application_topology_contract_version: "application_topology_range_v2"` 和 `application_topology_request`。范围指纹使用固定的 NUL 分隔字段序列，前缀为 `application-topology-range-v2`。UQ 从当前租户已发布的 `application_topology_targets` 中解析唯一的 `application_edge`，只查 `kapm_application_edge_observed_1m`；按 `[start,end)`、租户及升序 Namespace/业务允许集汇总有向应用对。回包包含指纹、发布版本、`expected_minutes` 和 `edges`，不包含覆盖状态。查询最多 30 天、129 个应用和 10,000 个有向应用对，超预算或身份不符拒绝。
 
-新租户只发布 `application_edge` 目标。存量成对目标可以继续发布；边和覆盖若同时存在，必须指向同一租户、集群和发布版本。旧 `application_topology_range_v1` 与 `a3_panorama_range_v1` 保持原两表查询与响应，缺少覆盖目标时明确拒绝。新旧字段同时发布时，对重叠目标逐项校验；旧覆盖目标可暂留给旧版请求。既有覆盖表及数据不删除。
+当前应用拓扑发布文档只使用一个 `application_edge` 目标。滚动升级期间，UQ 仍接受旧 Redis 发布字段与旧静态配置字段，但只保留其中的 Span/Summary 读路由；旧应用拓扑目标不会进入 v2 查询。Kingeye 重发单边目标后才开放应用图查询。旧的两表查询请求不再属于当前合同；既有覆盖表及数据不由查询服务删除。
 
 ## 与之前的区别
 
@@ -16,4 +16,4 @@ Kingeye 全景图按选定时间窗直接展示已有的跨应用有向边。合
 
 ## 验证与发布关注点
 
-聚焦测试覆盖 v2 单边发布、跨租户混合发布、只发一条边的查询、v1 旧覆盖兼容、摘要、版本和身份拒绝。目标环境还须按 UQ、Kingeye、Flinkd 的协议升级顺序验证真实 Doris 有边/空窗、跨业务与跨租户反例、查询延迟和页面呈现。UQ 的 `trace_profile.allowed_bk_app_codes`、成员查询白名单、JWT 与空间锚点仍须正确配置；发布成功不等于目标环境已完成读回。
+聚焦测试覆盖单边发布、只查已观测边、摘要、版本和身份拒绝。目标环境按 Kingeye、UQ、Flink 作业的协议升级顺序验证真实 Doris 有边/空窗、跨业务与跨租户反例、查询延迟和页面呈现；切换期间先确认 Kingeye 已使用 v2 请求。UQ 的 `trace_profile.allowed_bk_app_codes`、成员查询白名单、JWT 与空间锚点仍须正确配置；发布成功不等于目标环境已完成读回。

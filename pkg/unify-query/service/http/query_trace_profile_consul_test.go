@@ -29,7 +29,7 @@ const publishedBusiness132 = `{"route_snapshot_version":7,"bk_tenant_id":"system
 	`"schema_version":"sha256:e6e9af09d86b396e"},` +
 	`{"bk_tenant_id":"system","bk_biz_id":132,"profile":"trace_summary","observation_domain_id":"system_kapm",` +
 	`"database":"system_kapm","table":"otel_trace_summary_132","cluster_id":18,"cluster_name":"doris4_test",` +
-	`"schema_version":"sha256:281052267ec373fc"}],"a3_targets":[]}`
+	`"schema_version":"sha256:281052267ec373fc"}],"application_topology_targets":[]}`
 
 const publishedESSummaryTargets = `[{"bk_tenant_id":"system","bk_biz_id":132,"app_id":7,` +
 	`"app_name":"checkout","observation_domain_id":"system_kapm",` +
@@ -37,8 +37,8 @@ const publishedESSummaryTargets = `[{"bk_tenant_id":"system","bk_biz_id":132,"ap
 
 func TestPublishedTraceTargetsInstallESSummaryCandidateIntoRuntime(t *testing.T) {
 	prefix := "kingeye/metadata/unify-query/data/trace/read_target/"
-	publication := strings.Replace(publishedBusiness132, `"a3_targets":[]`,
-		`"a3_targets":[],"es_summary_targets":`+publishedESSummaryTargets, 1)
+	publication := strings.Replace(publishedBusiness132, `"application_topology_targets":[]`,
+		`"application_topology_targets":[],"es_summary_targets":`+publishedESSummaryTargets, 1)
 	snapshot, err := parsePublishedTraceTargets(prefix,
 		api.KVPairs{&api.KVPair{Key: prefix + "system", Value: []byte(publication)}}, nil)
 	version, routes, esTargets := snapshot.Version, snapshot.Routes, snapshot.ESTargets
@@ -112,7 +112,7 @@ func TestPublishedApplicationSpanRouteSurvivesRuntimeReload(t *testing.T) {
 		`"observation_domain_id":"` + database + `","database":"` + database + `",` +
 		`"table":"otel_trace_span","cluster_id":18,"cluster_name":"doris4_test",` +
 		`"schema_version":"sha256:e6e9af09d86b396e"}`
-	body := strings.Replace(publishedBusiness132, `],"a3_targets":[]`, appRoute+`],"a3_targets":[]`, 1)
+	body := strings.Replace(publishedBusiness132, `],"application_topology_targets":[]`, appRoute+`],"application_topology_targets":[]`, 1)
 	prefix := "kingeye/metadata/unify-query/data/trace/read_target/"
 	pairs := api.KVPairs{&api.KVPair{Key: prefix + "system", Value: []byte(body)}}
 	snapshot, err := parsePublishedTraceTargets(prefix, pairs, nil)

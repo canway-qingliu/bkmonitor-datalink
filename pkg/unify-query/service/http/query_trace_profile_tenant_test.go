@@ -232,16 +232,11 @@ func TestTraceSingleTenantIsNotDerivedFromSeveralTenants(t *testing.T) {
 func TestTraceSingleTenantIsDerivedFromApplicationTopologyOnlyTarget(t *testing.T) {
 	config := traceProfileRuntimeConfig()
 	config["read_routes"] = []any{}
-	config["a3_targets"] = []any{
+	config["application_topology_targets"] = []any{
 		map[string]any{
-			"bk_tenant_id": "system", "label": "a3_edge", "database": "system_kapm",
+			"bk_tenant_id": "system", "label": "application_edge", "database": "system_kapm",
 			"table": "kapm_application_edge_observed_1m", "cluster_id": "18", "cluster_name": "doris",
 			"schema_version": "sha256:19617e34c53d393e", "retention_days": 30, "published_route_version": 7,
-		},
-		map[string]any{
-			"bk_tenant_id": "system", "label": "a3_coverage", "database": "system_kapm",
-			"table": "kapm_application_edge_coverage_1m", "cluster_id": "18", "cluster_name": "doris",
-			"schema_version": "sha256:06c86fab2f251999", "retention_days": 30, "published_route_version": 7,
 		},
 	}
 	runtime, err := newTraceProfileRuntime(config)
@@ -250,7 +245,7 @@ func TestTraceSingleTenantIsDerivedFromApplicationTopologyOnlyTarget(t *testing.
 	}
 	defer runtime.close()
 	if runtime.singleTenantID != "system" {
-		t.Fatalf("A3-only target did not bind its tenant: %q", runtime.singleTenantID)
+		t.Fatalf("application topology target did not bind its tenant: %q", runtime.singleTenantID)
 	}
 }
 
@@ -263,11 +258,6 @@ func TestTraceStaticApplicationTopologyTargetsAcceptDescriptivePublicationField(
 			"table": "kapm_application_edge_observed_1m", "cluster_id": "18", "cluster_name": "doris",
 			"schema_version": "sha256:19617e34c53d393e", "retention_days": 30, "published_route_version": 7,
 		},
-		map[string]any{
-			"bk_tenant_id": "system", "label": "application_coverage", "database": "system_kapm",
-			"table": "kapm_application_edge_coverage_1m", "cluster_id": "18", "cluster_name": "doris",
-			"schema_version": "sha256:06c86fab2f251999", "retention_days": 30, "published_route_version": 7,
-		},
 	}
 	runtime, err := newTraceProfileRuntime(config)
 	if err != nil {
@@ -279,58 +269,16 @@ func TestTraceStaticApplicationTopologyTargetsAcceptDescriptivePublicationField(
 	}
 }
 
-func TestTraceStaticApplicationTopologyKeepsLegacyCoverageWithNewEdge(t *testing.T) {
+func TestLegacyStaticTopologyFieldKeepsOrdinaryTraceRuntime(t *testing.T) {
 	config := traceProfileRuntimeConfig()
-	legacyEdge := map[string]any{
-		"bk_tenant_id": "system", "label": "a3_edge", "database": "system_kapm",
-		"table": "kapm_application_edge_observed_1m", "cluster_id": "18", "cluster_name": "doris",
-		"schema_version": "sha256:19617e34c53d393e", "retention_days": 30, "published_route_version": 7,
-	}
-	legacyCoverage := map[string]any{
-		"bk_tenant_id": "system", "label": "a3_coverage", "database": "system_kapm",
-		"table": "kapm_application_edge_coverage_1m", "cluster_id": "18", "cluster_name": "doris",
-		"schema_version": "sha256:06c86fab2f251999", "retention_days": 30, "published_route_version": 7,
-	}
-	newEdge := map[string]any{}
-	for key, value := range legacyEdge {
-		newEdge[key] = value
-	}
-	newEdge["label"] = "application_edge"
-	config["a3_targets"] = []any{legacyEdge, legacyCoverage}
-	config["application_topology_targets"] = []any{newEdge}
+	config["a3_targets"] = []any{map[string]any{"bk_tenant_id": "system", "label": "a3_edge"}}
 	runtime, err := newTraceProfileRuntime(config)
-	if err != nil {
-		t.Fatalf("matching new edge and legacy pair must coexist: %v", err)
+	if err != nil || runtime == nil {
+		t.Fatalf("legacy static topology field blocked Trace runtime: %v", err)
 	}
 	defer runtime.close()
-}
-
-func TestTraceStaticLegacyApplicationTopologyStillRequiresCoverage(t *testing.T) {
-	config := traceProfileRuntimeConfig()
-	config["a3_targets"] = []any{map[string]any{
-		"bk_tenant_id": "system", "label": "a3_edge", "database": "system_kapm",
-		"table": "kapm_application_edge_observed_1m", "cluster_id": "18", "cluster_name": "doris",
-		"schema_version": "sha256:19617e34c53d393e", "retention_days": 30, "published_route_version": 7,
-	}}
-	runtime, err := newTraceProfileRuntime(config)
-	if err == nil {
-		runtime.close()
-		t.Fatal("legacy A3 target without coverage must remain invalid")
-	}
-}
-
-func TestNormalizeApplicationTopologyTargetsRetainsLegacyCoverage(t *testing.T) {
-	edge := traceProfileApplicationTopologyTargetConfig{BkTenantID: "system", Label: "a3_edge", ClusterID: "18"}
-	coverage := edge
-	coverage.Label = "a3_coverage"
-	newEdge := edge
-	newEdge.Label = "application_edge"
-	targets, err := normalizeApplicationTopologyTargetConfigs(
-		[]traceProfileApplicationTopologyTargetConfig{edge, coverage},
-		[]traceProfileApplicationTopologyTargetConfig{newEdge},
-	)
-	if err != nil || len(targets) != 2 || targets[0].Label != "application_edge" || targets[1].Label != "application_coverage" {
-		t.Fatalf("legacy coverage must remain available during the v2 cutover: %+v, %v", targets, err)
+	if runtime.routeCount == 0 {
+		t.Fatal("legacy static topology field removed ordinary Trace routes")
 	}
 }
 
@@ -342,9 +290,6 @@ func TestApplicationTopologyQueryRespondsWithDescriptiveContract(t *testing.T) {
 		{BkTenantID: "system", Label: "application_edge", Database: "system_kapm",
 			Table: "kapm_application_edge_observed_1m", ClusterID: "18", ClusterName: "doris",
 			SchemaVersion: "sha256:19617e34c53d393e", RetentionDays: 30, PublishedVersion: 7},
-		{BkTenantID: "system", Label: "application_coverage", Database: "system_kapm",
-			Table: "kapm_application_edge_coverage_1m", ClusterID: "18", ClusterName: "doris",
-			SchemaVersion: "sha256:06c86fab2f251999", RetentionDays: 30, PublishedVersion: 7},
 	}
 	snapshot, err := traceprofile.NewRouteSnapshotWithAllTargets(7, nil, nil, targets)
 	if err != nil {
@@ -359,12 +304,12 @@ func TestApplicationTopologyQueryRespondsWithDescriptiveContract(t *testing.T) {
 	}
 	traceProfileRuntimeValue.Load().executor = executor
 	query := traceprofile.ApplicationTopologyRangeQuery{
-		ProtocolVersion: "application_topology_range_v1", ObservationDomainID: "system_kapm", ExpectedRouteVersion: 7,
-		Request: traceprofile.ApplicationTopologyRangeRequest{StartMS: 1760572800000, EndMS: 1760573700000,
+		ProtocolVersion: "application_topology_range_v2", ObservationDomainID: "system_kapm", ExpectedRouteVersion: 7,
+		Request: traceprofile.ApplicationTopologyRangeRequest{ContractVersion: "application_topology_range_v2", StartMS: 1760572800000, EndMS: 1760573700000,
 			Applications: []traceprofile.ApplicationTopologyApplication{{NamespaceID: 11, BkBizID: 42}}, MaxPairs: 100},
 	}
 	fingerprint := traceprofile.ApplicationTopologyRangeFingerprint("system", query)
-	body := fmt.Sprintf(`{"application_topology_contract_version":"application_topology_range_v1",`+
+	body := fmt.Sprintf(`{"application_topology_contract_version":"application_topology_range_v2",`+
 		`"application_topology_request":{"expected_scope_fingerprint":"%s","observation_domain_id":"system_kapm",`+
 		`"expected_route_version":7,"start_time_ms":1760572800000,"end_time_ms":1760573700000,`+
 		`"applications":[{"namespace_id":11,"bk_biz_id":42}],"max_pairs":100}}`, fingerprint)
@@ -376,31 +321,11 @@ func TestApplicationTopologyQueryRespondsWithDescriptiveContract(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if response["application_topology_contract_version"] != "application_topology_range_v1" ||
+	if response["application_topology_contract_version"] != "application_topology_range_v2" ||
 		response["expected_minutes"] != float64(15) {
 		t.Fatalf("application topology response contract missing: %v", response)
 	}
-	if _, legacy := response["a3_contract_version"]; legacy {
-		t.Fatal("new response leaked the legacy A3 contract key")
-	}
-	query.ProtocolVersion = "a3_panorama_range_v1"
-	legacyFingerprint := traceprofile.ApplicationTopologyRangeFingerprint("system", query)
-	legacyBody := fmt.Sprintf(`{"a3_contract_version":"a3_panorama_range_v1",`+
-		`"a3_request":{"expected_scope_fingerprint":"%s","observation_domain_id":"system_kapm",`+
-		`"expected_route_version":7,"start_time_ms":1760572800000,"end_time_ms":1760573700000,`+
-		`"applications":[{"namespace_id":11,"bk_biz_id":42}],"max_pairs":100}}`, legacyFingerprint)
-	legacyRecorder := runTraceProfileRequest(t, legacyBody, "kingeye-apm")
-	if legacyRecorder.Code != http.StatusOK {
-		t.Fatalf("legacy application topology query failed: %d %s", legacyRecorder.Code, legacyRecorder.Body.String())
-	}
-	response = nil
-	if err := json.Unmarshal(legacyRecorder.Body.Bytes(), &response); err != nil {
-		t.Fatal(err)
-	}
-	if response["a3_contract_version"] != "a3_panorama_range_v1" {
-		t.Fatalf("legacy response contract changed: %v", response)
-	}
-	if _, newVersion := response["application_topology_contract_version"]; newVersion {
-		t.Fatal("legacy response was forced onto the new contract")
+	if _, hasCoverage := response["coverage"]; hasCoverage {
+		t.Fatal("observed-only response must not include coverage")
 	}
 }

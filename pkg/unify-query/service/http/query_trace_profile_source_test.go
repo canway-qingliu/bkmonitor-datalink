@@ -34,8 +34,8 @@ const (
 
 // tracePublicationFor 是租户 tenant 的一份完整发布文档：Doris 双 profile 与一个 ES Summary 目标。
 func tracePublicationFor(tenant string) string {
-	document := strings.Replace(publishedBusiness132, `"a3_targets":[]`,
-		`"a3_targets":[],"es_summary_targets":`+publishedESSummaryTargets, 1)
+	document := strings.Replace(publishedBusiness132, `"application_topology_targets":[]`,
+		`"application_topology_targets":[],"es_summary_targets":`+publishedESSummaryTargets, 1)
 	return strings.ReplaceAll(document, "system", tenant)
 }
 
