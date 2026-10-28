@@ -290,6 +290,17 @@ func HandlerQueryRaw(c *gin.Context) {
 		).Error(ctx, err))
 		return
 	}
+	if queryTs.BackgroundTaskSummaryEnvelope != nil {
+		rows, taskErr := queryTaskSummary(ctx, queryTs)
+		if taskErr != nil {
+			resp.failed(ctx, taskErr)
+			return
+		}
+		resp.success(ctx, taskSummaryResponse{
+			Total: len(rows), List: rows, BackgroundTaskSummaryExact: true,
+		})
+		return
+	}
 
 	var routeInfo []metadata.RouteInfo
 	listData.Total, listData.List, listData.ResultTableOptions, routeInfo, err = queryRawWithInstance(ctx, queryTs)

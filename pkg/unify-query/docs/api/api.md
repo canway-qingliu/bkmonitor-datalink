@@ -441,6 +441,8 @@ Kingeye 单租户发布物可选 `es_summary_targets`，每项目标包含租户
 
 `query_list[].exact_total`（bool，默认 `false`）：请求 Elasticsearch 返回精确命中总数（`track_total_hits`）。仅对单个、非聚合、全部路由到 ES 的原始查询生效（不含 `sql`、`scroll`、`collapse`、多查询合并），其他情况直接报错而不是返回看似精确的总数；ES 响应超时、分片失败或 `total.relation` 不为 `eq` 时报错；任一 ES 路由缺少索引前缀时报错（不请求时仍按原逻辑跳过该路由）。满足时响应带 `"total_exact": true`。不设置时请求体与响应与之前一致。
 
+`background_task_summary={"version":1}` 是同一路径的闭合 ES 聚合模式，只接受单个 `bkapm` Span 查询和一个 Elasticsearch 读路由、最长 24 小时窗口；秒级外层时间允许最多 2 秒的毫秒端点取整余量，精确数据范围仍由调用方的微秒结构化条件限定。调用方 `query_string` 必须为 `*`，候选条件与分类脚本均由 UQ 固定，不接受 `exact_total`、SQL、scroll、collapse、外部聚合函数或多查询合并。UQ 在已解析的租户/空间/应用条件和精确时间范围内，按服务、任务类型和名称聚合执行次数、失败次数、平均/最大耗时、最近执行时间及最新 Trace ID。ES 超时、分片失败、聚合桶不完整或超过 5,000 个任务分组时整次拒绝，不返回截断统计。成功时沿用 `ListData` 外壳，`list` 为带 `service_name/task_type/task_name/execution_count/failure_count/avg_duration_ms/max_duration_ms/last_called_ms/latest_trace_id` 的任务分组行，`total` 为精确分组数，并附 `background_task_summary_exact: true`。调用方必须先完成应用授权与存储路由判断；发布顺序为先升级 UQ，再切换 Kingeye 的 ES 分支。Doris 查询继续沿用原始 Span 读取。
+
 **响应格式**: 返回 `ListData` 格式
 
 **响应示例**:

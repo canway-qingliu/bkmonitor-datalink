@@ -62,6 +62,7 @@ type QueryTs struct {
 	ApplicationTopologyVersionEnvelope stdjson.RawMessage `json:"application_topology_contract_version,omitempty" swaggerignore:"true"`
 	ApplicationTopologyRequestEnvelope stdjson.RawMessage `json:"application_topology_request,omitempty" swaggerignore:"true"`
 	TraceRequestEnvelope               stdjson.RawMessage `json:"trace_request,omitempty" swaggerignore:"true"`
+	BackgroundTaskSummaryEnvelope      stdjson.RawMessage `json:"background_task_summary,omitempty" swaggerignore:"true"`
 	// TsDBMap 查询路由匹配中的 tsDB 列表 key:reference_name
 	TsDBMap map[string]TsDBs `json:"tsdb_map,omitempty"`
 	// SpaceUid 空间ID
