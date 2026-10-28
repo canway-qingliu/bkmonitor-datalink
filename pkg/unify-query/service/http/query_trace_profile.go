@@ -616,6 +616,16 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 	span.Set("trace-profile", string(request.Profile))
 	span.Set("trace-profile-route-version", runtime.routeVersion)
 	if request.Aggregation != nil {
+		if request.Aggregation.Method == "task_summary" {
+			rows, taskErr := runtime.executor.ExecuteTaskSummary(ctx, request, scope)
+			if taskErr != nil {
+				return writeTraceProfileError(ctx, c, span, taskErr)
+			}
+			span.Set("trace-profile-task-groups", len(rows))
+			metric.APIRequestInc(ctx, c.Request.URL.Path, metric.StatusSuccess, user.SpaceUID, user.Source)
+			c.JSON(http.StatusOK, traceprofile.NewTaskSummaryResponse(request, rows))
+			return nil
+		}
 		rows, aggregateErr := runtime.executor.ExecuteAggregate(ctx, request, scope)
 		if aggregateErr != nil {
 			return writeTraceProfileError(ctx, c, span, aggregateErr)
