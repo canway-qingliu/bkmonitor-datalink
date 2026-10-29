@@ -461,7 +461,34 @@ func TestDorisSQLExpr_ParserAllConditions(t *testing.T) {
 					},
 				},
 			},
-			want: "CAST(object['field'] AS STRING) LIKE '%pa\\*tial_'",
+			want: "CAST(object['field'] AS STRING) LIKE '%pa\\\\*tial_'",
+		},
+		{
+			name: "doris test windows path backslash escaped",
+			condition: metadata.AllConditions{
+				{
+					{
+						DimensionName: "path",
+						Value:         []string{`C:\test_gse\logs\bk-gse-agent-system.INFO`},
+						Operator:      metadata.ConditionEqual,
+					},
+				},
+			},
+			want: "`path` = 'C:\\\\test_gse\\\\logs\\\\bk-gse-agent-system.INFO'",
+		},
+		{
+			name:     "TSpider test windows path backslash escaped",
+			exprType: TSpider,
+			condition: metadata.AllConditions{
+				{
+					{
+						DimensionName: "path",
+						Value:         []string{`C:\test_gse\logs\bk-gse-agent-system.INFO`},
+						Operator:      metadata.ConditionEqual,
+					},
+				},
+			},
+			want: "`path` = 'C:\\\\test_gse\\\\logs\\\\bk-gse-agent-system.INFO'",
 		},
 		{
 			name: "doris test OR condition",

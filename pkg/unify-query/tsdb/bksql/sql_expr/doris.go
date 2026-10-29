@@ -1013,6 +1013,11 @@ func normalizeDorisFieldName(s string) string {
 }
 
 func (d *DorisSQLExpr) valueTransform(s string) string {
+	// Doris 会对字符串字面量中的反斜杠做转义解析（如 \t、\b），
+	// 未转义会导致 Windows 路径等值匹配失败，因此需要先将反斜杠加倍。
+	if strings.Contains(s, `\`) {
+		s = strings.ReplaceAll(s, `\`, `\\`)
+	}
 	if strings.Contains(s, "'") {
 		s = strings.ReplaceAll(s, "'", "''")
 	}
