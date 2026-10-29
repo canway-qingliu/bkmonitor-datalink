@@ -529,6 +529,57 @@ bk-collector:
 
     # ServiceDiscover: 服务发现处理器
     - name: "service_discover/common"
+      config:
+        rules:
+          # SkyWalking 定时任务框架 component_id 映射
+          - service: "None"
+            type: "sw-schedule-task"
+            kind: "SPAN_KIND_UNSPECIFIED,SPAN_KIND_INTERNAL,SPAN_KIND_SERVER,SPAN_KIND_CLIENT,SPAN_KIND_PRODUCER,SPAN_KIND_CONSUMER"
+            match_type: "regex"
+            predicate_key: "attributes.sw8.component_id"
+            match_key: "attributes.sw8.component_id"
+            replace_type: "missing"
+            match_groups:
+              - destination: "job.system"
+                const_val: "spring_scheduling"
+            rule:
+              regex: "^96$"
+          - service: "None"
+            type: "sw-schedule-task"
+            kind: "SPAN_KIND_UNSPECIFIED,SPAN_KIND_INTERNAL,SPAN_KIND_SERVER,SPAN_KIND_CLIENT,SPAN_KIND_PRODUCER,SPAN_KIND_CONSUMER"
+            match_type: "regex"
+            predicate_key: "attributes.sw8.component_id"
+            match_key: "attributes.sw8.component_id"
+            replace_type: "missing"
+            match_groups:
+              - destination: "job.system"
+                const_val: "quartz"
+            rule:
+              regex: "^97$"
+          - service: "None"
+            type: "sw-schedule-task"
+            kind: "SPAN_KIND_UNSPECIFIED,SPAN_KIND_INTERNAL,SPAN_KIND_SERVER,SPAN_KIND_CLIENT,SPAN_KIND_PRODUCER,SPAN_KIND_CONSUMER"
+            match_type: "regex"
+            predicate_key: "attributes.sw8.component_id"
+            match_key: "attributes.sw8.component_id"
+            replace_type: "missing"
+            match_groups:
+              - destination: "job.system"
+                const_val: "xxl-job"
+            rule:
+              regex: "^98$"
+          - service: "None"
+            type: "sw-schedule-task"
+            kind: "SPAN_KIND_UNSPECIFIED,SPAN_KIND_INTERNAL,SPAN_KIND_SERVER,SPAN_KIND_CLIENT,SPAN_KIND_PRODUCER,SPAN_KIND_CONSUMER"
+            match_type: "regex"
+            predicate_key: "attributes.sw8.component_id"
+            match_key: "attributes.sw8.component_id"
+            replace_type: "missing"
+            match_groups:
+              - destination: "job.system"
+                const_val: "dolphinscheduler"
+            rule:
+              regex: "^106$"
 
     # SpanProcessor: 应用级 span 处理器
     - name: "span_processor/common"
