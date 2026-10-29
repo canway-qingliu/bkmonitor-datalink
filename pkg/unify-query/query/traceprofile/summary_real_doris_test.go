@@ -28,7 +28,7 @@ func TestSummaryProfileReadsRealDorisTotalOrderAndEmptyPage(t *testing.T) {
 	ctx, admin := fixture.ctx, fixture.admin
 	host, port := fixture.host, fixture.port
 	tenant, database, minute := fixture.tenant, fixture.database, fixture.minute
-	const table = "otel_trace_summary_7"
+	const table = "otel_trace_summary"
 	date := minute.Format("2006-01-02")
 	upperDate := minute.AddDate(0, 0, 1).Format("2006-01-02")
 	createSummaryRealTable(t, ctx, admin, database, table, upperDate)
@@ -55,7 +55,7 @@ func TestSummaryProfileReadsRealDorisTotalOrderAndEmptyPage(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = connection.Close() })
 	target := DorisTarget{ClusterID: "local-summary", Database: database, Table: table,
-		SchemaVersion: "local-summary-v1"}
+		SchemaVersion: tenantSummarySchemaVersion}
 	snapshot, err := NewRouteSnapshot(7, []ReadRoute{{
 		BkTenantID: tenant, BkBizID: 7, Profile: metadata.TraceProfileSummary,
 		ObservationDomainID: database, PublishedVersion: 7, Doris: &target,

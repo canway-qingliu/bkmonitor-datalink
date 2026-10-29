@@ -36,10 +36,12 @@ func testScope(t *testing.T) Scope {
 
 func testTarget(profile metadata.TraceProfile) DorisTarget {
 	table := "otel_trace_span_7"
+	schemaVersion := "2026-09-24"
 	if profile == metadata.TraceProfileSummary {
-		table = "otel_trace_summary_7"
+		table = "otel_trace_summary"
+		schemaVersion = tenantSummarySchemaVersion
 	}
-	return DorisTarget{ClusterID: "18", Database: testDomain, Table: table, SchemaVersion: "2026-09-24"}
+	return DorisTarget{ClusterID: "18", Database: testDomain, Table: table, SchemaVersion: schemaVersion}
 }
 
 func testWindow() (int64, int64) {

@@ -33,7 +33,7 @@ func TestCompileAggregateKeepsTrustedScopeAndExactCount(t *testing.T) {
 		t.Fatalf("valid aggregate rejected: %v", err)
 	}
 	for _, required := range []string{
-		"COUNT(*) AS `count`", "`t1_kapm`.`otel_trace_summary_7`", "`trace_start_time_us`",
+		"COUNT(*) AS `count`", "`t1_kapm`.`otel_trace_summary`", "`trace_start_time_us`",
 		"`bk_tenant_id` = ?", "`bk_biz_id` = ?", "`app_id` = ?", "`root_service_name`", "LIMIT 10001",
 	} {
 		if !strings.Contains(compiled.Statement, required) {

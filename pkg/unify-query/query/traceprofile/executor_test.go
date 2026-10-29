@@ -45,7 +45,7 @@ func (f *fakeQuerier) Query(_ context.Context, statement string, args ...any) (d
 		}
 		if len(f.rows) == 0 {
 			profile := metadata.TraceProfileSpan
-			if strings.Contains(statement, "otel_trace_summary_") {
+			if strings.Contains(statement, "otel_trace_summary") {
 				profile = metadata.TraceProfileSummary
 			}
 			empty := map[string]any{"total": total}

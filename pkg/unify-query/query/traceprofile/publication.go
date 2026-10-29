@@ -16,8 +16,6 @@ import (
 	"io"
 	"regexp"
 	"strconv"
-
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 )
 
 var publishedSchemaVersionPattern = regexp.MustCompile(`^sha256:[0-9a-f]{16}$`)
@@ -26,7 +24,7 @@ var publishedSchemaVersionPattern = regexp.MustCompile(`^sha256:[0-9a-f]{16}$`)
 // 读投影不兼容时必须随 DDL 一起升级，不能只接受任意形状的摘要字符串。
 var supportedPublishedSchemaVersion = map[string]string{
 	"trace_span":    "sha256:e6e9af09d86b396e",
-	"trace_summary": "sha256:281052267ec373fc",
+	"trace_summary": tenantSummarySchemaVersion,
 }
 
 var supportedApplicationTopologyTargets = map[string]struct{ table, schema string }{
@@ -88,7 +86,7 @@ type publishedRouteWire struct {
 	SchemaVersion       string          `json:"schema_version"`
 }
 
-// ParsePublishedDocument 校验租户发布键、完整业务双 profile 与物理坐标。
+// ParsePublishedDocument 校验租户发布键与物理坐标。
 // 客户端请求不能通过此入口指定库、表或集群。
 func ParsePublishedDocument(body []byte, keyTenant string) (PublishedDocument, error) {
 	if !ValidTenantID(keyTenant) {
@@ -114,10 +112,8 @@ func ParsePublishedDocument(body []byte, keyTenant string) (PublishedDocument, e
 		return PublishedDocument{}, fmt.Errorf("Trace 发布文档 应用拓扑 段非法")
 	}
 	routes := make([]ReadRoute, 0, len(wire.Routes))
-	profilesByBiz := make(map[int64]uint8)
 	for index, item := range wire.Routes {
-		knownSchema := item.SchemaVersion == supportedPublishedSchemaVersion[item.Profile] ||
-			item.Profile == string(metadata.TraceProfileSummary) && item.SchemaVersion == tenantSummarySchemaVersion
+		knownSchema := item.SchemaVersion == supportedPublishedSchemaVersion[item.Profile]
 		if item.TenantID != keyTenant || item.ClusterName == "" || !publishedSchemaVersionPattern.MatchString(item.SchemaVersion) ||
 			!knownSchema {
 			return PublishedDocument{}, fmt.Errorf("Trace 发布路由 %d 的租户、集群或 schema 非法", index)
@@ -150,18 +146,6 @@ func ParsePublishedDocument(body []byte, keyTenant string) (PublishedDocument, e
 			BkTenantID: keyTenant, BkBizID: item.BizID, AppID: item.AppID, Profile: profile,
 			ObservationDomainID: item.ObservationDomainID, PublishedVersion: wire.Version, Doris: &target,
 		})
-		if item.AppID == 0 {
-			if item.Profile == "trace_span" {
-				profilesByBiz[item.BizID] |= 1
-			} else {
-				profilesByBiz[item.BizID] |= 2
-			}
-		}
-	}
-	for bizID, profiles := range profilesByBiz {
-		if profiles != 3 {
-			return PublishedDocument{}, fmt.Errorf("业务 %d 的 Trace Span/Summary 读目标不完整", bizID)
-		}
 	}
 	esTargets := make([]ESSummaryTarget, 0, len(wire.ESSummaryTargets))
 	for _, item := range wire.ESSummaryTargets {

@@ -21,12 +21,27 @@ const business132Document = `{"route_snapshot_version":7,"bk_tenant_id":"system"
 	`"database":"system_kapm","table":"otel_trace_span_132","cluster_id":18,"cluster_name":"doris4_test",` +
 	`"schema_version":"sha256:e6e9af09d86b396e"},` +
 	`{"bk_tenant_id":"system","bk_biz_id":132,"profile":"trace_summary","observation_domain_id":"system_kapm",` +
-	`"database":"system_kapm","table":"otel_trace_summary_132","cluster_id":18,"cluster_name":"doris4_test",` +
-	`"schema_version":"sha256:281052267ec373fc"}],"application_topology_targets":[]}`
+	`"database":"system_kapm","table":"otel_trace_summary","cluster_id":18,"cluster_name":"doris4_test",` +
+	`"schema_version":"sha256:cc07585afea58a5d"}],"application_topology_targets":[]}`
 
 const publishedESSummaryTargets = `[{"bk_tenant_id":"system","bk_biz_id":132,"app_id":7,` +
 	`"app_name":"checkout","observation_domain_id":"system_kapm",` +
 	`"read_result_table_id":"apm_global.trace_summary_v1_7","storage_cluster_id":9,"retention_days":30}]`
+
+func TestPublishedSpanOnlyRouteAndRetiredBusinessSummary(t *testing.T) {
+	spanOnly := strings.Replace(business132Document,
+		`,{"bk_tenant_id":"system","bk_biz_id":132,"profile":"trace_summary","observation_domain_id":"system_kapm",`+
+			`"database":"system_kapm","table":"otel_trace_summary","cluster_id":18,"cluster_name":"doris4_test",`+
+			`"schema_version":"sha256:cc07585afea58a5d"}`, "", 1)
+	document, err := ParsePublishedDocument([]byte(spanOnly), "system")
+	if err != nil || len(document.Routes) != 1 || document.Routes[0].Profile != metadata.TraceProfileSpan {
+		t.Fatalf("span-only route was rejected: routes=%+v err=%v", document.Routes, err)
+	}
+	legacy := strings.Replace(business132Document, `"table":"otel_trace_summary"`, `"table":"otel_trace_summary_132"`, 1)
+	if _, err := ParsePublishedDocument([]byte(legacy), "system"); err == nil {
+		t.Fatal("retired business Summary table was accepted")
+	}
+}
 
 func TestLegacyPublishedTopologyFieldKeepsSpanAndSummaryReadable(t *testing.T) {
 	legacy := strings.Replace(business132Document, `"application_topology_targets":[]`,
@@ -84,10 +99,7 @@ func TestPublishedApplicationSpanRouteAcceptsHyphenTenantWithHashedDatabase(t *t
 }
 
 func TestPublishedTenantSummaryRouteKeepsBusinessScopeInSharedTable(t *testing.T) {
-	body := strings.Replace(business132Document, `"table":"otel_trace_summary_132"`,
-		`"table":"otel_trace_summary"`, 1)
-	body = strings.Replace(body, `"schema_version":"sha256:281052267ec373fc"`,
-		`"schema_version":"`+tenantSummarySchemaVersion+`"`, 1)
+	body := business132Document
 	document, err := ParsePublishedDocument([]byte(body), "system")
 	if err != nil || len(document.Routes) != 2 || document.Routes[1].Doris.Table != "otel_trace_summary" {
 		t.Fatalf("tenant Summary route rejected: routes=%+v err=%v", document.Routes, err)
@@ -201,7 +213,7 @@ func TestParsePublishedDocumentRejectsTenantAndPhysicalDrift(t *testing.T) {
 		"wrong key tenant": business132Document,
 		"wrong table":      strings.Replace(business132Document, "otel_trace_span_132", "otel_trace_span_133", 1),
 		"wrong schema":     strings.Replace(business132Document, "sha256:e6e9af09d86b396e", "sha256:0123456789abcdef", 1),
-		"missing summary":  strings.Replace(business132Document, `,"profile":"trace_summary"`, `,"profile":"unknown"`, 1),
+		"unknown profile":  strings.Replace(business132Document, `,"profile":"trace_summary"`, `,"profile":"unknown"`, 1),
 	} {
 		tenant := "system"
 		if name == "wrong key tenant" {

@@ -82,13 +82,13 @@ var profilePhysicalTable = map[metadata.TraceProfile]string{
 	metadata.TraceProfileSummary: "otel_trace_summary",
 }
 
-// 与 Kingeye 租户 Summary 新表评审 DDL 的固定 shape 摘要配对；旧业务表仍按原版本解析。
+// 与 Kingeye 租户 Summary 表的固定 shape 摘要配对。
 const tenantSummarySchemaVersion = "sha256:cc07585afea58a5d"
 
 func physicalTableForSchema(profile metadata.TraceProfile, bizID int64, schemaVersion string) (string, error) {
-	if profile == metadata.TraceProfileSummary && schemaVersion == tenantSummarySchemaVersion {
-		if bizID <= 0 {
-			return "", fmt.Errorf("租户 Summary 业务 ID 必须为正")
+	if profile == metadata.TraceProfileSummary {
+		if bizID <= 0 || schemaVersion != tenantSummarySchemaVersion {
+			return "", fmt.Errorf("租户 Summary 目标非法")
 		}
 		return "otel_trace_summary", nil
 	}
