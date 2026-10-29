@@ -53,28 +53,26 @@ const (
 )
 
 type traceProfileRouteConfig struct {
-	BkTenantID          string `json:"bk_tenant_id"`
-	BkBizID             int64  `json:"bk_biz_id"`
-	AppID               int64  `json:"app_id,omitempty"`
-	Profile             string `json:"profile"`
-	ObservationDomainID string `json:"observation_domain_id"`
-	Database            string `json:"database,omitempty"`
-	Table               string `json:"table,omitempty"`
-	ClusterID           string `json:"cluster_id"`
-	ClusterName         string `json:"cluster_name,omitempty"`
-	SchemaVersion       string `json:"schema_version"`
-	PublishedVersion    int64  `json:"published_route_version,omitempty"`
+	BkTenantID       string `json:"bk_tenant_id"`
+	BkBizID          int64  `json:"bk_biz_id"`
+	AppID            int64  `json:"app_id,omitempty"`
+	Profile          string `json:"profile"`
+	Database         string `json:"database,omitempty"`
+	Table            string `json:"table,omitempty"`
+	ClusterID        string `json:"cluster_id"`
+	ClusterName      string `json:"cluster_name,omitempty"`
+	SchemaVersion    string `json:"schema_version"`
+	PublishedVersion int64  `json:"published_route_version,omitempty"`
 }
 
 type traceProfileESTargetConfig struct {
-	BkTenantID          string `json:"bk_tenant_id"`
-	BkBizID             int64  `json:"bk_biz_id"`
-	AppID               int64  `json:"app_id"`
-	AppName             string `json:"app_name"`
-	ObservationDomainID string `json:"observation_domain_id"`
-	ResultTableID       string `json:"read_result_table_id"`
-	StorageClusterID    int64  `json:"storage_cluster_id"`
-	RetentionDays       int64  `json:"retention_days"`
+	BkTenantID       string `json:"bk_tenant_id"`
+	BkBizID          int64  `json:"bk_biz_id"`
+	AppID            int64  `json:"app_id"`
+	AppName          string `json:"app_name"`
+	ResultTableID    string `json:"read_result_table_id"`
+	StorageClusterID int64  `json:"storage_cluster_id"`
+	RetentionDays    int64  `json:"retention_days"`
 	// EntryIndexVersion 是发布方声明的入口索引版本；2 时跨应用父关系筛选与逐行复核才生效。
 	EntryIndexVersion int64 `json:"entry_index_version,omitempty"`
 	PublishedVersion  int64 `json:"published_route_version,omitempty"`
@@ -295,7 +293,7 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 		} else {
 			var err error
 			target, err = traceprofile.NewDorisTarget(
-				route.ClusterID, route.ObservationDomainID, route.BkBizID, profile, route.SchemaVersion,
+				route.ClusterID, route.Database, route.BkBizID, profile, route.SchemaVersion,
 			)
 			if err != nil {
 				closeConnections()
@@ -312,13 +310,12 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 			return nil, fmt.Errorf("Trace 读路由的集群缺少只读连接: %s", route.ClusterID)
 		}
 		routes = append(routes, traceprofile.ReadRoute{
-			BkTenantID:          route.BkTenantID,
-			BkBizID:             route.BkBizID,
-			AppID:               route.AppID,
-			Profile:             profile,
-			ObservationDomainID: route.ObservationDomainID,
-			PublishedVersion:    route.PublishedVersion,
-			Doris:               &target,
+			BkTenantID:       route.BkTenantID,
+			BkBizID:          route.BkBizID,
+			AppID:            route.AppID,
+			Profile:          profile,
+			PublishedVersion: route.PublishedVersion,
+			Doris:            &target,
 		})
 	}
 	esTargets := make([]traceprofile.ESSummaryTarget, 0, len(config.ESSummaryTargets))
@@ -326,12 +323,11 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 		esTargets = append(esTargets, traceprofile.ESSummaryTarget{
 			BkTenantID: target.BkTenantID, BkBizID: target.BkBizID,
 			AppID: target.AppID, AppName: target.AppName,
-			ObservationDomainID: target.ObservationDomainID,
-			ResultTableID:       target.ResultTableID,
-			StorageClusterID:    target.StorageClusterID,
-			RetentionDays:       target.RetentionDays,
-			EntryIndexVersion:   target.EntryIndexVersion,
-			PublishedVersion:    target.PublishedVersion,
+			ResultTableID:     target.ResultTableID,
+			StorageClusterID:  target.StorageClusterID,
+			RetentionDays:     target.RetentionDays,
+			EntryIndexVersion: target.EntryIndexVersion,
+			PublishedVersion:  target.PublishedVersion,
 		})
 	}
 	topologyTargets := make([]traceprofile.ApplicationTopologyTarget, 0, len(topologyTargetConfigs))
@@ -474,7 +470,7 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 	dataTenantID := user.TenantID
 	span.Set("trace-profile-request-tenant-id", user.TenantID)
 	span.Set("trace-profile-data-tenant-id", dataTenantID)
-	scope, err := traceprofile.ResolveScope(dataTenantID, user.SpaceUID, request.ObservationDomainID)
+	scope, err := traceprofile.ResolveScope(dataTenantID, user.SpaceUID)
 	if err != nil {
 		return writeTraceProfileError(ctx, c, span, err)
 	}
@@ -495,7 +491,7 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 			return writeTraceProfileReject(ctx, c, span, traceprofile.CodeUnauthorizedMember, "ES Summary 成员业务不在受信空间内")
 		}
 		target, targetErr := runtime.executor.ResolveESSummaryTarget(
-			scope.BkTenantID, pair.BkBizID, pair.AppID, scope.ObservationDomainID,
+			scope.BkTenantID, pair.BkBizID, pair.AppID,
 		)
 		if targetErr != nil {
 			return writeTraceProfileError(ctx, c, span, targetErr)

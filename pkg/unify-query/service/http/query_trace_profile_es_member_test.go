@@ -32,7 +32,7 @@ import (
 func esMemberHTTPFixture(t *testing.T) (traceprofile.Request, traceprofile.Scope, traceprofile.ESSummaryTarget) {
 	t.Helper()
 	metadata.InitMetadata()
-	scope, err := traceprofile.ResolveScope("system", "bkcc__42", "system_kapm")
+	scope, err := traceprofile.ResolveScope("system", "bkcc__42")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func esMemberHTTPFixture(t *testing.T) (traceprofile.Request, traceprofile.Scope
 	}
 	target := traceprofile.ESSummaryTarget{
 		BkTenantID: "system", BkBizID: 42, AppID: 7, AppName: "checkout",
-		ObservationDomainID: "system_kapm", ResultTableID: "apm_global.trace_summary_v1_7",
+		ResultTableID:    "system.trace_summary_es_v2",
 		StorageClusterID: 9, RetentionDays: 30, PublishedVersion: 7,
 	}
 	return request, scope, target
@@ -65,8 +65,8 @@ func TestESMemberExecutionBuildsClosedExactQueryAndChecksResolvedRoute(t *testin
 		}
 		conditions := query.QueryList[0].Conditions.FieldList
 		wanted := map[string]string{
-			"trace_id": request.MemberLookup.TraceID, "bk_tenant_id": "system",
-			"observation_domain_id": "system_kapm", "biz_id": "42", "app_id": "7",
+			"trace_id": request.MemberLookup.TraceID,
+			"biz_id":   "42", "app_id": "7",
 		}
 		for _, field := range conditions {
 			if expected, found := wanted[field.DimensionName]; found {
@@ -169,7 +169,6 @@ func TestESMemberExecutionTraversesRealRawRouterAndMockElasticsearch(t *testing.
 	httpmock.RegisterResponder(http.MethodGet, mock.EsUrl+"/es_member_summary_index/_mapping/",
 		httpmock.NewStringResponder(http.StatusOK, mapping))
 	row := map[string]any{
-		"bk_tenant_id": "system", "observation_domain_id": "system_kapm",
 		"biz_id": "42", "app_id": 7, "app_name": "checkout", "trace_id": request.MemberLookup.TraceID,
 		"trace_date": "2024-07-15", "min_start_time": request.StartUS,
 		"max_end_time": request.StartUS + 1000, "trace_duration": 1000,

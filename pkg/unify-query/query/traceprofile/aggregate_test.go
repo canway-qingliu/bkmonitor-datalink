@@ -34,7 +34,7 @@ func TestCompileAggregateKeepsTrustedScopeAndExactCount(t *testing.T) {
 	}
 	for _, required := range []string{
 		"COUNT(*) AS `count`", "`t1_kapm`.`otel_trace_summary`", "`trace_start_time_us`",
-		"`bk_tenant_id` = ?", "`bk_biz_id` = ?", "`app_id` = ?", "`root_service_name`", "LIMIT 10001",
+		"`bk_biz_id` = ?", "`app_id` = ?", "`root_service_name`", "LIMIT 10001",
 	} {
 		if !strings.Contains(compiled.Statement, required) {
 			t.Fatalf("aggregate SQL missing %q: %s", required, compiled.Statement)

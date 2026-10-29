@@ -64,11 +64,11 @@ func (e *Executor) RouteVersion() int64 {
 }
 
 // ResolveESSummaryTarget 暴露同一版本快照中的 ES Summary 应用目标。
-func (e *Executor) ResolveESSummaryTarget(tenantID string, bizID, appID int64, observationDomainID string) (ESSummaryTarget, error) {
+func (e *Executor) ResolveESSummaryTarget(tenantID string, bizID, appID int64) (ESSummaryTarget, error) {
 	if e == nil || e.snapshot == nil {
 		return ESSummaryTarget{}, reject(CodeRouteNotFound, "ES Summary 读路由尚未配置")
 	}
-	return e.snapshot.ResolveESSummary(tenantID, bizID, appID, observationDomainID)
+	return e.snapshot.ResolveESSummary(tenantID, bizID, appID)
 }
 
 // exactSpanRouteAppID 只从闭合的单应用 AND 条件选路；其他请求保留旧业务路由。
@@ -104,7 +104,7 @@ func (e *Executor) Execute(ctx context.Context, request Request, scope Scope) (P
 		return Page{}, reject(CodeUnsupportedSchemaCapability, "ES Summary 成员查询不得进入 Doris 执行器")
 	}
 	route, err := e.snapshot.ResolveForApplication(
-		scope.BkTenantID, scope.BkBizID, exactSpanRouteAppID(request), request.Profile, scope.ObservationDomainID,
+		scope.BkTenantID, scope.BkBizID, exactSpanRouteAppID(request), request.Profile,
 	)
 	if err != nil {
 		return Page{}, err
@@ -122,7 +122,7 @@ func (e *Executor) Execute(ctx context.Context, request Request, scope Scope) (P
 		return Page{}, err
 	}
 	if request.MemberLookup == nil {
-		return executeSnapshotList(ctx, request, connection, compiled)
+		return executeSnapshotList(ctx, request, scope, connection, compiled)
 	}
 
 	// 精确成员查询先读 total，超预算时不读取成员行。
@@ -162,14 +162,14 @@ func (e *Executor) Execute(ctx context.Context, request Request, scope Scope) (P
 	if err := verifyMemberRows(rows, request, scope); err != nil {
 		return Page{}, err
 	}
-	items, err := ShapeRows(request.Profile, rows)
+	items, err := ShapeRows(request.Profile, rows, scope.BkTenantID)
 	if err != nil {
 		return Page{}, reject(CodePartialFailure, "Trace 结果不符合行合同: %s", err)
 	}
 	return Page{Items: items, Total: snapshotTotal}, nil
 }
 
-func executeSnapshotList(ctx context.Context, request Request, connection Querier, compiled CompiledList) (Page, error) {
+func executeSnapshotList(ctx context.Context, request Request, scope Scope, connection Querier, compiled CompiledList) (Page, error) {
 	result, err := connection.Query(ctx, compiled.SnapshotStatement, compiled.SnapshotArgs...)
 	if err != nil {
 		return Page{}, queryFailure(err)
@@ -196,7 +196,7 @@ func executeSnapshotList(ctx context.Context, request Request, connection Querie
 	if int64(len(rows)) != expected {
 		return Page{}, reject(CodePartialFailure, "Trace 同次快照 total/Page 行数不一致")
 	}
-	items, err := ShapeRows(request.Profile, rows)
+	items, err := ShapeRows(request.Profile, rows, scope.BkTenantID)
 	if err != nil {
 		return Page{}, reject(CodePartialFailure, "Trace 结果不符合行合同: %s", err)
 	}
@@ -218,11 +218,12 @@ func readSnapshotRows(profile metadata.TraceProfile, result dorisclient.Result) 
 		if index == 0 {
 			total = parsed
 		}
-		tenant, present := row["bk_tenant_id"]
+		firstField := projectionForProfile(profile)[0]
+		firstValue, present := row[firstField]
 		if !present {
-			return 0, dorisclient.Result{}, reject(CodePartialFailure, "Trace 同次快照缺少租户列")
+			return 0, dorisclient.Result{}, reject(CodePartialFailure, "Trace 同次快照缺少数据列")
 		}
-		if tenant == nil {
+		if firstValue == nil {
 			if len(result.Rows) != 1 {
 				return 0, dorisclient.Result{}, reject(CodePartialFailure, "Trace 空页哨兵与业务行混杂")
 			}
@@ -254,8 +255,6 @@ func verifyMemberRows(rows []map[string]any, request Request, scope Scope) error
 		bizID, err := exactTraceInt64(row["bk_biz_id"])
 		expectedBiz, allowedApp := allowed[appID]
 		if !ok || !allowedApp || err != nil || expectedBiz != bizID || bizID != scope.BkBizID ||
-			row["bk_tenant_id"] != scope.BkTenantID ||
-			row["observation_domain_id"] != scope.ObservationDomainID ||
 			row["trace_id"] != request.MemberLookup.TraceID {
 			return reject(CodeUnauthorizedMember, "Summary 精确成员行超出受信允许集")
 		}

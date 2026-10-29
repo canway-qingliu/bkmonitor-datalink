@@ -88,12 +88,13 @@ func TestTraceBackendFailureIs5xxWithoutDriverText(t *testing.T) {
 func TestTraceRejectionIsCountedByCodeAndNotASpanError(t *testing.T) {
 	withTraceProfileRuntime(t, traceProfileRuntimeConfig())
 	withTraceProfileAuth(t, true, "kingeye-apm")
-	before := traceProfileRejectionCount(t, traceprofile.CodeUnauthorizedDomain, "4xx")
-	recorder, spanErr := runTraceProfileHandler(t, typedTraceBody("trace_span", "other_kapm"))
+	before := traceProfileRejectionCount(t, traceprofile.CodeUnsupportedSchemaCapability, "4xx")
+	body := strings.Replace(typedTraceBody("trace_span", ""), `"trace_request":{`, `"trace_request":{"observation_domain_id":"other_kapm",`, 1)
+	recorder, spanErr := runTraceProfileHandler(t, body)
 	if recorder.Code != http.StatusBadRequest || spanErr != nil {
 		t.Fatalf("rejection returned HTTP %d span error %v", recorder.Code, spanErr)
 	}
-	if after := traceProfileRejectionCount(t, traceprofile.CodeUnauthorizedDomain, "4xx"); after != before+1 {
+	if after := traceProfileRejectionCount(t, traceprofile.CodeUnsupportedSchemaCapability, "4xx"); after != before+1 {
 		t.Fatalf("rejection was not counted by code: %v -> %v", before, after)
 	}
 }

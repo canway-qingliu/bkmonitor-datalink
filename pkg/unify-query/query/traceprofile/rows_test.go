@@ -24,8 +24,6 @@ func completeSpanRow() map[string]any {
 	for _, field := range spanProjection {
 		row[field] = "value"
 	}
-	row["bk_tenant_id"] = "system"
-	row["observation_domain_id"] = "system_kapm"
 	row["app_id"] = "app-a"
 	row["span_date"] = "2026-09-17"
 	row["trace_id"] = strings.Repeat("a", 32)
@@ -62,8 +60,6 @@ func completeSummaryRow() map[string]any {
 	for _, field := range summaryProjection {
 		row[field] = "value"
 	}
-	row["bk_tenant_id"] = "system"
-	row["observation_domain_id"] = "system_kapm"
 	row["trace_date"] = "2026-09-17"
 	row["app_id"] = "app-a"
 	row["trace_id"] = strings.Repeat("a", 32)
@@ -90,7 +86,7 @@ func completeSummaryRow() map[string]any {
 
 func TestShapeRowsBuildsClosedKAPMSpanAndSummaryItems(t *testing.T) {
 	spanInput := completeSpanRow()
-	spanRows, err := ShapeRows(metadata.TraceProfileSpan, []map[string]any{spanInput})
+	spanRows, err := ShapeRows(metadata.TraceProfileSpan, []map[string]any{spanInput}, "system")
 	if err != nil || len(spanRows) != 1 {
 		t.Fatalf("Span row shaping failed: rows=%+v err=%v", spanRows, err)
 	}
@@ -100,8 +96,8 @@ func TestShapeRowsBuildsClosedKAPMSpanAndSummaryItems(t *testing.T) {
 	}
 	member, ok := span["member"].(map[string]any)
 	if !ok || !reflect.DeepEqual(member, map[string]any{
-		"bk_tenant_id": "system", "observation_domain_id": "system_kapm",
-		"data_id": int64(101), "bk_biz_id": int64(42), "app_id": "app-a",
+		"bk_tenant_id": "system",
+		"data_id":      int64(101), "bk_biz_id": int64(42), "app_id": "app-a",
 	}) {
 		t.Fatalf("Span member identity was not typed correctly: %+v", span)
 	}
@@ -120,7 +116,7 @@ func TestShapeRowsBuildsClosedKAPMSpanAndSummaryItems(t *testing.T) {
 		t.Fatalf("large nested integer was not serialized exactly: %s err=%v", wire, err)
 	}
 
-	summaryRows, err := ShapeRows(metadata.TraceProfileSummary, []map[string]any{completeSummaryRow()})
+	summaryRows, err := ShapeRows(metadata.TraceProfileSummary, []map[string]any{completeSummaryRow()}, "system")
 	if err != nil || len(summaryRows) != 1 {
 		t.Fatalf("Summary row shaping failed: rows=%+v err=%v", summaryRows, err)
 	}
@@ -141,7 +137,7 @@ func TestShapeRowsFailsWholeBatchOnMissingOrInvalidPhysicalValues(t *testing.T) 
 	valid := completeSummaryRow()
 	invalid := completeSummaryRow()
 	delete(invalid, "span_count")
-	if rows, err := ShapeRows(metadata.TraceProfileSummary, []map[string]any{valid, invalid}); err == nil || rows != nil {
+	if rows, err := ShapeRows(metadata.TraceProfileSummary, []map[string]any{valid, invalid}, "system"); err == nil || rows != nil {
 		t.Fatalf("partial Summary batch escaped: rows=%+v err=%v", rows, err)
 	}
 	for name, mutate := range map[string]func(map[string]any){
@@ -151,13 +147,13 @@ func TestShapeRowsFailsWholeBatchOnMissingOrInvalidPhysicalValues(t *testing.T) 
 		"wrong JSON object":          func(row map[string]any) { row["category_statistics"] = []any{1} },
 		"null summary event time":    func(row map[string]any) { row["event_time_ms"] = nil },
 		"whitespace app identity":    func(row map[string]any) { row["app_id"] = " app-a " },
-		"foreign observation domain": func(row map[string]any) { row["observation_domain_id"] = "other_kapm" },
+		"retired observation domain": func(row map[string]any) { row["observation_domain_id"] = "other_kapm" },
 		"negative span count":        func(row map[string]any) { row["span_count"] = int64(-1) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			row := completeSummaryRow()
 			mutate(row)
-			if _, err := ShapeRows(metadata.TraceProfileSummary, []map[string]any{row}); err == nil {
+			if _, err := ShapeRows(metadata.TraceProfileSummary, []map[string]any{row}, "system"); err == nil {
 				t.Fatal("invalid Summary row was accepted")
 			}
 		})
@@ -167,7 +163,7 @@ func TestShapeRowsFailsWholeBatchOnMissingOrInvalidPhysicalValues(t *testing.T) 
 func TestShapeSpanRejectsBusinessSpaceMismatch(t *testing.T) {
 	row := completeSpanRow()
 	row["space_uid"] = "bkcc__43"
-	if _, err := ShapeRows(metadata.TraceProfileSpan, []map[string]any{row}); err == nil {
+	if _, err := ShapeRows(metadata.TraceProfileSpan, []map[string]any{row}, "system"); err == nil {
 		t.Fatal("Span row with a foreign business space was accepted")
 	}
 }

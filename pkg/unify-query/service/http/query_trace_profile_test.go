@@ -33,7 +33,7 @@ const verifiedJWTAppCodeContextKey = "unify_query_verified_jwt_app_code"
 
 func typedTraceBody(profile, domain string) string {
 	return `{"trace_profile":"` + profile + `","trace_contract_version":"trace_query_v2","trace_request":{` +
-		`"observation_domain_id":"` + domain + `",` +
+		`` +
 		`"expected_scope_fingerprint":"` + strings.Repeat("a", 64) + `",` +
 		`"start_time":"1758585600000000","end_time":"1758672000000000",` +
 		`"filters":{"field_list":[],"condition_list":[]},"order_by":[],"limit":100}}`
@@ -61,13 +61,13 @@ func TestTypedTaskSummaryUsesTrustedDorisRoute(t *testing.T) {
 	}
 	snapshot, err := traceprofile.NewRouteSnapshot(7, []traceprofile.ReadRoute{{
 		BkTenantID: "system", BkBizID: 42, Profile: metadata.TraceProfileSpan,
-		ObservationDomainID: "system_kapm", Doris: &target,
+		Doris: &target,
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	querier := tenantScopeQuerier(func(_ context.Context, statement string, args ...any) (dorisclient.Result, error) {
-		if !strings.Contains(statement, "`app_id` = ?") || !strings.Contains(statement, "LIMIT 5001") || len(args) < 9 {
+		if !strings.Contains(statement, "`app_id` = ?") || !strings.Contains(statement, "LIMIT 5001") || len(args) < 7 {
 			t.Fatalf("task summary lost trusted SQL scope or group budget: %s %v", statement, args)
 		}
 		return dorisclient.Result{Rows: []map[string]any{{
@@ -92,7 +92,7 @@ func TestTypedTaskSummaryUsesTrustedDorisRoute(t *testing.T) {
 }
 
 func TestDefaultTraceProfileBudgetCoversThirtyDayInclusiveWindow(t *testing.T) {
-	scope, err := traceprofile.ResolveScope("system", "bkcc__42", "system_kapm")
+	scope, err := traceprofile.ResolveScope("system", "bkcc__42")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +100,7 @@ func TestDefaultTraceProfileBudgetCoversThirtyDayInclusiveWindow(t *testing.T) {
 	start := end - 30*24*int64(time.Hour/time.Microsecond) - 1000
 	request := traceprofile.Request{
 		Profile: metadata.TraceProfileSpan, StartUS: start, EndUS: end,
-		ObservationDomainID: "system_kapm", Limit: 50,
+		Limit: 50,
 	}
 	target := traceprofile.DorisTarget{ClusterID: "18", Database: "system_kapm", Table: "otel_trace_span_42"}
 	limits := traceprofile.Limits{MaxRangeUS: traceprofile.MaxWindowUS(defaultTraceProfileMaxRangeDays)}
@@ -175,12 +175,12 @@ func traceProfileRuntimeConfig() map[string]any {
 		"max_range_days":                     7,
 		"read_routes": []any{
 			map[string]any{
-				"bk_tenant_id": "system", "bk_biz_id": 42, "profile": "trace_span", "observation_domain_id": "system_kapm",
-				"cluster_id": "18", "schema_version": "2026-09-24", "published_route_version": 7,
+				"bk_tenant_id": "system", "bk_biz_id": 42, "profile": "trace_span",
+				"database": "system_kapm", "cluster_id": "18", "schema_version": "2026-09-24", "published_route_version": 7,
 			},
 			map[string]any{
-				"bk_tenant_id": "system", "bk_biz_id": 42, "profile": "trace_summary", "observation_domain_id": "system_kapm",
-				"cluster_id": "18", "schema_version": "2026-09-24", "published_route_version": 7,
+				"bk_tenant_id": "system", "bk_biz_id": 42, "profile": "trace_summary",
+				"database": "system_kapm", "cluster_id": "18", "schema_version": "sha256:3d6b6b96f74453dd", "published_route_version": 7,
 			},
 		},
 		"readonly_connections": []any{
@@ -327,7 +327,7 @@ func TestNewTraceProfileRuntimeParsesOnlyCompleteConfiguration(t *testing.T) {
 		{
 			name: "observation domain is not an identifier",
 			mutate: func(config map[string]any) {
-				config["read_routes"].([]any)[0].(map[string]any)["observation_domain_id"] = "system-kapm"
+				config["read_routes"].([]any)[0].(map[string]any)["database"] = "system-kapm"
 			},
 		},
 		{
@@ -433,8 +433,8 @@ func TestESMemberLookupRejectsRangeBudgetBeforeIO(t *testing.T) {
 	config["max_range_days"] = 1
 	config["es_summary_targets"] = []any{map[string]any{
 		"bk_tenant_id": "system", "bk_biz_id": 42, "app_id": 7,
-		"app_name": "checkout", "observation_domain_id": "system_kapm",
-		"read_result_table_id": "apm_global.trace_summary_v1_7",
+		"app_name":             "checkout",
+		"read_result_table_id": "system.trace_summary_es_v2",
 		"storage_cluster_id":   9, "retention_days": 30, "published_route_version": 7,
 	}}
 	withTraceProfileRuntime(t, config)
@@ -479,8 +479,8 @@ func TestESMemberLookupChecksPublishedTargetAndVersionBeforeExecution(t *testing
 		config := traceProfileRuntimeConfig()
 		config["es_summary_targets"] = []any{map[string]any{
 			"bk_tenant_id": "system", "bk_biz_id": 42, "app_id": 7,
-			"app_name": "checkout", "observation_domain_id": "system_kapm",
-			"read_result_table_id": "apm_global.trace_summary_v1_7",
+			"app_name":             "checkout",
+			"read_result_table_id": "system.trace_summary_es_v2",
 			"storage_cluster_id":   9, "retention_days": 7,
 			"published_route_version": tc.version,
 		}}
@@ -490,7 +490,7 @@ func TestESMemberLookupChecksPublishedTargetAndVersionBeforeExecution(t *testing
 				int64, []map[string]any, metadata.ResultTableOptions, []metadata.RouteInfo, error,
 			) {
 				return 0, nil, nil, []metadata.RouteInfo{{
-					TableID: "apm_global.trace_summary_v1_7", StorageType: metadata.ElasticsearchStorageType,
+					TableID: "system.trace_summary_es_v2", StorageType: metadata.ElasticsearchStorageType,
 					StorageID: "9",
 				}}, nil
 			}
@@ -511,8 +511,8 @@ func TestESSummaryListUsesPublishedTargetInsteadOfDorisRoute(t *testing.T) {
 	config := traceProfileRuntimeConfig()
 	config["es_summary_targets"] = []any{map[string]any{
 		"bk_tenant_id": "system", "bk_biz_id": 42, "app_id": 7,
-		"app_name": "checkout", "observation_domain_id": "system_kapm",
-		"read_result_table_id": "apm_global.trace_summary_v1_7",
+		"app_name":             "checkout",
+		"read_result_table_id": "system.trace_summary_es_v2",
 		"storage_cluster_id":   9, "retention_days": 7, "published_route_version": 7,
 	}}
 	withTraceProfileRuntime(t, config)
@@ -526,11 +526,11 @@ func TestESSummaryListUsesPublishedTargetInsteadOfDorisRoute(t *testing.T) {
 		int64, []map[string]any, metadata.ResultTableOptions, []metadata.RouteInfo, error,
 	) {
 		called = true
-		if query.From != 1 || query.QueryList[0].TableID != "apm_global.trace_summary_v1_7" {
+		if query.From != 1 || query.QueryList[0].TableID != "system.trace_summary_es_v2" {
 			t.Fatalf("ES list did not use published target: %+v", query)
 		}
 		return 1, nil, nil, []metadata.RouteInfo{{
-			TableID: "apm_global.trace_summary_v1_7", StorageType: metadata.ElasticsearchStorageType, StorageID: "9",
+			TableID: "system.trace_summary_es_v2", StorageType: metadata.ElasticsearchStorageType, StorageID: "9",
 		}}, nil
 	}
 	recorder := runTraceProfileRequest(t, body, "kingeye-apm")
@@ -543,11 +543,11 @@ func TestTraceProfileDirectReadEnforcesAuthorizedScope(t *testing.T) {
 	withTraceProfileRuntime(t, traceProfileRuntimeConfig())
 	withTraceProfileAuth(t, true, "kingeye-apm")
 
-	t.Run("domain outside tenant", func(t *testing.T) {
-		body := typedTraceBody("trace_span", "other_kapm")
+	t.Run("retired domain input", func(t *testing.T) {
+		body := strings.Replace(typedTraceBody("trace_span", ""), `"trace_request":{`, `"trace_request":{"observation_domain_id":"other_kapm",`, 1)
 		code := decodeTraceProfileError(t, runTraceProfileRequest(t, body, "kingeye-apm"))
-		if code != traceprofile.CodeUnauthorizedDomain {
-			t.Fatalf("got %s, want %s", code, traceprofile.CodeUnauthorizedDomain)
+		if code != traceprofile.CodeUnsupportedSchemaCapability {
+			t.Fatalf("got %s, want %s", code, traceprofile.CodeUnsupportedSchemaCapability)
 		}
 	})
 
@@ -555,10 +555,10 @@ func TestTraceProfileDirectReadEnforcesAuthorizedScope(t *testing.T) {
 		config := traceProfileRuntimeConfig()
 		routes := config["read_routes"].([]any)
 		for _, raw := range routes {
-			// 观测域与租户同源，改租户必须连同观测域一起改，否则配置本身非法。
+			// 受信租户和物理库必须同时换到另一租户。
 			route := raw.(map[string]any)
 			route["bk_tenant_id"] = "other"
-			route["observation_domain_id"] = "other_kapm"
+			route["database"] = "other_kapm"
 		}
 		withTraceProfileRuntime(t, config)
 		code := decodeTraceProfileError(t, runTraceProfileRequest(t, typedTraceBody("trace_span", "system_kapm"), "kingeye-apm"))

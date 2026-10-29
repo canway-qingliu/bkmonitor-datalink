@@ -80,19 +80,18 @@ const maxMemberPairs = 128
 // Request contains only logical query fields. Physical coordinates and SQL are
 // absent from the wire type and rejected during strict JSON decoding.
 type Request struct {
-	Profile             metadata.TraceProfile
-	ScopeFingerprint    string
-	ObservationDomainID string
-	Scene               string
-	StartUS             int64
-	EndUS               int64
-	Filters             Filters
-	OrderBy             []string
-	Limit               int64
-	Offset              *int64
-	MemberLookup        *MemberLookup
-	ESSummaryList       *ESSummaryList
-	Aggregation         *CountAggregation
+	Profile          metadata.TraceProfile
+	ScopeFingerprint string
+	Scene            string
+	StartUS          int64
+	EndUS            int64
+	Filters          Filters
+	OrderBy          []string
+	Limit            int64
+	Offset           *int64
+	MemberLookup     *MemberLookup
+	ESSummaryList    *ESSummaryList
+	Aggregation      *CountAggregation
 
 	// esSummaryPredicate 是 ParseRequest 解析过的 ES Summary 列表入口筛选，避免重复解析。
 	esSummaryPredicate *ESSummaryListPredicate
@@ -107,7 +106,6 @@ type CountAggregation struct {
 }
 
 type wireRequest struct {
-	ObservationDomainID      string          `json:"observation_domain_id"`
 	ExpectedScopeFingerprint string          `json:"expected_scope_fingerprint"`
 	Scene                    json.RawMessage `json:"scene,omitempty"`
 	StartTime                string          `json:"start_time"`
@@ -174,8 +172,7 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 		}
 		offset = &value
 	}
-	if query.ObservationDomainID == "" || strings.ContainsRune(query.ObservationDomainID, 0) ||
-		!fingerprintPattern.MatchString(query.ExpectedScopeFingerprint) || query.Filters == nil || query.OrderBy == nil {
+	if !fingerprintPattern.MatchString(query.ExpectedScopeFingerprint) || query.Filters == nil || query.OrderBy == nil {
 		return Request{}, fmt.Errorf("Trace profile 缺少受信范围或查询字段")
 	}
 	if wire.TraceProfile == metadata.TraceProfileSummary {
@@ -310,7 +307,7 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 	}
 	return Request{
 		Profile: wire.TraceProfile, ScopeFingerprint: query.ExpectedScopeFingerprint,
-		ObservationDomainID: query.ObservationDomainID, Scene: scene,
+		Scene:   scene,
 		StartUS: startUS, EndUS: endUS, Filters: *query.Filters,
 		OrderBy: append([]string(nil), query.OrderBy...), Limit: query.Limit, Offset: offset,
 		MemberLookup:  memberLookup,

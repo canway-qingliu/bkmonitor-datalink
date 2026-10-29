@@ -27,7 +27,7 @@ const (
 
 func testScope(t *testing.T) Scope {
 	t.Helper()
-	scope, err := ResolveScope(testTenant, testSpaceUID, testDomain)
+	scope, err := ResolveScope(testTenant, testSpaceUID)
 	if err != nil {
 		t.Fatalf("ResolveScope returned error: %v", err)
 	}
@@ -53,12 +53,11 @@ func testWindow() (int64, int64) {
 func testRequest(profile metadata.TraceProfile) Request {
 	startUS, endUS := testWindow()
 	return Request{
-		Profile:             profile,
-		ScopeFingerprint:    strings.Repeat("a", 64),
-		ObservationDomainID: testDomain,
-		StartUS:             startUS,
-		EndUS:               endUS,
-		Limit:               100,
+		Profile:          profile,
+		ScopeFingerprint: strings.Repeat("a", 64),
+		StartUS:          startUS,
+		EndUS:            endUS,
+		Limit:            100,
 	}
 }
 
@@ -96,7 +95,7 @@ func TestCompileListBindsSpanScopeTimeAndCanonicalOrder(t *testing.T) {
 	}
 
 	wantWhere := "WHERE `span_date` >= ? AND `span_date` <= ? AND `start_time_us` >= ? AND `start_time_us` < ?" +
-		" AND `bk_tenant_id` = ? AND `observation_domain_id` = ? AND `space_uid` = ? AND `bk_biz_id` = ?"
+		" AND `space_uid` = ? AND `bk_biz_id` = ?"
 	if !strings.Contains(compiled.SnapshotStatement, wantWhere) {
 		t.Fatalf("unexpected where clause: %s", compiled.SnapshotStatement)
 	}
@@ -104,7 +103,7 @@ func TestCompileListBindsSpanScopeTimeAndCanonicalOrder(t *testing.T) {
 	if !strings.Contains(compiled.SnapshotStatement, wantOrder) {
 		t.Fatalf("unexpected order/limit clause: %s", compiled.SnapshotStatement)
 	}
-	if !strings.HasPrefix(compiled.SnapshotStatement, "WITH filtered AS (SELECT `bk_tenant_id`") ||
+	if !strings.HasPrefix(compiled.SnapshotStatement, "WITH filtered AS (SELECT `app_id`") ||
 		!strings.Contains(compiled.SnapshotStatement, "FROM `t1_kapm`.`otel_trace_span_7`") {
 		t.Fatalf("unexpected statement head: %s", compiled.SnapshotStatement)
 	}
@@ -113,7 +112,7 @@ func TestCompileListBindsSpanScopeTimeAndCanonicalOrder(t *testing.T) {
 	}
 
 	wantArgs := []any{"2026-09-23", "2026-09-23", request.StartUS, request.EndUS,
-		testTenant, testDomain, testSpaceUID, testBizID}
+		testSpaceUID, testBizID}
 	if !reflect.DeepEqual(compiled.SnapshotArgs, wantArgs) {
 		t.Fatalf("unexpected bound args: %#v", compiled.SnapshotArgs)
 	}
@@ -126,20 +125,19 @@ func TestCompileListBindsSpanScopeTimeAndCanonicalOrder(t *testing.T) {
 }
 
 func TestCompileListReadsBusiness132InTheRequestedUTCWindow(t *testing.T) {
-	scope, err := ResolveScope("system", "bkcc__132", "system_kapm")
+	scope, err := ResolveScope("system", "bkcc__132")
 	if err != nil {
 		t.Fatal(err)
 	}
 	offset := int64(0)
 	request := Request{
-		Profile: metadata.TraceProfileSpan, ObservationDomainID: "system_kapm",
-		StartUS: 1790749515960000, EndUS: 1790749816960000,
+		Profile: metadata.TraceProfileSpan, StartUS: 1790749515960000, EndUS: 1790749816960000,
 		Limit: 50, Offset: &offset,
 		Filters: Filters{FieldList: []FilterField{{FieldName: "app_id", Value: []string{"42"}, Operator: "eq"}}},
 	}
 	target := DorisTarget{
 		ClusterID: "18", Database: "system_kapm", Table: "otel_trace_span_132",
-		SchemaVersion: "sha256:e6e9af09d86b396e",
+		SchemaVersion: "sha256:3fee31e7c6376abe",
 	}
 	compiled, err := CompileList(metadata.TraceProfileSpan, target, scope, request, Limits{})
 	if err != nil {
@@ -150,10 +148,10 @@ func TestCompileListReadsBusiness132InTheRequestedUTCWindow(t *testing.T) {
 		!strings.Contains(compiled.SnapshotStatement, "LIMIT 50 OFFSET 0") {
 		t.Fatalf("query did not target the business table and requested page: %s", compiled.SnapshotStatement)
 	}
-	if len(compiled.SnapshotArgs) != 9 || compiled.SnapshotArgs[0] != "2026-09-30" ||
+	if len(compiled.SnapshotArgs) != 7 || compiled.SnapshotArgs[0] != "2026-09-30" ||
 		compiled.SnapshotArgs[1] != "2026-09-30" || compiled.SnapshotArgs[2] != request.StartUS ||
-		compiled.SnapshotArgs[3] != request.EndUS || compiled.SnapshotArgs[7] != int64(132) ||
-		compiled.SnapshotArgs[8] != "42" {
+		compiled.SnapshotArgs[3] != request.EndUS || compiled.SnapshotArgs[5] != int64(132) ||
+		compiled.SnapshotArgs[6] != "42" {
 		t.Fatalf("query lost UTC window or business scope: %#v", compiled.SnapshotArgs)
 	}
 }
@@ -169,7 +167,7 @@ func TestCompileListSummaryUsesSummaryIsolationAndOffset(t *testing.T) {
 		t.Fatalf("summary statement must not reference span-only columns: %s", compiled.SnapshotStatement)
 	}
 	wantWhere := "WHERE `trace_date` >= ? AND `trace_date` <= ? AND `trace_start_time_us` >= ? AND `trace_start_time_us` < ?" +
-		" AND `bk_tenant_id` = ? AND `observation_domain_id` = ? AND `bk_biz_id` = ?"
+		" AND `bk_biz_id` = ?"
 	if !strings.Contains(compiled.SnapshotStatement, wantWhere) {
 		t.Fatalf("unexpected summary where clause: %s", compiled.SnapshotStatement)
 	}
@@ -218,13 +216,13 @@ func TestCompileListKeepsConditionAlignmentWhenScopePredicateRepeats(t *testing.
 	request.Filters = Filters{
 		FieldList: []FilterField{
 			{FieldName: "app_id", Value: []string{"app-1"}, Operator: "eq"},
-			{FieldName: "bk_tenant_id", Value: []string{testTenant}, Operator: "eq"},
+			{FieldName: "space_uid", Value: []string{testSpaceUID}, Operator: "eq"},
 		},
 		ConditionList: []string{"or"},
 	}
 	statement := mustCompile(t, request, Limits{}).SnapshotStatement
 
-	if !strings.Contains(statement, "(`app_id` = ? OR `bk_tenant_id` = ?)") {
+	if !strings.Contains(statement, "(`app_id` = ? OR `space_uid` = ?)") {
 		t.Fatalf("client condition list must be preserved verbatim: %s", statement)
 	}
 }
@@ -238,7 +236,7 @@ func TestCompileListRejectsTrustedIdentityRewrite(t *testing.T) {
 		{
 			name:     "tenant conflict",
 			field:    FilterField{FieldName: "bk_tenant_id", Value: []string{"other"}, Operator: "eq"},
-			wantCode: CodePredicateConflict,
+			wantCode: CodeUnsupportedSchemaCapability,
 		},
 		{
 			name:     "space conflict",
@@ -251,18 +249,18 @@ func TestCompileListRejectsTrustedIdentityRewrite(t *testing.T) {
 			wantCode: CodePredicateConflict,
 		},
 		{
-			name:     "domain conflict",
+			name:     "retired domain field",
 			field:    FilterField{FieldName: "observation_domain_id", Value: []string{"other_kapm"}, Operator: "eq"},
-			wantCode: CodePredicateConflict,
+			wantCode: CodeUnsupportedSchemaCapability,
 		},
 		{
 			name:     "negation not allowed",
-			field:    FilterField{FieldName: "bk_tenant_id", Value: []string{testTenant}, Operator: "ne"},
+			field:    FilterField{FieldName: "space_uid", Value: []string{testSpaceUID}, Operator: "ne"},
 			wantCode: CodePredicateConflict,
 		},
 		{
 			name:     "multi value not allowed",
-			field:    FilterField{FieldName: "bk_tenant_id", Value: []string{testTenant, "other"}, Operator: "eq"},
+			field:    FilterField{FieldName: "space_uid", Value: []string{testSpaceUID, "other"}, Operator: "eq"},
 			wantCode: CodePredicateConflict,
 		},
 	}
@@ -279,11 +277,11 @@ func TestCompileListRejectsTrustedIdentityRewrite(t *testing.T) {
 	t.Run("equal repeat is accepted once per isolation column", func(t *testing.T) {
 		request := testRequest(metadata.TraceProfileSpan)
 		request.Filters = Filters{
-			FieldList:     []FilterField{{FieldName: "bk_tenant_id", Value: []string{testTenant}, Operator: "eq"}},
+			FieldList:     []FilterField{{FieldName: "space_uid", Value: []string{testSpaceUID}, Operator: "eq"}},
 			ConditionList: []string{},
 		}
 		statement := mustCompile(t, request, Limits{}).SnapshotStatement
-		if strings.Count(statement, "`bk_tenant_id` = ?") != 2 {
+		if strings.Count(statement, "`space_uid` = ?") != 2 {
 			t.Fatalf("expected trusted isolation plus echoed equal condition: %s", statement)
 		}
 	})

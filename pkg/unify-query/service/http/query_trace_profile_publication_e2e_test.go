@@ -25,7 +25,7 @@ import (
 // esSummaryListBody 是一个 ES Summary 列表请求；filters 为 field_list/condition_list 的 JSON 片段。
 func esSummaryListBody(startUS, endUS, filters, parentPairs string) string {
 	body := `{"trace_profile":"trace_summary","trace_contract_version":"trace_query_v2","trace_request":{` +
-		`"observation_domain_id":"system_kapm","expected_scope_fingerprint":"` + strings.Repeat("a", 64) + `",` +
+		`"expected_scope_fingerprint":"` + strings.Repeat("a", 64) + `",` +
 		`"start_time":"` + startUS + `","end_time":"` + endUS + `",` +
 		`"filters":` + filters + `,"order_by":["-min_start_time","trace_id"],"limit":2,"scene":"global",` +
 		`"es_summary_list":{"backend":"elasticsearch","app_id":7,"bk_biz_id":42,"expected_route_version":7`
@@ -55,7 +55,7 @@ func TestPublishedEntryIndexVersionReachesESListAtRuntime(t *testing.T) {
 			}
 		}
 		return 0, nil, nil, []metadata.RouteInfo{{
-			TableID: "apm_global.trace_summary_v1_7", StorageType: metadata.ElasticsearchStorageType, StorageID: "9",
+			TableID: "system.trace_summary_es_v2", StorageType: metadata.ElasticsearchStorageType, StorageID: "9",
 		}}, nil
 	}
 	filters := `{"field_list":[{"field_name":"entry_parent_state","value":["observed"],"op":"eq"}],"condition_list":[]}`
@@ -84,7 +84,7 @@ func TestESListAcceptsTheMaximumProductWindow(t *testing.T) {
 	) {
 		called = true
 		return 0, nil, nil, []metadata.RouteInfo{{
-			TableID: "apm_global.trace_summary_v1_7", StorageType: metadata.ElasticsearchStorageType, StorageID: "9",
+			TableID: "system.trace_summary_es_v2", StorageType: metadata.ElasticsearchStorageType, StorageID: "9",
 		}}, nil
 	}
 	start := int64(1758585600000000)

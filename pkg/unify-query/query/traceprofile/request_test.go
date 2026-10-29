@@ -19,7 +19,7 @@ import (
 
 func validRequestJSON() string {
 	return `{"trace_profile":"trace_summary","trace_contract_version":"trace_query_v2","trace_request":{` +
-		`"observation_domain_id":"system_kapm",` +
+		`` +
 		`"expected_scope_fingerprint":"` + strings.Repeat("a", 64) + `",` +
 		`"scene":"app","start_time":"1721024820000000","end_time":"1721024880000000",` +
 		`"filters":{"field_list":[{"field_name":"app_id","value":["7"],"op":"eq"}],"condition_list":[]},` +
@@ -54,7 +54,7 @@ func TestParseRequestAcceptsVersionedCountAggregation(t *testing.T) {
 
 func validMemberLookupJSON() string {
 	return `{"trace_profile":"trace_summary","trace_contract_version":"trace_query_v2","trace_request":{` +
-		`"observation_domain_id":"t1_kapm",` +
+		`` +
 		`"expected_scope_fingerprint":"` + strings.Repeat("a", 64) + `",` +
 		`"scene":"global","start_time":"1721024820000000","end_time":"1721024880000000",` +
 		`"filters":{"field_list":[],"condition_list":[]},"order_by":[],"limit":25,` +
@@ -64,7 +64,7 @@ func validMemberLookupJSON() string {
 
 func validESSummaryListJSON() string {
 	return `{"trace_profile":"trace_summary","trace_contract_version":"trace_query_v2","trace_request":{` +
-		`"observation_domain_id":"system_kapm",` +
+		`` +
 		`"expected_scope_fingerprint":"` + strings.Repeat("a", 64) + `",` +
 		`"scene":"global","start_time":"1721024820000000","end_time":"1721024880000000",` +
 		`"filters":{"field_list":[{"field_name":"entry_type","value":["request"],"op":"eq"}],` +

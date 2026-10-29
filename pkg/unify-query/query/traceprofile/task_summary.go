@@ -148,7 +148,7 @@ func (e *Executor) ExecuteTaskSummary(ctx context.Context, request Request, scop
 	}
 	// 1. 只在受信应用所属的已发布 Doris Span 目标上执行。
 	route, err := e.snapshot.ResolveForApplication(
-		scope.BkTenantID, scope.BkBizID, exactSpanRouteAppID(request), request.Profile, scope.ObservationDomainID,
+		scope.BkTenantID, scope.BkBizID, exactSpanRouteAppID(request), request.Profile,
 	)
 	if err != nil {
 		return nil, err

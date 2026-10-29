@@ -47,15 +47,18 @@ var traceInternalRowFields = map[string]struct{}{
 }
 
 var spanIdentityFields = map[string]struct{}{
-	"bk_tenant_id": {}, "observation_domain_id": {}, "bk_biz_id": {}, "data_id": {},
+	"bk_tenant_id": {}, "bk_biz_id": {}, "data_id": {},
 	"app_id": {}, "space_uid": {}, "trace_id": {}, "span_id": {},
 }
 
 // ShapeRows converts a complete physical Trace page into the closed KAPM row
 // contract. Any invalid row rejects the entire page; no partial result escapes.
-func ShapeRows(profile metadata.TraceProfile, input []map[string]any) ([]map[string]any, error) {
+func ShapeRows(profile metadata.TraceProfile, input []map[string]any, tenantID string) ([]map[string]any, error) {
 	if profile != metadata.TraceProfileSpan && profile != metadata.TraceProfileSummary {
 		return nil, fmt.Errorf("Trace 行 profile 不受支持")
+	}
+	if !ValidTenantID(tenantID) {
+		return nil, fmt.Errorf("Trace 行缺少可信租户")
 	}
 	projection := projectionForProfile(profile)
 	allowed := make(map[string]struct{}, len(projection)+len(traceInternalRowFields))
@@ -87,6 +90,7 @@ func ShapeRows(profile metadata.TraceProfile, input []map[string]any) ([]map[str
 			}
 			physical[field] = normalized
 		}
+		physical["bk_tenant_id"] = tenantID
 		traceID, ok := physical["trace_id"].(string)
 		if !ok || !traceIDPattern.MatchString(traceID) {
 			return nil, fmt.Errorf("Trace 第 %d 行 trace_id 非法", index)
@@ -95,9 +99,9 @@ func ShapeRows(profile metadata.TraceProfile, input []map[string]any) ([]map[str
 		if !ok || appID == "" || strings.TrimSpace(appID) != appID {
 			return nil, fmt.Errorf("Trace 第 %d 行 app_id 非法", index)
 		}
-		tenantID := physical["bk_tenant_id"].(string)
-		if tenantID == "" || physical["observation_domain_id"] != tenantID+"_kapm" {
-			return nil, fmt.Errorf("Trace 第 %d 行租户与观测域不一致", index)
+		tenant := physical["bk_tenant_id"].(string)
+		if tenant == "" {
+			return nil, fmt.Errorf("Trace 第 %d 行租户为空", index)
 		}
 		bizID := physical["bk_biz_id"].(int64)
 		if bizID < 0 {
@@ -117,8 +121,8 @@ func ShapeRows(profile metadata.TraceProfile, input []map[string]any) ([]map[str
 			}
 			items = append(items, map[string]any{
 				"member": map[string]any{
-					"bk_tenant_id": physical["bk_tenant_id"], "observation_domain_id": physical["observation_domain_id"],
-					"data_id": physical["data_id"], "bk_biz_id": physical["bk_biz_id"], "app_id": appID,
+					"bk_tenant_id": physical["bk_tenant_id"],
+					"data_id":      physical["data_id"], "bk_biz_id": physical["bk_biz_id"], "app_id": appID,
 				},
 				"trace_id": traceID, "span_id": spanID, "values": values,
 			})

@@ -58,7 +58,7 @@ func TestSummaryProfileReadsRealDorisTotalOrderAndEmptyPage(t *testing.T) {
 		SchemaVersion: tenantSummarySchemaVersion}
 	snapshot, err := NewRouteSnapshot(7, []ReadRoute{{
 		BkTenantID: tenant, BkBizID: 7, Profile: metadata.TraceProfileSummary,
-		ObservationDomainID: database, PublishedVersion: 7, Doris: &target,
+		PublishedVersion: 7, Doris: &target,
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -67,14 +67,13 @@ func TestSummaryProfileReadsRealDorisTotalOrderAndEmptyPage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scope, err := ResolveScope(tenant, "bkcc__7", database)
+	scope, err := ResolveScope(tenant, "bkcc__7")
 	if err != nil {
 		t.Fatal(err)
 	}
 	offset := int64(0)
 	request := Request{
-		Profile: metadata.TraceProfileSummary, ObservationDomainID: database,
-		StartUS: minute.UnixMicro(), EndUS: minute.Add(time.Minute).UnixMicro(),
+		Profile: metadata.TraceProfileSummary, StartUS: minute.UnixMicro(), EndUS: minute.Add(time.Minute).UnixMicro(),
 		Limit: 1, Offset: &offset,
 		Filters: Filters{FieldList: []FilterField{{
 			FieldName: "app_id", Value: []string{"7"}, Operator: "eq",
@@ -110,7 +109,7 @@ func TestSummaryProfileReadsRealDorisTotalOrderAndEmptyPage(t *testing.T) {
 		t.Fatalf("real Doris Summary zero-match page lost count sentinel: %+v err=%v", zero, err)
 	}
 	memberRequest := Request{
-		Profile: metadata.TraceProfileSummary, ObservationDomainID: database, Scene: "global",
+		Profile: metadata.TraceProfileSummary, Scene: "global",
 		StartUS: minute.UnixMicro(), EndUS: minute.Add(time.Minute).UnixMicro(), Limit: 2,
 		MemberLookup: &MemberLookup{TraceID: newerTrace, ExpectedRouteVersion: 7,
 			AllowedPairs: []MemberPair{{AppID: 7, BkBizID: 7}}},
@@ -125,9 +124,8 @@ func createSummaryRealTable(t *testing.T, ctx context.Context, db *sql.DB,
 	database, table, upperDate string) {
 	t.Helper()
 	statement := fmt.Sprintf(`CREATE TABLE %s.%s (
-  trace_date DATE NOT NULL, app_id VARCHAR(128) NOT NULL, trace_id VARCHAR(32) NOT NULL,
-  bk_tenant_id VARCHAR(64) NOT NULL, observation_domain_id VARCHAR(128) NOT NULL,
-  bk_biz_id BIGINT NOT NULL, app_name VARCHAR(255) NOT NULL,
+  trace_date DATE NOT NULL, bk_biz_id BIGINT NOT NULL,
+  app_id VARCHAR(128) NOT NULL, trace_id VARCHAR(32) NOT NULL, app_name VARCHAR(255) NOT NULL,
   trace_start_time_us BIGINT NOT NULL, trace_end_time_us BIGINT NOT NULL,
   duration_us BIGINT NOT NULL, span_count BIGINT NOT NULL, error_count BIGINT NOT NULL,
   service_count BIGINT NOT NULL, hierarchy_count BIGINT NOT NULL,
@@ -139,7 +137,7 @@ func createSummaryRealTable(t *testing.T, ctx context.Context, db *sql.DB,
   root_span_name STRING NOT NULL, root_span_service_name VARCHAR(512) NULL,
   root_span_kind INT NOT NULL, category_statistics JSON NOT NULL,
   kind_statistics JSON NOT NULL, partial BOOLEAN NOT NULL, computed_at_ms BIGINT NOT NULL
-) UNIQUE KEY (trace_date, app_id, trace_id, bk_tenant_id, observation_domain_id)
+) UNIQUE KEY (trace_date, bk_biz_id, app_id, trace_id)
 PARTITION BY RANGE (trace_date) (PARTITION p_recent VALUES LESS THAN ('%s'))
 DISTRIBUTED BY HASH (trace_id) BUCKETS 1
 PROPERTIES ("replication_num"="1", "enable_unique_key_merge_on_write"="true",

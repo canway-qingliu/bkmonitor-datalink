@@ -23,7 +23,7 @@ func ShapeESSummaryListPage(
 		request.MemberLookup != nil || request.Aggregation != nil ||
 		list.Backend != MemberBackendElasticsearch || list.AppID != target.AppID ||
 		list.BkBizID != target.BkBizID || list.BkBizID != scope.BkBizID ||
-		target.BkTenantID != scope.BkTenantID || target.ObservationDomainID != scope.ObservationDomainID {
+		target.BkTenantID != scope.BkTenantID {
 		return Page{}, reject(CodeUnauthorizedMember, "ES Summary 列表作用域与发布目标不一致")
 	}
 	if list.ExpectedRouteVersion <= 0 || list.ExpectedRouteVersion != target.PublishedVersion {

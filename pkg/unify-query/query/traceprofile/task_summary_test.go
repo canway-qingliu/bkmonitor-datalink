@@ -63,7 +63,7 @@ func TestCompileTaskSummaryKeepsTrustedScopeAndFixedClassifier(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, fragment := range []string{
-		"`span_date` >= ?", "`start_time_us` < ?", "`bk_tenant_id` = ?", "`app_id` = ?",
+		"`span_date` >= ?", "`start_time_us` < ?", "`bk_biz_id` = ?", "`app_id` = ?",
 		"`service_name` = ?", `JSON_EXTRACT_STRING(attributes, '$."plugind.action_uid"')`,
 		`JSON_EXTRACT_STRING(attributes, '$."celery.action"')`, "ROW_NUMBER() OVER", "LIMIT 5001",
 	} {
@@ -71,7 +71,7 @@ func TestCompileTaskSummaryKeepsTrustedScopeAndFixedClassifier(t *testing.T) {
 			t.Fatalf("task summary SQL missing %q: %s", fragment, compiled.Statement)
 		}
 	}
-	if strings.Contains(compiled.Statement, "svc-a") || len(compiled.Args) < 10 {
+	if strings.Contains(compiled.Statement, "svc-a") || len(compiled.Args) < 8 {
 		t.Fatalf("service filter was interpolated or trusted predicates missing: args=%v", compiled.Args)
 	}
 	if err := dorisclient.ValidateStatement(compiled.Statement); err != nil {

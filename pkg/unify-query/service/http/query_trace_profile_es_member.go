@@ -24,7 +24,7 @@ type esMemberRawReader func(context.Context, *structured.QueryTs) (
 )
 
 var esMemberColumns = structured.KeepColumns{
-	"bk_tenant_id", "observation_domain_id", "biz_id", "app_id", "app_name", "trace_id",
+	"biz_id", "app_id", "app_name", "trace_id",
 	"trace_date", "min_start_time", "max_end_time", "trace_duration", "span_count",
 	"error_count", "service_count", "hierarchy_count", "span_min_duration", "span_max_duration",
 	"event_time_ms", "root_service", "root_service_span_id", "root_service_span_name",
@@ -78,7 +78,7 @@ func executeESMemberLookup(
 	if reader == nil || lookup == nil || lookup.Backend != traceprofile.MemberBackendElasticsearch ||
 		len(lookup.AllowedPairs) != 1 || lookup.AllowedPairs[0].BkBizID != scope.BkBizID ||
 		lookup.AllowedPairs[0].AppID != target.AppID || target.BkBizID != scope.BkBizID ||
-		target.BkTenantID != scope.BkTenantID || target.ObservationDomainID != scope.ObservationDomainID {
+		target.BkTenantID != scope.BkTenantID {
 		return traceprofile.Page{}, esMemberReject(traceprofile.CodeUnauthorizedMember, "ES Summary 成员作用域与发布目标不一致")
 	}
 	if target.PublishedVersion <= 0 || target.PublishedVersion != lookup.ExpectedRouteVersion {
@@ -89,8 +89,6 @@ func executeESMemberLookup(
 	}
 	fields := []structured.ConditionField{
 		{DimensionName: "trace_id", Value: []string{lookup.TraceID}, Operator: "eq"},
-		{DimensionName: "bk_tenant_id", Value: []string{scope.BkTenantID}, Operator: "eq"},
-		{DimensionName: "observation_domain_id", Value: []string{scope.ObservationDomainID}, Operator: "eq"},
 		{DimensionName: "biz_id", Value: []string{strconv.FormatInt(scope.BkBizID, 10)}, Operator: "eq"},
 		{DimensionName: "app_id", Value: []string{strconv.FormatInt(target.AppID, 10)}, Operator: "eq"},
 		{DimensionName: "min_start_time", Value: []string{strconv.FormatInt(request.StartUS, 10)}, Operator: "gte"},

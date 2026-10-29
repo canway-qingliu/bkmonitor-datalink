@@ -28,11 +28,10 @@ type DorisTarget struct {
 
 // ReadRoute 按 (租户, profile) 定位一个物理读目标。
 type ReadRoute struct {
-	BkTenantID          string
-	BkBizID             int64
-	AppID               int64 // 0 保留旧业务路由；正数只用于新 Span 应用目标。
-	Profile             metadata.TraceProfile
-	ObservationDomainID string
+	BkTenantID string
+	BkBizID    int64
+	AppID      int64 // 0 保留旧业务路由；正数只用于新 Span 应用目标。
+	Profile    metadata.TraceProfile
 	// PublishedVersion 是 Kingeye 单租户文档版本；快照 Version 是所有租户的合成版本。
 	PublishedVersion int64
 	Doris            *DorisTarget
@@ -40,16 +39,15 @@ type ReadRoute struct {
 
 // ESSummaryTarget 是按应用发布的新 ES Summary 逻辑读 RT；不代表索引已暖机。
 type ESSummaryTarget struct {
-	BkTenantID          string
-	BkBizID             int64
-	AppID               int64
-	AppName             string
-	ObservationDomainID string
-	ResultTableID       string
-	StorageClusterID    int64
-	RetentionDays       int64
-	EntryIndexVersion   int64
-	PublishedVersion    int64
+	BkTenantID        string
+	BkBizID           int64
+	AppID             int64
+	AppName           string
+	ResultTableID     string
+	StorageClusterID  int64
+	RetentionDays     int64
+	EntryIndexVersion int64
+	PublishedVersion  int64
 }
 
 // ApplicationTopologyTarget 只来自同一租户已发布的边/覆盖物理目标，不能由查询请求指定。
@@ -83,7 +81,7 @@ var profilePhysicalTable = map[metadata.TraceProfile]string{
 }
 
 // 与 Kingeye 租户 Summary 表的固定 shape 摘要配对。
-const tenantSummarySchemaVersion = "sha256:cc07585afea58a5d"
+const tenantSummarySchemaVersion = "sha256:3d6b6b96f74453dd"
 
 func physicalTableForSchema(profile metadata.TraceProfile, bizID int64, schemaVersion string) (string, error) {
 	if profile == metadata.TraceProfileSummary {
@@ -104,6 +102,9 @@ func appRouteKey(tenantID string, bizID, appID int64, profile metadata.TraceProf
 }
 
 func tenantSpanDatabase(tenantID string) string {
+	if tenantID == "default" {
+		return "default_kapm"
+	}
 	digest := sha256.Sum256([]byte(tenantID))
 	return fmt.Sprintf("tenant_%x_kapm", digest[:8])
 }
@@ -124,13 +125,12 @@ func businessPhysicalTable(profile metadata.TraceProfile, bizID int64) (string, 
 
 func matchesPublishedPhysicalTable(profile metadata.TraceProfile, target DorisTarget, scope Scope, request Request) bool {
 	expected, err := physicalTableForSchema(profile, scope.BkBizID, target.SchemaVersion)
-	if err == nil && target.Table == expected && target.Database == scope.ObservationDomainID {
+	if err == nil && target.Table == expected && target.Database == scope.BkTenantID+"_kapm" {
 		return true
 	}
 	appID := exactSpanRouteAppID(request)
 	return profile == metadata.TraceProfileSpan && appID > 0 &&
 		target.Database == tenantSpanDatabase(scope.BkTenantID) &&
-		target.Database == scope.ObservationDomainID &&
 		(target.Table == "otel_trace_span" || target.Table == fmt.Sprintf("otel_trace_span_app_%d", appID))
 }
 
@@ -144,20 +144,20 @@ func ParseProfile(value string) (metadata.TraceProfile, error) {
 }
 
 // NewDorisTarget 从受信业务与 profile 派生物理表；调用方不能覆盖库表。
-func NewDorisTarget(clusterID, observationDomainID string, bizID int64, profile metadata.TraceProfile, schemaVersion string) (DorisTarget, error) {
+func NewDorisTarget(clusterID, database string, bizID int64, profile metadata.TraceProfile, schemaVersion string) (DorisTarget, error) {
 	table, err := physicalTableForSchema(profile, bizID, schemaVersion)
 	if err != nil {
 		return DorisTarget{}, err
 	}
-	if !physicalIdentifierPattern.MatchString(observationDomainID) {
-		return DorisTarget{}, fmt.Errorf("观测域作为物理库名非法: %s", observationDomainID)
+	if !physicalIdentifierPattern.MatchString(database) {
+		return DorisTarget{}, fmt.Errorf("物理库名非法: %s", database)
 	}
 	if clusterID == "" || schemaVersion == "" {
 		return DorisTarget{}, fmt.Errorf("Doris 目标缺少集群或 Schema 版本")
 	}
 	return DorisTarget{
 		ClusterID:     clusterID,
-		Database:      observationDomainID,
+		Database:      database,
 		Table:         table,
 		SchemaVersion: schemaVersion,
 	}, nil
@@ -242,8 +242,9 @@ var logicalResultTablePattern = regexp.MustCompile(`^[A-Za-z0-9_]+\.[A-Za-z0-9_]
 
 func validateESSummaryTarget(target ESSummaryTarget) error {
 	if !physicalIdentifierPattern.MatchString(target.BkTenantID) || target.BkBizID <= 0 || target.AppID <= 0 ||
-		target.AppName == "" || target.ObservationDomainID != target.BkTenantID+"_kapm" ||
-		!logicalResultTablePattern.MatchString(target.ResultTableID) || target.StorageClusterID <= 0 ||
+		target.AppName == "" ||
+		!logicalResultTablePattern.MatchString(target.ResultTableID) ||
+		target.ResultTableID != target.BkTenantID+".trace_summary_es_v2" || target.StorageClusterID <= 0 ||
 		target.RetentionDays < 1 || target.RetentionDays > 30 || target.PublishedVersion < 0 ||
 		(target.EntryIndexVersion != 0 && target.EntryIndexVersion != 2) ||
 		target.EntryIndexVersion == 2 && target.RetentionDays != 30 {
@@ -272,8 +273,8 @@ func validateReadRoute(route ReadRoute) error {
 			return fmt.Errorf("应用 Span 物理表名非法")
 		}
 		table = route.Doris.Table
-		if route.ObservationDomainID != tenantSpanDatabase(route.BkTenantID) {
-			return fmt.Errorf("应用 Span 观测域与租户不匹配")
+		if route.Doris.Database != tenantSpanDatabase(route.BkTenantID) {
+			return fmt.Errorf("应用 Span 物理库与租户不匹配")
 		}
 	} else {
 		var err error
@@ -281,12 +282,9 @@ func validateReadRoute(route ReadRoute) error {
 		if err != nil {
 			return err
 		}
-		if route.ObservationDomainID != route.BkTenantID+"_kapm" || !physicalIdentifierPattern.MatchString(route.ObservationDomainID) {
-			return fmt.Errorf("观测域与租户不匹配")
+		if route.Doris.Database != route.BkTenantID+"_kapm" || !physicalIdentifierPattern.MatchString(route.Doris.Database) {
+			return fmt.Errorf("物理库与租户不匹配")
 		}
-	}
-	if route.Doris.Database != route.ObservationDomainID {
-		return fmt.Errorf("物理库与观测域不匹配")
 	}
 	if route.Doris.Table != table {
 		return fmt.Errorf("物理表与 profile 不匹配")
@@ -305,9 +303,9 @@ func (s *RouteSnapshot) Version() int64 {
 	return s.version
 }
 
-// Resolve 按 (租户, profile) 解析读目标，并校验请求携带的观测域。
+// Resolve 按可信租户和 profile 解析已发布读目标。
 func (s *RouteSnapshot) Resolve(
-	tenantID string, bizID int64, profile metadata.TraceProfile, observationDomainID string,
+	tenantID string, bizID int64, profile metadata.TraceProfile,
 ) (ReadRoute, error) {
 	if s == nil {
 		return ReadRoute{}, reject(CodeRouteNotFound, "Trace 读路由尚未配置")
@@ -318,48 +316,32 @@ func (s *RouteSnapshot) Resolve(
 			CodeRouteNotFound, "Trace 读路由缺失: 租户 %s / 业务 %d / profile %s", tenantID, bizID, profile,
 		)
 	}
-	if observationDomainID != route.ObservationDomainID {
-		return ReadRoute{}, reject(
-			CodeUnauthorizedDomain, "Trace 观测域不在可信路由内: %s", observationDomainID,
-		)
-	}
 	return route, nil
 }
 
-// ResolveForApplication 优先取受信应用 Span 目标；旧业务路由只在旧观测域下回退。
+// ResolveForApplication 优先取受信应用 Span 目标，再回退到已发布业务目标。
 func (s *RouteSnapshot) ResolveForApplication(
-	tenantID string, bizID, appID int64, profile metadata.TraceProfile, observationDomainID string,
+	tenantID string, bizID, appID int64, profile metadata.TraceProfile,
 ) (ReadRoute, error) {
 	if s == nil {
 		return ReadRoute{}, reject(CodeRouteNotFound, "Trace 读路由尚未配置")
 	}
 	if profile == metadata.TraceProfileSpan && appID > 0 {
 		if route, found := s.routes[appRouteKey(tenantID, bizID, appID, profile)]; found {
-			if route.ObservationDomainID == observationDomainID {
-				return route, nil
-			}
-			if observationDomainID != tenantID+"_kapm" {
-				return ReadRoute{}, reject(CodeUnauthorizedDomain, "Trace 应用观测域不在可信路由内")
-			}
-		}
-		if observationDomainID == tenantSpanDatabase(tenantID) {
-			return ReadRoute{}, reject(CodeRouteNotFound, "Trace 应用 Span 读目标未发布")
+			return route, nil
 		}
 	}
-	return s.Resolve(tenantID, bizID, profile, observationDomainID)
+	return s.Resolve(tenantID, bizID, profile)
 }
 
 // ResolveESSummary 用成对业务/应用身份解析受信新 ES Summary 逻辑 RT。
-func (s *RouteSnapshot) ResolveESSummary(tenantID string, bizID, appID int64, observationDomainID string) (ESSummaryTarget, error) {
+func (s *RouteSnapshot) ResolveESSummary(tenantID string, bizID, appID int64) (ESSummaryTarget, error) {
 	if s == nil {
 		return ESSummaryTarget{}, reject(CodeRouteNotFound, "ES Summary 读路由尚未配置")
 	}
 	target, ok := s.esSummaryRoutes[esSummaryRouteKey(tenantID, bizID, appID)]
 	if !ok {
 		return ESSummaryTarget{}, reject(CodeRouteNotFound, "ES Summary 应用读路由缺失")
-	}
-	if target.ObservationDomainID != observationDomainID {
-		return ESSummaryTarget{}, reject(CodeUnauthorizedDomain, "ES Summary 观测域不在可信路由内")
 	}
 	return target, nil
 }

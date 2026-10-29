@@ -17,13 +17,12 @@ import (
 )
 
 // Scope 只由受信 transport 载体解析：租户与空间来自已验证请求头，
-// 观测域来自嵌套请求字段。UQ 不持有成员名单，app_id 是否属于调用方由 KAPM 承担
-// （读写契约 §5.2.5），这里只强制 tenant / space / domain 边界。
+// UQ 不持有成员名单，app_id 是否属于调用方由 KAPM 承担；
+// 这里只强制可信 tenant / space 边界。
 type Scope struct {
-	BkTenantID          string
-	SpaceUID            string
-	BkBizID             int64
-	ObservationDomainID string
+	BkTenantID string
+	SpaceUID   string
+	BkBizID    int64
 }
 
 var spaceUIDPattern = regexp.MustCompile(`^bkcc__([0-9]{1,18})$`)
@@ -35,7 +34,7 @@ func ValidTenantID(id string) bool {
 }
 
 // ResolveScope 是 fail closed 的唯一入口：作用域缺失或与冻结命名漂移即拒绝。
-func ResolveScope(tenantID, spaceUID, observationDomainID string) (Scope, error) {
+func ResolveScope(tenantID, spaceUID string) (Scope, error) {
 	if !ValidTenantID(tenantID) {
 		return Scope{}, reject(CodeUnauthorizedMember, "Trace 请求缺少可信租户")
 	}
@@ -50,13 +49,7 @@ func ResolveScope(tenantID, spaceUID, observationDomainID string) (Scope, error)
 	if err != nil || bizID < 0 {
 		return Scope{}, reject(CodeUnauthorizedMember, "Trace 请求空间标识非法: %s", spaceUID)
 	}
-	// 旧业务库与新租户 Span 库都必须由当前租户确定性派生。
-	legacyDomain := tenantID + "_kapm"
-	if observationDomainID != tenantSpanDatabase(tenantID) &&
-		(observationDomainID != legacyDomain || !physicalIdentifierPattern.MatchString(legacyDomain)) {
-		return Scope{}, reject(CodeUnauthorizedDomain, "Trace 观测域与租户不匹配: %s", observationDomainID)
-	}
-	return Scope{BkTenantID: tenantID, SpaceUID: spaceUID, BkBizID: bizID, ObservationDomainID: observationDomainID}, nil
+	return Scope{BkTenantID: tenantID, SpaceUID: spaceUID, BkBizID: bizID}, nil
 }
 
 type identityPredicate struct {
@@ -67,10 +60,7 @@ type identityPredicate struct {
 // isolationPredicates 返回该 profile 必须精确匹配的隔离列。
 // Summary 表没有 space_uid / data_id 列，不得硬塞不存在的列。
 func (s Scope) isolationPredicates(profile metadata.TraceProfile) []identityPredicate {
-	predicates := []identityPredicate{
-		{column: "bk_tenant_id", value: s.BkTenantID},
-		{column: "observation_domain_id", value: s.ObservationDomainID},
-	}
+	predicates := []identityPredicate{}
 	if profile == metadata.TraceProfileSummary {
 		return append(predicates, identityPredicate{column: "bk_biz_id", value: s.BkBizID})
 	}
@@ -85,10 +75,6 @@ func (s Scope) isolationPredicates(profile metadata.TraceProfile) []identityPred
 // 只允许作为收窄条件出现。
 func (s Scope) trustedIdentityValue(column string) (any, bool) {
 	switch column {
-	case "bk_tenant_id":
-		return s.BkTenantID, true
-	case "observation_domain_id":
-		return s.ObservationDomainID, true
 	case "space_uid":
 		return s.SpaceUID, true
 	case "bk_biz_id":

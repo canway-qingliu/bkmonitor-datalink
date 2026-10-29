@@ -6,8 +6,7 @@
           "app_id": "app-a",
           "bk_biz_id": 42,
           "bk_tenant_id": "system",
-          "data_id": 101,
-          "observation_domain_id": "system_kapm"
+          "data_id": 101
         },
         "span_id": "bbbbbbbbbbbbbbbb",
         "trace_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -53,7 +52,6 @@
           "nullable": null
         },
         "bk_biz_id": 42,
-        "bk_tenant_id": "system",
         "data_id": 101,
         "deployment_environment": null,
         "duration_us": 25000,
@@ -62,7 +60,6 @@
         "events": [],
         "ingest_time": 1789646400000,
         "links": [],
-        "observation_domain_id": "system_kapm",
         "parent_span_id": "",
         "resource": {
           "large": 9007199254740993,
@@ -106,7 +103,6 @@
             "async": 0,
             "sync": 3
           },
-          "observation_domain_id": "system_kapm",
           "partial": true,
           "root_service_category": "http",
           "root_service_kind": 2,
@@ -131,7 +127,6 @@
         "app_id": "app-a",
         "app_name": "checkout",
         "bk_biz_id": 42,
-        "bk_tenant_id": "system",
         "category_statistics": {
           "db": 0,
           "http": 2
@@ -145,7 +140,6 @@
           "async": 0,
           "sync": 3
         },
-        "observation_domain_id": "system_kapm",
         "partial": true,
         "root_service_category": "http",
         "root_service_kind": 2,

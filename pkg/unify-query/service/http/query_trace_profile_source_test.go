@@ -128,7 +128,7 @@ func resolveTenantTarget(tenant string) error {
 	if runtime == nil {
 		return errors.New("no Trace runtime installed")
 	}
-	_, err := runtime.executor.ResolveESSummaryTarget(tenant, 132, 7, tenant+"_kapm")
+	_, err := runtime.executor.ResolveESSummaryTarget(tenant, 132, 7)
 	return err
 }
 
@@ -213,7 +213,7 @@ func TestTraceContentChangeWithoutVersionBumpRebuilds(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime := traceProfileRuntimeValue.Load()
-	target, err := runtime.executor.ResolveESSummaryTarget("system", 132, 7, "system_kapm")
+	target, err := runtime.executor.ResolveESSummaryTarget("system", 132, 7)
 	if runtime.routeVersion == before || err != nil || target.RetentionDays != 7 {
 		t.Fatalf("content change was ignored: version %d -> %d target=%+v err=%v", before, runtime.routeVersion, target, err)
 	}

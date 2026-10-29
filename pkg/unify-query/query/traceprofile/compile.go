@@ -48,7 +48,7 @@ var jsonProjectionColumns = map[metadata.TraceProfile]map[string]struct{}{
 
 // identityScopeColumns 只能由受信 transport 供值的列，不接受调用方改写。
 var identityScopeColumns = map[string]struct{}{
-	"bk_tenant_id": {}, "observation_domain_id": {}, "space_uid": {}, "bk_biz_id": {},
+	"space_uid": {}, "bk_biz_id": {},
 }
 
 // narrowOnlyIdentityColumns 是允许调用方收窄、但不能扩宽的成员列。

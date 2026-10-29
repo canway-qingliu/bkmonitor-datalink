@@ -56,19 +56,17 @@ func TestTraceProfileUsesVerifiedTenantWithoutAlias(t *testing.T) {
 		bizID                                            int64
 	}{
 		{name: "default request"},
-		{name: "old system route is not an alias for default", target: "system", domain: "system_kapm", code: traceprofile.CodeUnauthorizedDomain},
+		{name: "system route is not an alias for default", target: "system", code: traceprofile.CodeRouteNotFound},
 		{name: "new business only needs authorization and published route", bizID: 43},
 		{name: "real tenant", incoming: "system", target: "system"},
 		{name: "multi tenant preserves identity", incoming: "system", target: "system", multiTenant: true},
-		{name: "multi tenant disables alias", target: "system", multiTenant: true, code: traceprofile.CodeUnauthorizedDomain},
+		{name: "multi tenant disables alias", target: "system", multiTenant: true, code: traceprofile.CodeRouteNotFound},
 		{name: "single tenant runtime survives mode reload", reloadMode: true},
-		{name: "multi tenant runtime survives mode reload", target: "system", multiTenant: true, reloadMode: true, code: traceprofile.CodeUnauthorizedDomain},
+		{name: "multi tenant runtime survives mode reload", target: "system", multiTenant: true, reloadMode: true, code: traceprofile.CodeRouteNotFound},
 		{name: "unverified caller", unverified: true, code: traceprofile.CodeUnauthorizedMember},
 		{name: "unauthorized app", app: "other", code: traceprofile.CodeUnauthorizedMember},
 		{name: "space without published route", space: "bkcc__43", code: traceprofile.CodeRouteNotFound},
-		{name: "other incoming tenant", incoming: "foreign", code: traceprofile.CodeUnauthorizedDomain},
-		{name: "body cannot choose tenant", domain: "foreign_kapm", code: traceprofile.CodeUnauthorizedDomain},
-		{name: "stale target", domain: "tenant_new_kapm", code: traceprofile.CodeUnauthorizedDomain},
+		{name: "other incoming tenant", incoming: "foreign", code: traceprofile.CodeRouteNotFound},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.bizID == 0 {
@@ -104,7 +102,8 @@ func TestTraceProfileUsesVerifiedTenantWithoutAlias(t *testing.T) {
 			config["read_routes"] = config["read_routes"].([]any)[:1]
 			for _, raw := range config["read_routes"].([]any) {
 				route := raw.(map[string]any)
-				route["bk_tenant_id"], route["observation_domain_id"] = tc.target, tc.target+"_kapm"
+				route["bk_tenant_id"] = tc.target
+				route["database"] = tc.target + "_kapm"
 				route["bk_biz_id"] = tc.bizID
 			}
 			withTraceProfileRuntime(t, config)
@@ -113,7 +112,7 @@ func TestTraceProfileUsesVerifiedTenantWithoutAlias(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			snapshot, err := traceprofile.NewRouteSnapshot(7, []traceprofile.ReadRoute{{BkTenantID: tc.target, BkBizID: tc.bizID, Profile: metadata.TraceProfileSpan, ObservationDomainID: tc.target + "_kapm", Doris: &target}})
+			snapshot, err := traceprofile.NewRouteSnapshot(7, []traceprofile.ReadRoute{{BkTenantID: tc.target, BkBizID: tc.bizID, Profile: metadata.TraceProfileSpan, Doris: &target}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -123,16 +122,11 @@ func TestTraceProfileUsesVerifiedTenantWithoutAlias(t *testing.T) {
 				if metadata.GetUser(ctx).TenantID != tc.incoming {
 					t.Fatal("shared request tenant was mutated")
 				}
-				if !strings.Contains(statement, "`bk_tenant_id` = ?") || !strings.Contains(statement, "`observation_domain_id` = ?") {
+				if strings.Contains(statement, "`bk_tenant_id` = ?") || strings.Contains(statement, "`observation_domain_id` = ?") {
 					t.Fatal("isolation filters were lost")
 				}
-				tenantFound, domainFound := false, false
-				for _, arg := range args {
-					tenantFound = tenantFound || arg == tc.target
-					domainFound = domainFound || arg == tc.target+"_kapm"
-				}
-				if !tenantFound || !domainFound {
-					t.Fatalf("query lost data identity: %v", args)
+				if len(args) != 6 || args[4] != tc.space || args[5] != tc.bizID {
+					t.Fatalf("query lost trusted space and business: %v", args)
 				}
 				row := make(map[string]any, len(fixture.Cases[0].PhysicalRow)+1)
 				for key, value := range fixture.Cases[0].PhysicalRow {
@@ -145,7 +139,7 @@ func TestTraceProfileUsesVerifiedTenantWithoutAlias(t *testing.T) {
 					}
 					row[key] = string(encoded)
 				}
-				row["bk_tenant_id"], row["observation_domain_id"], row["total"] = tc.target, tc.target+"_kapm", int64(1)
+				row["total"] = int64(1)
 				row["bk_biz_id"], row["space_uid"] = tc.bizID, fmt.Sprintf("bkcc__%d", tc.bizID)
 				return dorisclient.Result{Rows: []map[string]any{row}}, nil
 			})
@@ -178,7 +172,7 @@ func TestTraceProfileUsesVerifiedTenantWithoutAlias(t *testing.T) {
 					t.Fatalf("mapped query did not return a complete page: %s", recorder.Body.String())
 				}
 				member := response.Items[0]["member"].(map[string]any)
-				if member["bk_tenant_id"] != tc.target || member["observation_domain_id"] != tc.target+"_kapm" {
+				if member["bk_tenant_id"] != tc.target {
 					t.Fatal("response lost the data tenant")
 				}
 			} else if code := decodeTraceProfileError(t, recorder); code != tc.code {
@@ -210,7 +204,7 @@ func TestTraceStaticApplicationTopologyTargetsAcceptDescriptivePublicationField(
 		map[string]any{
 			"bk_tenant_id": "system", "label": "application_edge", "database": "system_kapm",
 			"table": "kapm_application_edge_observed_1m", "cluster_id": "18", "cluster_name": "doris",
-			"schema_version": "sha256:19617e34c53d393e", "retention_days": 30, "published_route_version": 7,
+			"schema_version": "sha256:8e56c7a2af5bd73b", "retention_days": 30, "published_route_version": 7,
 		},
 	}
 	runtime, err := newTraceProfileRuntime(config)
@@ -241,7 +235,7 @@ func TestApplicationTopologyQueryRespondsWithDescriptiveContract(t *testing.T) {
 	targets := []traceprofile.ApplicationTopologyTarget{
 		{BkTenantID: "default", Label: "application_edge", Database: "default_kapm",
 			Table: "kapm_application_edge_observed_1m", ClusterID: "18", ClusterName: "doris",
-			SchemaVersion: "sha256:19617e34c53d393e", RetentionDays: 30, PublishedVersion: 7},
+			SchemaVersion: "sha256:8e56c7a2af5bd73b", RetentionDays: 30, PublishedVersion: 7},
 	}
 	snapshot, err := traceprofile.NewRouteSnapshotWithAllTargets(7, nil, nil, targets)
 	if err != nil {
@@ -256,13 +250,13 @@ func TestApplicationTopologyQueryRespondsWithDescriptiveContract(t *testing.T) {
 	}
 	traceProfileRuntimeValue.Load().executor = executor
 	query := traceprofile.ApplicationTopologyRangeQuery{
-		ProtocolVersion: "application_topology_range_v2", ObservationDomainID: "default_kapm", ExpectedRouteVersion: 7,
+		ProtocolVersion: "application_topology_range_v2", ExpectedRouteVersion: 7,
 		Request: traceprofile.ApplicationTopologyRangeRequest{ContractVersion: "application_topology_range_v2", StartMS: 1760572800000, EndMS: 1760573700000,
 			Applications: []traceprofile.ApplicationTopologyApplication{{NamespaceID: 11, BkBizID: 42}}, MaxPairs: 100},
 	}
 	fingerprint := traceprofile.ApplicationTopologyRangeFingerprint("default", query)
 	body := fmt.Sprintf(`{"application_topology_contract_version":"application_topology_range_v2",`+
-		`"application_topology_request":{"expected_scope_fingerprint":"%s","observation_domain_id":"default_kapm",`+
+		`"application_topology_request":{"expected_scope_fingerprint":"%s",`+
 		`"expected_route_version":7,"start_time_ms":1760572800000,"end_time_ms":1760573700000,`+
 		`"applications":[{"namespace_id":11,"bk_biz_id":42}],"max_pairs":100}}`, fingerprint)
 	recorder := runTraceProfileRequestAs(t, body, "default")

@@ -17,22 +17,22 @@ import (
 )
 
 const business132Document = `{"route_snapshot_version":7,"bk_tenant_id":"system","read_routes":[` +
-	`{"bk_tenant_id":"system","bk_biz_id":132,"profile":"trace_span","observation_domain_id":"system_kapm",` +
+	`{"bk_tenant_id":"system","bk_biz_id":132,"profile":"trace_span",` +
 	`"database":"system_kapm","table":"otel_trace_span_132","cluster_id":18,"cluster_name":"doris4_test",` +
-	`"schema_version":"sha256:e6e9af09d86b396e"},` +
-	`{"bk_tenant_id":"system","bk_biz_id":132,"profile":"trace_summary","observation_domain_id":"system_kapm",` +
+	`"schema_version":"sha256:3fee31e7c6376abe"},` +
+	`{"bk_tenant_id":"system","bk_biz_id":132,"profile":"trace_summary",` +
 	`"database":"system_kapm","table":"otel_trace_summary","cluster_id":18,"cluster_name":"doris4_test",` +
-	`"schema_version":"sha256:cc07585afea58a5d"}],"application_topology_targets":[]}`
+	`"schema_version":"sha256:3d6b6b96f74453dd"}],"application_topology_targets":[]}`
 
 const publishedESSummaryTargets = `[{"bk_tenant_id":"system","bk_biz_id":132,"app_id":7,` +
-	`"app_name":"checkout","observation_domain_id":"system_kapm",` +
-	`"read_result_table_id":"apm_global.trace_summary_v1_7","storage_cluster_id":9,"retention_days":30}]`
+	`"app_name":"checkout",` +
+	`"read_result_table_id":"system.trace_summary_es_v2","storage_cluster_id":9,"retention_days":30}]`
 
 func TestPublishedSpanOnlyRouteAndRetiredBusinessSummary(t *testing.T) {
 	spanOnly := strings.Replace(business132Document,
-		`,{"bk_tenant_id":"system","bk_biz_id":132,"profile":"trace_summary","observation_domain_id":"system_kapm",`+
+		`,{"bk_tenant_id":"system","bk_biz_id":132,"profile":"trace_summary",`+
 			`"database":"system_kapm","table":"otel_trace_summary","cluster_id":18,"cluster_name":"doris4_test",`+
-			`"schema_version":"sha256:cc07585afea58a5d"}`, "", 1)
+			`"schema_version":"sha256:3d6b6b96f74453dd"}`, "", 1)
 	document, err := ParsePublishedDocument([]byte(spanOnly), "system")
 	if err != nil || len(document.Routes) != 1 || document.Routes[0].Profile != metadata.TraceProfileSpan {
 		t.Fatalf("span-only route was rejected: routes=%+v err=%v", document.Routes, err)
@@ -45,10 +45,10 @@ func TestPublishedSpanOnlyRouteAndRetiredBusinessSummary(t *testing.T) {
 
 func TestLegacyPublishedTopologyFieldKeepsSpanAndSummaryReadable(t *testing.T) {
 	legacy := strings.Replace(business132Document, `"application_topology_targets":[]`,
-		`"a3_targets":[{"label":"a3_edge","observation_domain_id":"system_kapm",`+
+		`"a3_targets":[{"label":"a3_edge",`+
 			`"database":"system_kapm","table":"kapm_application_edge_observed_1m",`+
 			`"cluster_id":18,"cluster_name":"doris4_test",`+
-			`"schema_version":"sha256:19617e34c53d393e","retention_days":30}]`, 1)
+			`"schema_version":"sha256:8e56c7a2af5bd73b","retention_days":30}]`, 1)
 	parsed, err := ParsePublishedDocument([]byte(legacy), "system")
 	if err != nil || len(parsed.Routes) != 2 || len(parsed.ApplicationTopologyTargets) != 0 {
 		t.Fatalf("legacy publication blocked ordinary Trace routes: routes=%d topology=%d err=%v",
@@ -58,13 +58,13 @@ func TestLegacyPublishedTopologyFieldKeepsSpanAndSummaryReadable(t *testing.T) {
 
 func TestPublishedApplicationSpanRoutesCoexistWithLegacyBusinessRoute(t *testing.T) {
 	extra := `,{"bk_tenant_id":"system","bk_biz_id":132,"app_id":7,"profile":"trace_span",` +
-		`"observation_domain_id":"tenant_bbc5e661e106c6dc_kapm","database":"tenant_bbc5e661e106c6dc_kapm",` +
+		`"database":"tenant_bbc5e661e106c6dc_kapm",` +
 		`"table":"otel_trace_span","cluster_id":18,"cluster_name":"doris4_test",` +
-		`"schema_version":"sha256:e6e9af09d86b396e"},` +
+		`"schema_version":"sha256:3fee31e7c6376abe"},` +
 		`{"bk_tenant_id":"system","bk_biz_id":132,"app_id":8,"profile":"trace_span",` +
-		`"observation_domain_id":"tenant_bbc5e661e106c6dc_kapm","database":"tenant_bbc5e661e106c6dc_kapm",` +
+		`"database":"tenant_bbc5e661e106c6dc_kapm",` +
 		`"table":"otel_trace_span_app_8","cluster_id":18,"cluster_name":"doris4_test",` +
-		`"schema_version":"sha256:e6e9af09d86b396e"}`
+		`"schema_version":"sha256:3fee31e7c6376abe"}`
 	body := strings.Replace(business132Document, `],"application_topology_targets":[]`, extra+`],"application_topology_targets":[]`, 1)
 	document, err := ParsePublishedDocument([]byte(body), "system")
 	if err != nil || len(document.Routes) != 4 {
@@ -75,7 +75,7 @@ func TestPublishedApplicationSpanRoutesCoexistWithLegacyBusinessRoute(t *testing
 		t.Fatal(err)
 	}
 	for appID, table := range map[int64]string{7: "otel_trace_span", 8: "otel_trace_span_app_8"} {
-		route, resolveErr := snapshot.ResolveForApplication("system", 132, appID, metadata.TraceProfileSpan, "tenant_bbc5e661e106c6dc_kapm")
+		route, resolveErr := snapshot.ResolveForApplication("system", 132, appID, metadata.TraceProfileSpan)
 		if resolveErr != nil || route.Doris.Table != table {
 			t.Fatalf("app %d route=%+v err=%v", appID, route, resolveErr)
 		}
@@ -88,9 +88,9 @@ func TestPublishedApplicationSpanRoutesCoexistWithLegacyBusinessRoute(t *testing
 func TestPublishedApplicationSpanRouteAcceptsHyphenTenantWithHashedDatabase(t *testing.T) {
 	const document = `{"route_snapshot_version":7,"bk_tenant_id":"tenant-a","read_routes":[` +
 		`{"bk_tenant_id":"tenant-a","bk_biz_id":132,"app_id":7,"profile":"trace_span",` +
-		`"observation_domain_id":"tenant_80a707af7dc77ee1_kapm",` +
+		`` +
 		`"database":"tenant_80a707af7dc77ee1_kapm","table":"otel_trace_span",` +
-		`"cluster_id":18,"cluster_name":"doris4_test","schema_version":"sha256:e6e9af09d86b396e"}],` +
+		`"cluster_id":18,"cluster_name":"doris4_test","schema_version":"sha256:3fee31e7c6376abe"}],` +
 		`"application_topology_targets":[]}`
 	parsed, err := ParsePublishedDocument([]byte(document), "tenant-a")
 	if err != nil || len(parsed.Routes) != 1 || parsed.Routes[0].AppID != 7 {
@@ -104,7 +104,7 @@ func TestPublishedTenantSummaryRouteKeepsBusinessScopeInSharedTable(t *testing.T
 	if err != nil || len(document.Routes) != 2 || document.Routes[1].Doris.Table != "otel_trace_summary" {
 		t.Fatalf("tenant Summary route rejected: routes=%+v err=%v", document.Routes, err)
 	}
-	scope, err := ResolveScope("system", "bkcc__132", "system_kapm")
+	scope, err := ResolveScope("system", "bkcc__132")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,18 +133,18 @@ func TestPublishedESSummaryTargetsAreVersionedAndScoped(t *testing.T) {
 		t.Fatalf("trusted ES Summary target was lost: targets=%+v err=%v", document.ESSummaryTargets, err)
 	}
 	target := document.ESSummaryTargets[0]
-	if target.AppID != 7 || target.ResultTableID != "apm_global.trace_summary_v1_7" || target.PublishedVersion != 7 {
+	if target.AppID != 7 || target.ResultTableID != "system.trace_summary_es_v2" || target.PublishedVersion != 7 {
 		t.Fatalf("ES Summary identity or version drifted: %+v", target)
 	}
 	snapshot, err := NewRouteSnapshotWithESTargets(document.Version, document.Routes, document.ESSummaryTargets)
 	if err != nil {
 		t.Fatalf("trusted ES target did not enter snapshot: %v", err)
 	}
-	resolved, err := snapshot.ResolveESSummary("system", 132, 7, "system_kapm")
+	resolved, err := snapshot.ResolveESSummary("system", 132, 7)
 	if err != nil || resolved.ResultTableID != target.ResultTableID {
 		t.Fatalf("ES target did not resolve by paired identity: %+v err=%v", resolved, err)
 	}
-	if _, err := snapshot.ResolveESSummary("system", 132, 8, "system_kapm"); ErrorCode(err) != CodeRouteNotFound {
+	if _, err := snapshot.ResolveESSummary("system", 132, 8); ErrorCode(err) != CodeRouteNotFound {
 		t.Fatalf("another application gained ES target access: %v", err)
 	}
 }
@@ -171,8 +171,8 @@ func TestPublishedESSummaryEntryV2RequiresThirtyDayTarget(t *testing.T) {
 func TestPublishedESSummaryTargetsRejectIdentityAndMetadataDrift(t *testing.T) {
 	for name, target := range map[string]string{
 		"wrong tenant":    strings.Replace(publishedESSummaryTargets, `"bk_tenant_id":"system"`, `"bk_tenant_id":"other"`, 1),
-		"wrong domain":    strings.Replace(publishedESSummaryTargets, `"system_kapm"`, `"other_kapm"`, 1),
-		"bad rt":          strings.Replace(publishedESSummaryTargets, `"apm_global.trace_summary_v1_7"`, `"trace_summary_v1_7"`, 1),
+		"retired domain":  strings.Replace(publishedESSummaryTargets, `"app_name":"checkout"`, `"app_name":"checkout","observation_domain_id":"other_kapm"`, 1),
+		"bad rt":          strings.Replace(publishedESSummaryTargets, `"system.trace_summary_es_v2"`, `"trace_summary_v1_7"`, 1),
 		"bad cluster":     strings.Replace(publishedESSummaryTargets, `"storage_cluster_id":9`, `"storage_cluster_id":0`, 1),
 		"short retention": strings.Replace(publishedESSummaryTargets, `"retention_days":30`, `"retention_days":0`, 1),
 		"duplicate":       publishedESSummaryTargets[:len(publishedESSummaryTargets)-1] + `,` + publishedESSummaryTargets[1:],
@@ -199,11 +199,11 @@ func TestParsePublishedDocumentResolvesBusiness132Tables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("published routes did not build a snapshot: %v", err)
 	}
-	span, err := snapshot.Resolve("system", 132, metadata.TraceProfileSpan, "system_kapm")
+	span, err := snapshot.Resolve("system", 132, metadata.TraceProfileSpan)
 	if err != nil || span.Doris.Table != "otel_trace_span_132" || span.Doris.ClusterID != "18" {
 		t.Fatalf("business 132 span target was lost: %+v, %v", span, err)
 	}
-	if _, err := snapshot.Resolve("system", 133, metadata.TraceProfileSpan, "system_kapm"); ErrorCode(err) != CodeRouteNotFound {
+	if _, err := snapshot.Resolve("system", 133, metadata.TraceProfileSpan); ErrorCode(err) != CodeRouteNotFound {
 		t.Fatalf("business 133 crossed into business 132: %v", err)
 	}
 }
@@ -212,7 +212,7 @@ func TestParsePublishedDocumentRejectsTenantAndPhysicalDrift(t *testing.T) {
 	for name, body := range map[string]string{
 		"wrong key tenant": business132Document,
 		"wrong table":      strings.Replace(business132Document, "otel_trace_span_132", "otel_trace_span_133", 1),
-		"wrong schema":     strings.Replace(business132Document, "sha256:e6e9af09d86b396e", "sha256:0123456789abcdef", 1),
+		"wrong schema":     strings.Replace(business132Document, "sha256:3fee31e7c6376abe", "sha256:0123456789abcdef", 1),
 		"unknown profile":  strings.Replace(business132Document, `,"profile":"trace_summary"`, `,"profile":"unknown"`, 1),
 	} {
 		tenant := "system"

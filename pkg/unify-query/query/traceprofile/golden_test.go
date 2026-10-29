@@ -66,7 +66,7 @@ func TestTraceProfileRowGoldenV2MatchesUQPhysicalRowShaping(t *testing.T) {
 	}
 	for _, testCase := range fixture.Cases {
 		t.Run(string(testCase.Profile), func(t *testing.T) {
-			items, err := ShapeRows(testCase.Profile, []map[string]any{testCase.PhysicalRow})
+			items, err := ShapeRows(testCase.Profile, []map[string]any{testCase.PhysicalRow}, "system")
 			if err != nil || len(items) != 1 {
 				t.Fatalf("golden physical row was rejected: items=%+v err=%v", items, err)
 			}
@@ -80,7 +80,7 @@ func TestTraceProfileRowGoldenV2MatchesUQPhysicalRowShaping(t *testing.T) {
 		})
 	}
 	for _, page := range fixture.EmptyPages {
-		items, err := ShapeRows(page.Profile, []map[string]any{})
+		items, err := ShapeRows(page.Profile, []map[string]any{}, "system")
 		if err != nil || len(items) != 0 || len(page.Items) != 0 || page.Total < 0 ||
 			page.Profile == metadata.TraceProfileSpan && (page.Total != 0 || page.Offset != 0) ||
 			page.Profile == metadata.TraceProfileSummary && page.Offset == 0 && page.Total > 0 {

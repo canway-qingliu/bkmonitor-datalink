@@ -87,7 +87,7 @@ func (e *Executor) QueryApplicationTopologyRange(ctx context.Context, request Ap
 			"MIN(e.resolution) AS min_resolution, MAX(e.resolution) AS max_resolution, "+
 			"COUNT(*) AS observed_minutes, MAX(e.as_of_ms) AS as_of_ms, "+
 			"SUM(CASE WHEN e.observed THEN 0 ELSE 1 END) AS unobserved_count "+
-			"FROM %s.%s e WHERE e.bk_tenant_id = ? AND e.edge_date >= ? AND e.edge_date <= ? "+
+			"FROM %s.%s e WHERE e.edge_date >= ? AND e.edge_date <= ? "+
 			"AND e.minute_start_ms >= ? AND e.minute_start_ms < ? AND e.resolution = 'stable' "+
 			"AND e.source_namespace_id IN (%s) AND e.target_namespace_id IN (%s) "+
 			"GROUP BY e.source_namespace_id, e.source_bk_biz_id, e.target_namespace_id, e.target_bk_biz_id "+
@@ -96,7 +96,7 @@ func (e *Executor) QueryApplicationTopologyRange(ctx context.Context, request Ap
 	)
 	startDate := time.UnixMilli(request.StartMS).UTC().Format("2006-01-02")
 	endDate := time.UnixMilli(request.EndMS - 1).UTC().Format("2006-01-02")
-	args := append([]any{request.TenantID, startDate, endDate, request.StartMS, request.EndMS}, ids...)
+	args := append([]any{startDate, endDate, request.StartMS, request.EndMS}, ids...)
 	args = append(args, ids...)
 	rows, err := connection.Query(ctx, statement, args...)
 	if err != nil {

@@ -22,7 +22,6 @@ import (
 
 type ApplicationTopologyRangeQuery struct {
 	Request              ApplicationTopologyRangeRequest
-	ObservationDomainID  string
 	ExpectedRouteVersion int64
 	ScopeFingerprint     string
 	ProtocolVersion      string
@@ -37,7 +36,6 @@ const observedApplicationTopologyRangeVersion = "application_topology_range_v2"
 
 type applicationTopologyInputWire struct {
 	ScopeFingerprint     string                           `json:"expected_scope_fingerprint"`
-	ObservationDomainID  string                           `json:"observation_domain_id"`
 	ExpectedRouteVersion int64                            `json:"expected_route_version"`
 	StartMS              int64                            `json:"start_time_ms"`
 	EndMS                int64                            `json:"end_time_ms"`
@@ -70,8 +68,7 @@ func ParseApplicationTopologyRangeRequest(body []byte, maxBodyBytes int) (Applic
 	if item == nil {
 		return ApplicationTopologyRangeQuery{}, fmt.Errorf("应用拓扑 全景合同版本不受支持")
 	}
-	if item.ObservationDomainID == "" || !physicalIdentifierPattern.MatchString(item.ObservationDomainID) ||
-		item.ExpectedRouteVersion <= 0 || len(item.ScopeFingerprint) != 64 ||
+	if item.ExpectedRouteVersion <= 0 || len(item.ScopeFingerprint) != 64 ||
 		len(item.Applications) == 0 || len(item.Applications) > 129 ||
 		item.MaxPairs < 1 || item.MaxPairs > 10000 ||
 		item.StartMS < 946684800000 || item.StartMS%60000 != 0 || item.EndMS%60000 != 0 ||
@@ -87,7 +84,6 @@ func ParseApplicationTopologyRangeRequest(body []byte, maxBodyBytes int) (Applic
 	}
 	return ApplicationTopologyRangeQuery{
 		Request:              ApplicationTopologyRangeRequest{ContractVersion: version, ExpectedVersion: item.ExpectedRouteVersion, StartMS: item.StartMS, EndMS: item.EndMS, Applications: item.Applications, MaxPairs: item.MaxPairs},
-		ObservationDomainID:  item.ObservationDomainID,
 		ExpectedRouteVersion: item.ExpectedRouteVersion,
 		ScopeFingerprint:     item.ScopeFingerprint,
 		ProtocolVersion:      version,
@@ -96,7 +92,7 @@ func ParseApplicationTopologyRangeRequest(body []byte, maxBodyBytes int) (Applic
 
 // ApplicationTopologyRangeFingerprint 是 Python/Go 共用的固定 ASCII 摘要输入，不依赖 JSON 键顺序。
 func ApplicationTopologyRangeFingerprint(tenantID string, query ApplicationTopologyRangeQuery) string {
-	parts := []string{"application-topology-range-v2", tenantID, query.ObservationDomainID,
+	parts := []string{"application-topology-range-v2", tenantID,
 		strconv.FormatInt(query.ExpectedRouteVersion, 10),
 		strconv.FormatInt(query.Request.StartMS, 10), strconv.FormatInt(query.Request.EndMS, 10),
 		strconv.FormatInt(query.Request.MaxPairs, 10)}

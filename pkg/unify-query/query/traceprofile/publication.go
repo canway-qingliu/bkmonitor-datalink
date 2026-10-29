@@ -23,12 +23,12 @@ var publishedSchemaVersionPattern = regexp.MustCompile(`^sha256:[0-9a-f]{16}$`)
 // Kingeye trace_doris_schema.schema_version_for 的当前 Span/Summary DDL 摘要。
 // 读投影不兼容时必须随 DDL 一起升级，不能只接受任意形状的摘要字符串。
 var supportedPublishedSchemaVersion = map[string]string{
-	"trace_span":    "sha256:e6e9af09d86b396e",
+	"trace_span":    "sha256:3fee31e7c6376abe",
 	"trace_summary": tenantSummarySchemaVersion,
 }
 
 var supportedApplicationTopologyTargets = map[string]struct{ table, schema string }{
-	"application_edge": {"kapm_application_edge_observed_1m", "sha256:19617e34c53d393e"},
+	"application_edge": {"kapm_application_edge_observed_1m", "sha256:8e56c7a2af5bd73b"},
 }
 
 // PublishedDocument 是 Kingeye 发布的单租户、带版本 Redis 只读目标。
@@ -51,39 +51,36 @@ type publishedDocumentWire struct {
 }
 
 type publishedApplicationTopologyTargetWire struct {
-	Label               string          `json:"label"`
-	ObservationDomainID string          `json:"observation_domain_id"`
-	Database            string          `json:"database"`
-	Table               string          `json:"table"`
-	ClusterID           json.RawMessage `json:"cluster_id"`
-	ClusterName         string          `json:"cluster_name"`
-	SchemaVersion       string          `json:"schema_version"`
-	RetentionDays       int64           `json:"retention_days"`
+	Label         string          `json:"label"`
+	Database      string          `json:"database"`
+	Table         string          `json:"table"`
+	ClusterID     json.RawMessage `json:"cluster_id"`
+	ClusterName   string          `json:"cluster_name"`
+	SchemaVersion string          `json:"schema_version"`
+	RetentionDays int64           `json:"retention_days"`
 }
 
 type publishedESSummaryTargetWire struct {
-	TenantID            string `json:"bk_tenant_id"`
-	BizID               int64  `json:"bk_biz_id"`
-	AppID               int64  `json:"app_id"`
-	AppName             string `json:"app_name"`
-	ObservationDomainID string `json:"observation_domain_id"`
-	ResultTableID       string `json:"read_result_table_id"`
-	StorageClusterID    int64  `json:"storage_cluster_id"`
-	RetentionDays       int64  `json:"retention_days"`
-	EntryIndexVersion   int64  `json:"entry_index_version,omitempty"`
+	TenantID          string `json:"bk_tenant_id"`
+	BizID             int64  `json:"bk_biz_id"`
+	AppID             int64  `json:"app_id"`
+	AppName           string `json:"app_name"`
+	ResultTableID     string `json:"read_result_table_id"`
+	StorageClusterID  int64  `json:"storage_cluster_id"`
+	RetentionDays     int64  `json:"retention_days"`
+	EntryIndexVersion int64  `json:"entry_index_version,omitempty"`
 }
 
 type publishedRouteWire struct {
-	TenantID            string          `json:"bk_tenant_id"`
-	BizID               int64           `json:"bk_biz_id"`
-	AppID               int64           `json:"app_id,omitempty"`
-	Profile             string          `json:"profile"`
-	ObservationDomainID string          `json:"observation_domain_id"`
-	Database            string          `json:"database"`
-	Table               string          `json:"table"`
-	ClusterID           json.RawMessage `json:"cluster_id"`
-	ClusterName         string          `json:"cluster_name"`
-	SchemaVersion       string          `json:"schema_version"`
+	TenantID      string          `json:"bk_tenant_id"`
+	BizID         int64           `json:"bk_biz_id"`
+	AppID         int64           `json:"app_id,omitempty"`
+	Profile       string          `json:"profile"`
+	Database      string          `json:"database"`
+	Table         string          `json:"table"`
+	ClusterID     json.RawMessage `json:"cluster_id"`
+	ClusterName   string          `json:"cluster_name"`
+	SchemaVersion string          `json:"schema_version"`
 }
 
 // ParsePublishedDocument 校验租户发布键与物理坐标。
@@ -134,7 +131,7 @@ func ParsePublishedDocument(body []byte, keyTenant string) (PublishedDocument, e
 			}
 		} else {
 			var err error
-			target, err = NewDorisTarget(strconv.FormatInt(clusterID, 10), item.ObservationDomainID, item.BizID, profile, item.SchemaVersion)
+			target, err = NewDorisTarget(strconv.FormatInt(clusterID, 10), item.Database, item.BizID, profile, item.SchemaVersion)
 			if err != nil {
 				return PublishedDocument{}, err
 			}
@@ -144,7 +141,7 @@ func ParsePublishedDocument(body []byte, keyTenant string) (PublishedDocument, e
 		}
 		routes = append(routes, ReadRoute{
 			BkTenantID: keyTenant, BkBizID: item.BizID, AppID: item.AppID, Profile: profile,
-			ObservationDomainID: item.ObservationDomainID, PublishedVersion: wire.Version, Doris: &target,
+			PublishedVersion: wire.Version, Doris: &target,
 		})
 	}
 	esTargets := make([]ESSummaryTarget, 0, len(wire.ESSummaryTargets))
@@ -154,7 +151,7 @@ func ParsePublishedDocument(body []byte, keyTenant string) (PublishedDocument, e
 		}
 		esTargets = append(esTargets, ESSummaryTarget{
 			BkTenantID: item.TenantID, BkBizID: item.BizID, AppID: item.AppID,
-			AppName: item.AppName, ObservationDomainID: item.ObservationDomainID,
+			AppName:       item.AppName,
 			ResultTableID: item.ResultTableID, StorageClusterID: item.StorageClusterID,
 			RetentionDays: item.RetentionDays, EntryIndexVersion: item.EntryIndexVersion,
 			PublishedVersion: wire.Version,
@@ -184,8 +181,7 @@ func parsePublishedApplicationTopologyTargets(wire []publishedApplicationTopolog
 	item := wire[0]
 	identity := supportedApplicationTopologyTargets["application_edge"]
 	var clusterID int64
-	if item.Label != "application_edge" || item.ObservationDomainID != tenantID+"_kapm" ||
-		item.Database != item.ObservationDomainID || item.Table != identity.table ||
+	if item.Label != "application_edge" || item.Database != tenantID+"_kapm" || item.Table != identity.table ||
 		item.SchemaVersion != identity.schema || item.RetentionDays != 30 ||
 		item.ClusterName == "" || json.Unmarshal(item.ClusterID, &clusterID) != nil || clusterID <= 0 {
 		return nil, fmt.Errorf("应用拓扑读目标身份、物理表、集群或 Schema 非法")

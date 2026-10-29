@@ -40,7 +40,7 @@ func (reader *applicationTopologyReader) Query(_ context.Context, statement stri
 	if err := dorisclient.ValidateStatement(statement); err != nil {
 		return dorisclient.Result{}, err
 	}
-	if len(args) < 6 || args[0] != "tenant_a" || !strings.Contains(statement, "LIMIT") {
+	if len(args) < 5 || args[0] != "2025-10-16" || !strings.Contains(statement, "LIMIT") {
 		return dorisclient.Result{}, nil
 	}
 	if reader.uniqueOnly && strings.Contains(statement, "e.resolution = 'stable'") {
@@ -93,7 +93,7 @@ func applicationTopologyExecutor(t *testing.T, reader *applicationTopologyReader
 	targets := []ApplicationTopologyTarget{
 		{BkTenantID: "tenant_a", Label: "application_edge", Database: "tenant_a_kapm",
 			Table: "kapm_application_edge_observed_1m", ClusterID: "7", ClusterName: "doris",
-			SchemaVersion: "sha256:19617e34c53d393e", RetentionDays: 30, PublishedVersion: 4},
+			SchemaVersion: "sha256:8e56c7a2af5bd73b", RetentionDays: 30, PublishedVersion: 4},
 	}
 	snapshot, err := NewRouteSnapshotWithAllTargets(7, nil, nil, targets)
 	if err != nil {
@@ -151,7 +151,7 @@ func TestApplicationTopologyV2ReadsEdgeOnlyPublication(t *testing.T) {
 	reader := &applicationTopologyReader{}
 	target := ApplicationTopologyTarget{BkTenantID: "tenant_a", Label: "application_edge", Database: "tenant_a_kapm",
 		Table: "kapm_application_edge_observed_1m", ClusterID: "7", ClusterName: "doris",
-		SchemaVersion: "sha256:19617e34c53d393e", RetentionDays: 30, PublishedVersion: 4}
+		SchemaVersion: "sha256:8e56c7a2af5bd73b", RetentionDays: 30, PublishedVersion: 4}
 	snapshot, err := NewRouteSnapshotWithAllTargets(7, nil, nil, []ApplicationTopologyTarget{target})
 	if err != nil {
 		t.Fatal(err)

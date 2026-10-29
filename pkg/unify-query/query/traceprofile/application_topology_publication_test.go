@@ -14,9 +14,9 @@ import (
 	"testing"
 )
 
-const observedApplicationTopologyTargetJSON = `[{"label":"application_edge","observation_domain_id":"system_kapm",
+const observedApplicationTopologyTargetJSON = `[{"label":"application_edge",
 "database":"system_kapm","table":"kapm_application_edge_observed_1m",
-"cluster_id":18,"cluster_name":"doris4_test","schema_version":"sha256:19617e34c53d393e","retention_days":30}]`
+"cluster_id":18,"cluster_name":"doris4_test","schema_version":"sha256:8e56c7a2af5bd73b","retention_days":30}]`
 
 func TestPublishedApplicationTopologyEdgeIsTenantBoundAndVersioned(t *testing.T) {
 	body := strings.Replace(business132Document, `"application_topology_targets":[]`,
@@ -54,7 +54,7 @@ func TestPublishedApplicationTopologyRejectsAdditionalOrWrongTarget(t *testing.T
 func TestApplicationTopologyRouteSnapshotAcceptsMixedTenantEdges(t *testing.T) {
 	edge := ApplicationTopologyTarget{BkTenantID: "tenant_a", Label: "application_edge", Database: "tenant_a_kapm",
 		Table: "kapm_application_edge_observed_1m", ClusterID: "7", ClusterName: "doris",
-		SchemaVersion: "sha256:19617e34c53d393e", RetentionDays: 30, PublishedVersion: 4}
+		SchemaVersion: "sha256:8e56c7a2af5bd73b", RetentionDays: 30, PublishedVersion: 4}
 	other := edge
 	other.BkTenantID = "tenant_b"
 	other.Database = "tenant_b_kapm"

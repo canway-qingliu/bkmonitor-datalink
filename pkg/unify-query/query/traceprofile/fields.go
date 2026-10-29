@@ -13,7 +13,7 @@ import "github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 
 // Complete physical row contracts stay independent of the storage transport.
 var spanProjection = []string{
-	"bk_tenant_id", "observation_domain_id", "app_id", "span_date", "trace_id", "span_id",
+	"app_id", "span_date", "trace_id", "span_id",
 	"space_uid", "bk_biz_id", "data_id", "app_name", "parent_span_id", "trace_state",
 	"span_name", "span_kind", "status_code", "status_message", "start_time_us", "end_time_us",
 	"duration_us", "event_time_ms", "service_namespace", "service_name", "service_instance_id",
@@ -21,7 +21,7 @@ var spanProjection = []string{
 }
 
 var summaryProjection = []string{
-	"bk_tenant_id", "observation_domain_id", "trace_date", "app_id", "trace_id", "bk_biz_id",
+	"trace_date", "bk_biz_id", "app_id", "trace_id",
 	"app_name", "trace_start_time_us", "trace_end_time_us", "duration_us", "span_count",
 	"error_count", "service_count", "hierarchy_count", "span_min_duration_us", "span_max_duration_us",
 	"event_time_ms", "root_service_name", "root_service_span_id", "root_service_span_name",

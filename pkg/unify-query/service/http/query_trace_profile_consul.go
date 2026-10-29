@@ -187,7 +187,7 @@ func parsePublishedTraceTargets(prefix string, pairs api.KVPairs, unreadable map
 		for _, route := range document.Routes {
 			snapshot.Routes = append(snapshot.Routes, traceProfileRouteConfig{
 				BkTenantID: route.BkTenantID, BkBizID: route.BkBizID, AppID: route.AppID,
-				Profile: string(route.Profile), ObservationDomainID: route.ObservationDomainID,
+				Profile:  string(route.Profile),
 				Database: route.Doris.Database, Table: route.Doris.Table,
 				ClusterID: route.Doris.ClusterID, SchemaVersion: route.Doris.SchemaVersion,
 				PublishedVersion: document.Version,
@@ -197,12 +197,11 @@ func parsePublishedTraceTargets(prefix string, pairs api.KVPairs, unreadable map
 			snapshot.ESTargets = append(snapshot.ESTargets, traceProfileESTargetConfig{
 				BkTenantID: target.BkTenantID, BkBizID: target.BkBizID,
 				AppID: target.AppID, AppName: target.AppName,
-				ObservationDomainID: target.ObservationDomainID,
-				ResultTableID:       target.ResultTableID,
-				StorageClusterID:    target.StorageClusterID,
-				RetentionDays:       target.RetentionDays,
-				EntryIndexVersion:   target.EntryIndexVersion,
-				PublishedVersion:    document.Version,
+				ResultTableID:     target.ResultTableID,
+				StorageClusterID:  target.StorageClusterID,
+				RetentionDays:     target.RetentionDays,
+				EntryIndexVersion: target.EntryIndexVersion,
+				PublishedVersion:  document.Version,
 			})
 		}
 		for _, target := range document.ApplicationTopologyTargets {

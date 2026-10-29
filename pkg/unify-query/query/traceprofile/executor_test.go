@@ -77,12 +77,11 @@ func testSnapshot(t *testing.T, profiles ...metadata.TraceProfile) *RouteSnapsho
 	routes := make([]ReadRoute, 0, len(profiles))
 	for _, profile := range profiles {
 		routes = append(routes, ReadRoute{
-			BkTenantID:          testTenant,
-			BkBizID:             testBizID,
-			Profile:             profile,
-			ObservationDomainID: testDomain,
-			PublishedVersion:    3,
-			Doris:               targetPtr(testTarget(profile)),
+			BkTenantID:       testTenant,
+			BkBizID:          testBizID,
+			Profile:          profile,
+			PublishedVersion: 3,
+			Doris:            targetPtr(testTarget(profile)),
 		})
 	}
 	snapshot, err := NewRouteSnapshot(3, routes)
@@ -108,8 +107,7 @@ func TestExecutorSelectsExactApplicationSpanRouteFromConjunctiveAppFilter(t *tes
 	const database = "tenant_bbc5e661e106c6dc_kapm"
 	route := ReadRoute{
 		BkTenantID: "system", BkBizID: 132, AppID: 7, Profile: metadata.TraceProfileSpan,
-		ObservationDomainID: database,
-		Doris:               &DorisTarget{ClusterID: "18", Database: database, Table: "otel_trace_span", SchemaVersion: "sha256:e6e9af09d86b396e"},
+		Doris: &DorisTarget{ClusterID: "18", Database: database, Table: "otel_trace_span", SchemaVersion: "sha256:3fee31e7c6376abe"},
 	}
 	snapshot, err := NewRouteSnapshot(7, []ReadRoute{route})
 	if err != nil {
@@ -120,7 +118,7 @@ func TestExecutorSelectsExactApplicationSpanRouteFromConjunctiveAppFilter(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	scope := Scope{BkTenantID: "system", BkBizID: 132, SpaceUID: "bkcc__132", ObservationDomainID: database}
+	scope := Scope{BkTenantID: "system", BkBizID: 132, SpaceUID: "bkcc__132"}
 	request := Request{
 		Profile: metadata.TraceProfileSpan, StartUS: 1721024820000000, EndUS: 1721024880000000, Limit: 1,
 		Filters: Filters{FieldList: []FilterField{{FieldName: "app_id", Value: []string{"7"}, Operator: "eq"}}},
@@ -365,13 +363,12 @@ func TestExecutorMemberLookupUsesTenantPublicationVersionInsteadOfAggregateSnaps
 	if err != nil {
 		t.Fatal(err)
 	}
-	scope, err := ResolveScope("system", "bkcc__132", "system_kapm")
+	scope, err := ResolveScope("system", "bkcc__132")
 	if err != nil {
 		t.Fatal(err)
 	}
 	request := testRequest(metadata.TraceProfileSummary)
 	request.Scene = "global"
-	request.ObservationDomainID = "system_kapm"
 	request.MemberLookup = &MemberLookup{TraceID: "0123456789abcdef0123456789abcdef",
 		ExpectedRouteVersion: 7, AllowedPairs: []MemberPair{{AppID: 7, BkBizID: 132}}}
 
@@ -456,8 +453,7 @@ func TestExecutorMemberLookupRejectsRowsOutsidePairedScopeAndTruncation(t *testi
 			row["app_id"] = "9"
 			row["bk_biz_id"] = int64(0)
 		},
-		"wrong trace":  func(row map[string]any) { row["trace_id"] = "11111111111111111111111111111111" },
-		"wrong tenant": func(row map[string]any) { row["bk_tenant_id"] = "other" },
+		"wrong trace": func(row map[string]any) { row["trace_id"] = "11111111111111111111111111111111" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			row := validTraceRow(metadata.TraceProfileSummary)
@@ -505,7 +501,7 @@ func TestExecutorFailsClosedOnRouting(t *testing.T) {
 		target := testTarget(metadata.TraceProfileSpan)
 		route := ReadRoute{
 			BkTenantID: testTenant, BkBizID: testBizID, Profile: metadata.TraceProfileSpan,
-			ObservationDomainID: testDomain, Doris: targetPtr(target),
+			Doris: targetPtr(target),
 		}
 		snapshot, err := NewRouteSnapshot(1, []ReadRoute{route})
 		if err != nil {
@@ -516,10 +512,10 @@ func TestExecutorFailsClosedOnRouting(t *testing.T) {
 			t.Fatalf("NewExecutor returned error: %v", err)
 		}
 		scope := testScope(t)
-		scope.ObservationDomainID = "other_kapm"
+		scope.BkTenantID = "other"
 		_, err = executor.Execute(context.Background(), testRequest(metadata.TraceProfileSpan), scope)
-		if ErrorCode(err) != CodeUnauthorizedDomain {
-			t.Fatalf("got %v, want %s", err, CodeUnauthorizedDomain)
+		if ErrorCode(err) != CodeRouteNotFound {
+			t.Fatalf("got %v, want %s", err, CodeRouteNotFound)
 		}
 	})
 }

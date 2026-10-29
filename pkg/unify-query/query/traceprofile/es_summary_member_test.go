@@ -21,7 +21,7 @@ const esMemberStartUS int64 = 1721024820000000
 func esMemberFixture(t *testing.T) (Request, Scope, ESSummaryTarget, map[string]any) {
 	t.Helper()
 	traceID := strings.Repeat("a", 32)
-	scope, err := ResolveScope("system", "bkcc__42", "system_kapm")
+	scope, err := ResolveScope("system", "bkcc__42")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,11 +35,10 @@ func esMemberFixture(t *testing.T) (Request, Scope, ESSummaryTarget, map[string]
 	}
 	target := ESSummaryTarget{
 		BkTenantID: "system", BkBizID: 42, AppID: 7, AppName: "checkout",
-		ObservationDomainID: "system_kapm", ResultTableID: "apm_global.trace_summary_v1_7",
+		ResultTableID:    "system.trace_summary_es_v2",
 		StorageClusterID: 9, RetentionDays: 30, PublishedVersion: 7,
 	}
 	row := map[string]any{
-		"bk_tenant_id": "system", "observation_domain_id": "system_kapm",
 		"biz_id": "42", "app_id": int64(7), "app_name": "checkout", "trace_id": traceID,
 		"trace_date": "2024-07-15", "min_start_time": esMemberStartUS,
 		"max_end_time": esMemberStartUS + 1000, "trace_duration": int64(1000),
@@ -113,7 +112,6 @@ func TestShapeESSummaryMemberPageRejectsTruncatedOrConflictingStatistics(t *test
 func TestShapeESSummaryMemberPageRejectsIncompleteOrForeignRows(t *testing.T) {
 	request, scope, target, row := esMemberFixture(t)
 	for name, mutate := range map[string]func(map[string]any){
-		"wrong tenant":    func(value map[string]any) { value["bk_tenant_id"] = "other" },
 		"wrong app":       func(value map[string]any) { value["app_id"] = int64(8) },
 		"wrong date":      func(value map[string]any) { value["trace_date"] = "2024-07-16" },
 		"out of window":   func(value map[string]any) { value["min_start_time"] = request.EndUS },

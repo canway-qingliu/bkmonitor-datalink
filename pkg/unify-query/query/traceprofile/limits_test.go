@@ -52,7 +52,7 @@ func TestESSummaryListLimitAndSortErrorsAreNotAuthorizationErrors(t *testing.T) 
 
 func TestParseRequestKeepsTheParsedESListPredicate(t *testing.T) {
 	body := `{"trace_profile":"trace_summary","trace_contract_version":"trace_query_v2","trace_request":{` +
-		`"observation_domain_id":"system_kapm","expected_scope_fingerprint":"` +
+		`"expected_scope_fingerprint":"` +
 		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" + `",` +
 		`"start_time":"1758585600000000","end_time":"1758672000000000",` +
 		`"filters":{"field_list":[{"field_name":"entry_type","value":["request"],"op":"eq"}],"condition_list":[]},` +

@@ -105,7 +105,6 @@ func TestESSummaryMemberLookupAgainstLocalElasticsearch(t *testing.T) {
 
 	request, scope, target := esMemberHTTPFixture(t)
 	row := map[string]any{
-		"bk_tenant_id": "system", "observation_domain_id": "system_kapm",
 		"biz_id": "42", "app_id": 7, "app_name": "checkout", "trace_id": request.MemberLookup.TraceID,
 		"trace_date": "2024-07-15", "min_start_time": request.StartUS,
 		"max_end_time": request.StartUS + 1000, "trace_duration": 1000,

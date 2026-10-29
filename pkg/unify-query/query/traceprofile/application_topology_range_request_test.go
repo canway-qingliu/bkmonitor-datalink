@@ -17,13 +17,13 @@ import (
 
 func observedApplicationTopologyRequestJSON(fingerprint string) []byte {
 	return []byte(fmt.Sprintf(`{"application_topology_contract_version":"application_topology_range_v2","application_topology_request":{
-"expected_scope_fingerprint":"%s","observation_domain_id":"tenant_a_kapm",
+"expected_scope_fingerprint":"%s",
 "expected_route_version":4,"start_time_ms":1760572800000,"end_time_ms":1760573700000,
 "applications":[{"namespace_id":11,"bk_biz_id":2},{"namespace_id":12,"bk_biz_id":3}],"max_pairs":10000}}`, fingerprint))
 }
 
 func TestApplicationTopologyObservedEdgesFingerprintMatchesPythonContract(t *testing.T) {
-	const expected = "dd338a45f464d3c05abf26d6106b6ce61b476dc50552a8d561f5a3deedc224fd"
+	const expected = "19770c654691835e30327afc88978d52730169a20f4c91fb20b5782a467e303b"
 	query, err := ParseApplicationTopologyRangeRequest(observedApplicationTopologyRequestJSON(expected), 65536)
 	if err != nil || query.Request.ContractVersion != observedApplicationTopologyRangeVersion {
 		t.Fatalf("observed edge request rejected: %+v, %v", query, err)
@@ -34,7 +34,7 @@ func TestApplicationTopologyObservedEdgesFingerprintMatchesPythonContract(t *tes
 }
 
 func TestApplicationTopologyRangeRequestRejectsUnknownAndDuplicateFields(t *testing.T) {
-	const expected = "dd338a45f464d3c05abf26d6106b6ce61b476dc50552a8d561f5a3deedc224fd"
+	const expected = "19770c654691835e30327afc88978d52730169a20f4c91fb20b5782a467e303b"
 	for _, body := range [][]byte{
 		[]byte(strings.Replace(string(observedApplicationTopologyRequestJSON(expected)),
 			`"max_pairs":10000`, `"max_pairs":10000,"database":"private"`, 1)),

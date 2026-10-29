@@ -81,7 +81,7 @@ func ShapeESSummaryMemberPage(raw []map[string]any, total int64, request Request
 	lookup := request.MemberLookup
 	if request.Profile != metadata.TraceProfileSummary || request.Scene != "global" || lookup == nil ||
 		lookup.Backend != MemberBackendElasticsearch || len(lookup.AllowedPairs) != 1 ||
-		target.BkTenantID != scope.BkTenantID || target.ObservationDomainID != scope.ObservationDomainID ||
+		target.BkTenantID != scope.BkTenantID ||
 		target.BkBizID != scope.BkBizID || target.PublishedVersion == 0 ||
 		target.PublishedVersion != lookup.ExpectedRouteVersion ||
 		lookup.AllowedPairs[0] != (MemberPair{AppID: target.AppID, BkBizID: target.BkBizID}) {
@@ -102,7 +102,6 @@ func ShapeESSummaryMemberPage(raw []map[string]any, total int64, request Request
 		versionUS, versionErr := exactTraceInt64(row["time"])
 		if appErr != nil || bizErr != nil || startErr != nil || endErr != nil || versionErr != nil ||
 			appID != target.AppID || bizID != target.BkBizID ||
-			row["bk_tenant_id"] != scope.BkTenantID || row["observation_domain_id"] != scope.ObservationDomainID ||
 			row["app_name"] != target.AppName || row["trace_id"] != lookup.TraceID ||
 			started < request.StartUS || started >= request.EndUS || ended < started ||
 			row["trace_date"] != time.UnixMicro(started).UTC().Format("2006-01-02") ||
@@ -144,7 +143,7 @@ func ShapeESSummaryMemberPage(raw []map[string]any, total int64, request Request
 		}
 		physicalRows = append(physicalRows, physical)
 	}
-	items, err := ShapeRows(metadata.TraceProfileSummary, physicalRows)
+	items, err := ShapeRows(metadata.TraceProfileSummary, physicalRows, scope.BkTenantID)
 	if err != nil {
 		return Page{}, reject(CodePartialFailure, "ES Summary 成员行合同非法: %s", err)
 	}

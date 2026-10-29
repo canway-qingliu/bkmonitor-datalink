@@ -24,16 +24,16 @@ import (
 )
 
 const publishedBusiness132 = `{"route_snapshot_version":7,"bk_tenant_id":"system","read_routes":[` +
-	`{"bk_tenant_id":"system","bk_biz_id":132,"profile":"trace_span","observation_domain_id":"system_kapm",` +
+	`{"bk_tenant_id":"system","bk_biz_id":132,"profile":"trace_span",` +
 	`"database":"system_kapm","table":"otel_trace_span_132","cluster_id":18,"cluster_name":"doris4_test",` +
-	`"schema_version":"sha256:e6e9af09d86b396e"},` +
-	`{"bk_tenant_id":"system","bk_biz_id":132,"profile":"trace_summary","observation_domain_id":"system_kapm",` +
-	`"database":"system_kapm","table":"otel_trace_summary_132","cluster_id":18,"cluster_name":"doris4_test",` +
-	`"schema_version":"sha256:281052267ec373fc"}],"application_topology_targets":[]}`
+	`"schema_version":"sha256:3fee31e7c6376abe"},` +
+	`{"bk_tenant_id":"system","bk_biz_id":132,"profile":"trace_summary",` +
+	`"database":"system_kapm","table":"otel_trace_summary","cluster_id":18,"cluster_name":"doris4_test",` +
+	`"schema_version":"sha256:3d6b6b96f74453dd"}],"application_topology_targets":[]}`
 
 const publishedESSummaryTargets = `[{"bk_tenant_id":"system","bk_biz_id":132,"app_id":7,` +
-	`"app_name":"checkout","observation_domain_id":"system_kapm",` +
-	`"read_result_table_id":"apm_global.trace_summary_v1_7","storage_cluster_id":9,"retention_days":30}]`
+	`"app_name":"checkout",` +
+	`"read_result_table_id":"system.trace_summary_es_v2","storage_cluster_id":9,"retention_days":30}]`
 
 func TestPublishedTraceTargetsInstallESSummaryCandidateIntoRuntime(t *testing.T) {
 	prefix := "kingeye/metadata/unify-query/data/trace/read_target/"
@@ -54,8 +54,8 @@ func TestPublishedTraceTargetsInstallESSummaryCandidateIntoRuntime(t *testing.T)
 		t.Fatalf("ES Summary target did not build a runtime: %v", err)
 	}
 	defer runtime.close()
-	target, err := runtime.executor.ResolveESSummaryTarget("system", 132, 7, "system_kapm")
-	if err != nil || target.ResultTableID != "apm_global.trace_summary_v1_7" || target.PublishedVersion != 7 {
+	target, err := runtime.executor.ResolveESSummaryTarget("system", 132, 7)
+	if err != nil || target.ResultTableID != "system.trace_summary_es_v2" || target.PublishedVersion != 7 {
 		t.Fatalf("ES Summary route identity/version drifted: %+v err=%v", target, err)
 	}
 }
@@ -67,8 +67,8 @@ func TestESSummaryOnlyTenantCanLoadTrustedCandidateWithoutDorisConnection(t *tes
 		"readonly_connections":   []any{},
 		"es_summary_targets": []any{map[string]any{
 			"bk_tenant_id": "system", "bk_biz_id": 132, "app_id": 7,
-			"app_name": "checkout", "observation_domain_id": "system_kapm",
-			"read_result_table_id": "apm_global.trace_summary_v1_7",
+			"app_name":             "checkout",
+			"read_result_table_id": "system.trace_summary_es_v2",
 			"storage_cluster_id":   9, "retention_days": 30, "published_route_version": 7,
 		}},
 	}
@@ -76,8 +76,8 @@ func TestESSummaryOnlyTenantCanLoadTrustedCandidateWithoutDorisConnection(t *tes
 	if err != nil || runtime == nil {
 		t.Fatalf("ES-only trusted candidate was not loaded: runtime=%v err=%v", runtime, err)
 	}
-	target, err := runtime.executor.ResolveESSummaryTarget("system", 132, 7, "system_kapm")
-	if err != nil || target.ResultTableID != "apm_global.trace_summary_v1_7" {
+	target, err := runtime.executor.ResolveESSummaryTarget("system", 132, 7)
+	if err != nil || target.ResultTableID != "system.trace_summary_es_v2" {
 		t.Fatalf("ES-only target was lost: %+v err=%v", target, err)
 	}
 }
@@ -109,9 +109,9 @@ func TestPublishedTraceTargetsBuildBusiness132Runtime(t *testing.T) {
 func TestPublishedApplicationSpanRouteSurvivesRuntimeReload(t *testing.T) {
 	const database = "tenant_bbc5e661e106c6dc_kapm"
 	appRoute := `,{"bk_tenant_id":"system","bk_biz_id":132,"app_id":7,"profile":"trace_span",` +
-		`"observation_domain_id":"` + database + `","database":"` + database + `",` +
+		`"database":"` + database + `",` +
 		`"table":"otel_trace_span","cluster_id":18,"cluster_name":"doris4_test",` +
-		`"schema_version":"sha256:e6e9af09d86b396e"}`
+		`"schema_version":"sha256:3fee31e7c6376abe"}`
 	body := strings.Replace(publishedBusiness132, `],"application_topology_targets":[]`, appRoute+`],"application_topology_targets":[]`, 1)
 	prefix := "kingeye/metadata/unify-query/data/trace/read_target/"
 	pairs := api.KVPairs{&api.KVPair{Key: prefix + "system", Value: []byte(body)}}

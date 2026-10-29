@@ -41,7 +41,6 @@ func TestESListExecutionBuildsClosedExactPageAndChecksRoute(t *testing.T) {
 			t.Fatalf("ES list query lost trusted pagination, route or order: %+v", query)
 		}
 		wanted := map[string]string{
-			"bk_tenant_id": "system", "observation_domain_id": "system_kapm",
 			"biz_id": "42", "app_id": "7", "entry_type": "request",
 		}
 		for _, field := range query.QueryList[0].Conditions.FieldList {
@@ -113,14 +112,11 @@ func TestESListExecutionRepeatsTrustedScopeAcrossMixedTypeBranches(t *testing.T)
 		}
 		for _, group := range groups {
 			identity := map[string]string{
-				"bk_tenant_id":          scope.BkTenantID,
-				"observation_domain_id": scope.ObservationDomainID,
-				"biz_id":                strconv.FormatInt(scope.BkBizID, 10),
-				"app_id":                strconv.FormatInt(target.AppID, 10),
+				"biz_id": strconv.FormatInt(scope.BkBizID, 10),
+				"app_id": strconv.FormatInt(target.AppID, 10),
 			}
 			timeBounds := map[string]bool{"gte": false, "lte": false}
-			wanted := map[string]bool{"bk_tenant_id": false, "observation_domain_id": false,
-				"biz_id": false, "app_id": false, "min_start_time": false,
+			wanted := map[string]bool{"biz_id": false, "app_id": false, "min_start_time": false,
 				"entry_type": false, "entry_parent_span_id": false}
 			for _, field := range group {
 				if expected, ok := identity[field.DimensionName]; ok &&

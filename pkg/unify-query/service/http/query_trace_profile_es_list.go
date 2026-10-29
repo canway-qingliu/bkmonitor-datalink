@@ -31,7 +31,7 @@ func executeESList(
 		request.MemberLookup != nil || request.Aggregation != nil ||
 		list.Backend != traceprofile.MemberBackendElasticsearch || list.AppID != target.AppID ||
 		list.BkBizID != target.BkBizID || target.BkBizID != scope.BkBizID ||
-		target.BkTenantID != scope.BkTenantID || target.ObservationDomainID != scope.ObservationDomainID ||
+		target.BkTenantID != scope.BkTenantID ||
 		target.ResultTableID == "" || target.StorageClusterID <= 0 {
 		return traceprofile.Page{}, esMemberReject(traceprofile.CodeUnauthorizedMember, "ES Summary 列表身份与发布目标不一致")
 	}
@@ -50,8 +50,6 @@ func executeESList(
 		offset = *request.Offset
 	}
 	baseFields := []structured.ConditionField{
-		{DimensionName: "bk_tenant_id", Value: []string{scope.BkTenantID}, Operator: "eq"},
-		{DimensionName: "observation_domain_id", Value: []string{scope.ObservationDomainID}, Operator: "eq"},
 		{DimensionName: "biz_id", Value: []string{strconv.FormatInt(scope.BkBizID, 10)}, Operator: "eq"},
 		{DimensionName: "app_id", Value: []string{strconv.FormatInt(target.AppID, 10)}, Operator: "eq"},
 		{DimensionName: "min_start_time", Value: []string{strconv.FormatInt(request.StartUS, 10)}, Operator: "gte"},

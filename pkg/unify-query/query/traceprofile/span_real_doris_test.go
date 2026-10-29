@@ -122,7 +122,7 @@ func TestSpanProfileReadsRealDorisVariantArraysAndExactTotal(t *testing.T) {
 		SchemaVersion: "local-span-v1"}
 	snapshot, err := NewRouteSnapshot(7, []ReadRoute{{
 		BkTenantID: tenant, BkBizID: 7, Profile: metadata.TraceProfileSpan,
-		ObservationDomainID: database, PublishedVersion: 7, Doris: &target,
+		PublishedVersion: 7, Doris: &target,
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -131,14 +131,13 @@ func TestSpanProfileReadsRealDorisVariantArraysAndExactTotal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scope, err := ResolveScope(tenant, "bkcc__7", database)
+	scope, err := ResolveScope(tenant, "bkcc__7")
 	if err != nil {
 		t.Fatal(err)
 	}
 	offset := int64(0)
 	request := Request{
-		Profile: metadata.TraceProfileSpan, ObservationDomainID: database,
-		StartUS: minute.UnixMicro(), EndUS: minute.Add(time.Minute).UnixMicro(),
+		Profile: metadata.TraceProfileSpan, StartUS: minute.UnixMicro(), EndUS: minute.Add(time.Minute).UnixMicro(),
 		Limit: 1, Offset: &offset,
 		Filters: Filters{FieldList: []FilterField{{
 			FieldName: "trace_id", Value: []string{traceID}, Operator: "eq",
@@ -179,8 +178,7 @@ func createSpanRealTable(t *testing.T, ctx context.Context, db *sql.DB,
 	t.Helper()
 	statement := fmt.Sprintf(`CREATE TABLE %s.%s (
   span_date DATE NOT NULL, app_id VARCHAR(128) NOT NULL, trace_id VARCHAR(32) NOT NULL,
-  span_id VARCHAR(32) NOT NULL, bk_tenant_id VARCHAR(64) NOT NULL,
-  observation_domain_id VARCHAR(128) NOT NULL, space_uid VARCHAR(128) NOT NULL,
+  span_id VARCHAR(32) NOT NULL, space_uid VARCHAR(128) NOT NULL,
   bk_biz_id BIGINT NOT NULL, data_id BIGINT NOT NULL, app_name VARCHAR(255) NOT NULL,
   parent_span_id VARCHAR(32) NOT NULL, trace_state STRING NOT NULL,
   span_name STRING NOT NULL, span_kind INT NOT NULL, status_code INT NOT NULL,
@@ -190,7 +188,7 @@ func createSpanRealTable(t *testing.T, ctx context.Context, db *sql.DB,
   service_instance_id VARCHAR(512) NULL, deployment_environment VARCHAR(512) NULL,
   resource VARIANT NOT NULL, attributes VARIANT NOT NULL,
   events VARIANT NOT NULL, links VARIANT NOT NULL, ingest_time BIGINT NOT NULL
-) UNIQUE KEY (span_date, app_id, trace_id, span_id, bk_tenant_id, observation_domain_id)
+) UNIQUE KEY (span_date, app_id, trace_id, span_id)
 PARTITION BY RANGE (span_date) (PARTITION p_recent VALUES LESS THAN ('%s'))
 DISTRIBUTED BY HASH (trace_id) BUCKETS 1
 PROPERTIES ("replication_num"="1", "enable_unique_key_merge_on_write"="true",
