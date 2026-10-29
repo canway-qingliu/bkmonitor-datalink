@@ -123,9 +123,6 @@ type publishedTraceSnapshot struct {
 	ESTargets                  []traceProfileESTargetConfig
 	ApplicationTopologyTargets []traceProfileApplicationTopologyTargetConfig
 	Invalid                    []invalidTraceDocument
-	// Tenants 是发布源上出现的全部租户，合法与非法都算；单租户映射按它推导，
-	// 一个租户的文档变成非法不会改变映射。
-	Tenants map[string]struct{}
 	// Documents 是每个合法租户文档的键与版本，供撤销日志使用。
 	Documents map[string]invalidTraceDocument
 }
@@ -157,7 +154,6 @@ func parsePublishedTraceTargets(prefix string, pairs api.KVPairs, unreadable map
 		Routes:                     make([]traceProfileRouteConfig, 0),
 		ESTargets:                  make([]traceProfileESTargetConfig, 0),
 		ApplicationTopologyTargets: make([]traceProfileApplicationTopologyTargetConfig, 0),
-		Tenants:                    make(map[string]struct{}, len(sorted)),
 		Documents:                  make(map[string]invalidTraceDocument, len(sorted)),
 	}
 	hasher := sha256.New()
@@ -167,9 +163,6 @@ func parsePublishedTraceTargets(prefix string, pairs api.KVPairs, unreadable map
 		_, _ = hasher.Write(content[:])
 		tenantID := strings.TrimPrefix(pair.Key, prefix)
 		invalid := invalidTraceDocument{Key: pair.Key, TenantID: tenantID, Version: publishedDocumentVersion(pair.Value)}
-		if tenantID != "" && !strings.Contains(tenantID, "/") {
-			snapshot.Tenants[tenantID] = struct{}{}
-		}
 		var document traceprofile.PublishedDocument
 		switch {
 		case !strings.HasPrefix(pair.Key, prefix) || tenantID == "" || strings.Contains(tenantID, "/"):
@@ -568,7 +561,7 @@ func buildPublishedTraceRuntimeLocked() (string, error) {
 	config["read_routes"] = snapshot.Routes
 	config["es_summary_targets"] = snapshot.ESTargets
 	config["application_topology_targets"] = snapshot.ApplicationTopologyTargets
-	runtime, err := newTraceProfileRuntimeFor(config, snapshot.Tenants)
+	runtime, err := newTraceProfileRuntime(config)
 	if err != nil {
 		// 本地配置与已校验的租户文档组合失败：不能确认任何授权，直读关闭。
 		installTraceProfileRuntime(nil, traceRuntimeInvalidConfig)

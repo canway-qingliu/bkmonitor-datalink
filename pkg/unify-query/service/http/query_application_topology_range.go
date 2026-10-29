@@ -52,9 +52,6 @@ func handleApplicationTopologyRangeQuery(c *gin.Context, ctx context.Context, sp
 		return writeTraceProfileReject(ctx, c, span, traceprofile.CodeUnauthorizedMember, "应用拓扑 全景路由空间不在受信应用目录")
 	}
 	tenantID := user.TenantID
-	if !runtime.multiTenantMode && tenantID == "default" && runtime.singleTenantID != "" {
-		tenantID = runtime.singleTenantID
-	}
 	if query.ObservationDomainID != tenantID+"_kapm" ||
 		query.ScopeFingerprint != traceprofile.ApplicationTopologyRangeFingerprint(tenantID, query) {
 		return writeTraceProfileReject(ctx, c, span, traceprofile.CodeUnauthorizedMember, "应用拓扑 全景租户范围摘要不匹配")

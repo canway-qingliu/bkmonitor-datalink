@@ -47,7 +47,6 @@ func setUpRedisTracePublication(t *testing.T) (context.Context, goRedis.Universa
 		t.Fatal(err)
 	}
 	config := traceProfileRuntimeConfig()
-	config["single_tenant_id"] = "system"
 	delete(config, "read_routes")
 	previousConfig, previousSource := viper.Get(TraceProfileConfigPath), viper.Get("storage.source")
 	previousBasePath := redisService.KVBasePath
@@ -84,9 +83,6 @@ func TestTracePublishedRoutesLoadFromRedisWhenStorageSourceIsRedis(t *testing.T)
 	runtime := traceProfileRuntimeValue.Load()
 	if runtime == nil || runtime.routeCount != 2 {
 		t.Fatalf("published business routes were not installed: %+v", runtime)
-	}
-	if runtime.singleTenantID != "system" {
-		t.Fatalf("single tenant binding was lost: %s", runtime.singleTenantID)
 	}
 }
 

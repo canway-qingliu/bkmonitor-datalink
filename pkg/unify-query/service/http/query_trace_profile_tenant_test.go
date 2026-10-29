@@ -35,7 +35,7 @@ func (query tenantScopeQuerier) Query(ctx context.Context, statement string, arg
 	return query(ctx, statement, args...)
 }
 
-func TestTraceProfileSingleTenantIDKeepsExistingSecurityChecks(t *testing.T) {
+func TestTraceProfileUsesVerifiedTenantWithoutAlias(t *testing.T) {
 	data, err := os.ReadFile("../../query/traceprofile/testdata/trace-profile-row-golden-v2.json")
 	if err != nil {
 		t.Fatal(err)
@@ -51,25 +51,24 @@ func TestTraceProfileSingleTenantIDKeepsExistingSecurityChecks(t *testing.T) {
 		t.Fatalf("invalid row fixture: %v", err)
 	}
 	for _, tc := range []struct {
-		name, incoming, space, app, domain, target, binding, code string
-		multiTenant, unconfigured, unverified, reloadMode         bool
-		bizID                                                     int64
+		name, incoming, space, app, domain, target, code string
+		multiTenant, unverified, reloadMode              bool
+		bizID                                            int64
 	}{
-		{name: "mapped request"},
-		{name: "configurable target", target: "tenant_new"},
+		{name: "default request"},
+		{name: "old system route is not an alias for default", target: "system", domain: "system_kapm", code: traceprofile.CodeUnauthorizedDomain},
 		{name: "new business only needs authorization and published route", bizID: 43},
-		{name: "real tenant", incoming: "system"},
-		{name: "multi tenant preserves identity", incoming: "system", multiTenant: true},
-		{name: "multi tenant disables alias", multiTenant: true, code: traceprofile.CodeUnauthorizedDomain},
+		{name: "real tenant", incoming: "system", target: "system"},
+		{name: "multi tenant preserves identity", incoming: "system", target: "system", multiTenant: true},
+		{name: "multi tenant disables alias", target: "system", multiTenant: true, code: traceprofile.CodeUnauthorizedDomain},
 		{name: "single tenant runtime survives mode reload", reloadMode: true},
-		{name: "multi tenant runtime survives mode reload", multiTenant: true, reloadMode: true, code: traceprofile.CodeUnauthorizedDomain},
-		{name: "unconfigured with one published tenant uses it", unconfigured: true},
+		{name: "multi tenant runtime survives mode reload", target: "system", multiTenant: true, reloadMode: true, code: traceprofile.CodeUnauthorizedDomain},
 		{name: "unverified caller", unverified: true, code: traceprofile.CodeUnauthorizedMember},
 		{name: "unauthorized app", app: "other", code: traceprofile.CodeUnauthorizedMember},
 		{name: "space without published route", space: "bkcc__43", code: traceprofile.CodeRouteNotFound},
 		{name: "other incoming tenant", incoming: "foreign", code: traceprofile.CodeUnauthorizedDomain},
 		{name: "body cannot choose tenant", domain: "foreign_kapm", code: traceprofile.CodeUnauthorizedDomain},
-		{name: "stale target", binding: "tenant_new", domain: "tenant_new_kapm", code: traceprofile.CodeRouteNotFound},
+		{name: "stale target", domain: "tenant_new_kapm", code: traceprofile.CodeUnauthorizedDomain},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.bizID == 0 {
@@ -85,10 +84,7 @@ func TestTraceProfileSingleTenantIDKeepsExistingSecurityChecks(t *testing.T) {
 				tc.app = "kingeye-apm"
 			}
 			if tc.target == "" {
-				tc.target = "system"
-			}
-			if tc.binding == "" {
-				tc.binding = tc.target
+				tc.target = "default"
 			}
 			if tc.domain == "" {
 				tc.domain = tc.target + "_kapm"
@@ -105,13 +101,11 @@ func TestTraceProfileSingleTenantIDKeepsExistingSecurityChecks(t *testing.T) {
 				viper.Set(influxdb.MultiTenantModeConfigPath, previousModeConfig)
 			})
 			config := traceProfileRuntimeConfig()
+			config["read_routes"] = config["read_routes"].([]any)[:1]
 			for _, raw := range config["read_routes"].([]any) {
 				route := raw.(map[string]any)
 				route["bk_tenant_id"], route["observation_domain_id"] = tc.target, tc.target+"_kapm"
 				route["bk_biz_id"] = tc.bizID
-			}
-			if !tc.unconfigured {
-				config["single_tenant_id"] = tc.binding
 			}
 			withTraceProfileRuntime(t, config)
 			withTraceProfileAuth(t, true, "kingeye-apm")
@@ -197,55 +191,15 @@ func TestTraceProfileSingleTenantIDKeepsExistingSecurityChecks(t *testing.T) {
 	}
 }
 
-// F10：非法的 single_tenant_id 在加载时就是配置错误，而不是每个请求都报"调用方未授权"。
-func TestTraceInvalidSingleTenantIDFailsAtLoad(t *testing.T) {
+// 旧配置字段必须在切流时移除，不能让已删除的租户别名静默继续生效。
+func TestTraceRemovedSingleTenantIDFieldFailsAtLoad(t *testing.T) {
 	config := traceProfileRuntimeConfig()
 	config["single_tenant_id"] = "../system"
 	if runtime, err := newTraceProfileRuntime(config); err == nil || !strings.Contains(err.Error(), "single_tenant_id") {
 		if runtime != nil {
 			runtime.close()
 		}
-		t.Fatalf("invalid single_tenant_id was accepted at load: %v", err)
-	}
-}
-
-// F10：未配置 single_tenant_id 时，多租户快照不猜测数据租户。
-func TestTraceSingleTenantIsNotDerivedFromSeveralTenants(t *testing.T) {
-	config := traceProfileRuntimeConfig()
-	routes := config["read_routes"].([]any)
-	other := map[string]any{}
-	for key, value := range routes[0].(map[string]any) {
-		other[key] = value
-	}
-	other["bk_tenant_id"], other["observation_domain_id"] = "other", "other_kapm"
-	config["read_routes"] = append(routes, other)
-	runtime, err := newTraceProfileRuntime(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer runtime.close()
-	if runtime.singleTenantID != "" {
-		t.Fatalf("a data tenant was guessed from several tenants: %s", runtime.singleTenantID)
-	}
-}
-
-func TestTraceSingleTenantIsDerivedFromApplicationTopologyOnlyTarget(t *testing.T) {
-	config := traceProfileRuntimeConfig()
-	config["read_routes"] = []any{}
-	config["application_topology_targets"] = []any{
-		map[string]any{
-			"bk_tenant_id": "system", "label": "application_edge", "database": "system_kapm",
-			"table": "kapm_application_edge_observed_1m", "cluster_id": "18", "cluster_name": "doris",
-			"schema_version": "sha256:19617e34c53d393e", "retention_days": 30, "published_route_version": 7,
-		},
-	}
-	runtime, err := newTraceProfileRuntime(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer runtime.close()
-	if runtime.singleTenantID != "system" {
-		t.Fatalf("application topology target did not bind its tenant: %q", runtime.singleTenantID)
+		t.Fatalf("removed single_tenant_id was accepted at load: %v", err)
 	}
 }
 
@@ -264,9 +218,6 @@ func TestTraceStaticApplicationTopologyTargetsAcceptDescriptivePublicationField(
 		t.Fatalf("descriptive application topology target rejected: %v", err)
 	}
 	defer runtime.close()
-	if runtime.singleTenantID != "system" {
-		t.Fatalf("descriptive topology target did not bind its tenant: %q", runtime.singleTenantID)
-	}
 }
 
 func TestLegacyStaticTopologyFieldKeepsOrdinaryTraceRuntime(t *testing.T) {
@@ -284,10 +235,11 @@ func TestLegacyStaticTopologyFieldKeepsOrdinaryTraceRuntime(t *testing.T) {
 
 func TestApplicationTopologyQueryRespondsWithDescriptiveContract(t *testing.T) {
 	config := traceProfileRuntimeConfig()
+	config["read_routes"] = config["read_routes"].([]any)[:1]
 	withTraceProfileRuntime(t, config)
 	withTraceProfileAuth(t, true, "kingeye-apm")
 	targets := []traceprofile.ApplicationTopologyTarget{
-		{BkTenantID: "system", Label: "application_edge", Database: "system_kapm",
+		{BkTenantID: "default", Label: "application_edge", Database: "default_kapm",
 			Table: "kapm_application_edge_observed_1m", ClusterID: "18", ClusterName: "doris",
 			SchemaVersion: "sha256:19617e34c53d393e", RetentionDays: 30, PublishedVersion: 7},
 	}
@@ -304,16 +256,16 @@ func TestApplicationTopologyQueryRespondsWithDescriptiveContract(t *testing.T) {
 	}
 	traceProfileRuntimeValue.Load().executor = executor
 	query := traceprofile.ApplicationTopologyRangeQuery{
-		ProtocolVersion: "application_topology_range_v2", ObservationDomainID: "system_kapm", ExpectedRouteVersion: 7,
+		ProtocolVersion: "application_topology_range_v2", ObservationDomainID: "default_kapm", ExpectedRouteVersion: 7,
 		Request: traceprofile.ApplicationTopologyRangeRequest{ContractVersion: "application_topology_range_v2", StartMS: 1760572800000, EndMS: 1760573700000,
 			Applications: []traceprofile.ApplicationTopologyApplication{{NamespaceID: 11, BkBizID: 42}}, MaxPairs: 100},
 	}
-	fingerprint := traceprofile.ApplicationTopologyRangeFingerprint("system", query)
+	fingerprint := traceprofile.ApplicationTopologyRangeFingerprint("default", query)
 	body := fmt.Sprintf(`{"application_topology_contract_version":"application_topology_range_v2",`+
-		`"application_topology_request":{"expected_scope_fingerprint":"%s","observation_domain_id":"system_kapm",`+
+		`"application_topology_request":{"expected_scope_fingerprint":"%s","observation_domain_id":"default_kapm",`+
 		`"expected_route_version":7,"start_time_ms":1760572800000,"end_time_ms":1760573700000,`+
 		`"applications":[{"namespace_id":11,"bk_biz_id":42}],"max_pairs":100}}`, fingerprint)
-	recorder := runTraceProfileRequest(t, body, "kingeye-apm")
+	recorder := runTraceProfileRequestAs(t, body, "default")
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("application topology query failed: %d %s", recorder.Code, recorder.Body.String())
 	}

@@ -26,19 +26,11 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/consul"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/traceprofile"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/redis"
 	redisService "github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/service/redis"
 )
-
-func withMultiTenantMode(t *testing.T, enabled bool) {
-	t.Helper()
-	previous := viper.Get(influxdb.MultiTenantModeConfigPath)
-	viper.Set(influxdb.MultiTenantModeConfigPath, enabled)
-	t.Cleanup(func() { viper.Set(influxdb.MultiTenantModeConfigPath, previous) })
-}
 
 // H2：一个租户的路由指向本地没有只读连接的集群，只撤销这个租户。
 func TestUnknownClusterRevokesOnlyThatTenant(t *testing.T) {
@@ -131,23 +123,6 @@ func TestStaticToPublishedFailsClosedUntilTheSourceReads(t *testing.T) {
 	}
 }
 
-// M1：多租户模式热切换立即生效，单租户映射随之停止。
-func TestMultiTenantModeToggleRebuildsAtOnce(t *testing.T) {
-	withMultiTenantMode(t, false)
-	withConsulTracePublication(t, map[string]string{"system": tracePublicationFor("system")})
-	if err := reloadTraceProfilePublishedRuntime(); err != nil {
-		t.Fatal(err)
-	}
-	if runtime := traceProfileRuntimeValue.Load(); runtime == nil || runtime.multiTenantMode {
-		t.Fatalf("expected a single-tenant runtime: %+v", runtime)
-	}
-	viper.Set(influxdb.MultiTenantModeConfigPath, true)
-	loadTraceProfileConfig()
-	if runtime := traceProfileRuntimeValue.Load(); runtime == nil || !runtime.multiTenantMode {
-		t.Fatalf("the runtime did not pick up multi-tenant mode: %+v", runtime)
-	}
-}
-
 // M2：前缀下一个非字符串键只撤销它自己，不让每次重载都失败。
 func TestRedisNonStringKeyIsAnInvalidDocument(t *testing.T) {
 	ctx, client, _ := setUpRedisTracePublication(t)
@@ -196,33 +171,6 @@ func TestConsulFolderKeyIsNotAPublication(t *testing.T) {
 	snapshot, err := parsePublishedTraceTargets("data", folderKeyPairs("data/"), nil)
 	if !errors.Is(err, errTraceReadTargetsUnpublished) || len(snapshot.Invalid) != 0 {
 		t.Fatalf("a folder key was read as a publication: %+v %v", snapshot.Invalid, err)
-	}
-}
-
-// L1：单租户映射按发布源上的全部租户推导，一个租户被撤销不改变映射。
-func TestSingleTenantMappingIgnoresRevocation(t *testing.T) {
-	withMultiTenantMode(t, false)
-	publication := withConsulTracePublication(t, map[string]string{
-		"system": tracePublicationFor("system"), "other": tracePublicationFor("other"),
-	})
-	if err := reloadTraceProfilePublishedRuntime(); err != nil {
-		t.Fatal(err)
-	}
-	publication.set("other", strings.Replace(tracePublicationFor("other"), "otel_trace_span_132", "otel_trace_span_133", 1))
-	_ = reloadTraceProfilePublishedRuntime()
-	if got := traceProfileRuntimeValue.Load().singleTenantID; got != "" {
-		t.Fatalf("revoking tenant other moved the default-tenant mapping to %q", got)
-	}
-}
-
-// L1：多租户模式下即使只有一个租户，也不做 default 映射。
-func TestMultiTenantModeDoesNotMapDefault(t *testing.T) {
-	withMultiTenantMode(t, true)
-	withTraceProfileRuntime(t, traceProfileRuntimeConfig())
-	withTraceProfileAuth(t, true, "kingeye-apm")
-	recorder := runTraceProfileRequestAs(t, typedTraceBody("trace_span", "system_kapm"), "default")
-	if code := decodeTraceProfileError(t, recorder); code != traceprofile.CodeUnauthorizedDomain {
-		t.Fatalf("multi-tenant mode mapped default to a data tenant: %s", code)
 	}
 }
 

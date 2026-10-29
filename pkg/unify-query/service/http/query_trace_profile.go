@@ -22,10 +22,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/spf13/viper"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/dorisclient"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metric"
@@ -140,10 +138,6 @@ type traceProfileConfig struct {
 	ApplicationTopologyTargets       []traceProfileApplicationTopologyTargetConfig `json:"application_topology_targets,omitempty"`
 	ReadonlyConnections              []traceProfileConnectionConfig                `json:"readonly_connections"`
 
-	// 单租户 typed Trace 的真实数据租户；应用和空间权限沿用 JWT 鉴权。
-	// 配置非法时加载即失败；未配置且读目标快照恰好只有一个租户时取该租户，
-	// 否则沿用入站租户。不从请求参数猜测数据归属。
-	SingleTenantID                string   `json:"single_tenant_id,omitempty"`
 	AllowedBkAppCodes             []string `json:"allowed_bk_app_codes"`
 	MemberLookupAllowedBkAppCodes []string `json:"member_lookup_allowed_bk_app_codes"`
 }
@@ -185,9 +179,6 @@ type traceProfileRuntime struct {
 	published    bool
 	configDigest [sha256.Size]byte
 
-	// 模式和数据租户在同一快照内，避免配置热更新时混用新旧值。
-	singleTenantID              string
-	multiTenantMode             bool
 	allowedAppCodes             []string
 	memberLookupAllowedAppCodes []string
 }
@@ -221,14 +212,8 @@ func loadTraceProfileConfig() {
 	applyTraceProfileStaticConfig()
 }
 
-// newTraceProfileRuntime 按静态配置构建运行时；单租户映射从配置自身的读目标推导。
+// newTraceProfileRuntime 按静态配置构建运行时。
 func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
-	return newTraceProfileRuntimeFor(raw, nil)
-}
-
-// newTraceProfileRuntimeFor 构建运行时。publishedTenants 非 nil 时是发布源上出现的全部租户，
-// 单租户映射按它推导，而不是只按校验通过的租户。
-func newTraceProfileRuntimeFor(raw any, publishedTenants map[string]struct{}) (*traceProfileRuntime, error) {
 	if raw == nil {
 		return nil, nil
 	}
@@ -367,12 +352,6 @@ func newTraceProfileRuntimeFor(raw any, publishedTenants map[string]struct{}) (*
 		closeConnections()
 		return nil, err
 	}
-	singleTenantID, err := traceProfileSingleTenantID(config.SingleTenantID, routes, esTargets, topologyTargets, publishedTenants)
-	if err != nil {
-		closeConnections()
-		return nil, err
-	}
-
 	queriers := make(map[string]traceprofile.Querier, len(connections))
 	for clusterID, instance := range connections {
 		queriers[clusterID] = instance
@@ -396,47 +375,9 @@ func newTraceProfileRuntimeFor(raw any, publishedTenants map[string]struct{}) (*
 		routeVersion:   config.RouteSnapshotVersion,
 		routeCount:     len(routes),
 
-		singleTenantID:              singleTenantID,
-		multiTenantMode:             viper.GetBool(influxdb.MultiTenantModeConfigPath),
 		allowedAppCodes:             config.AllowedBkAppCodes,
 		memberLookupAllowedAppCodes: config.MemberLookupAllowedBkAppCodes,
 	}, nil
-}
-
-// traceProfileSingleTenantID 是单租户网关请求（入站租户为 default）映射到的数据租户：
-// 配置值必须是合法租户标识，否则加载失败；未配置时，读目标恰好只有一个租户就取它。
-// publishedTenants 非 nil 时按发布源上的全部租户计数，一个租户被撤销不会改变映射。
-func traceProfileSingleTenantID(
-	configured string, routes []traceprofile.ReadRoute, esTargets []traceprofile.ESSummaryTarget,
-	topologyTargets []traceprofile.ApplicationTopologyTarget,
-	publishedTenants map[string]struct{},
-) (string, error) {
-	if configured != "" {
-		if !traceprofile.ValidTenantID(configured) {
-			return "", fmt.Errorf("Trace single_tenant_id 不是合法租户标识: %q", configured)
-		}
-		return configured, nil
-	}
-	tenants := publishedTenants
-	if tenants == nil {
-		tenants = make(map[string]struct{}, 1)
-		for _, route := range routes {
-			tenants[route.BkTenantID] = struct{}{}
-		}
-		for _, target := range esTargets {
-			tenants[target.BkTenantID] = struct{}{}
-		}
-		for _, target := range topologyTargets {
-			tenants[target.BkTenantID] = struct{}{}
-		}
-	}
-	if len(tenants) != 1 {
-		return "", nil
-	}
-	for tenant := range tenants {
-		return tenant, nil
-	}
-	return "", nil
 }
 
 // probeTraceEnvelope 只读取前缀用于识别 typed Trace 信封；非 Trace 请求的 body 原样回填，
@@ -531,12 +472,6 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 	}
 	user := metadata.GetUser(ctx)
 	dataTenantID := user.TenantID
-	// 单租户 APIGW 把租户头规范化为 default，这是传输协议值。
-	// JWT 应用和空间已鉴权；只按环境配置找数据租户，不从请求体猜租户，
-	// 映射结果仍须通过下方的作用域与发布路由校验。
-	if !runtime.multiTenantMode && dataTenantID == "default" && runtime.singleTenantID != "" {
-		dataTenantID = runtime.singleTenantID
-	}
 	span.Set("trace-profile-request-tenant-id", user.TenantID)
 	span.Set("trace-profile-data-tenant-id", dataTenantID)
 	scope, err := traceprofile.ResolveScope(dataTenantID, user.SpaceUID, request.ObservationDomainID)
