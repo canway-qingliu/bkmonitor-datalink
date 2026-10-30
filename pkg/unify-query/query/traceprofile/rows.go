@@ -29,16 +29,12 @@ var (
 var traceIntegerFields = map[string]struct{}{
 	"bk_biz_id": {}, "data_id": {}, "span_kind": {}, "status_code": {},
 	"start_time_us": {}, "end_time_us": {}, "duration_us": {}, "event_time_ms": {},
-	"ingest_time": {}, "trace_start_time_us": {}, "trace_end_time_us": {},
-	"span_count": {}, "error_count": {}, "service_count": {}, "hierarchy_count": {},
-	"span_min_duration_us": {}, "span_max_duration_us": {}, "root_service_kind": {},
-	"root_span_kind": {}, "computed_at_ms": {},
+	"ingest_time": {},
 }
 
 var traceNullableFields = map[string]struct{}{
 	"service_namespace": {}, "service_name": {},
 	"service_instance_id": {}, "deployment_environment": {},
-	"root_service_name": {}, "root_span_service_name": {}, "root_service_status_code": {},
 }
 
 var traceInternalRowFields = map[string]struct{}{
@@ -54,7 +50,7 @@ var spanIdentityFields = map[string]struct{}{
 // ShapeRows converts a complete physical Trace page into the closed KAPM row
 // contract. Any invalid row rejects the entire page; no partial result escapes.
 func ShapeRows(profile metadata.TraceProfile, input []map[string]any, tenantID string) ([]map[string]any, error) {
-	if profile != metadata.TraceProfileSpan && profile != metadata.TraceProfileSummary {
+	if profile != metadata.TraceProfileSpan {
 		return nil, fmt.Errorf("Trace 行 profile 不受支持")
 	}
 	if !ValidTenantID(tenantID) {
@@ -84,7 +80,7 @@ func ShapeRows(profile metadata.TraceProfile, input []map[string]any, tenantID s
 			if !present {
 				return nil, fmt.Errorf("Trace 第 %d 行缺少字段 %s", index, field)
 			}
-			normalized, err := normalizeTracePhysicalField(profile, field, value)
+			normalized, err := normalizeTracePhysicalField(field, value)
 			if err != nil {
 				return nil, fmt.Errorf("Trace 第 %d 行字段 %s 非法: %w", index, field, err)
 			}
@@ -107,50 +103,36 @@ func ShapeRows(profile metadata.TraceProfile, input []map[string]any, tenantID s
 		if bizID < 0 {
 			return nil, fmt.Errorf("Trace 第 %d 行业务 ID 非法", index)
 		}
+		spanID, ok := physical["span_id"].(string)
+		if !ok || !spanIDPattern.MatchString(spanID) || physical["data_id"].(int64) <= 0 ||
+			physical["space_uid"] != "bkcc__"+strconv.FormatInt(bizID, 10) {
+			return nil, fmt.Errorf("Trace 第 %d 行 Span 成员身份非法", index)
+		}
 		values := make(map[string]any, len(physical))
-		if profile == metadata.TraceProfileSpan {
-			spanID, ok := physical["span_id"].(string)
-			if !ok || !spanIDPattern.MatchString(spanID) || physical["data_id"].(int64) <= 0 ||
-				physical["space_uid"] != "bkcc__"+strconv.FormatInt(bizID, 10) {
-				return nil, fmt.Errorf("Trace 第 %d 行 Span 成员身份非法", index)
-			}
-			for field, value := range physical {
-				if _, identity := spanIdentityFields[field]; !identity {
-					values[field] = value
-				}
-			}
-			items = append(items, map[string]any{
-				"member": map[string]any{
-					"bk_tenant_id": physical["bk_tenant_id"],
-					"data_id":      physical["data_id"], "bk_biz_id": physical["bk_biz_id"], "app_id": appID,
-				},
-				"trace_id": traceID, "span_id": spanID, "values": values,
-			})
-			continue
-		}
-		for _, countField := range []string{"span_count", "error_count", "service_count", "hierarchy_count"} {
-			if physical[countField].(int64) < 0 {
-				return nil, fmt.Errorf("Trace 第 %d 行计数 %s 非法", index, countField)
-			}
-		}
 		for field, value := range physical {
-			if field != "trace_id" {
+			if _, identity := spanIdentityFields[field]; !identity {
 				values[field] = value
 			}
 		}
-		items = append(items, map[string]any{"app_id": appID, "trace_id": traceID, "values": values})
+		items = append(items, map[string]any{
+			"member": map[string]any{
+				"bk_tenant_id": physical["bk_tenant_id"],
+				"data_id":      physical["data_id"], "bk_biz_id": physical["bk_biz_id"], "app_id": appID,
+			},
+			"trace_id": traceID, "span_id": spanID, "values": values,
+		})
 	}
 	return items, nil
 }
 
-func normalizeTracePhysicalField(profile metadata.TraceProfile, field string, value any) (any, error) {
+func normalizeTracePhysicalField(field string, value any) (any, error) {
 	if value == nil {
 		// Doris VARIANT stores absent Span events/links as JSON null. In the
 		// response contract those collections are empty arrays.
-		if profile == metadata.TraceProfileSpan && (field == "events" || field == "links") {
+		if field == "events" || field == "links" {
 			return []any{}, nil
 		}
-		if profile == metadata.TraceProfileSpan && field == "event_time_ms" {
+		if field == "event_time_ms" {
 			return nil, nil
 		}
 		if _, nullable := traceNullableFields[field]; nullable {
@@ -162,7 +144,7 @@ func normalizeTracePhysicalField(profile metadata.TraceProfile, field string, va
 		return exactTraceInt64(value)
 	}
 	switch field {
-	case "span_date", "trace_date":
+	case "span_date":
 		text, ok := value.(string)
 		if !ok {
 			return nil, fmt.Errorf("日期必须是 UTC 字符串")
@@ -171,13 +153,7 @@ func normalizeTracePhysicalField(profile metadata.TraceProfile, field string, va
 			return nil, err
 		}
 		return text, nil
-	case "partial":
-		boolean, ok := value.(bool)
-		if !ok {
-			return nil, fmt.Errorf("partial 必须是布尔值")
-		}
-		return boolean, nil
-	case "resource", "attributes", "category_statistics", "kind_statistics":
+	case "resource", "attributes":
 		if _, ok := value.(map[string]any); !ok {
 			return nil, fmt.Errorf("JSON 列必须是对象")
 		}
@@ -191,12 +167,6 @@ func normalizeTracePhysicalField(profile metadata.TraceProfile, field string, va
 		}
 		if _, ok := value.([]any); !ok {
 			return nil, fmt.Errorf("JSON 列必须是数组")
-		}
-		return cloneTraceJSON(value, 0)
-	case "root_service_status_code":
-		switch value.(type) {
-		case map[string]any, []any:
-			return nil, fmt.Errorf("状态码 JSON 必须是标量")
 		}
 		return cloneTraceJSON(value, 0)
 	default:

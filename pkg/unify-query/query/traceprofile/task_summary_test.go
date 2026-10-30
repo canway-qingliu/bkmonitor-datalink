@@ -30,9 +30,7 @@ func taskSummaryRequest() Request {
 }
 
 func TestParseRequestAcceptsOnlyClosedTaskSummary(t *testing.T) {
-	body := strings.Replace(validRequestJSON(), `"trace_summary"`, `"trace_span"`, 1)
-	body = strings.Replace(body, `"trace_query_v2"`, `"trace_query_v3"`, 1)
-	body = strings.Replace(body, `"scene":"app",`, "", 1)
+	body := strings.Replace(validRequestJSON(), `"trace_query_v2"`, `"trace_query_v3"`, 1)
 	body = strings.Replace(body, `"order_by":["-timestamp","trace_id"],"limit":25,"offset":0`,
 		`"order_by":[],"limit":5000,"aggregation":{"method":"task_summary"}`, 1)
 	request, err := ParseRequest([]byte(body), 1<<20, 10000)

@@ -28,7 +28,7 @@ func CompileAggregate(
 ) (CompiledAggregate, error) {
 	aggregation := request.Aggregation
 	if aggregation == nil || aggregation.Method != "count" || aggregation.IntervalSeconds <= 0 ||
-		aggregation.IntervalSeconds > 86400 || request.Offset != nil || request.MemberLookup != nil ||
+		aggregation.IntervalSeconds > 86400 || request.Offset != nil ||
 		len(request.OrderBy) != 0 || request.Limit <= 0 || request.Limit >= 1<<63-1 ||
 		aggregation.TimezoneOffsetSeconds < -14*3600 || aggregation.TimezoneOffsetSeconds > 14*3600 ||
 		len(aggregation.GroupBy) > 5 {
@@ -63,7 +63,7 @@ func CompileAggregate(
 		seen[field] = struct{}{}
 		columns = append(columns, quoteIdentifier(field))
 	}
-	where, whereArgs, err := buildWhere(profile, scope, request)
+	where, whereArgs, err := buildWhere(scope, request)
 	if err != nil {
 		return CompiledAggregate{}, err
 	}
@@ -71,7 +71,7 @@ func CompileAggregate(
 	intervalUS := aggregation.IntervalSeconds * 1_000_000
 	selectColumns := []string{
 		fmt.Sprintf("CAST(FLOOR((%s + ?) / ?) * ? - ? AS BIGINT) AS `bucket_start_us`",
-			quoteIdentifier(timeColumnForProfile(profile))),
+			quoteIdentifier(timeColumnForProfile())),
 	}
 	selectColumns = append(selectColumns, columns...)
 	selectColumns = append(selectColumns, "COUNT(*) AS `count`")

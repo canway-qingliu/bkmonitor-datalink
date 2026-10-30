@@ -37,60 +37,18 @@ type ReadRoute struct {
 	Doris            *DorisTarget
 }
 
-// ESSummaryTarget 是按应用发布的新 ES Summary 逻辑读 RT；不代表索引已暖机。
-type ESSummaryTarget struct {
-	BkTenantID        string
-	BkBizID           int64
-	AppID             int64
-	AppName           string
-	ResultTableID     string
-	StorageClusterID  int64
-	RetentionDays     int64
-	EntryIndexVersion int64
-	PublishedVersion  int64
-}
-
-// ApplicationTopologyTarget 只来自同一租户已发布的边/覆盖物理目标，不能由查询请求指定。
-type ApplicationTopologyTarget struct {
-	BkTenantID       string
-	Label            string
-	Database         string
-	Table            string
-	ClusterID        string
-	ClusterName      string
-	SchemaVersion    string
-	RetentionDays    int64
-	PublishedVersion int64
-}
-
 // RouteSnapshot 是一次发布版本的只读快照。版本不匹配、路由缺失或物理坐标
 // 与冻结命名漂移时一律 fail closed，不猜、不回退。
 type RouteSnapshot struct {
-	version                   int64
-	routes                    map[string]ReadRoute
-	esSummaryRoutes           map[string]ESSummaryTarget
-	applicationTopologyRoutes map[string]ApplicationTopologyTarget
+	version int64
+	routes  map[string]ReadRoute
 }
 
 var physicalIdentifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // 物理表名由受信业务 ID 和闭合 profile 派生，不接受请求方指定。
 var profilePhysicalTable = map[metadata.TraceProfile]string{
-	metadata.TraceProfileSpan:    "otel_trace_span",
-	metadata.TraceProfileSummary: "otel_trace_summary",
-}
-
-// 与 Kingeye 租户 Summary 表的固定 shape 摘要配对。
-const tenantSummarySchemaVersion = "sha256:3d6b6b96f74453dd"
-
-func physicalTableForSchema(profile metadata.TraceProfile, bizID int64, schemaVersion string) (string, error) {
-	if profile == metadata.TraceProfileSummary {
-		if bizID <= 0 || schemaVersion != tenantSummarySchemaVersion {
-			return "", fmt.Errorf("租户 Summary 目标非法")
-		}
-		return "otel_trace_summary", nil
-	}
-	return businessPhysicalTable(profile, bizID)
+	metadata.TraceProfileSpan: "otel_trace_span",
 }
 
 func routeKey(tenantID string, bizID int64, profile metadata.TraceProfile) string {
@@ -109,12 +67,6 @@ func tenantSpanDatabase(tenantID string) string {
 	return fmt.Sprintf("tenant_%x_kapm", digest[:8])
 }
 
-func esSummaryRouteKey(tenantID string, bizID, appID int64) string {
-	return fmt.Sprintf("%s\x00%d\x00%d", tenantID, bizID, appID)
-}
-
-func applicationTopologyRouteKey(tenantID, label string) string { return tenantID + "\x00" + label }
-
 func businessPhysicalTable(profile metadata.TraceProfile, bizID int64) (string, error) {
 	base, supported := profilePhysicalTable[profile]
 	if !supported || bizID <= 0 {
@@ -124,7 +76,7 @@ func businessPhysicalTable(profile metadata.TraceProfile, bizID int64) (string, 
 }
 
 func matchesPublishedPhysicalTable(profile metadata.TraceProfile, target DorisTarget, scope Scope, request Request) bool {
-	expected, err := physicalTableForSchema(profile, scope.BkBizID, target.SchemaVersion)
+	expected, err := businessPhysicalTable(profile, scope.BkBizID)
 	if err == nil && target.Table == expected && target.Database == scope.BkTenantID+"_kapm" {
 		return true
 	}
@@ -145,7 +97,7 @@ func ParseProfile(value string) (metadata.TraceProfile, error) {
 
 // NewDorisTarget 从受信业务与 profile 派生物理表；调用方不能覆盖库表。
 func NewDorisTarget(clusterID, database string, bizID int64, profile metadata.TraceProfile, schemaVersion string) (DorisTarget, error) {
-	table, err := physicalTableForSchema(profile, bizID, schemaVersion)
+	table, err := businessPhysicalTable(profile, bizID)
 	if err != nil {
 		return DorisTarget{}, err
 	}
@@ -165,23 +117,11 @@ func NewDorisTarget(clusterID, database string, bizID int64, profile metadata.Tr
 
 // NewRouteSnapshot 校验并冻结一份读路由快照。
 func NewRouteSnapshot(version int64, routes []ReadRoute) (*RouteSnapshot, error) {
-	return NewRouteSnapshotWithESTargets(version, routes, nil)
-}
-
-// NewRouteSnapshotWithESTargets 冻结 Doris 路由与 ES Summary 应用目标。
-func NewRouteSnapshotWithESTargets(version int64, routes []ReadRoute, esTargets []ESSummaryTarget) (*RouteSnapshot, error) {
-	return NewRouteSnapshotWithAllTargets(version, routes, esTargets, nil)
-}
-
-// NewRouteSnapshotWithAllTargets 与现行 ES Summary 路由共用原子快照。
-func NewRouteSnapshotWithAllTargets(version int64, routes []ReadRoute, esTargets []ESSummaryTarget, topologyTargets []ApplicationTopologyTarget) (*RouteSnapshot, error) {
 	if version <= 0 {
 		return nil, fmt.Errorf("Trace 读路由快照版本必须为正整数")
 	}
 	snapshot := &RouteSnapshot{
 		version: version, routes: make(map[string]ReadRoute, len(routes)),
-		esSummaryRoutes:           make(map[string]ESSummaryTarget, len(esTargets)),
-		applicationTopologyRoutes: make(map[string]ApplicationTopologyTarget, len(topologyTargets)),
 	}
 	for index, route := range routes {
 		if err := validateReadRoute(route); err != nil {
@@ -196,61 +136,7 @@ func NewRouteSnapshotWithAllTargets(version int64, routes []ReadRoute, esTargets
 		}
 		snapshot.routes[key] = route
 	}
-	for index, target := range esTargets {
-		if err := validateESSummaryTarget(target); err != nil {
-			return nil, fmt.Errorf("ES Summary 读目标第 %d 条非法: %w", index, err)
-		}
-		key := esSummaryRouteKey(target.BkTenantID, target.BkBizID, target.AppID)
-		if _, duplicated := snapshot.esSummaryRoutes[key]; duplicated {
-			return nil, fmt.Errorf("ES Summary 应用读目标重复")
-		}
-		snapshot.esSummaryRoutes[key] = target
-	}
-	for _, target := range topologyTargets {
-		if target.BkTenantID == "" || !physicalIdentifierPattern.MatchString(target.BkTenantID) ||
-			target.Database != target.BkTenantID+"_kapm" || target.ClusterID == "" ||
-			target.ClusterName == "" || target.PublishedVersion <= 0 {
-			return nil, fmt.Errorf("应用拓扑 已发布目标身份非法")
-		}
-		identity, known := supportedApplicationTopologyTargets[target.Label]
-		if !known || target.Table != identity.table ||
-			target.SchemaVersion != identity.schema || target.RetentionDays != 30 {
-			return nil, fmt.Errorf("应用拓扑 已发布目标表不受支持")
-		}
-		key := applicationTopologyRouteKey(target.BkTenantID, target.Label)
-		if _, exists := snapshot.applicationTopologyRoutes[key]; exists {
-			return nil, fmt.Errorf("应用拓扑 已发布目标重复")
-		}
-		snapshot.applicationTopologyRoutes[key] = target
-	}
 	return snapshot, nil
-}
-
-// ResolveApplicationTopologyTarget 只接受已发布目标标签，返回租户级只读物理位置。
-func (s *RouteSnapshot) ResolveApplicationTopologyTarget(tenantID, label string) (ApplicationTopologyTarget, error) {
-	if s == nil {
-		return ApplicationTopologyTarget{}, reject(CodeRouteNotFound, "应用拓扑 读路由尚未配置")
-	}
-	target, found := s.applicationTopologyRoutes[applicationTopologyRouteKey(tenantID, label)]
-	if !found {
-		return ApplicationTopologyTarget{}, reject(CodeRouteNotFound, "应用拓扑 读目标未发布")
-	}
-	return target, nil
-}
-
-var logicalResultTablePattern = regexp.MustCompile(`^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$`)
-
-func validateESSummaryTarget(target ESSummaryTarget) error {
-	if !physicalIdentifierPattern.MatchString(target.BkTenantID) || target.BkBizID <= 0 || target.AppID <= 0 ||
-		target.AppName == "" ||
-		!logicalResultTablePattern.MatchString(target.ResultTableID) ||
-		target.ResultTableID != target.BkTenantID+".trace_summary_es_v2" || target.StorageClusterID <= 0 ||
-		target.RetentionDays < 1 || target.RetentionDays > 30 || target.PublishedVersion < 0 ||
-		(target.EntryIndexVersion != 0 && target.EntryIndexVersion != 2) ||
-		target.EntryIndexVersion == 2 && target.RetentionDays != 30 {
-		return fmt.Errorf("ES Summary 应用身份、逻辑 RT、集群或保留期非法")
-	}
-	return nil
 }
 
 func validateReadRoute(route ReadRoute) error {
@@ -278,7 +164,7 @@ func validateReadRoute(route ReadRoute) error {
 		}
 	} else {
 		var err error
-		table, err = physicalTableForSchema(route.Profile, route.BkBizID, route.Doris.SchemaVersion)
+		table, err = businessPhysicalTable(route.Profile, route.BkBizID)
 		if err != nil {
 			return err
 		}
@@ -332,16 +218,4 @@ func (s *RouteSnapshot) ResolveForApplication(
 		}
 	}
 	return s.Resolve(tenantID, bizID, profile)
-}
-
-// ResolveESSummary 用成对业务/应用身份解析受信新 ES Summary 逻辑 RT。
-func (s *RouteSnapshot) ResolveESSummary(tenantID string, bizID, appID int64) (ESSummaryTarget, error) {
-	if s == nil {
-		return ESSummaryTarget{}, reject(CodeRouteNotFound, "ES Summary 读路由尚未配置")
-	}
-	target, ok := s.esSummaryRoutes[esSummaryRouteKey(tenantID, bizID, appID)]
-	if !ok {
-		return ESSummaryTarget{}, reject(CodeRouteNotFound, "ES Summary 应用读路由缺失")
-	}
-	return target, nil
 }

@@ -41,9 +41,6 @@ var jsonProjectionColumns = map[metadata.TraceProfile]map[string]struct{}{
 	metadata.TraceProfileSpan: {
 		"resource": {}, "attributes": {}, "events": {}, "links": {},
 	},
-	metadata.TraceProfileSummary: {
-		"root_service_status_code": {}, "category_statistics": {}, "kind_statistics": {},
-	},
 }
 
 // identityScopeColumns 只能由受信 transport 供值的列，不接受调用方改写。
@@ -56,31 +53,16 @@ var narrowOnlyIdentityColumns = map[string]struct{}{
 	"app_id": {}, "data_id": {},
 }
 
-func timeColumnForProfile(profile metadata.TraceProfile) string {
-	if profile == metadata.TraceProfileSummary {
-		return "trace_start_time_us"
-	}
+func timeColumnForProfile() string {
 	return "start_time_us"
 }
 
-func dateColumnForProfile(profile metadata.TraceProfile) string {
-	if profile == metadata.TraceProfileSummary {
-		return "trace_date"
-	}
+func dateColumnForProfile() string {
 	return "span_date"
 }
 
 // canonicalOrder 给出稳定全序：时间倒序 + 唯一化尾键。
-// Span 的同一 trace 有多行，Summary 在没有 app_id 收窄时同一 trace 也可能跨应用成行，
-// 因此尾键必须能把行区分开，否则 OFFSET/LIMIT 会出现重读或漏读。
-func canonicalOrder(profile metadata.TraceProfile) []orderTerm {
-	if profile == metadata.TraceProfileSummary {
-		return []orderTerm{
-			{column: "trace_start_time_us", desc: true},
-			{column: "trace_id"},
-			{column: "app_id"},
-		}
-	}
+func canonicalOrder() []orderTerm {
 	return []orderTerm{
 		{column: "start_time_us", desc: true},
 		{column: "trace_id"},
@@ -120,25 +102,9 @@ func CompileList(
 	if request.Limit <= 0 {
 		return CompiledList{}, reject(CodeLimitExceeded, "Trace 查询行数预算非法")
 	}
-	if lookup := request.MemberLookup; lookup != nil {
-		if profile != metadata.TraceProfileSummary || request.Scene != "global" || request.Offset != nil ||
-			len(request.Filters.FieldList) != 0 || len(request.Filters.ConditionList) != 0 ||
-			len(request.OrderBy) != 0 {
-			return CompiledList{}, reject(CodePredicateConflict, "Summary 成员查询不能混用列表条件或分页")
-		}
-		if err := validateMemberLookup(*lookup); err != nil {
-			return CompiledList{}, reject(CodePredicateConflict, "Summary 成员查询范围非法: %s", err)
-		}
-		for _, pair := range lookup.AllowedPairs {
-			if pair.BkBizID != scope.BkBizID {
-				return CompiledList{}, reject(CodeUnauthorizedMember,
-					"Summary 成员业务与受信物理表不一致")
-			}
-		}
-	}
 
 	table := quoteIdentifier(target.Database) + "." + quoteIdentifier(target.Table)
-	where, args, err := buildWhere(profile, scope, request)
+	where, args, err := buildWhere(scope, request)
 	if err != nil {
 		return CompiledList{}, err
 	}
@@ -187,32 +153,22 @@ func CompileList(
 	}, nil
 }
 
-func buildWhere(profile metadata.TraceProfile, scope Scope, request Request) (string, []any, error) {
+func buildWhere(scope Scope, request Request) (string, []any, error) {
 	startDate := utcDate(request.StartUS)
 	// end 是排他边界：最后包含的 UTC 日期取 end_us-1。
 	lastDate := utcDate(request.EndUS - 1)
 
 	parts := []string{
-		quoteIdentifier(dateColumnForProfile(profile)) + " >= ?",
-		quoteIdentifier(dateColumnForProfile(profile)) + " <= ?",
-		quoteIdentifier(timeColumnForProfile(profile)) + " >= ?",
-		quoteIdentifier(timeColumnForProfile(profile)) + " < ?",
+		quoteIdentifier(dateColumnForProfile()) + " >= ?",
+		quoteIdentifier(dateColumnForProfile()) + " <= ?",
+		quoteIdentifier(timeColumnForProfile()) + " >= ?",
+		quoteIdentifier(timeColumnForProfile()) + " < ?",
 	}
 	args := []any{startDate, lastDate, request.StartUS, request.EndUS}
 
-	for _, identity := range scope.isolationPredicates(profile) {
+	for _, identity := range scope.isolationPredicates() {
 		parts = append(parts, quoteIdentifier(identity.column)+" = ?")
 		args = append(args, identity.value)
-	}
-	if lookup := request.MemberLookup; lookup != nil {
-		parts = append(parts, "`trace_id` = ?")
-		args = append(args, lookup.TraceID)
-		pairs := make([]string, 0, len(lookup.AllowedPairs))
-		for _, pair := range lookup.AllowedPairs {
-			pairs = append(pairs, "(`app_id` = ? AND `bk_biz_id` = ?)")
-			args = append(args, strconv.FormatInt(pair.AppID, 10), pair.BkBizID)
-		}
-		parts = append(parts, "("+strings.Join(pairs, " OR ")+")")
 	}
 
 	clientParts := make([]string, 0, len(request.Filters.FieldList))
@@ -225,7 +181,7 @@ func buildWhere(profile metadata.TraceProfile, scope Scope, request Request) (st
 			// 同值条件按原样编译而非丢弃：受信隔离条件已单独注入，多一条等价等值条件不影响
 			// 语义，但丢弃会让 condition_list 与保留下来的条件错位（"true OR X" 会被收窄成 X）。
 		}
-		statement, statementArgs, err := compileFilterField(profile, field)
+		statement, statementArgs, err := compileFilterField(field)
 		if err != nil {
 			return "", nil, err
 		}
@@ -275,8 +231,8 @@ func assertTrustedIdentityFilter(scope Scope, field FilterField) error {
 	return nil
 }
 
-func compileFilterField(profile metadata.TraceProfile, field FilterField) (string, []any, error) {
-	projection := projectionForProfile(profile)
+func compileFilterField(field FilterField) (string, []any, error) {
+	projection := projectionForProfile(metadata.TraceProfileSpan)
 	supported := false
 	for _, column := range projection {
 		if column == field.FieldName {
@@ -286,10 +242,10 @@ func compileFilterField(profile metadata.TraceProfile, field FilterField) (strin
 	}
 	if !supported {
 		return "", nil, reject(
-			CodeUnsupportedSchemaCapability, "Trace 过滤字段不在 %s 投影内: %s", profile, field.FieldName,
+			CodeUnsupportedSchemaCapability, "Trace 过滤字段不在 Span 投影内: %s", field.FieldName,
 		)
 	}
-	if _, json := jsonProjectionColumns[profile][field.FieldName]; json {
+	if _, json := jsonProjectionColumns[metadata.TraceProfileSpan][field.FieldName]; json {
 		return "", nil, reject(
 			CodeUnsupportedSchemaCapability,
 			"Trace JSON/VARIANT 列过滤需要半连接能力，尚未交付: %s", field.FieldName,
@@ -371,24 +327,10 @@ func bindValues(field FilterField) ([]any, error) {
 }
 
 func bindValue(column, value string) (any, error) {
-	if column == "partial" {
-		return exactTraceBool(value)
-	}
 	if _, integer := traceIntegerFields[column]; integer {
 		return exactTraceInt64(value)
 	}
 	return value, nil
-}
-
-func exactTraceBool(value string) (bool, error) {
-	switch value {
-	case "true", "1":
-		return true, nil
-	case "false", "0":
-		return false, nil
-	default:
-		return false, fmt.Errorf("不是布尔值")
-	}
 }
 
 func likePattern(value string, isWildcard, isPrefix, isSuffix bool) string {
@@ -427,7 +369,7 @@ func buildOrder(profile metadata.TraceProfile, request Request) ([]orderTerm, er
 		order = append(order, term)
 	}
 	// 收敛到稳定全序：调用方给出的顺序在前，随后补齐时间倒序与唯一化尾键。
-	for _, term := range canonicalOrder(profile) {
+	for _, term := range canonicalOrder() {
 		if _, present := seen[term.column]; present {
 			continue
 		}

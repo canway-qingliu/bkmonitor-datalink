@@ -26,74 +26,20 @@ import (
 const publishedBusiness132 = `{"route_snapshot_version":7,"bk_tenant_id":"system","read_routes":[` +
 	`{"bk_tenant_id":"system","bk_biz_id":132,"profile":"trace_span",` +
 	`"database":"system_kapm","table":"otel_trace_span_132","cluster_id":18,"cluster_name":"doris4_test",` +
-	`"schema_version":"sha256:3fee31e7c6376abe"},` +
-	`{"bk_tenant_id":"system","bk_biz_id":132,"profile":"trace_summary",` +
-	`"database":"system_kapm","table":"otel_trace_summary","cluster_id":18,"cluster_name":"doris4_test",` +
-	`"schema_version":"sha256:3d6b6b96f74453dd"}],"application_topology_targets":[]}`
-
-const publishedESSummaryTargets = `[{"bk_tenant_id":"system","bk_biz_id":132,"app_id":7,` +
-	`"app_name":"checkout",` +
-	`"read_result_table_id":"system.trace_summary_es_v2","storage_cluster_id":9,"retention_days":30}]`
-
-func TestPublishedTraceTargetsInstallESSummaryCandidateIntoRuntime(t *testing.T) {
-	prefix := "kingeye/metadata/unify-query/data/trace/read_target/"
-	publication := strings.Replace(publishedBusiness132, `"application_topology_targets":[]`,
-		`"application_topology_targets":[],"es_summary_targets":`+publishedESSummaryTargets, 1)
-	snapshot, err := parsePublishedTraceTargets(prefix,
-		api.KVPairs{&api.KVPair{Key: prefix + "system", Value: []byte(publication)}}, nil)
-	version, routes, esTargets := snapshot.Version, snapshot.Routes, snapshot.ESTargets
-	if err != nil || len(snapshot.Invalid) != 0 || len(esTargets) != 1 {
-		t.Fatalf("ES Summary publication was lost: targets=%+v err=%v", esTargets, err)
-	}
-	config := traceProfileRuntimeConfig()
-	config["route_snapshot_version"] = version
-	config["read_routes"] = routes
-	config["es_summary_targets"] = esTargets
-	runtime, err := newTraceProfileRuntime(config)
-	if err != nil {
-		t.Fatalf("ES Summary target did not build a runtime: %v", err)
-	}
-	defer runtime.close()
-	target, err := runtime.executor.ResolveESSummaryTarget("system", 132, 7)
-	if err != nil || target.ResultTableID != "system.trace_summary_es_v2" || target.PublishedVersion != 7 {
-		t.Fatalf("ES Summary route identity/version drifted: %+v err=%v", target, err)
-	}
-}
-
-func TestESSummaryOnlyTenantCanLoadTrustedCandidateWithoutDorisConnection(t *testing.T) {
-	config := map[string]any{
-		"route_snapshot_version": 7,
-		"read_routes":            []any{},
-		"readonly_connections":   []any{},
-		"es_summary_targets": []any{map[string]any{
-			"bk_tenant_id": "system", "bk_biz_id": 132, "app_id": 7,
-			"app_name":             "checkout",
-			"read_result_table_id": "system.trace_summary_es_v2",
-			"storage_cluster_id":   9, "retention_days": 30, "published_route_version": 7,
-		}},
-	}
-	runtime, err := newTraceProfileRuntime(config)
-	if err != nil || runtime == nil {
-		t.Fatalf("ES-only trusted candidate was not loaded: runtime=%v err=%v", runtime, err)
-	}
-	target, err := runtime.executor.ResolveESSummaryTarget("system", 132, 7)
-	if err != nil || target.ResultTableID != "system.trace_summary_es_v2" {
-		t.Fatalf("ES-only target was lost: %+v err=%v", target, err)
-	}
-}
+	`"schema_version":"sha256:3fee31e7c6376abe"}]}`
 
 func TestPublishedTraceTargetsBuildBusiness132Runtime(t *testing.T) {
 	prefix := "kingeye/metadata/unify-query/data/trace/read_target/"
 	pairs := api.KVPairs{&api.KVPair{Key: prefix + "system", Value: []byte(publishedBusiness132)}}
 	snapshot, err := parsePublishedTraceTargets(prefix, pairs, nil)
 	version, routes := snapshot.Version, snapshot.Routes
-	if err != nil || len(snapshot.Invalid) != 0 || version <= 0 || len(routes) != 2 {
+	if err != nil || len(snapshot.Invalid) != 0 || version <= 0 || len(routes) != 1 {
 		t.Fatalf("failed to parse published routes: version=%d routes=%d err=%v", version, len(routes), err)
 	}
 	if routes[0].BkBizID != 132 || routes[0].Table != "otel_trace_span_132" || routes[0].ClusterID != "18" {
 		t.Fatalf("business 132 span target was lost: %+v", routes[0])
 	}
-	if routes[0].PublishedVersion != 7 || routes[1].PublishedVersion != 7 {
+	if routes[0].PublishedVersion != 7 {
 		t.Fatalf("tenant-local publication version was lost: %+v", routes)
 	}
 	config := traceProfileRuntimeConfig()
@@ -112,11 +58,11 @@ func TestPublishedApplicationSpanRouteSurvivesRuntimeReload(t *testing.T) {
 		`"database":"` + database + `",` +
 		`"table":"otel_trace_span","cluster_id":18,"cluster_name":"doris4_test",` +
 		`"schema_version":"sha256:3fee31e7c6376abe"}`
-	body := strings.Replace(publishedBusiness132, `],"application_topology_targets":[]`, appRoute+`],"application_topology_targets":[]`, 1)
+	body := strings.Replace(publishedBusiness132, `]}`, appRoute+`]}`, 1)
 	prefix := "kingeye/metadata/unify-query/data/trace/read_target/"
 	pairs := api.KVPairs{&api.KVPair{Key: prefix + "system", Value: []byte(body)}}
 	snapshot, err := parsePublishedTraceTargets(prefix, pairs, nil)
-	if err != nil || len(snapshot.Routes) != 3 || snapshot.Routes[2].AppID != 7 {
+	if err != nil || len(snapshot.Routes) != 2 || snapshot.Routes[1].AppID != 7 {
 		t.Fatalf("application route lost while loading publication: %+v err=%v", snapshot.Routes, err)
 	}
 	config := traceProfileRuntimeConfig()
@@ -139,7 +85,7 @@ func TestPublishedTraceTargetsKeepVersionsPerTenant(t *testing.T) {
 	}
 	snapshot, err := parsePublishedTraceTargets(prefix, pairs, nil)
 	aggregate, routes := snapshot.Version, snapshot.Routes
-	if err != nil || len(snapshot.Invalid) != 0 || aggregate <= 0 || len(routes) != 4 {
+	if err != nil || len(snapshot.Invalid) != 0 || aggregate <= 0 || len(routes) != 2 {
 		t.Fatalf("multi-tenant publication was rejected: version=%d routes=%d err=%v", aggregate, len(routes), err)
 	}
 	versions := map[string]int64{}
@@ -187,7 +133,7 @@ func TestReloadTraceProfileRuntimeConsumesPublishedConsulRoutes(t *testing.T) {
 		t.Fatalf("published runtime did not load: %v", err)
 	}
 	runtime := traceProfileRuntimeValue.Load()
-	if runtime == nil || runtime.routeCount != 2 || runtime.routeVersion <= 0 {
+	if runtime == nil || runtime.routeCount != 1 || runtime.routeVersion <= 0 {
 		t.Fatalf("published business routes were not installed: %+v", runtime)
 	}
 }
@@ -274,7 +220,7 @@ func TestTraceProfileVersionWatchLoadsNewBusinessSnapshot(t *testing.T) {
 	watch <- struct{}{}
 	deadline := time.After(3 * time.Second)
 	for {
-		if current := traceProfileRuntimeValue.Load(); current != nil && current.routeCount == 2 && current.routeVersion != oldVersion {
+		if current := traceProfileRuntimeValue.Load(); current != nil && current.routeCount == 1 && current.routeVersion != oldVersion {
 			return
 		}
 		select {

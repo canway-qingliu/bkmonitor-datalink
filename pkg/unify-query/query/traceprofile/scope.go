@@ -12,8 +12,6 @@ package traceprofile
 import (
 	"regexp"
 	"strconv"
-
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 )
 
 // Scope 只由受信 transport 载体解析：租户与空间来自已验证请求头，
@@ -57,18 +55,12 @@ type identityPredicate struct {
 	value  any
 }
 
-// isolationPredicates 返回该 profile 必须精确匹配的隔离列。
-// Summary 表没有 space_uid / data_id 列，不得硬塞不存在的列。
-func (s Scope) isolationPredicates(profile metadata.TraceProfile) []identityPredicate {
-	predicates := []identityPredicate{}
-	if profile == metadata.TraceProfileSummary {
-		return append(predicates, identityPredicate{column: "bk_biz_id", value: s.BkBizID})
+// isolationPredicates 返回 Span 物理表必须精确匹配的隔离列。
+func (s Scope) isolationPredicates() []identityPredicate {
+	return []identityPredicate{
+		{column: "space_uid", value: s.SpaceUID},
+		{column: "bk_biz_id", value: s.BkBizID},
 	}
-	return append(
-		predicates,
-		identityPredicate{column: "space_uid", value: s.SpaceUID},
-		identityPredicate{column: "bk_biz_id", value: s.BkBizID},
-	)
 }
 
 // trustedIdentityValue 返回可被信任的作用域列取值；app_id / data_id 没有可信取值，

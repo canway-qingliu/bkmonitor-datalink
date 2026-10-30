@@ -55,36 +55,7 @@ func completeSpanRow() map[string]any {
 	return row
 }
 
-func completeSummaryRow() map[string]any {
-	row := make(map[string]any, len(summaryProjection)+3)
-	for _, field := range summaryProjection {
-		row[field] = "value"
-	}
-	row["trace_date"] = "2026-09-17"
-	row["app_id"] = "app-a"
-	row["trace_id"] = strings.Repeat("a", 32)
-	row["bk_biz_id"] = float64(42)
-	for _, field := range []string{
-		"trace_start_time_us", "trace_end_time_us", "duration_us", "span_count", "error_count",
-		"service_count", "hierarchy_count", "span_min_duration_us", "span_max_duration_us",
-		"event_time_ms", "root_service_kind", "root_span_kind", "computed_at_ms",
-	} {
-		row[field] = float64(1)
-	}
-	row["root_service_name"] = nil
-	row["root_span_service_name"] = nil
-	row["root_service_status_code"] = json.Number("503")
-	row["category_statistics"] = map[string]any{"http": json.Number("2")}
-	row["kind_statistics"] = map[string]any{"sync": json.Number("2")}
-	row["partial"] = true
-	row[metadata.KeyIndex] = "42_otel_trace_summary"
-	row[metadata.KeyTableID] = "42_otel_trace_summary.doris"
-	row["_value_"] = float64(1)
-	row["_timestamp_"] = float64(1)
-	return row
-}
-
-func TestShapeRowsBuildsClosedKAPMSpanAndSummaryItems(t *testing.T) {
+func TestShapeRowsBuildsClosedKAPMSpanItems(t *testing.T) {
 	spanInput := completeSpanRow()
 	spanRows, err := ShapeRows(metadata.TraceProfileSpan, []map[string]any{spanInput}, "system")
 	if err != nil || len(spanRows) != 1 {
@@ -115,48 +86,38 @@ func TestShapeRowsBuildsClosedKAPMSpanAndSummaryItems(t *testing.T) {
 	if err != nil || !strings.Contains(string(wire), `"counter":9007199254740993`) {
 		t.Fatalf("large nested integer was not serialized exactly: %s err=%v", wire, err)
 	}
-
-	summaryRows, err := ShapeRows(metadata.TraceProfileSummary, []map[string]any{completeSummaryRow()}, "system")
-	if err != nil || len(summaryRows) != 1 {
-		t.Fatalf("Summary row shaping failed: rows=%+v err=%v", summaryRows, err)
-	}
-	summary := summaryRows[0]
-	if len(summary) != 3 || summary["app_id"] != "app-a" || summary["trace_id"] != strings.Repeat("a", 32) {
-		t.Fatalf("Summary logical row keys are not closed: %+v", summary)
-	}
-	values, ok := summary["values"].(map[string]any)
-	if !ok || values["partial"] != true || values["bk_biz_id"] != int64(42) || values["span_count"] != int64(1) {
-		t.Fatalf("Summary values lost native types: %+v", summary)
-	}
-	if _, leaked := values[metadata.KeyTableID]; leaked {
-		t.Fatal("UQ internal field leaked into Summary values")
-	}
 }
 
 func TestShapeRowsFailsWholeBatchOnMissingOrInvalidPhysicalValues(t *testing.T) {
-	valid := completeSummaryRow()
-	invalid := completeSummaryRow()
-	delete(invalid, "span_count")
-	if rows, err := ShapeRows(metadata.TraceProfileSummary, []map[string]any{valid, invalid}, "system"); err == nil || rows != nil {
-		t.Fatalf("partial Summary batch escaped: rows=%+v err=%v", rows, err)
+	valid := completeSpanRow()
+	invalid := completeSpanRow()
+	delete(invalid, "attributes")
+	if rows, err := ShapeRows(metadata.TraceProfileSpan, []map[string]any{valid, invalid}, "system"); err == nil || rows != nil {
+		t.Fatalf("partial Span batch escaped: rows=%+v err=%v", rows, err)
 	}
 	for name, mutate := range map[string]func(map[string]any){
 		"unexpected physical field":  func(row map[string]any) { row["secret"] = "x" },
-		"imprecise large integer":    func(row map[string]any) { row["span_count"] = float64(9007199254740994) },
-		"invalid partial":            func(row map[string]any) { row["partial"] = "true" },
-		"wrong JSON object":          func(row map[string]any) { row["category_statistics"] = []any{1} },
-		"null summary event time":    func(row map[string]any) { row["event_time_ms"] = nil },
+		"imprecise large integer":    func(row map[string]any) { row["duration_us"] = float64(9007199254740994) },
+		"wrong JSON object":          func(row map[string]any) { row["attributes"] = []any{1} },
+		"retired summary column":     func(row map[string]any) { row["span_count"] = int64(1) },
 		"whitespace app identity":    func(row map[string]any) { row["app_id"] = " app-a " },
 		"retired observation domain": func(row map[string]any) { row["observation_domain_id"] = "other_kapm" },
-		"negative span count":        func(row map[string]any) { row["span_count"] = int64(-1) },
+		"missing span id":            func(row map[string]any) { row["span_id"] = "" },
+		"invalid trace id":           func(row map[string]any) { row["trace_id"] = "not-a-trace-id" },
 	} {
 		t.Run(name, func(t *testing.T) {
-			row := completeSummaryRow()
+			row := completeSpanRow()
 			mutate(row)
-			if _, err := ShapeRows(metadata.TraceProfileSummary, []map[string]any{row}, "system"); err == nil {
-				t.Fatal("invalid Summary row was accepted")
+			if _, err := ShapeRows(metadata.TraceProfileSpan, []map[string]any{row}, "system"); err == nil {
+				t.Fatal("invalid Span row was accepted")
 			}
 		})
+	}
+}
+
+func TestShapeRowsRejectsRetiredSummaryProfile(t *testing.T) {
+	if _, err := ShapeRows(metadata.TraceProfile("trace_summary"), nil, "system"); err == nil {
+		t.Fatal("retired Summary profile was accepted")
 	}
 }
 

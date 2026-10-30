@@ -35,13 +35,9 @@ func testScope(t *testing.T) Scope {
 }
 
 func testTarget(profile metadata.TraceProfile) DorisTarget {
-	table := "otel_trace_span_7"
-	schemaVersion := "2026-09-24"
-	if profile == metadata.TraceProfileSummary {
-		table = "otel_trace_summary"
-		schemaVersion = tenantSummarySchemaVersion
+	return DorisTarget{
+		ClusterID: "18", Database: testDomain, Table: "otel_trace_span_7", SchemaVersion: "2026-09-24",
 	}
-	return DorisTarget{ClusterID: "18", Database: testDomain, Table: table, SchemaVersion: schemaVersion}
 }
 
 func testWindow() (int64, int64) {
@@ -153,61 +149,6 @@ func TestCompileListReadsBusiness132InTheRequestedUTCWindow(t *testing.T) {
 		compiled.SnapshotArgs[3] != request.EndUS || compiled.SnapshotArgs[5] != int64(132) ||
 		compiled.SnapshotArgs[6] != "42" {
 		t.Fatalf("query lost UTC window or business scope: %#v", compiled.SnapshotArgs)
-	}
-}
-
-func TestCompileListSummaryUsesSummaryIsolationAndOffset(t *testing.T) {
-	request := testRequest(metadata.TraceProfileSummary)
-	offset := int64(20)
-	request.Offset = &offset
-	request.Limit = 50
-	compiled := mustCompile(t, request, Limits{})
-
-	if strings.Contains(compiled.SnapshotStatement, "space_uid") || strings.Contains(compiled.SnapshotStatement, "data_id") {
-		t.Fatalf("summary statement must not reference span-only columns: %s", compiled.SnapshotStatement)
-	}
-	wantWhere := "WHERE `trace_date` >= ? AND `trace_date` <= ? AND `trace_start_time_us` >= ? AND `trace_start_time_us` < ?" +
-		" AND `bk_biz_id` = ?"
-	if !strings.Contains(compiled.SnapshotStatement, wantWhere) {
-		t.Fatalf("unexpected summary where clause: %s", compiled.SnapshotStatement)
-	}
-	wantOrder := "ORDER BY `trace_start_time_us` DESC, `trace_id` ASC, `app_id` ASC LIMIT 50 OFFSET 20"
-	if !strings.Contains(compiled.SnapshotStatement, wantOrder) {
-		t.Fatalf("unexpected summary order/limit clause: %s", compiled.SnapshotStatement)
-	}
-}
-
-func TestCompileListMemberLookupBindsExactTraceAndPairedAllowSet(t *testing.T) {
-	request := testRequest(metadata.TraceProfileSummary)
-	request.Scene = "global"
-	request.Limit = 3
-	request.MemberLookup = &MemberLookup{
-		TraceID:              "0123456789abcdef0123456789abcdef",
-		ExpectedRouteVersion: 3,
-		AllowedPairs:         []MemberPair{{AppID: 7, BkBizID: 7}, {AppID: 8, BkBizID: 7}},
-	}
-	compiled := mustCompile(t, request, Limits{})
-	paired := "`trace_id` = ? AND ((`app_id` = ? AND `bk_biz_id` = ?) OR " +
-		"(`app_id` = ? AND `bk_biz_id` = ?))"
-	if !strings.Contains(compiled.SnapshotStatement, paired) ||
-		!strings.Contains(compiled.CountStatement, paired) ||
-		strings.Contains(compiled.SnapshotStatement, "`app_id` IN") {
-		t.Fatalf("member lookup lost paired exact predicate: %#v", compiled)
-	}
-	wantTail := []any{"0123456789abcdef0123456789abcdef", "7", int64(7), "8", int64(7)}
-	if !reflect.DeepEqual(compiled.SnapshotArgs[len(compiled.SnapshotArgs)-5:], wantTail) ||
-		!reflect.DeepEqual(compiled.CountArgs[len(compiled.CountArgs)-5:], wantTail) {
-		t.Fatalf("member lookup bound wrong pair values: %#v", compiled)
-	}
-}
-
-func TestCompileListMemberLookupRejectsPairOutsideTrustedBusiness(t *testing.T) {
-	request := testRequest(metadata.TraceProfileSummary)
-	request.Scene = "global"
-	request.MemberLookup = &MemberLookup{TraceID: "0123456789abcdef0123456789abcdef", ExpectedRouteVersion: 3,
-		AllowedPairs: []MemberPair{{AppID: 7, BkBizID: 8}}}
-	if code := compileErrorCode(t, request, Limits{}); code != CodeUnauthorizedMember {
-		t.Fatalf("cross-business pair was accepted: %s", code)
 	}
 }
 
@@ -378,14 +319,8 @@ func TestCompileListRejectsUnsupportedFiltersAndOrders(t *testing.T) {
 		},
 		{
 			name:     "json order column",
-			profile:  metadata.TraceProfileSummary,
-			orderBy:  []string{"kind_statistics"},
-			wantCode: CodeUnsupportedSchemaCapability,
-		},
-		{
-			name:     "summary space uid column absent",
-			profile:  metadata.TraceProfileSummary,
-			filters:  []FilterField{{FieldName: "space_uid", Value: []string{testSpaceUID}, Operator: "eq"}},
+			profile:  metadata.TraceProfileSpan,
+			orderBy:  []string{"attributes"},
 			wantCode: CodeUnsupportedSchemaCapability,
 		},
 	}
@@ -425,7 +360,7 @@ func TestCompileListEnforcesBudgets(t *testing.T) {
 	})
 
 	t.Run("offset over budget", func(t *testing.T) {
-		request := testRequest(metadata.TraceProfileSummary)
+		request := testRequest(metadata.TraceProfileSpan)
 		offset := int64(1000)
 		request.Offset = &offset
 		if code := compileErrorCode(t, request, Limits{MaxOffset: 500}); code != CodeLimitExceeded {
@@ -481,39 +416,24 @@ func TestCompileListBindsClientValuesWithoutInlining(t *testing.T) {
 	}
 }
 
-func TestCompileListBindsBoolAndContainsVariants(t *testing.T) {
-	request := testRequest(metadata.TraceProfileSummary)
+func TestCompileListBindsContainsVariants(t *testing.T) {
+	request := testRequest(metadata.TraceProfileSpan)
 	request.Filters = Filters{
 		FieldList: []FilterField{
-			{FieldName: "partial", Value: []string{"true"}, Operator: "eq"},
 			{FieldName: "app_name", Value: []string{"a", "b"}, Operator: "ncontains", IsWildcard: true},
 		},
-		ConditionList: []string{"and"},
+		ConditionList: []string{},
 	}
 	compiled := mustCompile(t, request, Limits{})
 	statement := compiled.SnapshotStatement
 
-	if !strings.Contains(statement, "`partial` = ?") {
-		t.Fatalf("unexpected partial predicate: %s", statement)
-	}
 	if !strings.Contains(statement, "NOT (`app_name` LIKE ? OR `app_name` LIKE ?)") {
 		t.Fatalf("unexpected ncontains predicate: %s", statement)
 	}
-	tail := compiled.SnapshotArgs[len(compiled.SnapshotArgs)-3:]
-	if !reflect.DeepEqual(tail, []any{true, "%a%", "%b%"}) {
+	tail := compiled.SnapshotArgs[len(compiled.SnapshotArgs)-2:]
+	if !reflect.DeepEqual(tail, []any{"%a%", "%b%"}) {
 		t.Fatalf("unexpected bound args: %#v", tail)
 	}
-
-	t.Run("invalid boolean rejected", func(t *testing.T) {
-		invalid := testRequest(metadata.TraceProfileSummary)
-		invalid.Filters = Filters{
-			FieldList:     []FilterField{{FieldName: "partial", Value: []string{"maybe"}, Operator: "eq"}},
-			ConditionList: []string{},
-		}
-		if code := compileErrorCode(t, invalid, Limits{}); code != CodePredicateConflict {
-			t.Fatalf("got %s, want %s", code, CodePredicateConflict)
-		}
-	})
 }
 
 func TestCompileListAppendsCanonicalTailWithoutDuplicating(t *testing.T) {
@@ -534,12 +454,6 @@ func TestCompileListAppendsCanonicalTailWithoutDuplicating(t *testing.T) {
 			profile: metadata.TraceProfileSpan,
 			orderBy: []string{"start_time_us", "-trace_id"},
 			want:    "ORDER BY `start_time_us` ASC, `trace_id` DESC, `span_id` ASC",
-		},
-		{
-			name:    "summary client tiebreak only",
-			profile: metadata.TraceProfileSummary,
-			orderBy: []string{"trace_id"},
-			want:    "ORDER BY `trace_id` ASC, `trace_start_time_us` DESC, `app_id` ASC",
 		},
 	}
 	for _, tc := range cases {

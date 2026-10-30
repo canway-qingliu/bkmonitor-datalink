@@ -10,7 +10,6 @@
 package traceprofile
 
 import (
-	"strconv"
 	"strings"
 	"testing"
 
@@ -18,10 +17,10 @@ import (
 )
 
 func validRequestJSON() string {
-	return `{"trace_profile":"trace_summary","trace_contract_version":"trace_query_v2","trace_request":{` +
+	return `{"trace_profile":"trace_span","trace_contract_version":"trace_query_v2","trace_request":{` +
 		`` +
 		`"expected_scope_fingerprint":"` + strings.Repeat("a", 64) + `",` +
-		`"scene":"app","start_time":"1721024820000000","end_time":"1721024880000000",` +
+		`"start_time":"1721024820000000","end_time":"1721024880000000",` +
 		`"filters":{"field_list":[{"field_name":"app_id","value":["7"],"op":"eq"}],"condition_list":[]},` +
 		`"order_by":["-timestamp","trace_id"],"limit":25,"offset":0}}`
 }
@@ -30,7 +29,7 @@ func TestParseRequestAcceptsVersionedCountAggregation(t *testing.T) {
 	body := strings.Replace(validRequestJSON(), `"trace_query_v2"`, `"trace_query_v3"`, 1)
 	body = strings.Replace(body, `"order_by":["-timestamp","trace_id"],"limit":25,"offset":0`,
 		`"order_by":[],"limit":10000,"aggregation":{"method":"count","interval_seconds":60,`+
-			`"timezone_offset_seconds":28800,"group_by":["root_service_name"]}`, 1)
+			`"timezone_offset_seconds":28800,"group_by":["service_name"]}`, 1)
 	if _, err := ParseRequest([]byte(body), 1<<20, 10000); err != nil {
 		t.Fatalf("bounded typed count aggregation was rejected: %v", err)
 	}
@@ -52,189 +51,12 @@ func TestParseRequestAcceptsVersionedCountAggregation(t *testing.T) {
 	}
 }
 
-func validMemberLookupJSON() string {
-	return `{"trace_profile":"trace_summary","trace_contract_version":"trace_query_v2","trace_request":{` +
-		`` +
-		`"expected_scope_fingerprint":"` + strings.Repeat("a", 64) + `",` +
-		`"scene":"global","start_time":"1721024820000000","end_time":"1721024880000000",` +
-		`"filters":{"field_list":[],"condition_list":[]},"order_by":[],"limit":25,` +
-		`"member_lookup":{"trace_id":"0123456789abcdef0123456789abcdef","expected_route_version":3,"allowed_pairs":` +
-		`[{"app_id":7,"bk_biz_id":7},{"app_id":8,"bk_biz_id":7}]}}}`
-}
-
-func validESSummaryListJSON() string {
-	return `{"trace_profile":"trace_summary","trace_contract_version":"trace_query_v2","trace_request":{` +
-		`` +
-		`"expected_scope_fingerprint":"` + strings.Repeat("a", 64) + `",` +
-		`"scene":"global","start_time":"1721024820000000","end_time":"1721024880000000",` +
-		`"filters":{"field_list":[{"field_name":"entry_type","value":["request"],"op":"eq"}],` +
-		`"condition_list":[]},"order_by":["-min_start_time","trace_id"],"limit":25,"offset":0,` +
-		`"es_summary_list":{"backend":"elasticsearch","app_id":7,"bk_biz_id":2,"expected_route_version":3}}}`
-}
-
-func TestParseRequestAcceptsBoundedESSummaryListAndRejectsScopeExpansion(t *testing.T) {
-	valid := validESSummaryListJSON()
-	if _, err := ParseRequest([]byte(valid), 1<<20, 100); err != nil {
-		t.Fatalf("bounded ES Summary list was rejected: %v", err)
-	}
-	for name, body := range map[string]string{
-		"wrong backend":     strings.Replace(valid, `"backend":"elasticsearch"`, `"backend":"doris"`, 1),
-		"zero app":          strings.Replace(valid, `"app_id":7`, `"app_id":0`, 1),
-		"zero version":      strings.Replace(valid, `"expected_route_version":3`, `"expected_route_version":0`, 1),
-		"wrong scene":       strings.Replace(valid, `"scene":"global"`, `"scene":"app"`, 1),
-		"unsupported field": strings.Replace(valid, `"entry_type"`, `"attributes"`, 1),
-		"physical target":   strings.Replace(valid, `"es_summary_list":{`, `"read_result_table_id":"other.rt","es_summary_list":{`, 1),
-		"with member":       strings.Replace(valid, `"es_summary_list":{`, `"member_lookup":{},"es_summary_list":{`, 1),
-	} {
-		t.Run(name, func(t *testing.T) {
-			if _, err := ParseRequest([]byte(body), 1<<20, 100); err == nil {
-				t.Fatal("unsafe ES Summary list request was accepted")
-			}
-		})
-	}
-}
-
-func TestParseRequestAcceptsEntryMultiselectWithoutArbitraryBooleanScope(t *testing.T) {
-	valid := strings.Replace(validESSummaryListJSON(),
-		`"field_name":"entry_type","value":["request"],"op":"eq"`,
-		`"field_name":"entry_type","value":["request","background"],"op":"eq"},`+
-			`{"field_name":"entry_subtype","value":["scheduled","async"],"op":"eq"`, 1)
-	valid = strings.Replace(valid, `"condition_list":[]`, `"condition_list":["and"]`, 1)
-	request, err := ParseRequest([]byte(valid), 1<<20, 100)
-	if err != nil || len(request.Filters.FieldList) != 2 {
-		t.Fatalf("bounded entry multiselect rejected: request=%+v err=%v", request, err)
-	}
-	for name, invalid := range map[string]string{
-		"or connector":               strings.Replace(valid, `"condition_list":["and"]`, `"condition_list":["or"]`, 1),
-		"unknown type":               strings.Replace(valid, `"request","background"`, `"request","foreign"`, 1),
-		"unknown subtype":            strings.Replace(valid, `"scheduled","async"`, `"scheduled","foreign"`, 1),
-		"subtype without background": strings.Replace(valid, `"request","background"`, `"request","other"`, 1),
-		"duplicate type":             strings.Replace(valid, `"request","background"`, `"request","request"`, 1),
-	} {
-		t.Run(name, func(t *testing.T) {
-			if _, err := ParseRequest([]byte(invalid), 1<<20, 100); err == nil {
-				t.Fatal("unsafe entry multiselect was accepted")
-			}
-		})
-	}
-}
-
-func TestParseRequestAllowsFutureTenantRetentionWithinThirtyDayBudget(t *testing.T) {
-	valid := validESSummaryListJSON()
-	for days, accepted := range map[int64]bool{10: true, 31: false} {
-		end := strconv.FormatInt(1721024820000000+days*86_400_000_000, 10)
-		body := strings.Replace(valid, `"end_time":"1721024880000000"`, `"end_time":"`+end+`"`, 1)
-		_, err := ParseRequest([]byte(body), 1<<20, 100)
-		if (err == nil) != accepted {
-			t.Fatalf("ES Summary range %d days accepted=%v err=%v", days, accepted, err)
-		}
-	}
-}
-
-func TestParseRequestRequiresBoundedAuthorizedParentPairsForCrossAppRelation(t *testing.T) {
-	observed := strings.Replace(validESSummaryListJSON(),
-		`"field_name":"entry_type","value":["request"]`,
-		`"field_name":"entry_parent_state","value":["observed"]`, 1)
-	valid := strings.Replace(observed, `"expected_route_version":3}}}`,
-		`"expected_route_version":3,"parent_allowed_pairs":[{"app_id":7,"bk_biz_id":2},`+
-			`{"app_id":8,"bk_biz_id":3}]}}}`, 1)
-	request, err := ParseRequest([]byte(valid), 1<<20, 100)
-	if err != nil || request.ESSummaryList == nil || len(request.ESSummaryList.ParentAllowedPairs) != 2 {
-		t.Fatalf("authorized cross-app parent scope rejected or lost: request=%+v err=%v", request, err)
-	}
-	for name, body := range map[string]string{
-		"missing pairs": observed,
-		"duplicate": strings.Replace(valid, `{"app_id":8,"bk_biz_id":3}`,
-			`{"app_id":7,"bk_biz_id":2}`, 1),
-		"unsorted": strings.Replace(valid, `{"app_id":7,"bk_biz_id":2},{"app_id":8,"bk_biz_id":3}`,
-			`{"app_id":8,"bk_biz_id":3},{"app_id":7,"bk_biz_id":2}`, 1),
-	} {
-		t.Run(name, func(t *testing.T) {
-			if _, err := ParseRequest([]byte(body), 1<<20, 100); err == nil {
-				t.Fatal("cross-app parent relation accepted incomplete or ambiguous authorization")
-			}
-		})
-	}
-}
-
-func TestParseRequestAcceptsThirtyDayInclusiveMillisecondBoundary(t *testing.T) {
-	start := int64(1721024820000000)
-	valid := strings.Replace(validESSummaryListJSON(), `"end_time":"1721024880000000"`,
-		`"end_time":"`+strconv.FormatInt(start+30*86_400_000_000+1000, 10)+`"`, 1)
-	if _, err := ParseRequest([]byte(valid), 1<<20, 100); err != nil {
-		t.Fatalf("inclusive thirty-day UI window was rejected: %v", err)
-	}
-	invalid := strings.Replace(valid, strconv.FormatInt(start+30*86_400_000_000+1000, 10),
-		strconv.FormatInt(start+30*86_400_000_000+1001, 10), 1)
-	if _, err := ParseRequest([]byte(invalid), 1<<20, 100); err == nil {
-		t.Fatal("window longer than one inclusive endpoint was accepted")
-	}
-}
-
-func TestParseRequestAcceptsBoundedExactSummaryMemberLookup(t *testing.T) {
-	request, err := ParseRequest([]byte(validMemberLookupJSON()), 1<<20, 100)
-	if err != nil {
-		t.Fatalf("bounded exact member lookup was rejected: %v", err)
-	}
-	if request.MemberLookup == nil || request.MemberLookup.TraceID != "0123456789abcdef0123456789abcdef" ||
-		len(request.MemberLookup.AllowedPairs) != 2 || request.MemberLookup.AllowedPairs[1].AppID != 8 ||
-		request.MemberLookup.Backend != MemberBackendDoris {
-		t.Fatalf("member lookup lost exact identity or pairs: %+v", request.MemberLookup)
-	}
-}
-
-func TestParseRequestRequiresOnePairForExplicitESMemberBackend(t *testing.T) {
-	valid := strings.Replace(validMemberLookupJSON(),
-		`"member_lookup":{"trace_id":`, `"member_lookup":{"backend":"elasticsearch","trace_id":`, 1)
-	valid = strings.Replace(valid, `,{"app_id":8,"bk_biz_id":7}`, ``, 1)
-	request, err := ParseRequest([]byte(valid), 1<<20, 100)
-	if err != nil || request.MemberLookup == nil || request.MemberLookup.Backend != MemberBackendElasticsearch {
-		t.Fatalf("one-pair ES member lookup was rejected: request=%+v err=%v", request, err)
-	}
-	for name, body := range map[string]string{
-		"unknown backend":   strings.Replace(valid, `"backend":"elasticsearch"`, `"backend":"other"`, 1),
-		"es multiple pairs": strings.Replace(valid, `{"app_id":7,"bk_biz_id":7}`, `{"app_id":7,"bk_biz_id":7},{"app_id":8,"bk_biz_id":7}`, 1),
-	} {
-		t.Run(name, func(t *testing.T) {
-			if _, err := ParseRequest([]byte(body), 1<<20, 100); err == nil {
-				t.Fatal("unsupported ES member backend scope was accepted")
-			}
-		})
-	}
-}
-
-func TestParseRequestRejectsMemberLookupScopeExpansionAndListMixing(t *testing.T) {
-	valid := validMemberLookupJSON()
-	cases := map[string]string{
-		"null lookup":           valid[:strings.Index(valid, `"member_lookup":`)] + `"member_lookup":null}}`,
-		"missing route version": strings.Replace(valid, `"expected_route_version":3,`, ``, 1),
-		"zero route version":    strings.Replace(valid, `"expected_route_version":3`, `"expected_route_version":0`, 1),
-		"uppercase trace":       strings.Replace(valid, "0123456789abcdef0123456789abcdef", "0123456789ABCDEF0123456789ABCDEF", 1),
-		"empty pairs":           strings.Replace(valid, `[{"app_id":7,"bk_biz_id":7},{"app_id":8,"bk_biz_id":7}]`, `[]`, 1),
-		"duplicate pair":        strings.Replace(valid, `{"app_id":8,"bk_biz_id":7}`, `{"app_id":7,"bk_biz_id":7}`, 1),
-		"unsorted pair": strings.Replace(valid, `{"app_id":7,"bk_biz_id":7},{"app_id":8,"bk_biz_id":7}`,
-			`{"app_id":8,"bk_biz_id":7},{"app_id":7,"bk_biz_id":7}`, 1),
-		"list offset": strings.Replace(valid, `"limit":25,`, `"limit":25,"offset":0,`, 1),
-		"list filter": strings.Replace(valid, `"field_list":[]`,
-			`"field_list":[{"field_name":"app_id","value":["7"],"op":"eq"}]`, 1),
-		"span profile":   strings.Replace(valid, `"trace_summary"`, `"trace_span"`, 1),
-		"nested unknown": strings.Replace(valid, `"allowed_pairs":`, `"sql":"SELECT *","allowed_pairs":`, 1),
-	}
-	for name, body := range cases {
-		t.Run(name, func(t *testing.T) {
-			if _, err := ParseRequest([]byte(body), 1<<20, 100); err == nil {
-				t.Fatal("untrusted member lookup scope was accepted")
-			}
-		})
-	}
-}
-
 func TestParseRequestAcceptsClosedKingeyeTraceEnvelope(t *testing.T) {
 	request, err := ParseRequest([]byte(validRequestJSON()), 1<<20, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if request.Profile != metadata.TraceProfileSummary || request.StartUS != 1721024820000000 ||
+	if request.Profile != metadata.TraceProfileSpan || request.StartUS != 1721024820000000 ||
 		request.EndUS != 1721024880000000 || request.Limit != 25 || request.Offset == nil || *request.Offset != 0 {
 		t.Fatalf("parsed request lost typed fields: %+v", request)
 	}
@@ -243,10 +65,27 @@ func TestParseRequestAcceptsClosedKingeyeTraceEnvelope(t *testing.T) {
 	}
 }
 
+func TestParseRequestRejectsRetiredSummaryModes(t *testing.T) {
+	cases := map[string]string{
+		"summary profile": strings.Replace(validRequestJSON(), `"trace_span"`, `"trace_summary"`, 1),
+		"scene": strings.Replace(validRequestJSON(), `"start_time":`,
+			`"scene":"global","start_time":`, 1),
+		"member lookup": strings.Replace(validRequestJSON(), `"limit":25,`,
+			`"limit":25,"member_lookup":{"trace_id":"0123456789abcdef0123456789abcdef"},`, 1),
+		"es summary list": strings.Replace(validRequestJSON(), `"limit":25,`,
+			`"limit":25,"es_summary_list":{"backend":"elasticsearch","app_id":7},`, 1),
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseRequest([]byte(body), 1<<20, 100); err == nil {
+				t.Fatal("retired Summary request mode was accepted")
+			}
+		})
+	}
+}
+
 func TestParseRequestAcceptsBoundedSpanOffset(t *testing.T) {
-	body := strings.Replace(validRequestJSON(), `"trace_summary"`, `"trace_span"`, 1)
-	body = strings.Replace(body, `"scene":"app",`, "", 1)
-	body = strings.Replace(body, `"offset":0`, `"offset":50`, 1)
+	body := strings.Replace(validRequestJSON(), `"offset":0`, `"offset":50`, 1)
 	request, err := ParseRequest([]byte(body), 1<<20, 100)
 	if err != nil {
 		t.Fatalf("Span page offset was rejected: %v", err)
@@ -268,10 +107,10 @@ func TestParseRequestRejectsSecondAndMillisecondEpochs(t *testing.T) {
 func TestParseRequestRejectsCoordinatesUnknownFieldsAndDuplicateKeys(t *testing.T) {
 	valid := validRequestJSON()
 	cases := map[string]string{
-		"client table_id":   strings.Replace(valid, `"trace_profile":"trace_summary"`, `"trace_profile":"trace_summary","table_id":"42_otel_trace_summary.doris"`, 1),
-		"nested SQL":        strings.Replace(valid, `"scene":"app"`, `"scene":"app","sql":"SELECT *"`, 1),
-		"duplicate profile": strings.Replace(valid, `"trace_profile":"trace_summary"`, `"trace_profile":"trace_span","trace_profile":"trace_summary"`, 1),
-		"invalid profile":   strings.Replace(valid, `"trace_summary"`, `"service_edge"`, 1),
+		"client table_id":   strings.Replace(valid, `"trace_profile":"trace_span"`, `"trace_profile":"trace_span","table_id":"42_otel_trace_span.doris"`, 1),
+		"nested SQL":        strings.Replace(valid, `"trace_request":{`, `"trace_request":{"sql":"SELECT *",`, 1),
+		"duplicate profile": strings.Replace(valid, `"trace_profile":"trace_span"`, `"trace_profile":"trace_span","trace_profile":"trace_span"`, 1),
+		"invalid profile":   strings.Replace(valid, `"trace_span"`, `"service_edge"`, 1),
 		"wrong contract":    strings.Replace(valid, `"trace_query_v2"`, `"other"`, 1),
 		"fractional limit":  strings.Replace(valid, `"limit":25`, `"limit":25.5`, 1),
 		"quoted limit":      strings.Replace(valid, `"limit":25`, `"limit":"25"`, 1),
@@ -310,12 +149,6 @@ func TestParseRequestRejectsInvalidTimePaginationAndFilterShape(t *testing.T) {
 				t.Fatal("invalid Trace range, pagination or filter was accepted")
 			}
 		})
-	}
-	spanWithNullScene := strings.Replace(valid, `"trace_summary"`, `"trace_span"`, 1)
-	spanWithNullScene = strings.Replace(spanWithNullScene, `"scene":"app"`, `"scene":null`, 1)
-	spanWithNullScene = strings.Replace(spanWithNullScene, `,"offset":0`, ``, 1)
-	if _, err := ParseRequest([]byte(spanWithNullScene), 1<<20, 100); err == nil {
-		t.Fatal("Span request with explicit null scene was accepted")
 	}
 	if _, err := ParseRequest([]byte(valid), len(valid)-1, 100); err == nil {
 		t.Fatal("oversized request was accepted")

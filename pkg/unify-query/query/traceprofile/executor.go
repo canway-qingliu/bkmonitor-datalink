@@ -45,7 +45,7 @@ func NewExecutor(snapshot *RouteSnapshot, connections map[string]Querier, limits
 	if snapshot == nil {
 		return nil, fmt.Errorf("Trace 读路由尚未配置")
 	}
-	if len(connections) == 0 && (len(snapshot.routes) > 0 || len(snapshot.esSummaryRoutes) == 0) {
+	if len(connections) == 0 && len(snapshot.routes) > 0 {
 		return nil, fmt.Errorf("Trace Doris 只读连接尚未配置")
 	}
 	frozen := make(map[string]Querier, len(connections))
@@ -63,17 +63,9 @@ func (e *Executor) RouteVersion() int64 {
 	return e.snapshot.Version()
 }
 
-// ResolveESSummaryTarget 暴露同一版本快照中的 ES Summary 应用目标。
-func (e *Executor) ResolveESSummaryTarget(tenantID string, bizID, appID int64) (ESSummaryTarget, error) {
-	if e == nil || e.snapshot == nil {
-		return ESSummaryTarget{}, reject(CodeRouteNotFound, "ES Summary 读路由尚未配置")
-	}
-	return e.snapshot.ResolveESSummary(tenantID, bizID, appID)
-}
-
 // exactSpanRouteAppID 只从闭合的单应用 AND 条件选路；其他请求保留旧业务路由。
 func exactSpanRouteAppID(request Request) int64 {
-	if request.Profile != metadata.TraceProfileSpan || request.MemberLookup != nil || len(request.Filters.FieldList) == 0 {
+	if request.Profile != metadata.TraceProfileSpan || len(request.Filters.FieldList) == 0 {
 		return 0
 	}
 	for _, connector := range request.Filters.ConditionList {
@@ -100,18 +92,11 @@ func exactSpanRouteAppID(request Request) int64 {
 
 // Execute 执行一次列表查询。
 func (e *Executor) Execute(ctx context.Context, request Request, scope Scope) (Page, error) {
-	if request.MemberLookup != nil && request.MemberLookup.Backend == MemberBackendElasticsearch {
-		return Page{}, reject(CodeUnsupportedSchemaCapability, "ES Summary 成员查询不得进入 Doris 执行器")
-	}
 	route, err := e.snapshot.ResolveForApplication(
 		scope.BkTenantID, scope.BkBizID, exactSpanRouteAppID(request), request.Profile,
 	)
 	if err != nil {
 		return Page{}, err
-	}
-	if request.MemberLookup != nil && (route.PublishedVersion == 0 ||
-		request.MemberLookup.ExpectedRouteVersion != route.PublishedVersion) {
-		return Page{}, reject(CodeScopePartial, "Summary 成员查询的单租户发布路由版本尚未在 UQ 生效")
 	}
 	connection, ok := e.connections[route.Doris.ClusterID]
 	if !ok {
@@ -121,52 +106,7 @@ func (e *Executor) Execute(ctx context.Context, request Request, scope Scope) (P
 	if err != nil {
 		return Page{}, err
 	}
-	if request.MemberLookup == nil {
-		return executeSnapshotList(ctx, request, scope, connection, compiled)
-	}
-
-	// 精确成员查询先读 total，超预算时不读取成员行。
-	countResult, err := connection.Query(ctx, compiled.CountStatement, compiled.CountArgs...)
-	if err != nil {
-		return Page{}, queryFailure(err)
-	}
-	total, err := readTotal(countResult)
-	if err != nil {
-		return Page{}, err
-	}
-	if total > request.Limit {
-		return Page{}, reject(CodeLimitExceeded, "Summary 精确成员命中超过行预算")
-	}
-
-	snapshotResult, err := connection.Query(ctx, compiled.SnapshotStatement, compiled.SnapshotArgs...)
-	if err != nil {
-		return Page{}, queryFailure(err)
-	}
-	snapshotTotal, pageResult, err := readSnapshotRows(request.Profile, snapshotResult)
-	if err != nil {
-		return Page{}, err
-	}
-	if snapshotTotal > request.Limit {
-		return Page{}, reject(CodeLimitExceeded, "Summary 精确成员在读取时超过行预算")
-	}
-	if snapshotTotal != total {
-		return Page{}, reject(CodePartialFailure, "Summary 精确成员预检与读取快照 total 不一致")
-	}
-	rows, err := decodeTraceRows(request.Profile, pageResult)
-	if err != nil {
-		return Page{}, err
-	}
-	if int64(len(rows)) != snapshotTotal {
-		return Page{}, reject(CodePartialFailure, "Summary 精确成员行数与真实 total 不一致")
-	}
-	if err := verifyMemberRows(rows, request, scope); err != nil {
-		return Page{}, err
-	}
-	items, err := ShapeRows(request.Profile, rows, scope.BkTenantID)
-	if err != nil {
-		return Page{}, reject(CodePartialFailure, "Trace 结果不符合行合同: %s", err)
-	}
-	return Page{Items: items, Total: snapshotTotal}, nil
+	return executeSnapshotList(ctx, request, scope, connection, compiled)
 }
 
 func executeSnapshotList(ctx context.Context, request Request, scope Scope, connection Querier, compiled CompiledList) (Page, error) {
@@ -245,40 +185,8 @@ func readSnapshotRows(profile metadata.TraceProfile, result dorisclient.Result) 
 	return total, page, nil
 }
 
-func verifyMemberRows(rows []map[string]any, request Request, scope Scope) error {
-	allowed := make(map[string]int64, len(request.MemberLookup.AllowedPairs))
-	for _, pair := range request.MemberLookup.AllowedPairs {
-		allowed[strconv.FormatInt(pair.AppID, 10)] = pair.BkBizID
-	}
-	for _, row := range rows {
-		appID, ok := row["app_id"].(string)
-		bizID, err := exactTraceInt64(row["bk_biz_id"])
-		expectedBiz, allowedApp := allowed[appID]
-		if !ok || !allowedApp || err != nil || expectedBiz != bizID || bizID != scope.BkBizID ||
-			row["trace_id"] != request.MemberLookup.TraceID {
-			return reject(CodeUnauthorizedMember, "Summary 精确成员行超出受信允许集")
-		}
-	}
-	return nil
-}
-
 func queryFailure(err error) error {
 	return &RejectError{Code: CodePartialFailure, Message: "Trace 存储查询失败或超时", Cause: err}
-}
-
-func readTotal(result dorisclient.Result) (int64, error) {
-	if len(result.Rows) != 1 {
-		return 0, reject(CodePartialFailure, "Trace 计数结果行数非法: %d", len(result.Rows))
-	}
-	value, present := result.Rows[0]["total"]
-	if !present {
-		return 0, reject(CodePartialFailure, "Trace 计数结果缺少 total")
-	}
-	total, err := exactTraceInt64(value)
-	if err != nil || total < 0 {
-		return 0, reject(CodePartialFailure, "Trace 计数结果非法")
-	}
-	return total, nil
 }
 
 // decodeTraceRows 只做 Doris → 行合同的类型桥接：JSON/VARIANT 文本转结构、
@@ -303,9 +211,6 @@ func decodeTraceValue(profile metadata.TraceProfile, field string, value any) (a
 	if value == nil {
 		return nil, nil
 	}
-	if field == "partial" {
-		return decodeTraceBool(value)
-	}
 	if _, isJSON := jsonProjectionColumns[profile][field]; isJSON {
 		text, ok := value.(string)
 		if !ok {
@@ -317,19 +222,6 @@ func decodeTraceValue(profile metadata.TraceProfile, field string, value any) (a
 		return decodeTraceJSONText(text)
 	}
 	return value, nil
-}
-
-func decodeTraceBool(value any) (bool, error) {
-	switch typed := value.(type) {
-	case bool:
-		return typed, nil
-	case int64:
-		return typed != 0, nil
-	case string:
-		return exactTraceBool(typed)
-	default:
-		return false, fmt.Errorf("不是布尔值")
-	}
 }
 
 // decodeTraceJSONText 用 UseNumber 保留大整数精度；非 JSON 文本按标量字符串放行，

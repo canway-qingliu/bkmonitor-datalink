@@ -88,7 +88,6 @@ const (
 	JwtBkAppCodeSpacesConfigPath                = "jwt.bk_app_code_spaces"
 	JwtEnabledConfigPath                        = "jwt.enabled"
 	TraceProfileAllowedAppCodesConfigPath       = "trace_profile.allowed_bk_app_codes"
-	TraceMemberLookupAllowedAppCodesConfigPath  = "trace_profile.member_lookup_allowed_bk_app_codes"
 	TraceProfileConfigPath                      = "trace_profile"
 	TraceProfileReadTargetDataPathConfigPath    = "trace_profile.read_target_data_path"
 	TraceProfileReadTargetVersionPathConfigPath = "trace_profile.read_target_version_path"

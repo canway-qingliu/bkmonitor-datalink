@@ -61,7 +61,7 @@ func TestTraceProfileRowGoldenV2MatchesUQPhysicalRowShaping(t *testing.T) {
 		t.Fatal(err)
 	}
 	if fixture.Schema != "trace-profile-row-golden-v2" || fixture.TraceContractVersion != "trace_query_v2" ||
-		len(fixture.Cases) != 2 || len(fixture.EmptyPages) != 2 {
+		len(fixture.Cases) != 1 || len(fixture.EmptyPages) != 1 {
 		t.Fatalf("row golden shape drifted: %+v", fixture)
 	}
 	for _, testCase := range fixture.Cases {
@@ -82,8 +82,7 @@ func TestTraceProfileRowGoldenV2MatchesUQPhysicalRowShaping(t *testing.T) {
 	for _, page := range fixture.EmptyPages {
 		items, err := ShapeRows(page.Profile, []map[string]any{}, "system")
 		if err != nil || len(items) != 0 || len(page.Items) != 0 || page.Total < 0 ||
-			page.Profile == metadata.TraceProfileSpan && (page.Total != 0 || page.Offset != 0) ||
-			page.Profile == metadata.TraceProfileSummary && page.Offset == 0 && page.Total > 0 {
+			page.Total != 0 || page.Offset != 0 {
 			t.Fatalf("empty page golden is not admissible: %+v err=%v", page, err)
 		}
 	}

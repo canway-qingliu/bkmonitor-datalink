@@ -69,7 +69,7 @@ func validTaskSummaryFilters(filters Filters) bool {
 func CompileTaskSummary(target DorisTarget, scope Scope, request Request, limits Limits) (CompiledAggregate, error) {
 	if request.Profile != metadata.TraceProfileSpan || request.Aggregation == nil ||
 		request.Aggregation.Method != "task_summary" || request.Limit < 1 || request.Limit > taskSummaryMaxGroups ||
-		request.Offset != nil || len(request.OrderBy) != 0 || request.MemberLookup != nil || request.ESSummaryList != nil ||
+		request.Offset != nil || len(request.OrderBy) != 0 ||
 		request.Aggregation.IntervalSeconds != 0 || request.Aggregation.TimezoneOffsetSeconds != 0 ||
 		request.Aggregation.GroupBy != nil ||
 		request.EndUS <= request.StartUS || !validTaskSummaryFilters(request.Filters) ||
@@ -80,7 +80,7 @@ func CompileTaskSummary(target DorisTarget, scope Scope, request Request, limits
 	if !matchesPublishedPhysicalTable(request.Profile, target, scope, request) {
 		return CompiledAggregate{}, reject(CodeRouteNotFound, "后台任务聚合读目标与 Span profile 不匹配")
 	}
-	where, args, err := buildWhere(request.Profile, scope, request)
+	where, args, err := buildWhere(scope, request)
 	if err != nil {
 		return CompiledAggregate{}, err
 	}

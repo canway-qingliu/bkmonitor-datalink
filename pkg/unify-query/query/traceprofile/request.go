@@ -47,54 +47,18 @@ type Filters struct {
 	ConditionList []string      `json:"condition_list"`
 }
 
-// MemberPair 是 KAPM 授权目录下发的一个应用/业务组合，不允许拆成独立 IN 条件。
-type MemberPair struct {
-	AppID   int64 `json:"app_id"`
-	BkBizID int64 `json:"bk_biz_id"`
-}
-
-// MemberLookup 仅用于 Summary 内部精确 Trace ID 成员查询。
-type MemberLookup struct {
-	Backend              string       `json:"backend,omitempty"`
-	TraceID              string       `json:"trace_id"`
-	ExpectedRouteVersion int64        `json:"expected_route_version"`
-	AllowedPairs         []MemberPair `json:"allowed_pairs"`
-}
-
-// ESSummaryList 仅声明受信应用和已发布版本；物理 RT 由 UQ 路由解析。
-type ESSummaryList struct {
-	Backend              string       `json:"backend"`
-	AppID                int64        `json:"app_id"`
-	BkBizID              int64        `json:"bk_biz_id"`
-	ExpectedRouteVersion int64        `json:"expected_route_version"`
-	ParentAllowedPairs   []MemberPair `json:"parent_allowed_pairs,omitempty"`
-}
-
-const (
-	MemberBackendDoris         = "doris"
-	MemberBackendElasticsearch = "elasticsearch"
-)
-
-const maxMemberPairs = 128
-
 // Request contains only logical query fields. Physical coordinates and SQL are
 // absent from the wire type and rejected during strict JSON decoding.
 type Request struct {
 	Profile          metadata.TraceProfile
 	ScopeFingerprint string
-	Scene            string
 	StartUS          int64
 	EndUS            int64
 	Filters          Filters
 	OrderBy          []string
 	Limit            int64
 	Offset           *int64
-	MemberLookup     *MemberLookup
-	ESSummaryList    *ESSummaryList
 	Aggregation      *CountAggregation
-
-	// esSummaryPredicate 是 ParseRequest 解析过的 ES Summary 列表入口筛选，避免重复解析。
-	esSummaryPredicate *ESSummaryListPredicate
 }
 
 // CountAggregation is a bounded, server-side count query over one trusted Trace profile.
@@ -115,8 +79,6 @@ type wireRequest struct {
 	Limit                    int64           `json:"limit"`
 	Offset                   json.RawMessage `json:"offset,omitempty"`
 	PageToken                json.RawMessage `json:"page_token,omitempty"`
-	MemberLookup             json.RawMessage `json:"member_lookup,omitempty"`
-	ESSummaryList            json.RawMessage `json:"es_summary_list,omitempty"`
 	Aggregation              json.RawMessage `json:"aggregation,omitempty"`
 }
 
@@ -147,7 +109,7 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 		wire.TraceContractVersion != contractVersion && wire.TraceContractVersion != aggregateContractVersion {
 		return Request{}, fmt.Errorf("Trace profile 合同版本或请求体不受支持")
 	}
-	if wire.TraceProfile != metadata.TraceProfileSpan && wire.TraceProfile != metadata.TraceProfileSummary {
+	if wire.TraceProfile != metadata.TraceProfileSpan {
 		return Request{}, fmt.Errorf("Trace profile 类型不受支持")
 	}
 	query := wire.TraceRequest
@@ -155,11 +117,8 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 		wire.TraceContractVersion == aggregateContractVersion && len(query.Aggregation) == 0 {
 		return Request{}, fmt.Errorf("Trace profile 聚合与合同版本不匹配")
 	}
-	scene := ""
 	if len(query.Scene) != 0 {
-		if bytes.Equal(query.Scene, []byte("null")) || json.Unmarshal(query.Scene, &scene) != nil {
-			return Request{}, fmt.Errorf("Trace profile 场景字段非法")
-		}
+		return Request{}, fmt.Errorf("Span profile 不支持场景")
 	}
 	var offset *int64
 	if len(query.Offset) != 0 {
@@ -174,13 +133,6 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 	}
 	if !fingerprintPattern.MatchString(query.ExpectedScopeFingerprint) || query.Filters == nil || query.OrderBy == nil {
 		return Request{}, fmt.Errorf("Trace profile 缺少受信范围或查询字段")
-	}
-	if wire.TraceProfile == metadata.TraceProfileSummary {
-		if scene != "app" && scene != "namespace" && scene != "global" {
-			return Request{}, fmt.Errorf("Summary profile 场景不受支持")
-		}
-	} else if len(query.Scene) != 0 {
-		return Request{}, fmt.Errorf("Span profile 不支持场景")
 	}
 	if len(query.PageToken) != 0 || query.Limit <= 0 || query.Limit > maxLimit ||
 		offset != nil && (*offset < 0 || *offset > (1<<63-1)-query.Limit) {
@@ -199,9 +151,8 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 	}
 	var aggregation *CountAggregation
 	if len(query.Aggregation) != 0 {
-		if bytes.Equal(query.Aggregation, []byte("null")) || offset != nil || len(query.OrderBy) != 0 ||
-			len(query.MemberLookup) != 0 || len(query.ESSummaryList) != 0 {
-			return Request{}, fmt.Errorf("Trace 聚合不能混用分页、排序或成员查询")
+		if bytes.Equal(query.Aggregation, []byte("null")) || offset != nil || len(query.OrderBy) != 0 {
+			return Request{}, fmt.Errorf("Trace 聚合不能混用分页或排序")
 		}
 		aggregationDecoder := json.NewDecoder(bytes.NewReader(query.Aggregation))
 		aggregationDecoder.DisallowUnknownFields()
@@ -220,7 +171,7 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 			})); err != nil {
 				return Request{}, fmt.Errorf("后台任务聚合只接受 method 字段: %w", err)
 			}
-			if wire.TraceProfile != metadata.TraceProfileSpan || query.Limit > 5000 ||
+			if query.Limit > 5000 ||
 				value.IntervalSeconds != 0 || value.TimezoneOffsetSeconds != 0 || value.GroupBy != nil ||
 				!validTaskSummaryFilters(*query.Filters) {
 				return Request{}, fmt.Errorf("后台任务聚合范围或字段超出闭合合同")
@@ -244,62 +195,6 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 		}
 		aggregation = &value
 	}
-	var memberLookup *MemberLookup
-	if len(query.MemberLookup) != 0 {
-		if bytes.Equal(query.MemberLookup, []byte("null")) || len(query.ESSummaryList) != 0 ||
-			wire.TraceProfile != metadata.TraceProfileSummary ||
-			scene != "global" || offset != nil || len(query.Filters.FieldList) != 0 ||
-			len(query.Filters.ConditionList) != 0 || len(query.OrderBy) != 0 {
-			return Request{}, fmt.Errorf("Summary 成员查询模式不能混用列表条件或分页")
-		}
-		lookupDecoder := json.NewDecoder(bytes.NewReader(query.MemberLookup))
-		lookupDecoder.DisallowUnknownFields()
-		var lookup MemberLookup
-		if err := lookupDecoder.Decode(&lookup); err != nil {
-			return Request{}, fmt.Errorf("Summary 成员查询形状非法: %w", err)
-		}
-		if err := lookupDecoder.Decode(&extra); err != io.EOF {
-			return Request{}, fmt.Errorf("Summary 成员查询包含多余内容")
-		}
-		if lookup.Backend == "" {
-			lookup.Backend = MemberBackendDoris
-		}
-		if err := validateMemberLookup(lookup); err != nil {
-			return Request{}, err
-		}
-		memberLookup = &lookup
-	}
-	var esSummaryList *ESSummaryList
-	var esSummaryPredicate *ESSummaryListPredicate
-	if len(query.ESSummaryList) != 0 {
-		if bytes.Equal(query.ESSummaryList, []byte("null")) || memberLookup != nil || aggregation != nil ||
-			wire.TraceProfile != metadata.TraceProfileSummary || scene != "global" ||
-			!WindowFits(startUS, endUS, MaxWindowUS(MaxRangeDays)) {
-			return Request{}, fmt.Errorf("ES Summary 列表模式、场景或三十天上限非法")
-		}
-		listDecoder := json.NewDecoder(bytes.NewReader(query.ESSummaryList))
-		listDecoder.DisallowUnknownFields()
-		var target ESSummaryList
-		if err := listDecoder.Decode(&target); err != nil {
-			return Request{}, fmt.Errorf("ES Summary 列表身份非法: %w", err)
-		}
-		if err := listDecoder.Decode(&extra); err != io.EOF || target.Backend != MemberBackendElasticsearch ||
-			target.AppID <= 0 || target.BkBizID <= 0 || target.ExpectedRouteVersion <= 0 {
-			return Request{}, fmt.Errorf("ES Summary 列表缺少单应用和发布版本")
-		}
-		if !validESSummaryListOrder(query.OrderBy) {
-			return Request{}, fmt.Errorf("ES Summary 列表必须按开始时间或耗时与 Trace ID 稳定排序")
-		}
-		predicate, err := ParseESSummaryListPredicate(*query.Filters)
-		if err != nil {
-			return Request{}, err
-		}
-		if err := validateESParentPairs(target, predicate.ParentState); err != nil {
-			return Request{}, err
-		}
-		esSummaryList = &target
-		esSummaryPredicate = &predicate
-	}
 	for _, order := range query.OrderBy {
 		if !orderPattern.MatchString(order) {
 			return Request{}, fmt.Errorf("Trace profile 排序字段非法")
@@ -307,84 +202,10 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 	}
 	return Request{
 		Profile: wire.TraceProfile, ScopeFingerprint: query.ExpectedScopeFingerprint,
-		Scene:   scene,
 		StartUS: startUS, EndUS: endUS, Filters: *query.Filters,
 		OrderBy: append([]string(nil), query.OrderBy...), Limit: query.Limit, Offset: offset,
-		MemberLookup:  memberLookup,
-		ESSummaryList: esSummaryList,
-		Aggregation:   aggregation,
-
-		esSummaryPredicate: esSummaryPredicate,
+		Aggregation: aggregation,
 	}, nil
-}
-
-func validESSummaryListOrder(order []string) bool {
-	if len(order) != 2 || order[1] != "trace_id" {
-		return false
-	}
-	switch order[0] {
-	case "-min_start_time", "min_start_time", "-trace_duration", "trace_duration":
-		return true
-	default:
-		return false
-	}
-}
-
-func validateESParentPairs(target ESSummaryList, parentState string) error {
-	if parentState != "observed" && parentState != "missing" {
-		if len(target.ParentAllowedPairs) != 0 {
-			return fmt.Errorf("ES Summary 无跨应用父关系条件时不得提交授权应用集合")
-		}
-		return nil
-	}
-	if len(target.ParentAllowedPairs) == 0 || len(target.ParentAllowedPairs) > 64 {
-		return fmt.Errorf("ES Summary 跨应用父关系缺少有界授权应用集合")
-	}
-	previous := MemberPair{}
-	includesTarget := false
-	for index, pair := range target.ParentAllowedPairs {
-		if pair.AppID <= 0 || pair.BkBizID <= 0 || index > 0 &&
-			(pair.BkBizID < previous.BkBizID || pair.BkBizID == previous.BkBizID && pair.AppID <= previous.AppID) {
-			return fmt.Errorf("ES Summary 跨应用父关系授权集合未严格排序或含无效应用")
-		}
-		includesTarget = includesTarget || pair.AppID == target.AppID && pair.BkBizID == target.BkBizID
-		previous = pair
-	}
-	if !includesTarget {
-		return fmt.Errorf("ES Summary 跨应用父关系授权集合缺少目标应用")
-	}
-	return nil
-}
-
-// ESParentOwnerKeys only derives indexed owner terms from a bounded, validated typed request.
-func ESParentOwnerKeys(target ESSummaryList, parentState string) ([]string, error) {
-	if err := validateESParentPairs(target, parentState); err != nil {
-		return nil, err
-	}
-	keys := make([]string, 0, len(target.ParentAllowedPairs))
-	for _, pair := range target.ParentAllowedPairs {
-		keys = append(keys, fmt.Sprintf("%d:%d", pair.BkBizID, pair.AppID))
-	}
-	return keys, nil
-}
-
-func validateMemberLookup(lookup MemberLookup) error {
-	if (lookup.Backend != "" && lookup.Backend != MemberBackendDoris && lookup.Backend != MemberBackendElasticsearch) ||
-		lookup.Backend == MemberBackendElasticsearch && len(lookup.AllowedPairs) != 1 ||
-		!traceIDPattern.MatchString(lookup.TraceID) || lookup.ExpectedRouteVersion <= 0 ||
-		len(lookup.AllowedPairs) == 0 ||
-		len(lookup.AllowedPairs) > maxMemberPairs {
-		return fmt.Errorf("Summary 成员查询缺少精确 Trace ID 或有界允许集")
-	}
-	var previous MemberPair
-	for index, pair := range lookup.AllowedPairs {
-		if pair.AppID <= 0 || pair.BkBizID <= 0 || index > 0 &&
-			(pair.BkBizID < previous.BkBizID || pair.BkBizID == previous.BkBizID && pair.AppID <= previous.AppID) {
-			return fmt.Errorf("Summary 成员允许集必须按业务/应用严格排序且不重复")
-		}
-		previous = pair
-	}
-	return nil
 }
 
 func parseMicroseconds(value string) (int64, error) {

@@ -81,7 +81,7 @@ func TestTracePublishedRoutesLoadFromRedisWhenStorageSourceIsRedis(t *testing.T)
 		t.Fatalf("Redis publication was not loaded: %v", err)
 	}
 	runtime := traceProfileRuntimeValue.Load()
-	if runtime == nil || runtime.routeCount != 2 {
+	if runtime == nil || runtime.routeCount != 1 {
 		t.Fatalf("published business routes were not installed: %+v", runtime)
 	}
 }

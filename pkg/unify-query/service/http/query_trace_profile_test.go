@@ -24,7 +24,6 @@ import (
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/dorisclient"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/structured"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/traceprofile"
 )
 
@@ -166,21 +165,16 @@ func withTraceProfileAuth(t *testing.T, enabled bool, allowed ...string) {
 
 func traceProfileRuntimeConfig() map[string]any {
 	return map[string]any{
-		"route_snapshot_version":             7,
-		"allowed_bk_app_codes":               []string{"kingeye-apm"},
-		"member_lookup_allowed_bk_app_codes": []string{"kingeye-apm"},
-		"max_body_bytes":                     65536,
-		"max_limit":                          100,
-		"max_offset":                         1000,
-		"max_range_days":                     7,
+		"route_snapshot_version": 7,
+		"allowed_bk_app_codes":   []string{"kingeye-apm"},
+		"max_body_bytes":         65536,
+		"max_limit":              100,
+		"max_offset":             1000,
+		"max_range_days":         7,
 		"read_routes": []any{
 			map[string]any{
 				"bk_tenant_id": "system", "bk_biz_id": 42, "profile": "trace_span",
 				"database": "system_kapm", "cluster_id": "18", "schema_version": "2026-09-24", "published_route_version": 7,
-			},
-			map[string]any{
-				"bk_tenant_id": "system", "bk_biz_id": 42, "profile": "trace_summary",
-				"database": "system_kapm", "cluster_id": "18", "schema_version": "sha256:3d6b6b96f74453dd", "published_route_version": 7,
 			},
 		},
 		"readonly_connections": []any{
@@ -238,8 +232,7 @@ func TestProbeTraceEnvelopeDetectsOnlyTypedTopLevelKeys(t *testing.T) {
 		want bool
 	}{
 		{name: "typed span envelope", body: typedTraceBody("trace_span", "system_kapm"), want: true},
-		{name: "typed summary envelope", body: typedTraceBody("trace_summary", "system_kapm"), want: true},
-		{name: "typed application topology envelope", body: `{"application_topology_contract_version":"application_topology_range_v2","application_topology_request":{}}`, want: true},
+		{name: "retired topology envelope", body: `{"application_topology_contract_version":"application_topology_range_v2","application_topology_request":{}}`, want: false},
 		{name: "nested key", body: `{"query_list":[{"trace_request":{}}]}`, want: false},
 		{name: "value named like the key", body: `{"table_id":"trace_profile"}`, want: false},
 		{name: "legacy body", body: `{"query_list":[{"table_id":"t1"}],"space_uid":"bkcc__42"}`, want: false},
@@ -292,7 +285,7 @@ func TestNewTraceProfileRuntimeParsesOnlyCompleteConfiguration(t *testing.T) {
 			t.Fatalf("newTraceProfileRuntime returned error: %v", err)
 		}
 		defer runtime.close()
-		if runtime.routeVersion != 7 || runtime.routeCount != 2 || runtime.maxLimit != 100 || len(runtime.connections) != 1 {
+		if runtime.routeVersion != 7 || runtime.routeCount != 1 || runtime.maxLimit != 100 || len(runtime.connections) != 1 {
 			t.Fatalf("unexpected runtime: %+v", runtime)
 		}
 	})
@@ -409,136 +402,6 @@ func TestTraceProfileDirectReadRequiresVerifiedAllowlistedWorkload(t *testing.T)
 	})
 }
 
-func TestTraceMemberLookupRequiresItsOwnWorkloadAllowlist(t *testing.T) {
-	withTraceProfileRuntime(t, traceProfileRuntimeConfig())
-	withTraceProfileAuth(t, true, "kingeye-apm")
-	traceProfileRuntimeValue.Load().memberLookupAllowedAppCodes = nil
-	body := strings.Replace(typedTraceBody("trace_summary", "system_kapm"), `"limit":100}}`,
-		`"limit":100,"scene":"global","member_lookup":{`+
-			`"trace_id":"0123456789abcdef0123456789abcdef","expected_route_version":7,`+
-			`"allowed_pairs":[{"app_id":7,"bk_biz_id":42}]}}}`, 1)
-	code := decodeTraceProfileError(t, runTraceProfileRequest(t, body, "kingeye-apm"))
-	if code != traceprofile.CodeUnauthorizedMember {
-		t.Fatalf("member allow set escaped the dedicated workload gate: %s", code)
-	}
-	traceProfileRuntimeValue.Load().memberLookupAllowedAppCodes = []string{"kingeye-apm"}
-	code = decodeTraceProfileError(t, runTraceProfileRequest(t, body, "kingeye-apm"))
-	if code != traceprofile.CodePartialFailure {
-		t.Fatalf("authorized member lookup was blocked before the configured readonly query: %s", code)
-	}
-}
-
-func TestESMemberLookupRejectsRangeBudgetBeforeIO(t *testing.T) {
-	config := traceProfileRuntimeConfig()
-	config["max_range_days"] = 1
-	config["es_summary_targets"] = []any{map[string]any{
-		"bk_tenant_id": "system", "bk_biz_id": 42, "app_id": 7,
-		"app_name":             "checkout",
-		"read_result_table_id": "system.trace_summary_es_v2",
-		"storage_cluster_id":   9, "retention_days": 30, "published_route_version": 7,
-	}}
-	withTraceProfileRuntime(t, config)
-	withTraceProfileAuth(t, true, "kingeye-apm")
-	called := false
-	traceProfileRuntimeValue.Load().esMemberReader = func(context.Context, *structured.QueryTs) (
-		int64, []map[string]any, metadata.ResultTableOptions, []metadata.RouteInfo, error,
-	) {
-		called = true
-		return 0, nil, nil, nil, nil
-	}
-	body := strings.Replace(typedTraceBody("trace_summary", "system_kapm"),
-		`"end_time":"1758672000000000"`, `"end_time":"1758758400000000"`, 1)
-	body = strings.Replace(body, `"limit":100}}`,
-		`"limit":100,"scene":"global","member_lookup":{`+
-			`"backend":"elasticsearch","trace_id":"0123456789abcdef0123456789abcdef",`+
-			`"expected_route_version":7,"allowed_pairs":[{"app_id":7,"bk_biz_id":42}]}}}`, 1)
-	code := decodeTraceProfileError(t, runTraceProfileRequest(t, body, "kingeye-apm"))
-	if code != traceprofile.CodeUnboundedRange || called {
-		t.Fatalf("range budget must reject before ES I/O: code=%s called=%v", code, called)
-	}
-}
-
-func TestESMemberLookupChecksPublishedTargetAndVersionBeforeExecution(t *testing.T) {
-	withTraceProfileAuth(t, true, "kingeye-apm")
-	body := strings.Replace(typedTraceBody("trace_summary", "system_kapm"), `"limit":100}}`,
-		`"limit":100,"scene":"global","member_lookup":{`+
-			`"backend":"elasticsearch","trace_id":"0123456789abcdef0123456789abcdef",`+
-			`"expected_route_version":7,"allowed_pairs":[{"app_id":7,"bk_biz_id":42}]}}}`, 1)
-	config := traceProfileRuntimeConfig()
-	withTraceProfileRuntime(t, config)
-	if code := decodeTraceProfileError(t, runTraceProfileRequest(t, body, "kingeye-apm")); code != traceprofile.CodeRouteNotFound {
-		t.Fatalf("missing ES target used Doris route: %s", code)
-	}
-	for _, tc := range []struct {
-		version int64
-		want    string
-	}{
-		{8, traceprofile.CodeScopePartial},
-		{7, "success"},
-	} {
-		config := traceProfileRuntimeConfig()
-		config["es_summary_targets"] = []any{map[string]any{
-			"bk_tenant_id": "system", "bk_biz_id": 42, "app_id": 7,
-			"app_name":             "checkout",
-			"read_result_table_id": "system.trace_summary_es_v2",
-			"storage_cluster_id":   9, "retention_days": 7,
-			"published_route_version": tc.version,
-		}}
-		withTraceProfileRuntime(t, config)
-		if tc.want == "success" {
-			traceProfileRuntimeValue.Load().esMemberReader = func(_ context.Context, _ *structured.QueryTs) (
-				int64, []map[string]any, metadata.ResultTableOptions, []metadata.RouteInfo, error,
-			) {
-				return 0, nil, nil, []metadata.RouteInfo{{
-					TableID: "system.trace_summary_es_v2", StorageType: metadata.ElasticsearchStorageType,
-					StorageID: "9",
-				}}, nil
-			}
-			recorder := runTraceProfileRequest(t, body, "kingeye-apm")
-			if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"total":0`) {
-				t.Fatalf("trusted ES member route did not execute typed query: %d %s", recorder.Code, recorder.Body.String())
-			}
-			continue
-		}
-		if code := decodeTraceProfileError(t, runTraceProfileRequest(t, body, "kingeye-apm")); code != tc.want {
-			t.Fatalf("ES version=%d got %s, want %s", tc.version, code, tc.want)
-		}
-	}
-}
-
-func TestESSummaryListUsesPublishedTargetInsteadOfDorisRoute(t *testing.T) {
-	withTraceProfileAuth(t, true, "kingeye-apm")
-	config := traceProfileRuntimeConfig()
-	config["es_summary_targets"] = []any{map[string]any{
-		"bk_tenant_id": "system", "bk_biz_id": 42, "app_id": 7,
-		"app_name":             "checkout",
-		"read_result_table_id": "system.trace_summary_es_v2",
-		"storage_cluster_id":   9, "retention_days": 7, "published_route_version": 7,
-	}}
-	withTraceProfileRuntime(t, config)
-	body := strings.Replace(typedTraceBody("trace_summary", "system_kapm"),
-		`"order_by":[]`, `"order_by":["-min_start_time","trace_id"]`, 1)
-	body = strings.Replace(body, `"limit":100}}`,
-		`"limit":2,"offset":1,"scene":"global","es_summary_list":{`+
-			`"backend":"elasticsearch","app_id":7,"bk_biz_id":42,"expected_route_version":7}}}`, 1)
-	called := false
-	traceProfileRuntimeValue.Load().esMemberReader = func(_ context.Context, query *structured.QueryTs) (
-		int64, []map[string]any, metadata.ResultTableOptions, []metadata.RouteInfo, error,
-	) {
-		called = true
-		if query.From != 1 || query.QueryList[0].TableID != "system.trace_summary_es_v2" {
-			t.Fatalf("ES list did not use published target: %+v", query)
-		}
-		return 1, nil, nil, []metadata.RouteInfo{{
-			TableID: "system.trace_summary_es_v2", StorageType: metadata.ElasticsearchStorageType, StorageID: "9",
-		}}, nil
-	}
-	recorder := runTraceProfileRequest(t, body, "kingeye-apm")
-	if !called || recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"total":1`) {
-		t.Fatalf("published ES list did not execute: called=%v status=%d body=%s", called, recorder.Code, recorder.Body.String())
-	}
-}
-
 func TestTraceProfileDirectReadEnforcesAuthorizedScope(t *testing.T) {
 	withTraceProfileRuntime(t, traceProfileRuntimeConfig())
 	withTraceProfileAuth(t, true, "kingeye-apm")
@@ -586,7 +449,7 @@ func TestTraceProfileDirectReadDisabledKeepsPinnedRejection(t *testing.T) {
 	if previous := traceProfileRuntimeValue.Swap(nil); previous != nil {
 		previous.close()
 	}
-	recorder := runTraceProfileRequest(t, typedTraceBody("trace_summary", "system_kapm"), "kingeye-apm")
+	recorder := runTraceProfileRequest(t, typedTraceBody("trace_span", "system_kapm"), "kingeye-apm")
 	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), traceProfileUnwiredMessage) {
 		t.Fatalf("unconfigured direct read must keep the pinned rejection: %d %s",
 			recorder.Code, recorder.Body.String())

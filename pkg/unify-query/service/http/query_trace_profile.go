@@ -65,50 +65,6 @@ type traceProfileRouteConfig struct {
 	PublishedVersion int64  `json:"published_route_version,omitempty"`
 }
 
-type traceProfileESTargetConfig struct {
-	BkTenantID       string `json:"bk_tenant_id"`
-	BkBizID          int64  `json:"bk_biz_id"`
-	AppID            int64  `json:"app_id"`
-	AppName          string `json:"app_name"`
-	ResultTableID    string `json:"read_result_table_id"`
-	StorageClusterID int64  `json:"storage_cluster_id"`
-	RetentionDays    int64  `json:"retention_days"`
-	// EntryIndexVersion 是发布方声明的入口索引版本；2 时跨应用父关系筛选与逐行复核才生效。
-	EntryIndexVersion int64 `json:"entry_index_version,omitempty"`
-	PublishedVersion  int64 `json:"published_route_version,omitempty"`
-}
-
-type traceProfileApplicationTopologyTargetConfig struct {
-	BkTenantID       string `json:"bk_tenant_id"`
-	Label            string `json:"label"`
-	Database         string `json:"database"`
-	Table            string `json:"table"`
-	ClusterID        string `json:"cluster_id"`
-	ClusterName      string `json:"cluster_name"`
-	SchemaVersion    string `json:"schema_version"`
-	RetentionDays    int64  `json:"retention_days"`
-	PublishedVersion int64  `json:"published_route_version"`
-}
-
-func normalizeApplicationTopologyTargetConfigs(
-	targets []traceProfileApplicationTopologyTargetConfig,
-) ([]traceProfileApplicationTopologyTargetConfig, error) {
-	if targets == nil {
-		return nil, nil
-	}
-	seen := make(map[string]bool, len(targets))
-	for _, target := range targets {
-		if target.Label != "application_edge" {
-			return nil, fmt.Errorf("应用拓扑读目标标签非法")
-		}
-		if seen[target.BkTenantID] {
-			return nil, fmt.Errorf("应用拓扑读目标重复")
-		}
-		seen[target.BkTenantID] = true
-	}
-	return targets, nil
-}
-
 type traceProfileConnectionConfig struct {
 	ClusterID      string       `json:"cluster_id"`
 	Host           string       `json:"host"`
@@ -122,22 +78,22 @@ type traceProfileConnectionConfig struct {
 }
 
 type traceProfileConfig struct {
-	RouteSnapshotVersion  int64                        `json:"route_snapshot_version"`
-	ReadTargetDataPath    string                       `json:"read_target_data_path,omitempty"`
-	ReadTargetVersionPath string                       `json:"read_target_version_path,omitempty"`
-	MaxBodyBytes          int                          `json:"max_body_bytes"`
-	MaxLimit              int64                        `json:"max_limit"`
-	MaxOffset             int64                        `json:"max_offset"`
-	MaxRangeDays          int64                        `json:"max_range_days"`
-	ReadRoutes            []traceProfileRouteConfig    `json:"read_routes"`
-	ESSummaryTargets      []traceProfileESTargetConfig `json:"es_summary_targets,omitempty"`
-	// 只接受旧部署配置的字段形状，不把旧目标用于当前应用拓扑查询。
-	LegacyApplicationTopologyTargets []traceProfileApplicationTopologyTargetConfig `json:"a3_targets,omitempty"`
-	ApplicationTopologyTargets       []traceProfileApplicationTopologyTargetConfig `json:"application_topology_targets,omitempty"`
-	ReadonlyConnections              []traceProfileConnectionConfig                `json:"readonly_connections"`
+	RouteSnapshotVersion  int64                          `json:"route_snapshot_version"`
+	ReadTargetDataPath    string                         `json:"read_target_data_path,omitempty"`
+	ReadTargetVersionPath string                         `json:"read_target_version_path,omitempty"`
+	MaxBodyBytes          int                            `json:"max_body_bytes"`
+	MaxLimit              int64                          `json:"max_limit"`
+	MaxOffset             int64                          `json:"max_offset"`
+	MaxRangeDays          int64                          `json:"max_range_days"`
+	ReadRoutes            []traceProfileRouteConfig      `json:"read_routes"`
+	ReadonlyConnections   []traceProfileConnectionConfig `json:"readonly_connections"`
 
-	AllowedBkAppCodes             []string `json:"allowed_bk_app_codes"`
-	MemberLookupAllowedBkAppCodes []string `json:"member_lookup_allowed_bk_app_codes"`
+	AllowedBkAppCodes []string `json:"allowed_bk_app_codes"`
+	// 已退役段：仍接受旧部署配置中的这些字段以完成滚动升级，但不解析、不生效。
+	MemberLookupAllowedBkAppCodes    []string        `json:"member_lookup_allowed_bk_app_codes,omitempty"`
+	LegacyApplicationTopologyTargets json.RawMessage `json:"a3_targets,omitempty"`
+	ApplicationTopologyTargets       json.RawMessage `json:"application_topology_targets,omitempty"`
+	ESSummaryTargets                 json.RawMessage `json:"es_summary_targets,omitempty"`
 }
 
 type jsonDuration struct {
@@ -163,22 +119,19 @@ func (d *jsonDuration) UnmarshalJSON(raw []byte) error {
 // traceProfileRuntime 是直连读取的全部运行时状态：可信路由快照、只读连接与预算。
 // 配置未提供或非法时保持 nil，请求一律 fail closed。
 type traceProfileRuntime struct {
-	executor       *traceprofile.Executor
-	esMemberReader esMemberRawReader
-	connections    map[string]*dorisclient.Instance
-	maxBodyBytes   int
-	maxLimit       int64
-	maxRangeUS     int64
-	esLimits       traceprofile.ESSummaryLimits
-	routeVersion   int64
-	routeCount     int
+	executor     *traceprofile.Executor
+	connections  map[string]*dorisclient.Instance
+	maxBodyBytes int
+	maxLimit     int64
+	maxRangeUS   int64
+	routeVersion int64
+	routeCount   int
 	// published 与 configDigest 仅发布源模式使用：configDigest 是构建该快照时的本地输入摘要
 	// （traceProfileConfigDigest）。
 	published    bool
 	configDigest [sha256.Size]byte
 
-	allowedAppCodes             []string
-	memberLookupAllowedAppCodes []string
+	allowedAppCodes []string
 }
 
 func (r *traceProfileRuntime) close() {
@@ -231,15 +184,10 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 	if err := decoder.Decode(&config); err != nil {
 		return nil, fmt.Errorf("Trace profile 直连读取配置非法: %w", err)
 	}
-	topologyTargetConfigs, err := normalizeApplicationTopologyTargetConfigs(config.ApplicationTopologyTargets)
-	if err != nil {
-		return nil, err
-	}
-	if len(config.ReadRoutes) == 0 && len(config.ReadonlyConnections) == 0 &&
-		len(config.ESSummaryTargets) == 0 && len(topologyTargetConfigs) == 0 {
+	if len(config.ReadRoutes) == 0 && len(config.ReadonlyConnections) == 0 {
 		return nil, nil
 	}
-	if (len(config.ReadRoutes) == 0 && len(topologyTargetConfigs) == 0) != (len(config.ReadonlyConnections) == 0) {
+	if (len(config.ReadRoutes) == 0) != (len(config.ReadonlyConnections) == 0) {
 		return nil, fmt.Errorf("Trace profile 直连读取必须同时提供读路由与只读连接")
 	}
 	if config.MaxBodyBytes <= 0 || config.MaxLimit <= 0 || config.MaxOffset <= 0 ||
@@ -318,32 +266,7 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 			Doris:            &target,
 		})
 	}
-	esTargets := make([]traceprofile.ESSummaryTarget, 0, len(config.ESSummaryTargets))
-	for _, target := range config.ESSummaryTargets {
-		esTargets = append(esTargets, traceprofile.ESSummaryTarget{
-			BkTenantID: target.BkTenantID, BkBizID: target.BkBizID,
-			AppID: target.AppID, AppName: target.AppName,
-			ResultTableID:     target.ResultTableID,
-			StorageClusterID:  target.StorageClusterID,
-			RetentionDays:     target.RetentionDays,
-			EntryIndexVersion: target.EntryIndexVersion,
-			PublishedVersion:  target.PublishedVersion,
-		})
-	}
-	topologyTargets := make([]traceprofile.ApplicationTopologyTarget, 0, len(topologyTargetConfigs))
-	for _, target := range topologyTargetConfigs {
-		if _, connected := connections[target.ClusterID]; !connected {
-			closeConnections()
-			return nil, fmt.Errorf("应用拓扑 读目标的集群缺少只读连接")
-		}
-		topologyTargets = append(topologyTargets, traceprofile.ApplicationTopologyTarget{
-			BkTenantID: target.BkTenantID, Label: target.Label,
-			Database: target.Database, Table: target.Table, ClusterID: target.ClusterID,
-			ClusterName: target.ClusterName, SchemaVersion: target.SchemaVersion,
-			RetentionDays: target.RetentionDays, PublishedVersion: target.PublishedVersion,
-		})
-	}
-	snapshot, err := traceprofile.NewRouteSnapshotWithAllTargets(config.RouteSnapshotVersion, routes, esTargets, topologyTargets)
+	snapshot, err := traceprofile.NewRouteSnapshot(config.RouteSnapshotVersion, routes)
 	if err != nil {
 		closeConnections()
 		return nil, err
@@ -361,18 +284,15 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 		return nil, err
 	}
 	return &traceProfileRuntime{
-		executor:       executor,
-		esMemberReader: queryESMemberRawWithTimeField,
-		connections:    connections,
-		maxBodyBytes:   config.MaxBodyBytes,
-		maxLimit:       config.MaxLimit,
-		maxRangeUS:     traceprofile.MaxWindowUS(config.MaxRangeDays),
-		esLimits:       traceprofile.NewESSummaryLimits(config.MaxLimit, config.MaxOffset),
-		routeVersion:   config.RouteSnapshotVersion,
-		routeCount:     len(routes),
+		executor:     executor,
+		connections:  connections,
+		maxBodyBytes: config.MaxBodyBytes,
+		maxLimit:     config.MaxLimit,
+		maxRangeUS:   traceprofile.MaxWindowUS(config.MaxRangeDays),
+		routeVersion: config.RouteSnapshotVersion,
+		routeCount:   len(routes),
 
-		allowedAppCodes:             config.AllowedBkAppCodes,
-		memberLookupAllowedAppCodes: config.MemberLookupAllowedBkAppCodes,
+		allowedAppCodes: config.AllowedBkAppCodes,
 	}, nil
 }
 
@@ -412,8 +332,7 @@ func prefixHasTraceEnvelope(probe []byte) bool {
 		if depth == 1 && expectKey {
 			if key, isKey := token.(string); isKey {
 				switch key {
-				case "trace_profile", "trace_contract_version", "trace_request",
-					"application_topology_contract_version", "application_topology_request":
+				case "trace_profile", "trace_contract_version", "trace_request":
 					return true
 				}
 			}
@@ -450,21 +369,13 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 	if err != nil {
 		return writeTraceProfileReject(ctx, c, span, traceprofile.CodeUnsupportedSchemaCapability, "Trace profile 请求体读取失败")
 	}
-	if isApplicationTopologyRangeEnvelope(body) {
-		return handleApplicationTopologyRangeQuery(c, ctx, span, runtime, verified, appCode, body)
-	}
 	request, err := traceprofile.ParseRequest(body, runtime.maxBodyBytes, runtime.maxLimit)
 	if err != nil {
 		return writeTraceProfileReject(ctx, c, span, traceprofile.CodeUnsupportedSchemaCapability, err.Error())
 	}
-	// 时间预算属于 typed 合同，Doris 与 ES 成员读取必须在分流前一致校验。
+	// 时间预算属于 typed 合同，Doris 读取必须在执行前一致校验。
 	if !traceprofile.WindowFits(request.StartUS, request.EndUS, runtime.maxRangeUS) {
 		return writeTraceProfileReject(ctx, c, span, traceprofile.CodeUnboundedRange, "Trace 查询时间范围超过预算")
-	}
-	if request.MemberLookup != nil || request.ESSummaryList != nil {
-		if err := authorizeTraceProfile(verified, appCode, runtime.memberLookupAllowedAppCodes); err != nil {
-			return writeTraceProfileReject(ctx, c, span, traceprofile.CodeUnauthorizedMember, err.Error())
-		}
 	}
 	user := metadata.GetUser(ctx)
 	dataTenantID := user.TenantID
@@ -473,33 +384,6 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 	scope, err := traceprofile.ResolveScope(dataTenantID, user.SpaceUID)
 	if err != nil {
 		return writeTraceProfileError(ctx, c, span, err)
-	}
-	isESMember := request.MemberLookup != nil && request.MemberLookup.Backend == traceprofile.MemberBackendElasticsearch
-	isESList := request.ESSummaryList != nil
-	var esTarget traceprofile.ESSummaryTarget
-	if isESMember || isESList {
-		pair := traceprofile.MemberPair{}
-		version := int64(0)
-		if isESMember {
-			pair = request.MemberLookup.AllowedPairs[0]
-			version = request.MemberLookup.ExpectedRouteVersion
-		} else {
-			pair = traceprofile.MemberPair{AppID: request.ESSummaryList.AppID, BkBizID: request.ESSummaryList.BkBizID}
-			version = request.ESSummaryList.ExpectedRouteVersion
-		}
-		if pair.BkBizID != scope.BkBizID {
-			return writeTraceProfileReject(ctx, c, span, traceprofile.CodeUnauthorizedMember, "ES Summary 成员业务不在受信空间内")
-		}
-		target, targetErr := runtime.executor.ResolveESSummaryTarget(
-			scope.BkTenantID, pair.BkBizID, pair.AppID,
-		)
-		if targetErr != nil {
-			return writeTraceProfileError(ctx, c, span, targetErr)
-		}
-		if target.PublishedVersion == 0 || target.PublishedVersion != version {
-			return writeTraceProfileReject(ctx, c, span, traceprofile.CodeScopePartial, "ES Summary 单租户发布版本尚未在 UQ 生效")
-		}
-		esTarget = target
 	}
 
 	span.Set("trace-profile", string(request.Profile))
@@ -524,14 +408,7 @@ func handleTraceProfileQuery(c *gin.Context, ctx context.Context, span *trace.Sp
 		c.JSON(http.StatusOK, traceprofile.NewAggregateResponse(request, rows))
 		return nil
 	}
-	var page traceprofile.Page
-	if isESMember {
-		page, err = executeESMemberLookup(ctx, request, scope, esTarget, runtime.esMemberReader, runtime.esLimits)
-	} else if isESList {
-		page, err = executeESList(ctx, request, scope, esTarget, runtime.esMemberReader, runtime.esLimits)
-	} else {
-		page, err = runtime.executor.Execute(ctx, request, scope)
-	}
+	page, err := runtime.executor.Execute(ctx, request, scope)
 	if err != nil {
 		return writeTraceProfileError(ctx, c, span, err)
 	}

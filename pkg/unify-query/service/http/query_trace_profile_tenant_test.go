@@ -197,81 +197,19 @@ func TestTraceRemovedSingleTenantIDFieldFailsAtLoad(t *testing.T) {
 	}
 }
 
-func TestTraceStaticApplicationTopologyTargetsAcceptDescriptivePublicationField(t *testing.T) {
-	config := traceProfileRuntimeConfig()
-	config["read_routes"] = []any{}
-	config["application_topology_targets"] = []any{
-		map[string]any{
-			"bk_tenant_id": "system", "label": "application_edge", "database": "system_kapm",
-			"table": "kapm_application_edge_observed_1m", "cluster_id": "18", "cluster_name": "doris",
-			"schema_version": "sha256:8e56c7a2af5bd73b", "retention_days": 30, "published_route_version": 7,
-		},
-	}
-	runtime, err := newTraceProfileRuntime(config)
-	if err != nil {
-		t.Fatalf("descriptive application topology target rejected: %v", err)
-	}
-	defer runtime.close()
-}
-
-func TestLegacyStaticTopologyFieldKeepsOrdinaryTraceRuntime(t *testing.T) {
+// 已退役的静态发布字段只用于滚动升级兼容，不得改变 Span 运行时。
+func TestRetiredStaticPublicationFieldsDoNotAffectRuntime(t *testing.T) {
 	config := traceProfileRuntimeConfig()
 	config["a3_targets"] = []any{map[string]any{"bk_tenant_id": "system", "label": "a3_edge"}}
+	config["application_topology_targets"] = []any{map[string]any{"bk_tenant_id": "system", "label": "application_edge"}}
+	config["es_summary_targets"] = []any{map[string]any{"bk_tenant_id": "system", "app_id": 7}}
+	config["member_lookup_allowed_bk_app_codes"] = []string{"kingeye-apm"}
 	runtime, err := newTraceProfileRuntime(config)
 	if err != nil || runtime == nil {
-		t.Fatalf("legacy static topology field blocked Trace runtime: %v", err)
+		t.Fatalf("retired static fields blocked Trace runtime: %v", err)
 	}
 	defer runtime.close()
-	if runtime.routeCount == 0 {
-		t.Fatal("legacy static topology field removed ordinary Trace routes")
-	}
-}
-
-func TestApplicationTopologyQueryRespondsWithDescriptiveContract(t *testing.T) {
-	config := traceProfileRuntimeConfig()
-	config["read_routes"] = config["read_routes"].([]any)[:1]
-	withTraceProfileRuntime(t, config)
-	withTraceProfileAuth(t, true, "kingeye-apm")
-	targets := []traceprofile.ApplicationTopologyTarget{
-		{BkTenantID: "default", Label: "application_edge", Database: "default_kapm",
-			Table: "kapm_application_edge_observed_1m", ClusterID: "18", ClusterName: "doris",
-			SchemaVersion: "sha256:8e56c7a2af5bd73b", RetentionDays: 30, PublishedVersion: 7},
-	}
-	snapshot, err := traceprofile.NewRouteSnapshotWithAllTargets(7, nil, nil, targets)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reader := tenantScopeQuerier(func(context.Context, string, ...any) (dorisclient.Result, error) {
-		return dorisclient.Result{Rows: []map[string]any{}}, nil
-	})
-	executor, err := traceprofile.NewExecutor(snapshot, map[string]traceprofile.Querier{"18": reader}, traceprofile.Limits{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	traceProfileRuntimeValue.Load().executor = executor
-	query := traceprofile.ApplicationTopologyRangeQuery{
-		ProtocolVersion: "application_topology_range_v2", ExpectedRouteVersion: 7,
-		Request: traceprofile.ApplicationTopologyRangeRequest{ContractVersion: "application_topology_range_v2", StartMS: 1760572800000, EndMS: 1760573700000,
-			Applications: []traceprofile.ApplicationTopologyApplication{{NamespaceID: 11, BkBizID: 42}}, MaxPairs: 100},
-	}
-	fingerprint := traceprofile.ApplicationTopologyRangeFingerprint("default", query)
-	body := fmt.Sprintf(`{"application_topology_contract_version":"application_topology_range_v2",`+
-		`"application_topology_request":{"expected_scope_fingerprint":"%s",`+
-		`"expected_route_version":7,"start_time_ms":1760572800000,"end_time_ms":1760573700000,`+
-		`"applications":[{"namespace_id":11,"bk_biz_id":42}],"max_pairs":100}}`, fingerprint)
-	recorder := runTraceProfileRequestAs(t, body, "default")
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("application topology query failed: %d %s", recorder.Code, recorder.Body.String())
-	}
-	var response map[string]any
-	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
-		t.Fatal(err)
-	}
-	if response["application_topology_contract_version"] != "application_topology_range_v2" ||
-		response["expected_minutes"] != float64(15) {
-		t.Fatalf("application topology response contract missing: %v", response)
-	}
-	if _, hasCoverage := response["coverage"]; hasCoverage {
-		t.Fatal("observed-only response must not include coverage")
+	if runtime.routeCount != 1 {
+		t.Fatalf("retired static fields changed Span routes: %+v", runtime)
 	}
 }

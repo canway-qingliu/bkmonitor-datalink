@@ -11,7 +11,7 @@ package traceprofile
 
 import "github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 
-// Complete physical row contracts stay independent of the storage transport.
+// Complete physical row contract stays independent of the storage transport.
 var spanProjection = []string{
 	"app_id", "span_date", "trace_id", "span_id",
 	"space_uid", "bk_biz_id", "data_id", "app_name", "parent_span_id", "trace_state",
@@ -20,19 +20,6 @@ var spanProjection = []string{
 	"deployment_environment", "resource", "attributes", "events", "links", "ingest_time",
 }
 
-var summaryProjection = []string{
-	"trace_date", "bk_biz_id", "app_id", "trace_id",
-	"app_name", "trace_start_time_us", "trace_end_time_us", "duration_us", "span_count",
-	"error_count", "service_count", "hierarchy_count", "span_min_duration_us", "span_max_duration_us",
-	"event_time_ms", "root_service_name", "root_service_span_id", "root_service_span_name",
-	"root_service_kind", "root_service_category", "root_service_status_code", "root_span_id",
-	"root_span_name", "root_span_service_name", "root_span_kind", "category_statistics",
-	"kind_statistics", "partial", "computed_at_ms",
-}
-
 func projectionForProfile(profile metadata.TraceProfile) []string {
-	if profile == metadata.TraceProfileSpan {
-		return spanProjection
-	}
-	return summaryProjection
+	return spanProjection
 }

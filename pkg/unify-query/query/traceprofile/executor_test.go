@@ -35,21 +35,14 @@ func (f *fakeQuerier) Query(_ context.Context, statement string, args ...any) (d
 	if f.err != nil {
 		return dorisclient.Result{}, f.err
 	}
-	if strings.HasPrefix(statement, "SELECT COUNT(*)") {
-		return dorisclient.Result{Rows: []map[string]any{{"total": f.total}}}, nil
-	}
 	if strings.HasPrefix(statement, "WITH ") {
 		total := f.total
 		if f.snapshotTotal != nil {
 			total = *f.snapshotTotal
 		}
 		if len(f.rows) == 0 {
-			profile := metadata.TraceProfileSpan
-			if strings.Contains(statement, "otel_trace_summary") {
-				profile = metadata.TraceProfileSummary
-			}
 			empty := map[string]any{"total": total}
-			for _, column := range projectionForProfile(profile) {
+			for _, column := range projectionForProfile(metadata.TraceProfileSpan) {
 				empty[column] = nil
 			}
 			return dorisclient.Result{Rows: []map[string]any{empty}}, nil
@@ -94,7 +87,7 @@ func testSnapshot(t *testing.T, profiles ...metadata.TraceProfile) *RouteSnapsho
 func testExecutor(t *testing.T, querier Querier, profiles ...metadata.TraceProfile) *Executor {
 	t.Helper()
 	if len(profiles) == 0 {
-		profiles = []metadata.TraceProfile{metadata.TraceProfileSpan, metadata.TraceProfileSummary}
+		profiles = []metadata.TraceProfile{metadata.TraceProfileSpan}
 	}
 	executor, err := NewExecutor(testSnapshot(t, profiles...), map[string]Querier{"18": querier}, Limits{})
 	if err != nil {
@@ -162,10 +155,6 @@ func validTraceRow(profile metadata.TraceProfile) map[string]any {
 // Doris 侧的原样（文本、整型），由执行器的解码桥接成行合同要求的类型。
 func traceFixtureValue(field string) any {
 	switch field {
-	case "bk_tenant_id":
-		return testTenant
-	case "observation_domain_id":
-		return testDomain
 	case "space_uid":
 		return testSpaceUID
 	case "bk_biz_id":
@@ -178,16 +167,12 @@ func traceFixtureValue(field string) any {
 		return "0123456789abcdef0123456789abcdef"
 	case "span_id":
 		return "0123456789abcdef"
-	case "span_date", "trace_date":
+	case "span_date":
 		return "2026-09-23"
-	case "partial":
-		return int64(1)
-	case "resource", "attributes", "category_statistics", "kind_statistics":
+	case "resource", "attributes":
 		return `{"k": 1}`
 	case "events", "links":
 		return `[{"k": 1}]`
-	case "root_service_status_code":
-		return `200`
 	}
 	if _, integer := traceIntegerFields[field]; integer {
 		return int64(1)
@@ -247,26 +232,25 @@ func TestExecutorReturnsShapedPageWithRealTotal(t *testing.T) {
 
 func TestExecutorRejectsIncompleteOrExcessListPage(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		profile metadata.TraceProfile
-		total   int64
-		rows    int
-		limit   int64
+		name  string
+		total int64
+		rows  int
+		limit int64
 	}{
-		{name: "span short page", profile: metadata.TraceProfileSpan, total: 2, rows: 1, limit: 2},
-		{name: "summary missing page", profile: metadata.TraceProfileSummary, total: 1, rows: 0, limit: 2},
-		{name: "summary excess page", profile: metadata.TraceProfileSummary, total: 1, rows: 2, limit: 2},
+		{name: "short page", total: 2, rows: 1, limit: 2},
+		{name: "missing page", total: 1, rows: 0, limit: 2},
+		{name: "excess page", total: 1, rows: 2, limit: 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rows := make([]map[string]any, tc.rows)
 			for i := range rows {
-				rows[i] = validTraceRow(tc.profile)
+				rows[i] = validTraceRow(metadata.TraceProfileSpan)
 			}
 			querier := &fakeQuerier{total: tc.total, rows: rows}
-			request := testRequest(tc.profile)
+			request := testRequest(metadata.TraceProfileSpan)
 			request.Limit = tc.limit
 
-			_, err := testExecutor(t, querier, tc.profile).Execute(context.Background(), request, testScope(t))
+			_, err := testExecutor(t, querier).Execute(context.Background(), request, testScope(t))
 			if err == nil || ErrorCode(err) != CodePartialFailure {
 				t.Fatalf("COUNT/Page mismatch returned %s (%v), want %s", ErrorCode(err), err, CodePartialFailure)
 			}
@@ -276,12 +260,12 @@ func TestExecutorRejectsIncompleteOrExcessListPage(t *testing.T) {
 
 func TestExecutorKeepsTotalForPageBeyondEnd(t *testing.T) {
 	querier := &fakeQuerier{total: 2}
-	request := testRequest(metadata.TraceProfileSummary)
+	request := testRequest(metadata.TraceProfileSpan)
 	request.Limit = 1
 	offset := int64(2)
 	request.Offset = &offset
 
-	page, err := testExecutor(t, querier, metadata.TraceProfileSummary).Execute(context.Background(), request, testScope(t))
+	page, err := testExecutor(t, querier).Execute(context.Background(), request, testScope(t))
 	if err != nil || page.Total != 2 || len(page.Items) != 0 {
 		t.Fatalf("empty page lost real total: page=%#v err=%v", page, err)
 	}
@@ -290,200 +274,7 @@ func TestExecutorKeepsTotalForPageBeyondEnd(t *testing.T) {
 	}
 }
 
-func TestExecutorDecodesSummaryPartialIntoBoolean(t *testing.T) {
-	querier := &fakeQuerier{total: 1, rows: []map[string]any{validTraceRow(metadata.TraceProfileSummary)}}
-	executor := testExecutor(t, querier)
-
-	page, err := executor.Execute(context.Background(), testRequest(metadata.TraceProfileSummary), testScope(t))
-	if err != nil {
-		t.Fatalf("Execute returned error: %v", err)
-	}
-	values := page.Items[0]["values"].(map[string]any)
-	if values["partial"] != true {
-		t.Fatalf("partial was not decoded into bool: %#v", values["partial"])
-	}
-	if _, isObject := values["kind_statistics"].(map[string]any); !isObject {
-		t.Fatalf("JSON column was not decoded into object: %#v", values["kind_statistics"])
-	}
-}
-
-func TestExecutorMemberLookupRejectsOverflowBeforeReadingRows(t *testing.T) {
-	querier := &fakeQuerier{total: 2, rows: []map[string]any{validTraceRow(metadata.TraceProfileSummary)}}
-	executor := testExecutor(t, querier, metadata.TraceProfileSummary)
-	request := testRequest(metadata.TraceProfileSummary)
-	request.Scene = "global"
-	request.Limit = 1
-	request.MemberLookup = &MemberLookup{TraceID: "0123456789abcdef0123456789abcdef", ExpectedRouteVersion: 3,
-		AllowedPairs: []MemberPair{{AppID: 7, BkBizID: 7}}}
-
-	_, err := executor.Execute(context.Background(), request, testScope(t))
-	if ErrorCode(err) != CodeLimitExceeded || len(querier.statements) != 1 {
-		t.Fatalf("member overflow must stop after count: code=%s statements=%#v", ErrorCode(err), querier.statements)
-	}
-}
-
-func TestExecutorMemberLookupRejectsStalePublishedRouteBeforeQuery(t *testing.T) {
-	querier := &fakeQuerier{total: 0}
-	request := testRequest(metadata.TraceProfileSummary)
-	request.Scene = "global"
-	request.MemberLookup = &MemberLookup{TraceID: "0123456789abcdef0123456789abcdef",
-		ExpectedRouteVersion: 2, AllowedPairs: []MemberPair{{AppID: 7, BkBizID: 7}}}
-
-	_, err := testExecutor(t, querier, metadata.TraceProfileSummary).Execute(
-		context.Background(), request, testScope(t))
-	if ErrorCode(err) != CodeScopePartial || len(querier.statements) != 0 {
-		t.Fatalf("stale route was queried or accepted: code=%s statements=%#v", ErrorCode(err), querier.statements)
-	}
-}
-
-func TestExecutorDoesNotRouteESMemberLookupIntoDoris(t *testing.T) {
-	querier := &fakeQuerier{total: 0}
-	request := testRequest(metadata.TraceProfileSummary)
-	request.Scene = "global"
-	request.MemberLookup = &MemberLookup{Backend: MemberBackendElasticsearch,
-		TraceID: "0123456789abcdef0123456789abcdef", ExpectedRouteVersion: 3,
-		AllowedPairs: []MemberPair{{AppID: 7, BkBizID: 7}}}
-	_, err := testExecutor(t, querier, metadata.TraceProfileSummary).Execute(context.Background(), request, testScope(t))
-	if ErrorCode(err) != CodeUnsupportedSchemaCapability || len(querier.statements) != 0 {
-		t.Fatalf("ES member lookup entered Doris executor: code=%s queries=%#v", ErrorCode(err), querier.statements)
-	}
-}
-
-func TestExecutorMemberLookupUsesTenantPublicationVersionInsteadOfAggregateSnapshot(t *testing.T) {
-	document, err := ParsePublishedDocument([]byte(business132Document), "system")
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := NewRouteSnapshot(999, document.Routes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	querier := &fakeQuerier{total: 0}
-	executor, err := NewExecutor(snapshot, map[string]Querier{"18": querier}, Limits{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	scope, err := ResolveScope("system", "bkcc__132")
-	if err != nil {
-		t.Fatal(err)
-	}
-	request := testRequest(metadata.TraceProfileSummary)
-	request.Scene = "global"
-	request.MemberLookup = &MemberLookup{TraceID: "0123456789abcdef0123456789abcdef",
-		ExpectedRouteVersion: 7, AllowedPairs: []MemberPair{{AppID: 7, BkBizID: 132}}}
-
-	if _, err := executor.Execute(context.Background(), request, scope); err != nil || len(querier.statements) != 2 {
-		t.Fatalf("tenant-published route was rejected by aggregate version: err=%v statements=%#v", err, querier.statements)
-	}
-}
-
-func TestExecutorMemberLookupRejectsStaticRouteWithoutPublishedVersion(t *testing.T) {
-	querier := &fakeQuerier{total: 0}
-	snapshot := testSnapshot(t, metadata.TraceProfileSummary)
-	key := routeKey(testTenant, testBizID, metadata.TraceProfileSummary)
-	route := snapshot.routes[key]
-	route.PublishedVersion = 0
-	snapshot.routes[key] = route
-	executor, err := NewExecutor(snapshot, map[string]Querier{"18": querier}, Limits{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	request := testRequest(metadata.TraceProfileSummary)
-	request.Scene = "global"
-	request.MemberLookup = &MemberLookup{TraceID: "0123456789abcdef0123456789abcdef",
-		ExpectedRouteVersion: 3, AllowedPairs: []MemberPair{{AppID: 7, BkBizID: 7}}}
-
-	_, err = executor.Execute(context.Background(), request, testScope(t))
-	if ErrorCode(err) != CodeScopePartial || len(querier.statements) != 0 {
-		t.Fatalf("static route cannot attest a tenant publication: code=%s statements=%#v", ErrorCode(err), querier.statements)
-	}
-}
-
-func TestExecutorMemberLookupReturnsAllExactAuthorizedSummaryRows(t *testing.T) {
-	row := validTraceRow(metadata.TraceProfileSummary)
-	row["app_id"] = "7"
-	querier := &fakeQuerier{total: 1, rows: []map[string]any{row}}
-	request := testRequest(metadata.TraceProfileSummary)
-	request.Scene = "global"
-	request.Limit = 2
-	request.MemberLookup = &MemberLookup{TraceID: "0123456789abcdef0123456789abcdef", ExpectedRouteVersion: 3,
-		AllowedPairs: []MemberPair{{AppID: 7, BkBizID: 7}}}
-
-	page, err := testExecutor(t, querier, metadata.TraceProfileSummary).Execute(
-		context.Background(), request, testScope(t))
-	if err != nil || page.Total != 1 || len(page.Items) != 1 || page.Items[0]["app_id"] != "7" {
-		t.Fatalf("exact authorized member was not returned: page=%#v err=%v", page, err)
-	}
-	if len(querier.statements) != 2 {
-		t.Fatalf("member lookup must count and fetch the whole bounded result: %#v", querier.statements)
-	}
-	if !strings.HasPrefix(querier.statements[0], "SELECT COUNT(*)") ||
-		!strings.HasPrefix(querier.statements[1], "WITH ") {
-		t.Fatalf("member rows must come from their own total/page snapshot: %#v", querier.statements)
-	}
-}
-
-func TestExecutorMemberLookupRejectsGrowthAfterBudgetPrecheck(t *testing.T) {
-	row := validTraceRow(metadata.TraceProfileSummary)
-	row["app_id"] = "7"
-	newTotal := int64(2)
-	querier := &fakeQuerier{total: 1, snapshotTotal: &newTotal, rows: []map[string]any{row}}
-	request := testRequest(metadata.TraceProfileSummary)
-	request.Scene = "global"
-	request.Limit = 1
-	request.MemberLookup = &MemberLookup{TraceID: "0123456789abcdef0123456789abcdef", ExpectedRouteVersion: 3,
-		AllowedPairs: []MemberPair{{AppID: 7, BkBizID: 7}}}
-
-	_, err := testExecutor(t, querier, metadata.TraceProfileSummary).Execute(
-		context.Background(), request, testScope(t))
-	if err == nil || ErrorCode(err) != CodeLimitExceeded {
-		t.Fatalf("member growth after precheck was returned as complete: code=%s err=%v", ErrorCode(err), err)
-	}
-}
-
-func TestExecutorMemberLookupRejectsRowsOutsidePairedScopeAndTruncation(t *testing.T) {
-	request := testRequest(metadata.TraceProfileSummary)
-	request.Scene = "global"
-	request.Limit = 2
-	request.MemberLookup = &MemberLookup{TraceID: "0123456789abcdef0123456789abcdef", ExpectedRouteVersion: 3,
-		AllowedPairs: []MemberPair{{AppID: 7, BkBizID: 7}}}
-	for name, mutate := range map[string]func(map[string]any){
-		"wrong app": func(row map[string]any) { row["app_id"] = "8" },
-		"unknown app with zero business": func(row map[string]any) {
-			row["app_id"] = "9"
-			row["bk_biz_id"] = int64(0)
-		},
-		"wrong trace": func(row map[string]any) { row["trace_id"] = "11111111111111111111111111111111" },
-	} {
-		t.Run(name, func(t *testing.T) {
-			row := validTraceRow(metadata.TraceProfileSummary)
-			row["app_id"] = "7"
-			mutate(row)
-			querier := &fakeQuerier{total: 1, rows: []map[string]any{row}}
-			_, err := testExecutor(t, querier, metadata.TraceProfileSummary).Execute(
-				context.Background(), request, testScope(t))
-			if ErrorCode(err) != CodeUnauthorizedMember {
-				t.Fatalf("out-of-scope member row was accepted: %v", err)
-			}
-		})
-	}
-	querier := &fakeQuerier{total: 1}
-	_, err := testExecutor(t, querier, metadata.TraceProfileSummary).Execute(
-		context.Background(), request, testScope(t))
-	if ErrorCode(err) != CodePartialFailure {
-		t.Fatalf("missing row was reported as a complete member result: %v", err)
-	}
-}
-
 func TestExecutorFailsClosedOnRouting(t *testing.T) {
-	t.Run("route missing for profile", func(t *testing.T) {
-		executor := testExecutor(t, &fakeQuerier{}, metadata.TraceProfileSummary)
-		_, err := executor.Execute(context.Background(), testRequest(metadata.TraceProfileSpan), testScope(t))
-		if ErrorCode(err) != CodeRouteNotFound {
-			t.Fatalf("got %v, want %s", err, CodeRouteNotFound)
-		}
-	})
-
 	t.Run("cluster has no readonly connection", func(t *testing.T) {
 		executor, err := NewExecutor(
 			testSnapshot(t, metadata.TraceProfileSpan), map[string]Querier{"99": &fakeQuerier{}}, Limits{},
@@ -497,7 +288,7 @@ func TestExecutorFailsClosedOnRouting(t *testing.T) {
 		}
 	})
 
-	t.Run("observation domain outside route", func(t *testing.T) {
+	t.Run("unknown tenant outside route", func(t *testing.T) {
 		target := testTarget(metadata.TraceProfileSpan)
 		route := ReadRoute{
 			BkTenantID: testTenant, BkBizID: testBizID, Profile: metadata.TraceProfileSpan,
@@ -552,13 +343,6 @@ func TestExecutorFailsClosedOnStorageAndContract(t *testing.T) {
 			querier: &fakeQuerier{total: 1},
 			mutate: func(row map[string]any) {
 				delete(row, "attributes")
-			},
-		},
-		{
-			name:    "partial not boolean",
-			querier: &fakeQuerier{total: 1},
-			mutate: func(row map[string]any) {
-				row["partial"] = "maybe"
 			},
 		},
 		{

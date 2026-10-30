@@ -420,11 +420,11 @@
 
 **请求体**: 同结构体查询
 
-`trace_profile`、`trace_contract_version`、`trace_request` 是 `trace_query_v2` 的 typed Trace 信封；出现任一字段（包括显式 `null`）时不能作为普通 raw 查询返回成功。UQ 对 `trace_span` / `trace_summary` 依据 Kingeye Metadata 的逐业务 Consul 读目标直连 Doris，库表由受信 `(租户, 业务, profile)` 路由确定；只读连接、JWT 验证及专用 app code 允许列表缺失时明确返回 400，不回落到 BKSQL/QueryEngine。typed 时间为 UTC epoch **微秒字符串**，结束时间为排他边界；Span/Summary 均支持预算内的 `offset`，`offset` 与 `page_token` 不能同时使用；直读配置 `max_offset` 必须为正数。客户端不得提交 RT、库表、集群或 SQL。结构化 `/query/ts` 和 raw-with-scroll 拒绝 typed 信封，普通 raw 请求沿用原路径。A3 边/覆盖直读与目标环境验收另行完成。
+`trace_profile`、`trace_contract_version`、`trace_request` 是 `trace_query_v2` 的 typed Trace 信封；出现任一字段（包括显式 `null`）时不能作为普通 raw 查询返回成功。UQ 只服务 `trace_span`：依据 Kingeye Metadata 的逐业务 Consul 读目标直连 Doris，库表由受信 `(租户, 业务, profile)` 路由确定；只读连接、JWT 验证及专用 app code 允许列表缺失时明确返回 400，不回落到 BKSQL/QueryEngine。typed 时间为 UTC epoch **微秒字符串**，结束时间为排他边界；Span 支持预算内的 `offset`，`offset` 与 `page_token` 不能同时使用；直读配置 `max_offset` 必须为正数。客户端不得提交 RT、库表、集群或 SQL。结构化 `/query/ts` 和 raw-with-scroll 拒绝 typed 信封，普通 raw 请求沿用原路径。`trace_summary`、ES Summary 成员/列表与应用拓扑 typed 查询已从 UQ 退役，改由 KAPM 直接查询 Doris / ES；旧发布文档与旧静态配置中的 `es_summary_targets`、`application_topology_targets`、`a3_targets` 段仅为滚动升级兼容被忽略，不产生查询路由。
 
 `trace_query_v3` 在同一 `/query/ts/raw` typed 入口表达受控服务端聚合；原生仪表盘的 `COUNT` 模式必须带
 `trace_request.aggregation={"method":"count","interval_seconds":正整数,"timezone_offset_seconds":整数,"group_by":[]}`；
-V2 列表仍拒绝该字段，V3 不带聚合也拒绝。聚合请求不能混用 `offset`、`order_by` 或 `member_lookup`，
+V2 列表仍拒绝该字段，V3 不带聚合也拒绝。聚合请求不能混用 `offset` 或 `order_by`，
 最多五个直接标量分组字段，JSON/VARIANT 和受信身份列不可分组。UQ 在受信物理表上先固定租户、业务与
 调用方收窄的应用谓词，再按 UTC 微秒时间列和固定时区偏移编译有界分桶 SQL；调用方不能指定库表或 SQL。
 响应只含版本、profile、scope fingerprint、`product_state=null` 与 `buckets[]`（每项为
@@ -433,13 +433,7 @@ V2 列表仍拒绝该字段，V3 不带聚合也拒绝。聚合请求不能混�
 
 `trace_query_v3` 的 `trace_span` 另接受闭合的 `aggregation={"method":"task_summary"}`。此模式只允许单应用 `app_id` 等值条件和可选的 `service_name` 等值条件，最长 24 小时、最多 5,000 个任务分组，不接受分页、排序、客户端 SQL 或 JSON 表达式。UQ 复用受信 Doris Span 读路由与租户/业务/应用/微秒时间谓词，在物理表中按固定的 Celery、APScheduler、Java 调度及 Plugind 根 Span 规则分组；响应沿用 V3 信封，`buckets[]` 每项为 `service_name/task_type/task_name/execution_count/failure_count/avg_duration_ms/max_duration_ms/last_called_ms/latest_trace_id`。超过分组上限、查询失败或结果字段非法时整次报错，不返回截断统计；Kingeye 仅在完整任务桶上执行关键字过滤、稳定排序和分页。此模式不改变既有 `count` 聚合及普通 typed Trace 列表。
 
-T6.6 的 Doris `trace_summary` 内部 `member_lookup` 形如 `{"trace_id":"<32 位小写 hex>","expected_route_version":3,"allowed_pairs":[{"app_id":7,"bk_biz_id":42}]}`，只接受 `scene=global`、空过滤/排序且无 offset 的请求。允许对按业务 ID、应用 ID 严格排序并去重，单请求最多 128 对，且每对业务必须等于受信空间对应的业务物理表；UQ 在 SQL 前要求期望版本与已加载的发布读路由快照一致。SQL 使用成对 OR 条件与精确 Trace ID，不把两列拆成独立 IN。真实命中数超过 `limit`、查询行数不等于 total 或回包出现范围外行均失败，不返回截断成员。该模式还要求 `trace_profile.member_lookup_allowed_bk_app_codes` 单独授权，默认关闭。KAPM 授权目录编排、ES 分支、保留期覆盖和目标读回仍由 T6.6 后续验收。
-
-Kingeye 单租户发布物可选 `es_summary_targets`，每项目标包含租户、业务、应用 ID/名称、观测域、新 ES Summary 逻辑 `read_result_table_id`、ES 存储集群与保留期。UQ 现严格解析并随发布版本冻结这些候选路由；旧发布文档不含此段时继续加载 Doris。A3 段此阶段仅检查为数组，不加载为查询路由。启用 Kingeye 的 `--include-es-summary` 前须先部署能解析该段的 UQ，目标 RT→读别名、索引暖机和真实行仍须独立验证。
-
-`member_lookup.backend` 可显式为 `elasticsearch`，省略时按原 Doris 分支执行；ES 模式只接受一个 `(app_id,bk_biz_id)` 对。UQ 先按已发布的租户/业务/应用/域目标和单租户版本核对，再用受信逻辑 RT 生成精确 Trace、成对应用/业务、租户/域及微秒时间条件，走现有 raw ES 执行器。实际 RT 路由的时间字段必须在 ES I/O 前解析为 `min_start_time/long/microsecond`，默认 `dtEventTimeStamp` 明确拒绝；校验后的路由引用直接用于 ES 执行，避免再次解析时切到不同的时间字段。返回前复核 RT、ES 存储类型/集群、真实 total、全部命中行和版本，把兼容 ES Summary 字段转换为闭合 typed Summary 行；任一子路由部分失败拒绝整次。本地模拟 Metadata RT 与 ES `_search` 已跑通真实 raw 路由，统计对象的点号展平字段按 Flink 固定的 6+4 键完整还原。目标 RT 读别名、ES mapping、保留期暖机与真实数据面仍待验证，不代表 T6.6 产品准入。
-
-可选本机真 ES 验证：设置 `ES_TEST_URL`（只接受 loopback HTTP）、`ES_TEST_USERNAME`、`ES_TEST_PASSWORD`，运行 `go test ./service/http -run '^TestESSummaryMemberLookupAgainstLocalElasticsearch$' -count=1`。测试在隔离临时索引及读别名写入同 Trace 的目标/外来应用 Summary，用真实 ES mapping 和 `_search` 验证精确过滤、typed 行及统计字段还原，结束时删除临时索引。缺环境变量时跳过；这不证明目标 RT 与目标读别名、保留期暖机或真实业务数据可查。
+T6.6 的 Doris `trace_summary` 内部 `member_lookup`、Kingeye 单租户发布物中的 `es_summary_targets` 以及 `member_lookup.backend=elasticsearch` 的 ES Summary 读路径均已退役：UQ 不再解析或执行这些模式，Summary 与应用拓扑由 KAPM 直接查询 Doris / ES。旧发布文档中的对应字段仍被容忍但不会进入查询路由，旧客户端提交 `member_lookup` / `es_summary_list` 会因闭合 JSON 校验被拒绝。
 
 `query_list[].exact_total`（bool，默认 `false`）：请求 Elasticsearch 返回精确命中总数（`track_total_hits`）。仅对单个、非聚合、全部路由到 ES 的原始查询生效（不含 `sql`、`scroll`、`collapse`、多查询合并），其他情况直接报错而不是返回看似精确的总数；ES 响应超时、分片失败或 `total.relation` 不为 `eq` 时报错；任一 ES 路由缺少索引前缀时报错（不请求时仍按原逻辑跳过该路由）。满足时响应带 `"total_exact": true`。不设置时请求体与响应与之前一致。
 

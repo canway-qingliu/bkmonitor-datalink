@@ -24,7 +24,6 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/consul"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/traceprofile"
 )
 
 const (
@@ -32,11 +31,18 @@ const (
 	consulTraceVersionPath = "test/unify-query/version/trace/read_target"
 )
 
-// tracePublicationFor 是租户 tenant 的一份完整发布文档：Doris 双 profile 与一个 ES Summary 目标。
+// tracePublicationFor 是租户 tenant 的一份完整发布文档：一条业务 Span 读路由。
 func tracePublicationFor(tenant string) string {
-	document := strings.Replace(publishedBusiness132, `"application_topology_targets":[]`,
-		`"application_topology_targets":[],"es_summary_targets":`+publishedESSummaryTargets, 1)
-	return strings.ReplaceAll(document, "system", tenant)
+	return strings.ReplaceAll(publishedBusiness132, "system", tenant)
+}
+
+// installedRouteCount 返回当前运行时的读路由数；运行时未安装时为 0。
+func installedRouteCount() int {
+	runtime := traceProfileRuntimeValue.Load()
+	if runtime == nil {
+		return 0
+	}
+	return runtime.routeCount
 }
 
 // consulTracePublication 用可替换的文档与读错误驱动 Consul 发布源。
@@ -123,15 +129,6 @@ func resetTraceProfileLoader(t *testing.T) {
 	})
 }
 
-func resolveTenantTarget(tenant string) error {
-	runtime := traceProfileRuntimeValue.Load()
-	if runtime == nil {
-		return errors.New("no Trace runtime installed")
-	}
-	_, err := runtime.executor.ResolveESSummaryTarget(tenant, 132, 7)
-	return err
-}
-
 // F4：一次读取失败不能扔掉可用快照。
 func TestTraceTransientConsulReadErrorKeepsLastGoodSnapshot(t *testing.T) {
 	publication := withConsulTracePublication(t, map[string]string{"system": tracePublicationFor("system")})
@@ -169,20 +166,16 @@ func TestInvalidDocumentRevokesOnlyItsTenant(t *testing.T) {
 	if err := reloadTraceProfilePublishedRuntime(); err != nil {
 		t.Fatal(err)
 	}
-	if resolveTenantTarget("system") != nil || resolveTenantTarget("other") != nil {
-		t.Fatal("both tenants should be served before the invalid publication")
+	if installedRouteCount() != 2 {
+		t.Fatalf("both tenant routes should be served before the invalid publication: %d", installedRouteCount())
 	}
 	publication.set("other", strings.Replace(tracePublicationFor("other"), "otel_trace_span_132", "otel_trace_span_133", 1))
 	err := reloadTraceProfilePublishedRuntime()
 	if err == nil || !strings.Contains(err.Error(), "other") {
 		t.Fatalf("invalid document was not reported with its tenant: %v", err)
 	}
-	if err := resolveTenantTarget("system"); err != nil {
-		t.Fatalf("a valid tenant was revoked by another tenant's document: %v", err)
-	}
-	revoked := resolveTenantTarget("other")
-	if revoked == nil || traceprofile.ErrorCode(revoked) != traceprofile.CodeRouteNotFound {
-		t.Fatalf("invalid tenant still served or wrong code: %v", revoked)
+	if installedRouteCount() != 1 {
+		t.Fatalf("the valid tenant was revoked with the invalid one: %d routes", installedRouteCount())
 	}
 }
 
@@ -208,14 +201,13 @@ func TestTraceContentChangeWithoutVersionBumpRebuilds(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := traceProfileRuntimeValue.Load().routeVersion
-	publication.set("system", strings.Replace(tracePublicationFor("system"), `"retention_days":30`, `"retention_days":7`, 1))
+	publication.set("system", strings.Replace(tracePublicationFor("system"), `"cluster_name":"doris4_test"`, `"cluster_name":"doris4_backup"`, 1))
 	if err := reloadTraceProfilePublishedRuntime(); err != nil {
 		t.Fatal(err)
 	}
 	runtime := traceProfileRuntimeValue.Load()
-	target, err := runtime.executor.ResolveESSummaryTarget("system", 132, 7)
-	if runtime.routeVersion == before || err != nil || target.RetentionDays != 7 {
-		t.Fatalf("content change was ignored: version %d -> %d target=%+v err=%v", before, runtime.routeVersion, target, err)
+	if runtime.routeVersion == before || runtime.routeCount != 1 {
+		t.Fatalf("content change was ignored: version %d -> %d routes=%d", before, runtime.routeVersion, runtime.routeCount)
 	}
 }
 
@@ -296,7 +288,7 @@ func TestTraceRedisKeyVanishingMidScanSkipsOnlyThatKey(t *testing.T) {
 		t.Fatalf("a key removed between SCAN and read failed the whole load: %v", err)
 	}
 	runtime := traceProfileRuntimeValue.Load()
-	if runtime == nil || runtime.routeCount != 2 {
+	if runtime == nil || runtime.routeCount != 1 {
 		t.Fatalf("the remaining tenant was not loaded: %+v", runtime)
 	}
 }

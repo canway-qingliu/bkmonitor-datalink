@@ -27,7 +27,6 @@ import (
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/consul"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/traceprofile"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/redis"
 	redisService "github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/service/redis"
 )
@@ -40,11 +39,8 @@ func TestUnknownClusterRevokesOnlyThatTenant(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "other") {
 		t.Fatalf("the revoked tenant was not reported: %v", err)
 	}
-	if err := resolveTenantTarget("system"); err != nil {
-		t.Fatalf("a tenant on a known cluster was revoked with the other: %v", err)
-	}
-	if revoked := resolveTenantTarget("other"); traceprofile.ErrorCode(revoked) != traceprofile.CodeRouteNotFound {
-		t.Fatalf("the tenant on an unknown cluster is still served: %v", revoked)
+	if installedRouteCount() != 1 {
+		t.Fatalf("a tenant on a known cluster was revoked with the other: %d routes", installedRouteCount())
 	}
 	if failures := traceProfileLoad.consecutiveFailures(); failures != 0 {
 		t.Fatalf("a publication-side revocation was counted as a load failure: %d", failures)
@@ -66,8 +62,8 @@ func TestLocalConfigChangeAppliesWhileSourceIsDown(t *testing.T) {
 	if runtime == nil || len(runtime.allowedAppCodes) != 1 || runtime.allowedAppCodes[0] != "nobody" {
 		t.Fatalf("a removed app code is still authorized while the source is down: %+v", runtime)
 	}
-	if err := resolveTenantTarget("system"); err != nil {
-		t.Fatalf("the cached publication was not kept across the config change: %v", err)
+	if installedRouteCount() != 1 {
+		t.Fatalf("the cached publication was not kept across the config change: %d routes", installedRouteCount())
 	}
 }
 

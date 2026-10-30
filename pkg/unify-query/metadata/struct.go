@@ -140,8 +140,7 @@ type Aggregates []Aggregate
 type TraceProfile string
 
 const (
-	TraceProfileSpan    TraceProfile = "trace_span"
-	TraceProfileSummary TraceProfile = "trace_summary"
+	TraceProfileSpan TraceProfile = "trace_span"
 )
 
 // QueryCostProfile describes structural query properties used for observation.

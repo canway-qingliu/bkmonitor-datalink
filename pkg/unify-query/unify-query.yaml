@@ -119,9 +119,6 @@ trace_profile:
   # 仍要求签名有效、app.verified=true 且空间授权成功。
   # allowed_bk_app_codes:
   # - kingeye-apm
-  # T6.6 内部精确成员查询还需单独允许列表；缺省为空时该模式拒绝。
-  # member_lookup_allowed_bk_app_codes:
-  # - kingeye-apm
   # 只读连接凭据仅留在 UQ；cluster_id 必须覆盖发布路由引用的全部集群。
   # readonly_connections:
   # - cluster_id: "18"

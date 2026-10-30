@@ -20,21 +20,20 @@ import (
 )
 
 func TestCompileAggregateKeepsTrustedScopeAndExactCount(t *testing.T) {
-	request := testRequest(metadata.TraceProfileSummary)
-	request.Scene = "app"
+	request := testRequest(metadata.TraceProfileSpan)
 	request.Limit = 10000
 	request.Filters = Filters{FieldList: []FilterField{{FieldName: "app_id", Value: []string{"7"}, Operator: "eq"}}}
 	request.Aggregation = &CountAggregation{
 		Method: "count", IntervalSeconds: 60, TimezoneOffsetSeconds: 8 * 3600,
-		GroupBy: []string{"root_service_name"},
+		GroupBy: []string{"service_name"},
 	}
 	compiled, err := CompileAggregate(request.Profile, testTarget(request.Profile), testScope(t), request, Limits{})
 	if err != nil {
 		t.Fatalf("valid aggregate rejected: %v", err)
 	}
 	for _, required := range []string{
-		"COUNT(*) AS `count`", "`t1_kapm`.`otel_trace_summary`", "`trace_start_time_us`",
-		"`bk_biz_id` = ?", "`app_id` = ?", "`root_service_name`", "LIMIT 10001",
+		"COUNT(*) AS `count`", "`t1_kapm`.`otel_trace_span_7`", "`start_time_us`",
+		"`bk_biz_id` = ?", "`app_id` = ?", "`service_name`", "LIMIT 10001",
 	} {
 		if !strings.Contains(compiled.Statement, required) {
 			t.Fatalf("aggregate SQL missing %q: %s", required, compiled.Statement)
@@ -59,21 +58,20 @@ func TestCompileAggregateRejectsUnsupportedDimension(t *testing.T) {
 }
 
 func TestExecuteAggregateReturnsExactBucketRows(t *testing.T) {
-	request := testRequest(metadata.TraceProfileSummary)
-	request.Scene = "app"
+	request := testRequest(metadata.TraceProfileSpan)
 	request.Aggregation = &CountAggregation{
 		Method: "count", IntervalSeconds: 60, TimezoneOffsetSeconds: 8 * 3600,
-		GroupBy: []string{"root_service_name"},
+		GroupBy: []string{"service_name"},
 	}
 	querier := &fakeQuerier{rows: []map[string]any{{
-		"bucket_start_us": request.StartUS, "count": int64(3), "root_service_name": "svc-a",
+		"bucket_start_us": request.StartUS, "count": int64(3), "service_name": "svc-a",
 	}}}
 	rows, err := testExecutor(t, querier).ExecuteAggregate(context.Background(), request, testScope(t))
 	if err != nil {
 		t.Fatalf("aggregate execution rejected trusted rows: %v", err)
 	}
 	if len(rows) != 1 || rows[0].BucketStartMS != request.StartUS/1000 || rows[0].Count != 3 ||
-		rows[0].Dimensions["root_service_name"] != "svc-a" || len(querier.statements) != 1 {
+		rows[0].Dimensions["service_name"] != "svc-a" || len(querier.statements) != 1 {
 		t.Fatalf("aggregate rows or query count drifted: rows=%+v statements=%v", rows, querier.statements)
 	}
 }
