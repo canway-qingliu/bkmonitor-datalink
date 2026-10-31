@@ -22,7 +22,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/dorisclient"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/traceprofile"
 )
@@ -47,46 +46,6 @@ func TestTypedCountAggregationUsesAggregateCompiler(t *testing.T) {
 			`"timezone_offset_seconds":28800,"group_by":["resource"]}}}`, 1)
 	if code := decodeTraceProfileError(t, runTraceProfileRequest(t, body, "kingeye-apm")); code != traceprofile.CodeUnsupportedSchemaCapability {
 		t.Fatalf("typed aggregate did not enforce scalar dimension whitelist: %s", code)
-	}
-}
-
-func TestTypedTaskSummaryUsesTrustedDorisRoute(t *testing.T) {
-	config := traceProfileRuntimeConfig()
-	config["max_limit"] = 5000
-	withTraceProfileRuntime(t, config)
-	withTraceProfileAuth(t, true, "kingeye-apm")
-	target := traceprofile.DorisTarget{
-		ClusterID: "18", Database: "system_kapm", Table: "otel_trace_span_42", SchemaVersion: "2026-09-24",
-	}
-	snapshot, err := traceprofile.NewRouteSnapshot(7, []traceprofile.ReadRoute{{
-		BkTenantID: "system", BkBizID: 42, Profile: metadata.TraceProfileSpan,
-		Doris: &target,
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	querier := tenantScopeQuerier(func(_ context.Context, statement string, args ...any) (dorisclient.Result, error) {
-		if !strings.Contains(statement, "`app_id` = ?") || !strings.Contains(statement, "LIMIT 5001") || len(args) < 7 {
-			t.Fatalf("task summary lost trusted SQL scope or group budget: %s %v", statement, args)
-		}
-		return dorisclient.Result{Rows: []map[string]any{{
-			"service_name": "worker", "task_type": "async", "task_name": "plugind.action.reconcile",
-			"execution_count": int64(2), "failure_count": int64(1), "duration_sum_us": int64(400000),
-			"duration_max_us": int64(300000), "last_called_us": int64(1758585600000000),
-			"latest_trace_id": strings.Repeat("a", 32), "invalid_count": int64(0),
-		}}}, nil
-	})
-	executor, err := traceprofile.NewExecutor(snapshot, map[string]traceprofile.Querier{"18": querier}, traceprofile.Limits{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	traceProfileRuntimeValue.Load().executor = executor
-	body := strings.Replace(typedTraceBody("trace_span", "system_kapm"), `"trace_query_v2"`, `"trace_query_v3"`, 1)
-	body = strings.Replace(body, `"field_list":[]`, `"field_list":[{"field_name":"app_id","value":["7"],"op":"eq"}]`, 1)
-	body = strings.Replace(body, `"limit":100}}`, `"limit":5000,"aggregation":{"method":"task_summary"}}}`, 1)
-	response := runTraceProfileRequest(t, body, "kingeye-apm")
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"task_name":"plugind.action.reconcile"`) {
-		t.Fatalf("trusted task summary rejected: status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 

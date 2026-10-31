@@ -163,20 +163,7 @@ func ParseRequest(body []byte, maxBodyBytes int, maxLimit int64) (Request, error
 		if err := aggregationDecoder.Decode(&extra); err != io.EOF {
 			return Request{}, fmt.Errorf("Trace 聚合包含多余内容")
 		}
-		if value.Method == "task_summary" {
-			closed := json.NewDecoder(bytes.NewReader(query.Aggregation))
-			closed.DisallowUnknownFields()
-			if err := closed.Decode(new(struct {
-				Method string `json:"method"`
-			})); err != nil {
-				return Request{}, fmt.Errorf("后台任务聚合只接受 method 字段: %w", err)
-			}
-			if query.Limit > 5000 ||
-				value.IntervalSeconds != 0 || value.TimezoneOffsetSeconds != 0 || value.GroupBy != nil ||
-				!validTaskSummaryFilters(*query.Filters) {
-				return Request{}, fmt.Errorf("后台任务聚合范围或字段超出闭合合同")
-			}
-		} else if value.Method != "count" || value.IntervalSeconds <= 0 || value.IntervalSeconds > 86400 ||
+		if value.Method != "count" || value.IntervalSeconds <= 0 || value.IntervalSeconds > 86400 ||
 			value.TimezoneOffsetSeconds < -14*3600 || value.TimezoneOffsetSeconds > 14*3600 ||
 			value.GroupBy == nil || len(value.GroupBy) > 5 {
 			return Request{}, fmt.Errorf("Trace 聚合方法、周期、时区或分组超出合同")

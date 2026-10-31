@@ -22,6 +22,23 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 )
 
+func TestRetiredBackgroundTaskSummaryEnvelopeIsRejected(t *testing.T) {
+	metadata.InitMetadata()
+	gin.SetMode(gin.TestMode)
+	body := `{"background_task_summary":{"version":2}}`
+	ctx := metadata.InitHashID(context.Background())
+	metadata.SetUser(ctx, &metadata.User{TenantID: "system", SpaceUID: "bkcc__42"})
+	recorder := httptest.NewRecorder()
+	ginContext, _ := gin.CreateTestContext(recorder)
+	ginContext.Request = httptest.NewRequest(http.MethodPost, "/query/ts/raw", bytes.NewBufferString(body)).WithContext(ctx)
+
+	HandlerQueryRaw(ginContext)
+
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "background_task_summary") {
+		t.Fatalf("retired summary envelope was not rejected: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestUnwiredDirectTraceEnvelopeCannotBecomeLegacyRawSuccess(t *testing.T) {
 	metadata.InitMetadata()
 	gin.SetMode(gin.TestMode)

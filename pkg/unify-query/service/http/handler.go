@@ -260,6 +260,10 @@ func HandlerQueryRaw(c *gin.Context) {
 		resp.failed(ctx, err)
 		return
 	}
+	if queryTs.BackgroundTaskSummaryEnvelope != nil {
+		resp.failed(ctx, fmt.Errorf("background_task_summary 已退役，请升级客户端"))
+		return
+	}
 	if queryTs.HasTraceEnvelope() {
 		err = fmt.Errorf("Trace profile 直连存储查询入口尚未完成")
 		resp.failed(ctx, err)
@@ -290,18 +294,6 @@ func HandlerQueryRaw(c *gin.Context) {
 		).Error(ctx, err))
 		return
 	}
-	if queryTs.BackgroundTaskSummaryEnvelope != nil {
-		rows, taskErr := queryTaskSummary(ctx, queryTs)
-		if taskErr != nil {
-			resp.failed(ctx, taskErr)
-			return
-		}
-		resp.success(ctx, taskSummaryResponse{
-			Total: len(rows), List: rows, BackgroundTaskSummaryExact: true,
-		})
-		return
-	}
-
 	var routeInfo []metadata.RouteInfo
 	listData.Total, listData.List, listData.ResultTableOptions, routeInfo, err = queryRawWithInstance(ctx, queryTs)
 	if err != nil {
