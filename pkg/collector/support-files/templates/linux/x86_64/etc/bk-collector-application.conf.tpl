@@ -8,7 +8,7 @@ traces_shared: true
 {% endif %}
 metrics_dataid: {{ metric_data_id | default(0) }}{% if metrics_shared is defined and metrics_shared %}
 metrics_shared: true
-{% endif %}{% if (traces_shared is defined and traces_shared) or (metrics_shared is defined and metrics_shared) %}
+{% endif %}{% if (traces_shared is defined and traces_shared) or (metrics_shared is defined and metrics_shared) or (bk_tenant_id is defined and bk_tenant_id) %}
 bk_tenant_id: {{ bk_tenant_id | default('') | tojson }}
 {% endif %}
 logs_dataid: {{ log_data_id | default(0) }}

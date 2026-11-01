@@ -68,6 +68,8 @@ processor:
 Trace 原 Flat item 的 bk_tenant_id、bk_biz_id 和 app_id 来自已校验的 Token，
 不采用客户端 Span/Resource 属性。AES v0/v1 Token 不编码租户和 app_id；
 aes256WithMeta 从同一 Token 的受信应用配置补齐它们。
+旧独占应用的子配置若已有受信租户和 app_id，也须渲染这两个字段；
+traces_shared 只表示共享 DataID 路由，不能作为是否输出身份的条件。
 receiver 在校验成功后给 Trace Record 固定首次接收时间和请求 ID；
 converter 按请求内 Span 顺序生成稳定 source_event_id，原队列重试不改写。
 

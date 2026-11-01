@@ -141,7 +141,7 @@ processor:
 {% endif %}
       metrics_dataid: {{ token_checker_config.metric_data_id | default(0) }}{% if token_checker_config.metrics_shared is defined and token_checker_config.metrics_shared %}
       metrics_shared: true
-{% endif %}{% if (token_checker_config.traces_shared is defined and token_checker_config.traces_shared) or (token_checker_config.metrics_shared is defined and token_checker_config.metrics_shared) %}
+{% endif %}{% if (token_checker_config.traces_shared is defined and token_checker_config.traces_shared) or (token_checker_config.metrics_shared is defined and token_checker_config.metrics_shared) or (token_checker_config.bk_tenant_id is defined and token_checker_config.bk_tenant_id) %}
       bk_tenant_id: {{ token_checker_config.bk_tenant_id | default('') | tojson }}
 {% endif %}
       logs_dataid: {{ token_checker_config.log_data_id | default(0) }}
