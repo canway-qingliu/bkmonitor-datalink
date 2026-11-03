@@ -11,6 +11,7 @@ package http
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,21 +24,21 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/consul"
 )
 
-const publishedBusiness132 = `{"route_snapshot_version":7,"bk_tenant_id":"system","read_routes":[` +
-	`{"bk_tenant_id":"system","bk_biz_id":132,"profile":"trace_span",` +
-	`"database":"system_kapm","table":"otel_trace_span_132","cluster_id":18,"cluster_name":"doris4_test",` +
-	`"schema_version":"sha256:3fee31e7c6376abe"}]}`
+const publishedApplication7 = `{"route_snapshot_version":7,"bk_tenant_id":"system","read_routes":[` +
+	`{"bk_tenant_id":"system","bk_biz_id":132,"app_id":7,"profile":"trace_span",` +
+	`"database":"system_kapm","table":"cw_trace_span_app_7","cluster_id":18,"cluster_name":"doris4_test",` +
+	`"schema_version":"sha256:0bf5aac6160a636e"}]}`
 
-func TestPublishedTraceTargetsBuildBusiness132Runtime(t *testing.T) {
+func TestPublishedTraceTargetsBuildApplication7Runtime(t *testing.T) {
 	prefix := "kingeye/metadata/unify-query/data/trace/read_target/"
-	pairs := api.KVPairs{&api.KVPair{Key: prefix + "system", Value: []byte(publishedBusiness132)}}
+	pairs := api.KVPairs{&api.KVPair{Key: prefix + "system", Value: []byte(publishedApplication7)}}
 	snapshot, err := parsePublishedTraceTargets(prefix, pairs, nil)
 	version, routes := snapshot.Version, snapshot.Routes
 	if err != nil || len(snapshot.Invalid) != 0 || version <= 0 || len(routes) != 1 {
 		t.Fatalf("failed to parse published routes: version=%d routes=%d err=%v", version, len(routes), err)
 	}
-	if routes[0].BkBizID != 132 || routes[0].Table != "otel_trace_span_132" || routes[0].ClusterID != "18" {
-		t.Fatalf("business 132 span target was lost: %+v", routes[0])
+	if routes[0].BkBizID != 132 || routes[0].AppID != 7 || routes[0].Table != "cw_trace_span_app_7" || routes[0].ClusterID != "18" {
+		t.Fatalf("application 7 span target was lost: %+v", routes[0])
 	}
 	if routes[0].PublishedVersion != 7 {
 		t.Fatalf("tenant-local publication version was lost: %+v", routes)
@@ -52,17 +53,42 @@ func TestPublishedTraceTargetsBuildBusiness132Runtime(t *testing.T) {
 	defer runtime.close()
 }
 
+func TestPublishedTraceSourceIdentitySurvivesRuntime(t *testing.T) {
+	body := strings.Replace(publishedApplication7, `"profile":`,
+		`"result_table_id":"system.apm_trace_span","data_id":901,"profile":`, 1)
+	prefix := "kingeye/metadata/unify-query/data/trace/read_target/"
+	snapshot, err := parsePublishedTraceTargets(prefix, api.KVPairs{&api.KVPair{
+		Key: prefix + "system", Value: []byte(body),
+	}}, nil)
+	if err != nil || len(snapshot.Invalid) != 0 || len(snapshot.Routes) != 1 {
+		t.Fatalf("source identity was lost during publication loading: %+v %v", snapshot, err)
+	}
+	encoded, err := json.Marshal(snapshot.Routes[0])
+	if err != nil || !strings.Contains(string(encoded), `"result_table_id":"system.apm_trace_span"`) ||
+		!strings.Contains(string(encoded), `"data_id":901`) {
+		t.Fatalf("source identity did not survive runtime config conversion: %s err=%v", encoded, err)
+	}
+	config := traceProfileRuntimeConfig()
+	config["route_snapshot_version"] = snapshot.Version
+	config["read_routes"] = snapshot.Routes
+	runtime, err := newTraceProfileRuntime(config)
+	if err != nil || runtime == nil {
+		t.Fatalf("paired source identity did not build a runtime: %v", err)
+	}
+	defer runtime.close()
+}
+
 func TestPublishedApplicationSpanRouteSurvivesRuntimeReload(t *testing.T) {
 	const database = "tenant_bbc5e661e106c6dc_kapm"
-	appRoute := `,{"bk_tenant_id":"system","bk_biz_id":132,"app_id":7,"profile":"trace_span",` +
+	appRoute := `,{"bk_tenant_id":"system","bk_biz_id":132,"app_id":8,"profile":"trace_span",` +
 		`"database":"` + database + `",` +
-		`"table":"otel_trace_span","cluster_id":18,"cluster_name":"doris4_test",` +
-		`"schema_version":"sha256:3fee31e7c6376abe"}`
-	body := strings.Replace(publishedBusiness132, `]}`, appRoute+`]}`, 1)
+		`"table":"cw_trace_span","cluster_id":18,"cluster_name":"doris4_test",` +
+		`"schema_version":"sha256:0bf5aac6160a636e"}`
+	body := strings.Replace(publishedApplication7, `]}`, appRoute+`]}`, 1)
 	prefix := "kingeye/metadata/unify-query/data/trace/read_target/"
 	pairs := api.KVPairs{&api.KVPair{Key: prefix + "system", Value: []byte(body)}}
 	snapshot, err := parsePublishedTraceTargets(prefix, pairs, nil)
-	if err != nil || len(snapshot.Routes) != 2 || snapshot.Routes[1].AppID != 7 {
+	if err != nil || len(snapshot.Routes) != 2 || snapshot.Routes[1].AppID != 8 {
 		t.Fatalf("application route lost while loading publication: %+v err=%v", snapshot.Routes, err)
 	}
 	config := traceProfileRuntimeConfig()
@@ -77,10 +103,10 @@ func TestPublishedApplicationSpanRouteSurvivesRuntimeReload(t *testing.T) {
 
 func TestPublishedTraceTargetsKeepVersionsPerTenant(t *testing.T) {
 	prefix := "kingeye/metadata/unify-query/data/trace/read_target/"
-	other := strings.ReplaceAll(publishedBusiness132, "system", "other")
+	other := strings.ReplaceAll(publishedApplication7, "system", "other")
 	other = strings.Replace(other, `"route_snapshot_version":7`, `"route_snapshot_version":11`, 1)
 	pairs := api.KVPairs{
-		&api.KVPair{Key: prefix + "system", Value: []byte(publishedBusiness132)},
+		&api.KVPair{Key: prefix + "system", Value: []byte(publishedApplication7)},
 		&api.KVPair{Key: prefix + "other", Value: []byte(other)},
 	}
 	snapshot, err := parsePublishedTraceTargets(prefix, pairs, nil)
@@ -113,7 +139,7 @@ func TestReloadTraceProfileRuntimeConsumesPublishedConsulRoutes(t *testing.T) {
 		if path != prefix+"/" {
 			t.Fatalf("read wrong Consul prefix: %s", path)
 		}
-		return api.KVPairs{&api.KVPair{Key: path + "system", Value: []byte(publishedBusiness132)}}, nil
+		return api.KVPairs{&api.KVPair{Key: path + "system", Value: []byte(publishedApplication7)}}, nil
 	}
 	consul.GetKVDataContext = func(_ context.Context, path string) ([]byte, error) {
 		if path != versionPath {
@@ -134,7 +160,7 @@ func TestReloadTraceProfileRuntimeConsumesPublishedConsulRoutes(t *testing.T) {
 	}
 	runtime := traceProfileRuntimeValue.Load()
 	if runtime == nil || runtime.routeCount != 1 || runtime.routeVersion <= 0 {
-		t.Fatalf("published business routes were not installed: %+v", runtime)
+		t.Fatalf("published application routes were not installed: %+v", runtime)
 	}
 }
 
@@ -155,7 +181,7 @@ func TestReloadTraceProfileRuntimeRevokesOldRouteOnInvalidPublication(t *testing
 	previousRuntime := traceProfileRuntimeValue.Swap(old)
 	previousPrefixReader, previousKeyReader := consul.GetDataWithPrefixContext, consul.GetKVDataContext
 	consul.GetDataWithPrefixContext = func(_ context.Context, path string) (api.KVPairs, error) {
-		bad := strings.Replace(publishedBusiness132, "otel_trace_span_132", "otel_trace_span_133", 1)
+		bad := strings.Replace(publishedApplication7, "cw_trace_span_app_7", "cw_trace_span_app_8", 1)
 		return api.KVPairs{&api.KVPair{Key: path + "system", Value: []byte(bad)}}, nil
 	}
 	consul.GetKVDataContext = func(context.Context, string) ([]byte, error) { return []byte(`{"time":2}`), nil }
@@ -175,7 +201,7 @@ func TestReloadTraceProfileRuntimeRevokesOldRouteOnInvalidPublication(t *testing
 	}
 }
 
-func TestTraceProfileVersionWatchLoadsNewBusinessSnapshot(t *testing.T) {
+func TestTraceProfileVersionWatchLoadsNewApplicationSnapshot(t *testing.T) {
 	prefix := "kingeye/metadata/unify-query/data/trace/read_target"
 	versionPath := "kingeye/metadata/unify-query/version/trace/read_target"
 	config := traceProfileRuntimeConfig()
@@ -188,7 +214,7 @@ func TestTraceProfileVersionWatchLoadsNewBusinessSnapshot(t *testing.T) {
 	previousRuntime := traceProfileRuntimeValue.Swap(nil)
 	previousPrefixReader, previousKeyReader, previousWatch := consul.GetDataWithPrefixContext, consul.GetKVDataContext, consul.WatchChangeContext
 	var document, version atomic.Value
-	document.Store(publishedBusiness132)
+	document.Store(publishedApplication7)
 	version.Store(`{"time":1}`)
 	consul.GetDataWithPrefixContext = func(_ context.Context, path string) (api.KVPairs, error) {
 		return api.KVPairs{&api.KVPair{Key: path + "system", Value: []byte(document.Load().(string))}}, nil
@@ -214,7 +240,7 @@ func TestTraceProfileVersionWatchLoadsNewBusinessSnapshot(t *testing.T) {
 	if err := startTraceProfileRouteWatch(ctx, &wg); err != nil {
 		t.Fatal(err)
 	}
-	document.Store(strings.ReplaceAll(strings.Replace(publishedBusiness132,
+	document.Store(strings.ReplaceAll(strings.Replace(publishedApplication7,
 		`"route_snapshot_version":7`, `"route_snapshot_version":8`, 1), "132", "133"))
 	version.Store(`{"time":2}`)
 	watch <- struct{}{}
@@ -225,8 +251,34 @@ func TestTraceProfileVersionWatchLoadsNewBusinessSnapshot(t *testing.T) {
 		}
 		select {
 		case <-deadline:
-			t.Fatal("Trace version watch did not replace the published business snapshot")
+			t.Fatal("Trace version watch did not replace the published application snapshot")
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+}
+
+func TestPublishedCanonicalTraceTargetsBuildRuntime(t *testing.T) {
+	for _, table := range []string{"cw_trace_span", "cw_trace_span_app_7", "cw_trace_span", "cw_trace_span_app_7"} {
+		t.Run(table, func(t *testing.T) {
+			body := strings.Replace(publishedApplication7, "cw_trace_span_app_7", table, 1)
+			prefix := "kingeye/metadata/unify-query/data/trace/read_target/"
+			snapshot, err := parsePublishedTraceTargets(prefix, api.KVPairs{&api.KVPair{
+				Key: prefix + "system", Value: []byte(body),
+			}}, nil)
+			if err != nil || len(snapshot.Invalid) != 0 || len(snapshot.Routes) != 1 {
+				t.Fatalf("canonical publication was rejected: %+v %v", snapshot, err)
+			}
+			if snapshot.Routes[0].Table != table {
+				t.Fatalf("target changed: %+v", snapshot.Routes)
+			}
+			config := traceProfileRuntimeConfig()
+			config["route_snapshot_version"] = snapshot.Version
+			config["read_routes"] = snapshot.Routes
+			runtime, err := newTraceProfileRuntime(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer runtime.close()
+		})
 	}
 }

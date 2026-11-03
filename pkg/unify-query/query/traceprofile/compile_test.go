@@ -10,6 +10,7 @@
 package traceprofile
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -36,7 +37,7 @@ func testScope(t *testing.T) Scope {
 
 func testTarget(profile metadata.TraceProfile) DorisTarget {
 	return DorisTarget{
-		ClusterID: "18", Database: testDomain, Table: "otel_trace_span_7", SchemaVersion: "2026-09-24",
+		ClusterID: "18", Database: testDomain, Table: "cw_trace_span_app_7", SchemaVersion: "2026-09-24",
 	}
 }
 
@@ -54,6 +55,7 @@ func testRequest(profile metadata.TraceProfile) Request {
 		StartUS:          startUS,
 		EndUS:            endUS,
 		Limit:            100,
+		Filters:          Filters{FieldList: []FilterField{{FieldName: "app_id", Value: []string{"7"}, Operator: "eq"}}},
 	}
 }
 
@@ -100,15 +102,15 @@ func TestCompileListBindsSpanScopeTimeAndCanonicalOrder(t *testing.T) {
 		t.Fatalf("unexpected order/limit clause: %s", compiled.SnapshotStatement)
 	}
 	if !strings.HasPrefix(compiled.SnapshotStatement, "WITH filtered AS (SELECT `app_id`") ||
-		!strings.Contains(compiled.SnapshotStatement, "FROM `t1_kapm`.`otel_trace_span_7`") {
+		!strings.Contains(compiled.SnapshotStatement, "FROM `t1_kapm`.`cw_trace_span_app_7`") {
 		t.Fatalf("unexpected statement head: %s", compiled.SnapshotStatement)
 	}
-	if !strings.Contains(compiled.CountStatement, "SELECT COUNT(*) AS `total` FROM `t1_kapm`.`otel_trace_span_7`") {
+	if !strings.Contains(compiled.CountStatement, "SELECT COUNT(*) AS `total` FROM `t1_kapm`.`cw_trace_span_app_7`") {
 		t.Fatalf("unexpected count statement: %s", compiled.CountStatement)
 	}
 
 	wantArgs := []any{"2026-09-23", "2026-09-23", request.StartUS, request.EndUS,
-		testSpaceUID, testBizID}
+		testSpaceUID, testBizID, "7"}
 	if !reflect.DeepEqual(compiled.SnapshotArgs, wantArgs) {
 		t.Fatalf("unexpected bound args: %#v", compiled.SnapshotArgs)
 	}
@@ -120,7 +122,26 @@ func TestCompileListBindsSpanScopeTimeAndCanonicalOrder(t *testing.T) {
 	}
 }
 
-func TestCompileListReadsBusiness132InTheRequestedUTCWindow(t *testing.T) {
+func TestTypedCompilersRejectRetiredBusinessTargets(t *testing.T) {
+	scope := Scope{BkTenantID: "system", BkBizID: 132, SpaceUID: "bkcc__132"}
+	for _, appID := range []int64{0, 7} {
+		for _, table := range []string{"cw_trace_span_132", "cw_trace_span_biz_132", "otel_trace_span_132", "trace_span_biz_132"} {
+			t.Run(fmt.Sprintf("%s/app=%d", table, appID), func(t *testing.T) {
+				request := namingRequest(appID)
+				target := DorisTarget{ClusterID: "18", Database: "system_kapm", Table: table, SchemaVersion: "test"}
+				if _, err := CompileList(request.Profile, target, scope, request, Limits{}); ErrorCode(err) != CodeRouteNotFound {
+					t.Errorf("list compiler accepted retired business target: %v", err)
+				}
+				request.Aggregation = &CountAggregation{Method: "count", IntervalSeconds: 60}
+				if _, err := CompileAggregate(request.Profile, target, scope, request, Limits{}); ErrorCode(err) != CodeRouteNotFound {
+					t.Errorf("aggregate compiler accepted retired business target: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestCompileListReadsApplication42InTheRequestedUTCWindow(t *testing.T) {
 	scope, err := ResolveScope("system", "bkcc__132")
 	if err != nil {
 		t.Fatal(err)
@@ -132,17 +153,17 @@ func TestCompileListReadsBusiness132InTheRequestedUTCWindow(t *testing.T) {
 		Filters: Filters{FieldList: []FilterField{{FieldName: "app_id", Value: []string{"42"}, Operator: "eq"}}},
 	}
 	target := DorisTarget{
-		ClusterID: "18", Database: "system_kapm", Table: "otel_trace_span_132",
-		SchemaVersion: "sha256:3fee31e7c6376abe",
+		ClusterID: "18", Database: "system_kapm", Table: "cw_trace_span_app_42",
+		SchemaVersion: "sha256:0bf5aac6160a636e",
 	}
 	compiled, err := CompileList(metadata.TraceProfileSpan, target, scope, request, Limits{})
 	if err != nil {
-		t.Fatalf("business 132 query rejected: %v", err)
+		t.Fatalf("application 42 query rejected: %v", err)
 	}
-	if !strings.Contains(compiled.SnapshotStatement, "FROM `system_kapm`.`otel_trace_span_132`") ||
+	if !strings.Contains(compiled.SnapshotStatement, "FROM `system_kapm`.`cw_trace_span_app_42`") ||
 		!strings.Contains(compiled.SnapshotStatement, "`app_id` = ?") ||
 		!strings.Contains(compiled.SnapshotStatement, "LIMIT 50 OFFSET 0") {
-		t.Fatalf("query did not target the business table and requested page: %s", compiled.SnapshotStatement)
+		t.Fatalf("query did not target the application table and requested page: %s", compiled.SnapshotStatement)
 	}
 	if len(compiled.SnapshotArgs) != 7 || compiled.SnapshotArgs[0] != "2026-09-30" ||
 		compiled.SnapshotArgs[1] != "2026-09-30" || compiled.SnapshotArgs[2] != request.StartUS ||
@@ -156,14 +177,14 @@ func TestCompileListKeepsConditionAlignmentWhenScopePredicateRepeats(t *testing.
 	request := testRequest(metadata.TraceProfileSpan)
 	request.Filters = Filters{
 		FieldList: []FilterField{
-			{FieldName: "app_id", Value: []string{"app-1"}, Operator: "eq"},
+			{FieldName: "app_id", Value: []string{"7"}, Operator: "eq"},
 			{FieldName: "space_uid", Value: []string{testSpaceUID}, Operator: "eq"},
 		},
-		ConditionList: []string{"or"},
+		ConditionList: []string{"and"},
 	}
 	statement := mustCompile(t, request, Limits{}).SnapshotStatement
 
-	if !strings.Contains(statement, "(`app_id` = ? OR `space_uid` = ?)") {
+	if !strings.Contains(statement, "(`app_id` = ? AND `space_uid` = ?)") {
 		t.Fatalf("client condition list must be preserved verbatim: %s", statement)
 	}
 }
@@ -208,7 +229,7 @@ func TestCompileListRejectsTrustedIdentityRewrite(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			request := testRequest(metadata.TraceProfileSpan)
-			request.Filters = Filters{FieldList: []FilterField{tc.field}, ConditionList: []string{}}
+			request.Filters = Filters{FieldList: []FilterField{request.Filters.FieldList[0], tc.field}, ConditionList: []string{"and"}}
 			if code := compileErrorCode(t, request, Limits{}); code != tc.wantCode {
 				t.Fatalf("got error code %s, want %s", code, tc.wantCode)
 			}
@@ -218,8 +239,11 @@ func TestCompileListRejectsTrustedIdentityRewrite(t *testing.T) {
 	t.Run("equal repeat is accepted once per isolation column", func(t *testing.T) {
 		request := testRequest(metadata.TraceProfileSpan)
 		request.Filters = Filters{
-			FieldList:     []FilterField{{FieldName: "space_uid", Value: []string{testSpaceUID}, Operator: "eq"}},
-			ConditionList: []string{},
+			FieldList: []FilterField{
+				{FieldName: "app_id", Value: []string{"7"}, Operator: "eq"},
+				{FieldName: "space_uid", Value: []string{testSpaceUID}, Operator: "eq"},
+			},
+			ConditionList: []string{"and"},
 		}
 		statement := mustCompile(t, request, Limits{}).SnapshotStatement
 		if strings.Count(statement, "`space_uid` = ?") != 2 {
@@ -236,7 +260,7 @@ func TestCompileListOnlyAllowsEqOnMemberColumns(t *testing.T) {
 	}{
 		{
 			name:  "app eq allowed",
-			field: FilterField{FieldName: "app_id", Value: []string{"app-1"}, Operator: "eq"},
+			field: FilterField{FieldName: "app_id", Value: []string{"7"}, Operator: "eq"},
 		},
 		{
 			name:  "data id eq allowed",
@@ -245,12 +269,12 @@ func TestCompileListOnlyAllowsEqOnMemberColumns(t *testing.T) {
 		{
 			name:     "app contains rejected",
 			field:    FilterField{FieldName: "app_id", Value: []string{"app"}, Operator: "contains"},
-			wantCode: CodePredicateConflict,
+			wantCode: CodeRouteNotFound,
 		},
 		{
 			name:     "app ne rejected",
-			field:    FilterField{FieldName: "app_id", Value: []string{"app-1"}, Operator: "ne"},
-			wantCode: CodePredicateConflict,
+			field:    FilterField{FieldName: "app_id", Value: []string{"7"}, Operator: "ne"},
+			wantCode: CodeRouteNotFound,
 		},
 		{
 			name:     "data id nexisted rejected",
@@ -261,7 +285,12 @@ func TestCompileListOnlyAllowsEqOnMemberColumns(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			request := testRequest(metadata.TraceProfileSpan)
-			request.Filters = Filters{FieldList: []FilterField{tc.field}, ConditionList: []string{}}
+			if tc.field.FieldName == "app_id" {
+				request.Filters = Filters{FieldList: []FilterField{tc.field}}
+			} else {
+				request.Filters.FieldList = append(request.Filters.FieldList, tc.field)
+				request.Filters.ConditionList = []string{"and"}
+			}
 			_, err := CompileList(request.Profile, testTarget(request.Profile), testScope(t), request, Limits{})
 			if tc.wantCode == "" {
 				if err != nil {
@@ -327,7 +356,10 @@ func TestCompileListRejectsUnsupportedFiltersAndOrders(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			request := testRequest(tc.profile)
-			request.Filters = Filters{FieldList: tc.filters, ConditionList: []string{}}
+			request.Filters.FieldList = append(request.Filters.FieldList, tc.filters...)
+			if len(tc.filters) > 0 {
+				request.Filters.ConditionList = []string{"and"}
+			}
 			request.OrderBy = tc.orderBy
 			if code := compileErrorCode(t, request, Limits{}); code != tc.wantCode {
 				t.Fatalf("got error code %s, want %s", code, tc.wantCode)
@@ -393,9 +425,10 @@ func TestCompileListBindsClientValuesWithoutInlining(t *testing.T) {
 			{FieldName: "status_code", Value: []string{"2"}, Operator: "gte"},
 			{FieldName: "duration_us", Value: []string{"1000", "2000"}, Operator: "ne"},
 			{FieldName: "service_name", Value: []string{}, Operator: "existed"},
-			{FieldName: "app_id", Value: []string{"' OR 1=1 --"}, Operator: "eq"},
+			{FieldName: "service_instance_id", Value: []string{"' OR 1=1 --"}, Operator: "eq"},
+			{FieldName: "app_id", Value: []string{"7"}, Operator: "eq"},
 		},
-		ConditionList: []string{"and", "and", "and", "and"},
+		ConditionList: []string{"and", "and", "and", "and", "and"},
 	}
 	compiled := mustCompile(t, request, Limits{})
 	statement := compiled.SnapshotStatement
@@ -409,7 +442,7 @@ func TestCompileListBindsClientValuesWithoutInlining(t *testing.T) {
 		t.Fatalf("unexpected predicate shape: %s", statement)
 	}
 
-	wantTailArgs := []any{`100\%\_x\\%`, int64(2), int64(1000), int64(2000), "' OR 1=1 --"}
+	wantTailArgs := []any{`100\%\_x\\%`, int64(2), int64(1000), int64(2000), "' OR 1=1 --", "7"}
 	tail := compiled.SnapshotArgs[len(compiled.SnapshotArgs)-len(wantTailArgs):]
 	if !reflect.DeepEqual(tail, wantTailArgs) {
 		t.Fatalf("unexpected bound client args: %#v", tail)
@@ -420,9 +453,10 @@ func TestCompileListBindsContainsVariants(t *testing.T) {
 	request := testRequest(metadata.TraceProfileSpan)
 	request.Filters = Filters{
 		FieldList: []FilterField{
+			{FieldName: "app_id", Value: []string{"7"}, Operator: "eq"},
 			{FieldName: "app_name", Value: []string{"a", "b"}, Operator: "ncontains", IsWildcard: true},
 		},
-		ConditionList: []string{},
+		ConditionList: []string{"and"},
 	}
 	compiled := mustCompile(t, request, Limits{})
 	statement := compiled.SnapshotStatement

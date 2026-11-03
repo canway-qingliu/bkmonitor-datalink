@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -72,6 +73,7 @@ func testSnapshot(t *testing.T, profiles ...metadata.TraceProfile) *RouteSnapsho
 		routes = append(routes, ReadRoute{
 			BkTenantID:       testTenant,
 			BkBizID:          testBizID,
+			AppID:            7,
 			Profile:          profile,
 			PublishedVersion: 3,
 			Doris:            targetPtr(testTarget(profile)),
@@ -100,7 +102,7 @@ func TestExecutorSelectsExactApplicationSpanRouteFromConjunctiveAppFilter(t *tes
 	const database = "tenant_bbc5e661e106c6dc_kapm"
 	route := ReadRoute{
 		BkTenantID: "system", BkBizID: 132, AppID: 7, Profile: metadata.TraceProfileSpan,
-		Doris: &DorisTarget{ClusterID: "18", Database: database, Table: "otel_trace_span", SchemaVersion: "sha256:3fee31e7c6376abe"},
+		Doris: &DorisTarget{ClusterID: "18", Database: database, Table: "cw_trace_span", SchemaVersion: "sha256:0bf5aac6160a636e"},
 	}
 	snapshot, err := NewRouteSnapshot(7, []ReadRoute{route})
 	if err != nil {
@@ -119,7 +121,7 @@ func TestExecutorSelectsExactApplicationSpanRouteFromConjunctiveAppFilter(t *tes
 	if _, err := executor.Execute(context.Background(), request, scope); err != nil {
 		t.Fatal(err)
 	}
-	if len(querier.statements) == 0 || !strings.Contains(querier.statements[0], "`"+database+"`.`otel_trace_span`") {
+	if len(querier.statements) == 0 || !strings.Contains(querier.statements[0], "`"+database+"`.`cw_trace_span`") {
 		t.Fatalf("application Span query used another table: %v", querier.statements)
 	}
 	querier.statements = nil
@@ -143,6 +145,95 @@ func TestExecutorSelectsExactApplicationSpanRouteFromConjunctiveAppFilter(t *tes
 	}
 }
 
+func TestExecutorNeverFallsBackToBusinessOrOtherApplication(t *testing.T) {
+	for _, aggregate := range []bool{false, true} {
+		for _, appID := range []string{"", "0", "-1", "9"} {
+			t.Run(fmt.Sprintf("aggregate=%t/app=%s", aggregate, appID), func(t *testing.T) {
+				other := ReadRoute{
+					BkTenantID: "system", BkBizID: 132, AppID: 8, Profile: metadata.TraceProfileSpan,
+					Doris: &DorisTarget{ClusterID: "18", Database: "system_kapm", Table: "cw_trace_span_app_8", SchemaVersion: "test"},
+				}
+				snapshot, err := NewRouteSnapshot(7, []ReadRoute{other})
+				if err != nil {
+					t.Fatal(err)
+				}
+				// 即使快照中残留旧格式键，缺应用也不能回退到它。
+				snapshot.routes["system\x00132\x00trace_span"] = ReadRoute{
+					BkTenantID: "system", BkBizID: 132, Profile: metadata.TraceProfileSpan,
+					Doris: &DorisTarget{ClusterID: "18", Database: "system_kapm", Table: "cw_trace_span_132", SchemaVersion: "test"},
+				}
+				querier := &fakeQuerier{}
+				executor, err := NewExecutor(snapshot, map[string]Querier{"18": querier}, Limits{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				request := Request{Profile: metadata.TraceProfileSpan, StartUS: 1, EndUS: 2, Limit: 1}
+				if appID != "" {
+					request.Filters = Filters{FieldList: []FilterField{{FieldName: "app_id", Operator: "eq", Value: []string{appID}}}}
+				}
+				scope := Scope{BkTenantID: "system", BkBizID: 132, SpaceUID: "bkcc__132"}
+				if aggregate {
+					request.Aggregation = &CountAggregation{Method: "count", IntervalSeconds: 60}
+					_, err = executor.ExecuteAggregate(context.Background(), request, scope)
+				} else {
+					_, err = executor.Execute(context.Background(), request, scope)
+				}
+				if ErrorCode(err) != CodeRouteNotFound {
+					t.Errorf("missing application did not fail closed: %v", err)
+				}
+				if len(querier.statements) != 0 {
+					t.Errorf("missing application reached storage: %v", querier.statements)
+				}
+			})
+		}
+	}
+}
+
+func TestExecutorRejectsNonExactApplicationFilters(t *testing.T) {
+	app := FilterField{FieldName: "app_id", Operator: "eq", Value: []string{"7"}}
+	data := FilterField{FieldName: "data_id", Operator: "eq", Value: []string{"901"}}
+	for name, filters := range map[string]Filters{
+		"missing app":       {},
+		"zero app":          {FieldList: []FilterField{{FieldName: "app_id", Operator: "eq", Value: []string{"0"}}}},
+		"negative app":      {FieldList: []FilterField{{FieldName: "app_id", Operator: "eq", Value: []string{"-1"}}}},
+		"fractional app":    {FieldList: []FilterField{{FieldName: "app_id", Operator: "eq", Value: []string{"7.5"}}}},
+		"text app":          {FieldList: []FilterField{{FieldName: "app_id", Operator: "eq", Value: []string{"app-7"}}}},
+		"multiple apps":     {FieldList: []FilterField{{FieldName: "app_id", Operator: "eq", Value: []string{"7", "8"}}}},
+		"duplicate app":     {FieldList: []FilterField{app, app}, ConditionList: []string{"and"}},
+		"non equality app":  {FieldList: []FilterField{{FieldName: "app_id", Operator: "ne", Value: []string{"7"}}}},
+		"or widens app":     {FieldList: []FilterField{app, data}, ConditionList: []string{"or"}},
+		"missing connector": {FieldList: []FilterField{app, data}},
+		"extra connector":   {FieldList: []FilterField{app}, ConditionList: []string{"and"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			target := DorisTarget{ClusterID: "18", Database: "system_kapm", Table: "cw_trace_span", SchemaVersion: "test"}
+			snapshot, err := NewRouteSnapshot(7, []ReadRoute{{
+				BkTenantID: "system", BkBizID: 132, AppID: 7, Profile: metadata.TraceProfileSpan, Doris: &target,
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			querier := &fakeQuerier{}
+			executor, err := NewExecutor(snapshot, map[string]Querier{"18": querier}, Limits{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := Request{Profile: metadata.TraceProfileSpan, StartUS: 1, EndUS: 2, Limit: 1, Filters: filters}
+			scope := Scope{BkTenantID: "system", BkBizID: 132, SpaceUID: "bkcc__132"}
+			if _, err := executor.Execute(context.Background(), request, scope); ErrorCode(err) != CodeRouteNotFound {
+				t.Errorf("non-exact application filter was accepted: %v", err)
+			}
+			request.Aggregation = &CountAggregation{Method: "count", IntervalSeconds: 60}
+			if _, err := executor.ExecuteAggregate(context.Background(), request, scope); ErrorCode(err) != CodeRouteNotFound {
+				t.Errorf("aggregate accepted non-exact application filter: %v", err)
+			}
+			if len(querier.statements) != 0 {
+				t.Fatal("invalid application filter reached Doris")
+			}
+		})
+	}
+}
+
 func validTraceRow(profile metadata.TraceProfile) map[string]any {
 	row := make(map[string]any, len(projectionForProfile(profile)))
 	for _, field := range projectionForProfile(profile) {
@@ -162,7 +253,7 @@ func traceFixtureValue(field string) any {
 	case "data_id":
 		return int64(42)
 	case "app_id":
-		return "app-1"
+		return "7"
 	case "trace_id":
 		return "0123456789abcdef0123456789abcdef"
 	case "span_id":
@@ -198,7 +289,7 @@ func TestExecutorReturnsShapedPageWithRealTotal(t *testing.T) {
 	if !ok {
 		t.Fatalf("span item missing member contract: %#v", item)
 	}
-	if member["data_id"] != int64(42) || member["app_id"] != "app-1" || member["bk_tenant_id"] != testTenant {
+	if member["data_id"] != int64(42) || member["app_id"] != "7" || member["bk_tenant_id"] != testTenant {
 		t.Fatalf("unexpected member: %#v", member)
 	}
 	values, ok := item["values"].(map[string]any)
@@ -291,7 +382,7 @@ func TestExecutorFailsClosedOnRouting(t *testing.T) {
 	t.Run("unknown tenant outside route", func(t *testing.T) {
 		target := testTarget(metadata.TraceProfileSpan)
 		route := ReadRoute{
-			BkTenantID: testTenant, BkBizID: testBizID, Profile: metadata.TraceProfileSpan,
+			BkTenantID: testTenant, BkBizID: testBizID, AppID: 7, Profile: metadata.TraceProfileSpan,
 			Doris: targetPtr(target),
 		}
 		snapshot, err := NewRouteSnapshot(1, []ReadRoute{route})

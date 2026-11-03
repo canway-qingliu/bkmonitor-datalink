@@ -181,8 +181,15 @@ func parsePublishedTraceTargets(prefix string, pairs api.KVPairs, unreadable map
 		}
 		snapshot.Documents[tenantID] = invalidTraceDocument{Key: pair.Key, TenantID: tenantID, Version: document.Version}
 		for _, route := range document.Routes {
+			var resultTableID, dataID json.RawMessage
+			if route.ResultTableID != "" {
+				// 已经通过成对校验；string/int64 的 JSON 编码不会失败。
+				resultTableID, _ = json.Marshal(route.ResultTableID)
+				dataID, _ = json.Marshal(route.DataID)
+			}
 			snapshot.Routes = append(snapshot.Routes, traceProfileRouteConfig{
 				BkTenantID: route.BkTenantID, BkBizID: route.BkBizID, AppID: route.AppID,
+				ResultTableID: resultTableID, DataID: dataID,
 				Profile:  string(route.Profile),
 				Database: route.Doris.Database, Table: route.Doris.Table,
 				ClusterID: route.Doris.ClusterID, SchemaVersion: route.Doris.SchemaVersion,

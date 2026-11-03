@@ -47,8 +47,8 @@ func completeSpanRow() map[string]any {
 	row["events"] = []any{}
 	row["links"] = []any{}
 	row["ingest_time"] = int64(1789646400000)
-	row[metadata.KeyIndex] = "42_otel_trace_span"
-	row[metadata.KeyTableID] = "42_otel_trace_span.doris"
+	row[metadata.KeyIndex] = "42_cw_trace_span"
+	row[metadata.KeyTableID] = "42_cw_trace_span.doris"
 	row[metadata.KeyDataLabel] = ""
 	row["_value_"] = float64(1789646400000000)
 	row["_timestamp_"] = float64(1789646400000000)

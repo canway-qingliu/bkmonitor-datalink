@@ -33,7 +33,9 @@ Storage、空间及表路由由配置发布端写入 Redis，Redis 连接、认�
 
 `storage.source` 同时选择 Trace profile 发布物来源。`consul` 模式沿用 `trace_profile.read_target_data_path`、`read_target_version_path`；`redis` 模式在配置了 `trace_profile` 时直接从 `redis.kv_base_path` 派生 `<kv_base_path>:data:trace:read_target:<bk_tenant_id>`，无需单独的 `read_target_enabled` 开关。每个租户一个无 TTL 的 String key，值为原单租户 JSON 文档。写方更新租户 key 后向 `<kv_base_path>:data:trace:read_target:read_target_channel` 发布通知。UQ 启动订阅后扫描全部租户 key，收到通知及每分钟定期重读，沿用原文档的租户、物理目标和版本校验，不回退 Consul。读取或传输失败（含监听出错或关闭、加载期间发布变化）保留上一份可用快照；某个租户的文档非法或其路由指向本地没有只读连接的集群时只撤销该租户；读取成功但没有任何读目标时直读关闭并报告"未发布"。只读存储连接凭据仍仅在 UQ 本地配置中。
 
-Trace `read_routes` 中不带 `app_id` 的旧业务 Span/Summary 路由保持原样；带正整数 `app_id` 的新路由只用于 Span，按 `(租户, 业务, app_id)` 从已发布目标选 `tenant_<租户 ID SHA-256 前 16 位>_kapm.otel_trace_span` 或 `otel_trace_span_app_<app_id>`。查询必须含单个精确 `app_id` 和 AND 条件，缺路由时拒绝，不回查旧业务表。Kingeye 应在发布含 `app_id` 的租户文档前先升级 UQ；旧 UQ 的闭合 JSON 解析会拒绝新字段并撤销该租户读目标。
+Trace `read_routes` 必须包含正整数 `app_id`，只支持 Span 应用路由，按 `(租户, 业务, app_id, profile)` 精确定位受信目标。物理表仅接受租户共享 `cw_trace_span` 或该应用独占 `cw_trace_span_app_<app_id>`；库名须与同一受信租户的规范化库或已登记的合法租户库匹配。`bk_biz_id` 保留用于身份、IAM 和行过滤，不派生物理表。AppID=0、缺少 `app_id`、旧 `cw_trace_span_<BizID>` 业务表及 `otel_trace_*` / `trace_span_*` 目标均拒绝；静态配置也必须明确登记库表，不再隐式按业务拼表。查询必须含单个正整数 `app_id` 精确等值条件，且过滤条件只用 AND；缺应用路由明确失败，不访问业务表或其它应用。某租户发布文档含退役路由时整份文档校验失败并只撤销该租户，其它租户、传输失败保留快照和热重载规则不变。上线需配套升级 Kingeye/UQ，并由 Kingeye 重发仅含应用路由的完整租户快照；本变更不迁移、改名或删除历史物理资源。
+
+应用路由可选携带来源元数据 `result_table_id` / `data_id`：必须同时缺省或成对提供非空 RT 字符串及正整数 DataID，显式 `null`、空值或错误类型会使租户文档校验失败。UQ 随路由保留这两个字段，不用它们派生物理表或切换普通 RT 引擎，也不新增 typed request 来源元数据字段；既有 `data_id` 精确过滤语义不变。
 
 ### 设置 Feature Flag
 

@@ -420,7 +420,7 @@
 
 **请求体**: 同结构体查询
 
-`trace_profile`、`trace_contract_version`、`trace_request` 是 `trace_query_v2` 的 typed Trace 信封；出现任一字段（包括显式 `null`）时不能作为普通 raw 查询返回成功。UQ 只服务 `trace_span`：依据 Kingeye Metadata 的逐业务 Consul 读目标直连 Doris，库表由受信 `(租户, 业务, profile)` 路由确定；只读连接、JWT 验证及专用 app code 允许列表缺失时明确返回 400，不回落到 BKSQL/QueryEngine。typed 时间为 UTC epoch **微秒字符串**，结束时间为排他边界；Span 支持预算内的 `offset`，`offset` 与 `page_token` 不能同时使用；直读配置 `max_offset` 必须为正数。客户端不得提交 RT、库表、集群或 SQL。结构化 `/query/ts` 和 raw-with-scroll 拒绝 typed 信封，普通 raw 请求沿用原路径。`trace_summary`、ES Summary 成员/列表与应用拓扑 typed 查询已从 UQ 退役，改由 KAPM 直接查询 Doris / ES；旧发布文档与旧静态配置中的 `es_summary_targets`、`application_topology_targets`、`a3_targets` 段仅为滚动升级兼容被忽略，不产生查询路由。
+`trace_profile`、`trace_contract_version`、`trace_request` 是 `trace_query_v2` 的 typed Trace 信封；出现任一字段（包括显式 `null`）时不能作为普通 raw 查询返回成功。UQ 只服务 `trace_span`：依据 Kingeye Metadata 的逐租户 Redis / Consul 读目标直连 Doris，库表由受信 `(租户, 业务, app_id, profile)` 应用路由确定，`app_id` 必须为正整数；只读连接、JWT 验证及专用 app code 允许列表缺失时明确返回 400，不回落到 BKSQL/QueryEngine。typed 时间为 UTC epoch **微秒字符串**，结束时间为排他边界；Span 支持预算内的 `offset`，`offset` 与 `page_token` 不能同时使用；直读配置 `max_offset` 必须为正数。客户端不得提交 RT、库表、集群或 SQL。结构化 `/query/ts` 和 raw-with-scroll 拒绝 typed 信封，普通 raw 请求沿用原路径。`trace_summary`、ES Summary 成员/列表与应用拓扑 typed 查询已从 UQ 退役，改由 KAPM 直接查询 Doris / ES；旧发布文档与旧静态配置中的 `es_summary_targets`、`application_topology_targets`、`a3_targets` 段仅为滚动升级兼容被忽略，不产生查询路由。
 
 `trace_query_v3` 在同一 `/query/ts/raw` typed 入口表达受控服务端聚合；原生仪表盘的 `COUNT` 模式必须带
 `trace_request.aggregation={"method":"count","interval_seconds":正整数,"timezone_offset_seconds":整数,"group_by":[]}`；
@@ -1482,3 +1482,14 @@ curl -X POST http://localhost:10205/query/ts \
 ### B. 更多示例
 
 更多使用示例请参考项目根目录的 `README.md`。
+
+
+### Trace 受信物理表兼容
+
+Trace Profile 查询不接受客户端指定的任意 Doris 库表。每条受信路由必须带正整数 `app_id`，物理表仅精确接受租户共享 `cw_trace_span` 或该应用独占 `cw_trace_span_app_<AppID>`。`bk_biz_id` 仍用于身份、IAM 与行过滤，不派生物理表。AppID=0、缺少 `app_id`、`cw_trace_span_<BizID>` 业务目标及旧 `otel_trace_*` / `trace_span_*` 名称均拒绝；Summary 和其它前缀不能冒充 Span。租户、业务、应用与 schema 指纹仍统一校验。
+
+列表和聚合请求必须含单个正整数 `app_id` 的精确等值条件，所有过滤条件使用 AND。缺失该应用的发布路由时明确返回 `TRACE_ROUTE_NOT_FOUND`，不访问业务表或其它应用。运行配置和 SQL 编译只使用受信发布物明确登记的实际库表，不存在按业务拼表的默认构造。应用库仍接受同一受信租户的 hash 库或合法规范化租户库，不能使用其它租户的库。
+
+上线需配套升级 Kingeye/UQ，并由 Kingeye 重发仅含应用路由的完整租户快照。应用路由可选携带 `result_table_id` / `data_id` 来源元数据，两字段必须同时缺省或成对提供非空字符串及正整数；显式 `null`、错误类型、零或负数均拒绝。UQ 只校验并保留元数据，不据此派生库表或改走普通 RT 引擎；`trace_request` 顶层不接受这两个发布元数据字段，既有过滤条件中的 `data_id` 精确匹配语义不变。
+
+含退役业务路由或非法来源元数据的文档严格校验失败，只撤销对应租户，其它租户保持可用；Redis / Consul 热重载、严格 JSON 解码及传输失败保留最后快照的合同不变。本变更不迁移、改名或删除历史物理表及数据。

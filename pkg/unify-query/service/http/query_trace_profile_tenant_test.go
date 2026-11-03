@@ -108,11 +108,8 @@ func TestTraceProfileUsesVerifiedTenantWithoutAlias(t *testing.T) {
 			}
 			withTraceProfileRuntime(t, config)
 			withTraceProfileAuth(t, true, "kingeye-apm")
-			target, err := traceprofile.NewDorisTarget("18", tc.target+"_kapm", tc.bizID, metadata.TraceProfileSpan, "2026-09-24")
-			if err != nil {
-				t.Fatal(err)
-			}
-			snapshot, err := traceprofile.NewRouteSnapshot(7, []traceprofile.ReadRoute{{BkTenantID: tc.target, BkBizID: tc.bizID, Profile: metadata.TraceProfileSpan, Doris: &target}})
+			target := traceprofile.DorisTarget{ClusterID: "18", Database: tc.target + "_kapm", Table: "cw_trace_span_app_7", SchemaVersion: "2026-09-24"}
+			snapshot, err := traceprofile.NewRouteSnapshot(7, []traceprofile.ReadRoute{{BkTenantID: tc.target, BkBizID: tc.bizID, AppID: 7, Profile: metadata.TraceProfileSpan, Doris: &target}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -125,7 +122,7 @@ func TestTraceProfileUsesVerifiedTenantWithoutAlias(t *testing.T) {
 				if strings.Contains(statement, "`bk_tenant_id` = ?") || strings.Contains(statement, "`observation_domain_id` = ?") {
 					t.Fatal("isolation filters were lost")
 				}
-				if len(args) != 6 || args[4] != tc.space || args[5] != tc.bizID {
+				if len(args) != 7 || args[4] != tc.space || args[5] != tc.bizID || args[6] != "7" {
 					t.Fatalf("query lost trusted space and business: %v", args)
 				}
 				row := make(map[string]any, len(fixture.Cases[0].PhysicalRow)+1)
@@ -140,7 +137,7 @@ func TestTraceProfileUsesVerifiedTenantWithoutAlias(t *testing.T) {
 					row[key] = string(encoded)
 				}
 				row["total"] = int64(1)
-				row["bk_biz_id"], row["space_uid"] = tc.bizID, fmt.Sprintf("bkcc__%d", tc.bizID)
+				row["bk_biz_id"], row["space_uid"], row["app_id"] = tc.bizID, fmt.Sprintf("bkcc__%d", tc.bizID), "7"
 				return dorisclient.Result{Rows: []map[string]any{row}}, nil
 			})
 			executor, err := traceprofile.NewExecutor(snapshot, map[string]traceprofile.Querier{"18": querier}, traceprofile.Limits{MaxRangeUS: traceprofile.MaxWindowUS(7), MaxOffset: 1000})

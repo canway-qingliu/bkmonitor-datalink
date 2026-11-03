@@ -43,7 +43,7 @@ func setUpRedisTracePublication(t *testing.T) (context.Context, goRedis.Universa
 		t.Fatal(err)
 	}
 	client := redis.Client()
-	if err := client.Set(ctx, redisTraceDataPrefix+"system", publishedBusiness132, 0).Err(); err != nil {
+	if err := client.Set(ctx, redisTraceDataPrefix+"system", publishedApplication7, 0).Err(); err != nil {
 		t.Fatal(err)
 	}
 	config := traceProfileRuntimeConfig()
@@ -82,7 +82,7 @@ func TestTracePublishedRoutesLoadFromRedisWhenStorageSourceIsRedis(t *testing.T)
 	}
 	runtime := traceProfileRuntimeValue.Load()
 	if runtime == nil || runtime.routeCount != 1 {
-		t.Fatalf("published business routes were not installed: %+v", runtime)
+		t.Fatalf("published application routes were not installed: %+v", runtime)
 	}
 }
 
@@ -104,7 +104,7 @@ func TestTraceRedisInvalidPublicationRevokesOldRoute(t *testing.T) {
 	if err := reloadTraceProfilePublishedRuntime(); err != nil {
 		t.Fatal(err)
 	}
-	bad := strings.Replace(publishedBusiness132, "otel_trace_span_132", "otel_trace_span_133", 1)
+	bad := strings.Replace(publishedApplication7, "cw_trace_span_app_7", "cw_trace_span_app_8", 1)
 	if err := client.Set(ctx, redisTraceDataPrefix+"system", bad, 0).Err(); err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestTraceRedisNotificationReloadsRoutes(t *testing.T) {
 		}
 	}
 	oldVersion := traceProfileRuntimeValue.Load().routeVersion
-	next := strings.ReplaceAll(strings.Replace(publishedBusiness132, `"route_snapshot_version":7`, `"route_snapshot_version":8`, 1), "132", "133")
+	next := strings.ReplaceAll(strings.Replace(publishedApplication7, `"route_snapshot_version":7`, `"route_snapshot_version":8`, 1), "132", "133")
 	if err := client.Set(ctx, redisTraceDataPrefix+"system", next, 0).Err(); err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +190,7 @@ func TestRedisSourceWithNoTraceKeysIsUnpublished(t *testing.T) {
 		!strings.Contains(recorder.Body.String(), traceProfilePublishedEmptyMessage) {
 		t.Fatalf("unpublished answered HTTP %d (%s) span error %v", recorder.Code, recorder.Body.String(), spanErr)
 	}
-	if err := client.Set(ctx, redisTraceDataPrefix+"system", publishedBusiness132, 0).Err(); err != nil {
+	if err := client.Set(ctx, redisTraceDataPrefix+"system", publishedApplication7, 0).Err(); err != nil {
 		t.Fatal(err)
 	}
 	if err := reloadTraceProfilePublishedRuntime(); err != nil || traceProfileRuntimeValue.Load() == nil {

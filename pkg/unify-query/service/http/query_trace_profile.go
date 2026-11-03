@@ -53,16 +53,18 @@ const (
 )
 
 type traceProfileRouteConfig struct {
-	BkTenantID       string `json:"bk_tenant_id"`
-	BkBizID          int64  `json:"bk_biz_id"`
-	AppID            int64  `json:"app_id,omitempty"`
-	Profile          string `json:"profile"`
-	Database         string `json:"database,omitempty"`
-	Table            string `json:"table,omitempty"`
-	ClusterID        string `json:"cluster_id"`
-	ClusterName      string `json:"cluster_name,omitempty"`
-	SchemaVersion    string `json:"schema_version"`
-	PublishedVersion int64  `json:"published_route_version,omitempty"`
+	BkTenantID       string          `json:"bk_tenant_id"`
+	BkBizID          int64           `json:"bk_biz_id"`
+	AppID            int64           `json:"app_id"`
+	ResultTableID    json.RawMessage `json:"result_table_id,omitempty"`
+	DataID           json.RawMessage `json:"data_id,omitempty"`
+	Profile          string          `json:"profile"`
+	Database         string          `json:"database,omitempty"`
+	Table            string          `json:"table,omitempty"`
+	ClusterID        string          `json:"cluster_id"`
+	ClusterName      string          `json:"cluster_name,omitempty"`
+	SchemaVersion    string          `json:"schema_version"`
+	PublishedVersion int64           `json:"published_route_version,omitempty"`
 }
 
 type traceProfileConnectionConfig struct {
@@ -231,26 +233,16 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 			closeConnections()
 			return nil, err
 		}
-		var target traceprofile.DorisTarget
-		if route.AppID > 0 {
-			// 应用 Span 的物理名只来自已校验发布物，快照构造还会逐项验证应用 ID 与表名。
-			target = traceprofile.DorisTarget{
-				ClusterID: route.ClusterID, Database: route.Database,
-				Table: route.Table, SchemaVersion: route.SchemaVersion,
-			}
-		} else {
-			var err error
-			target, err = traceprofile.NewDorisTarget(
-				route.ClusterID, route.Database, route.BkBizID, profile, route.SchemaVersion,
-			)
-			if err != nil {
-				closeConnections()
-				return nil, err
-			}
-		}
-		if route.Database != "" && route.Database != target.Database || route.Table != "" && route.Table != target.Table {
+		resultTableID, dataID, err := traceprofile.ParseRouteSourceIdentity(route.ResultTableID, route.DataID)
+		if err != nil {
 			closeConnections()
-			return nil, fmt.Errorf("Trace 发布路由物理库表与受信业务命名不匹配")
+			return nil, err
+		}
+		// 物理坐标必须由受信配置明确登记，不再按业务 ID 拼表。
+		// 快照构造统一验证租户、业务、正整数 app_id 与物理目标。
+		target := traceprofile.DorisTarget{
+			ClusterID: route.ClusterID, Database: route.Database,
+			Table: route.Table, SchemaVersion: route.SchemaVersion,
 		}
 		// 路由所指集群必须有可用的只读连接，否则配置期就拒绝而不是查询期才失败。
 		if _, connected := connections[route.ClusterID]; !connected {
@@ -261,6 +253,8 @@ func newTraceProfileRuntime(raw any) (*traceProfileRuntime, error) {
 			BkTenantID:       route.BkTenantID,
 			BkBizID:          route.BkBizID,
 			AppID:            route.AppID,
+			ResultTableID:    resultTableID,
+			DataID:           dataID,
 			Profile:          profile,
 			PublishedVersion: route.PublishedVersion,
 			Doris:            &target,

@@ -97,7 +97,7 @@ func TestSourceSwitchFailsClosedUntilTheNewSourceReads(t *testing.T) {
 		t.Fatalf("an unread new source returned HTTP %d span error %v", recorder.Code, spanErr)
 	}
 	mr.SetError("")
-	if err := mr.Set(redisTraceDataPrefix+"system", publishedBusiness132); err != nil {
+	if err := mr.Set(redisTraceDataPrefix+"system", publishedApplication7); err != nil {
 		t.Fatal(err)
 	}
 	if err := reloadTraceProfilePublishedRuntime(); err != nil || traceProfileRuntimeValue.Load() == nil {
@@ -151,7 +151,7 @@ func TestAllTenantsRevokedIsNotALocalConfigError(t *testing.T) {
 	if err := reloadTraceProfilePublishedRuntime(); err != nil {
 		t.Fatal(err)
 	}
-	publication.set("system", strings.Replace(tracePublicationFor("system"), "otel_trace_span_132", "otel_trace_span_133", 1))
+	publication.set("system", strings.Replace(tracePublicationFor("system"), "cw_trace_span_app_7", "cw_trace_span_app_8", 1))
 	result, _, _ := loadTraceProfilePublishedRuntime()
 	if result == traceReloadInvalidConfig || traceProfileRuntimeValue.Load() != nil {
 		t.Fatalf("all tenants revoked was labelled %s", result)
@@ -301,7 +301,7 @@ func TestEmptyReadPathIsInvalidConfig(t *testing.T) {
 // R4：全部租户被撤销时，重载结果不是 success。
 func TestAllTenantsRevokedReportsRevoked(t *testing.T) {
 	publication := withConsulTracePublication(t, map[string]string{"system": tracePublicationFor("system")})
-	publication.set("system", strings.Replace(tracePublicationFor("system"), "otel_trace_span_132", "otel_trace_span_133", 1))
+	publication.set("system", strings.Replace(tracePublicationFor("system"), "cw_trace_span_app_7", "cw_trace_span_app_8", 1))
 	if result, _, _ := loadTraceProfilePublishedRuntime(); result != traceReloadRevoked {
 		t.Fatalf("all tenants revoked reported %q", result)
 	}

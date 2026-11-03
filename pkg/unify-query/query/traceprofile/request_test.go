@@ -107,7 +107,7 @@ func TestParseRequestRejectsSecondAndMillisecondEpochs(t *testing.T) {
 func TestParseRequestRejectsCoordinatesUnknownFieldsAndDuplicateKeys(t *testing.T) {
 	valid := validRequestJSON()
 	cases := map[string]string{
-		"client table_id":   strings.Replace(valid, `"trace_profile":"trace_span"`, `"trace_profile":"trace_span","table_id":"42_otel_trace_span.doris"`, 1),
+		"client table_id":   strings.Replace(valid, `"trace_profile":"trace_span"`, `"trace_profile":"trace_span","table_id":"42_cw_trace_span.doris"`, 1),
 		"nested SQL":        strings.Replace(valid, `"trace_request":{`, `"trace_request":{"sql":"SELECT *",`, 1),
 		"duplicate profile": strings.Replace(valid, `"trace_profile":"trace_span"`, `"trace_profile":"trace_span","trace_profile":"trace_span"`, 1),
 		"invalid profile":   strings.Replace(valid, `"trace_span"`, `"service_edge"`, 1),

@@ -101,14 +101,29 @@ bk_data:
 
 # Trace profile 直连存储读取（T6.1）。未配置时保持 fail closed：带 Trace 信封的
 # /query/ts/raw 请求返回固定拒绝，绝不回落到老的 BKBase/ES 链路。
-# 生产读目标来自 Kingeye Metadata 的逐租户发布物；发布物中的业务 ID
-# 与 profile 必须对应 otel_trace_span_<bk_biz_id> / otel_trace_summary_<bk_biz_id>。
+# 生产读目标来自 Kingeye Metadata 的逐租户发布物；每条路由必须含正整数 app_id，
+# 只接受租户共享 cw_trace_span 或该应用独占 cw_trace_span_app_<app_id>。
+# bk_biz_id 保留用于身份/IAM/行过滤，不按业务拼表；AppID=0 与旧业务物理表均拒绝。
+# 查询必须含单应用 app_id 等值条件和 AND 连接，缺应用路由不回退；上线需重发完整应用快照。
 # 来源跟随 storage.source：consul 时使用下方 data_path/version_path；redis 时
 # 从 redis.kv_base_path 派生逐租户 String key 与通知 channel，不使用这两条 Consul 路径。
 # Redis 模式在配置 trace_profile 时启用发布物加载；两种模式均要求只读连接配置先就绪。
 trace_profile:
   # read_target_data_path: kingeye_<platform>_<environment>/metadata/unify-query/data/trace/read_target
   # read_target_version_path: kingeye_<platform>_<environment>/metadata/unify-query/version/trace/read_target
+  # 若使用本地受信静态路由，必须明确登记 app_id 和物理库表，不能同时配置发布源路由。
+  # read_routes:
+  # - bk_tenant_id: default
+  #   bk_biz_id: 132
+  #   app_id: 7
+  #   # 可选来源元数据必须成对提供；不用于选择物理库表，不接受客户端传入。
+  #   result_table_id: default.apm_trace_span
+  #   data_id: 901
+  #   profile: trace_span
+  #   database: default_kapm
+  #   table: cw_trace_span  # 应用独占目标则为 cw_trace_span_app_7
+  #   cluster_id: "18"
+  #   schema_version: sha256:0bf5aac6160a636e
   # 单请求预算上限；缺省为 max_body_bytes=65536、max_limit=10000、max_offset=100000、max_range_days=30。
   # max_body_bytes: 65536
   # max_limit: 10000

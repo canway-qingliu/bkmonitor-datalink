@@ -24,6 +24,8 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/consul"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/traceprofile"
 )
 
 const (
@@ -31,9 +33,9 @@ const (
 	consulTraceVersionPath = "test/unify-query/version/trace/read_target"
 )
 
-// tracePublicationFor 是租户 tenant 的一份完整发布文档：一条业务 Span 读路由。
+// tracePublicationFor 是租户 tenant 的一份完整发布文档：一条正整数应用 Span 读路由。
 func tracePublicationFor(tenant string) string {
-	return strings.ReplaceAll(publishedBusiness132, "system", tenant)
+	return strings.ReplaceAll(publishedApplication7, "system", tenant)
 }
 
 // installedRouteCount 返回当前运行时的读路由数；运行时未安装时为 0。
@@ -158,6 +160,63 @@ func TestTraceTransientConsulReadErrorKeepsLastGoodSnapshot(t *testing.T) {
 }
 
 // 读取成功但一个租户的文档非法：只撤销该租户，其余租户照常服务。
+func TestBusinessRoutePublicationRevokesOnlyItsTenant(t *testing.T) {
+	good := tracePublicationFor("other")
+	legacyRoute := `,{"bk_tenant_id":"other","bk_biz_id":132,"profile":"trace_span",` +
+		`"database":"other_kapm","table":"cw_trace_span_132","cluster_id":18,"cluster_name":"doris4_test",` +
+		`"schema_version":"sha256:0bf5aac6160a636e"}`
+	for _, source := range []string{"consul", "redis"} {
+		for name, bad := range map[string]string{
+			"missing app":                    strings.Replace(good, `"app_id":7,`, "", 1),
+			"zero app":                       strings.Replace(good, `"app_id":7`, `"app_id":0`, 1),
+			"business table with app":        strings.Replace(good, "cw_trace_span_app_7", "cw_trace_span_132", 1),
+			"mixed application and business": strings.Replace(good, `]}`, legacyRoute+`]}`, 1),
+			"unpaired source identity":       strings.Replace(good, `"profile":`, `"result_table_id":"other.apm_trace_span","profile":`, 1),
+			"null source identity":           strings.Replace(good, `"profile":`, `"result_table_id":null,"data_id":null,"profile":`, 1),
+		} {
+			t.Run(source+"/"+name, func(t *testing.T) {
+				var publish func(string)
+				if source == "redis" {
+					ctx, client, _ := setUpRedisTracePublication(t)
+					publish = func(body string) {
+						if err := client.Set(ctx, redisTraceDataPrefix+"other", body, 0).Err(); err != nil {
+							t.Fatal(err)
+						}
+					}
+					publish(good)
+				} else {
+					publication := withConsulTracePublication(t, map[string]string{
+						"system": tracePublicationFor("system"), "other": good,
+					})
+					publish = func(body string) { publication.set("other", body) }
+				}
+				if err := reloadTraceProfilePublishedRuntime(); err != nil || installedRouteCount() != 2 {
+					t.Fatalf("application routes did not load: count=%d err=%v", installedRouteCount(), err)
+				}
+				publish(bad)
+				err := reloadTraceProfilePublishedRuntime()
+				if err == nil || !strings.Contains(err.Error(), "other") || installedRouteCount() != 1 {
+					t.Fatalf("retired route did not revoke only its tenant: count=%d err=%v", installedRouteCount(), err)
+				}
+				request := traceprofile.Request{
+					Profile: metadata.TraceProfileSpan, StartUS: 1, EndUS: 2, Limit: 1,
+					Filters: traceprofile.Filters{FieldList: []traceprofile.FilterField{{FieldName: "app_id", Operator: "eq", Value: []string{"7"}}}},
+				}
+				_, err = traceProfileRuntimeValue.Load().executor.Execute(t.Context(), request, traceprofile.Scope{
+					BkTenantID: "other", BkBizID: 132, SpaceUID: "bkcc__132",
+				})
+				if traceprofile.ErrorCode(err) != traceprofile.CodeRouteNotFound {
+					t.Fatalf("revoked tenant still reached a route: %v", err)
+				}
+				publish(good)
+				if err := reloadTraceProfilePublishedRuntime(); err != nil || installedRouteCount() != 2 {
+					t.Fatalf("corrected application snapshot did not recover: count=%d err=%v", installedRouteCount(), err)
+				}
+			})
+		}
+	}
+}
+
 func TestInvalidDocumentRevokesOnlyItsTenant(t *testing.T) {
 	publication := withConsulTracePublication(t, map[string]string{
 		"system": tracePublicationFor("system"),
@@ -169,7 +228,7 @@ func TestInvalidDocumentRevokesOnlyItsTenant(t *testing.T) {
 	if installedRouteCount() != 2 {
 		t.Fatalf("both tenant routes should be served before the invalid publication: %d", installedRouteCount())
 	}
-	publication.set("other", strings.Replace(tracePublicationFor("other"), "otel_trace_span_132", "otel_trace_span_133", 1))
+	publication.set("other", strings.Replace(tracePublicationFor("other"), "cw_trace_span_app_7", "cw_trace_span_app_8", 1))
 	err := reloadTraceProfilePublishedRuntime()
 	if err == nil || !strings.Contains(err.Error(), "other") {
 		t.Fatalf("invalid document was not reported with its tenant: %v", err)
@@ -280,7 +339,7 @@ func (mgetHook) AfterProcessPipeline(context.Context, []goRedis.Cmder) error { r
 
 func TestTraceRedisKeyVanishingMidScanSkipsOnlyThatKey(t *testing.T) {
 	ctx, client, mr := setUpRedisTracePublication(t)
-	if err := client.Set(ctx, redisTraceDataPrefix+"other", strings.ReplaceAll(publishedBusiness132, "system", "other"), 0).Err(); err != nil {
+	if err := client.Set(ctx, redisTraceDataPrefix+"other", strings.ReplaceAll(publishedApplication7, "system", "other"), 0).Err(); err != nil {
 		t.Fatal(err)
 	}
 	client.AddHook(mgetHook{before: func() { mr.Del(redisTraceDataPrefix + "other") }})
@@ -300,7 +359,7 @@ func TestTraceRedisKeyAddedMidLoadKeepsLastGoodSnapshot(t *testing.T) {
 	}
 	installed := traceProfileRuntimeValue.Load()
 	client.AddHook(mgetHook{before: func() {
-		_ = mr.Set(redisTraceDataPrefix+"other", strings.ReplaceAll(publishedBusiness132, "system", "other"))
+		_ = mr.Set(redisTraceDataPrefix+"other", strings.ReplaceAll(publishedApplication7, "system", "other"))
 	}})
 	err := reloadTraceProfilePublishedRuntime()
 	if err == nil || !strings.Contains(err.Error(), "加载期间发生变化") {

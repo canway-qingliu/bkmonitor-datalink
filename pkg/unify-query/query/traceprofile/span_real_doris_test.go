@@ -92,7 +92,7 @@ func TestSpanProfileReadsRealDorisVariantArraysAndExactTotal(t *testing.T) {
 	ctx, admin := fixture.ctx, fixture.admin
 	host, port := fixture.host, fixture.port
 	tenant, database, minute := fixture.tenant, fixture.database, fixture.minute
-	const table = "otel_trace_span_7"
+	const table = "cw_trace_span_app_7"
 	date := minute.Format("2006-01-02")
 	upperDate := minute.AddDate(0, 0, 1).Format("2006-01-02")
 	createSpanRealTable(t, ctx, admin, database, table, upperDate)
@@ -100,15 +100,16 @@ func TestSpanProfileReadsRealDorisVariantArraysAndExactTotal(t *testing.T) {
 	olderSpan := strings.Repeat("b", 15) + "1"
 	newerSpan := strings.Repeat("b", 15) + "2"
 	for _, row := range []struct {
-		tenant, domain, spanID string
-		startUS                int64
+		spaceUID, spanID string
+		bizID, startUS   int64
 	}{
-		{tenant, database, olderSpan, minute.Add(10 * time.Second).UnixMicro()},
-		{tenant, database, newerSpan, minute.Add(20 * time.Second).UnixMicro()},
-		{"other", "other_kapm", strings.Repeat("c", 15) + "1", minute.Add(30 * time.Second).UnixMicro()},
+		{"bkcc__7", olderSpan, 7, minute.Add(10 * time.Second).UnixMicro()},
+		{"bkcc__7", newerSpan, 7, minute.Add(20 * time.Second).UnixMicro()},
+		{"bkcc__8", strings.Repeat("c", 15) + "1", 7, minute.Add(30 * time.Second).UnixMicro()},
+		{"bkcc__7", strings.Repeat("c", 15) + "2", 8, minute.Add(40 * time.Second).UnixMicro()},
 	} {
-		insertSpanRealRow(t, ctx, admin, database, table, date, row.tenant,
-			row.domain, traceID, row.spanID, row.startUS)
+		insertSpanRealRow(t, ctx, admin, database, table, date, row.spaceUID,
+			row.bizID, traceID, row.spanID, row.startUS)
 	}
 
 	connection, err := dorisclient.New(dorisclient.Options{
@@ -121,7 +122,7 @@ func TestSpanProfileReadsRealDorisVariantArraysAndExactTotal(t *testing.T) {
 	target := DorisTarget{ClusterID: "local-span", Database: database, Table: table,
 		SchemaVersion: "local-span-v1"}
 	snapshot, err := NewRouteSnapshot(7, []ReadRoute{{
-		BkTenantID: tenant, BkBizID: 7, Profile: metadata.TraceProfileSpan,
+		BkTenantID: tenant, BkBizID: 7, AppID: 7, Profile: metadata.TraceProfileSpan,
 		PublishedVersion: 7, Doris: &target,
 	}})
 	if err != nil {
@@ -139,9 +140,10 @@ func TestSpanProfileReadsRealDorisVariantArraysAndExactTotal(t *testing.T) {
 	request := Request{
 		Profile: metadata.TraceProfileSpan, StartUS: minute.UnixMicro(), EndUS: minute.Add(time.Minute).UnixMicro(),
 		Limit: 1, Offset: &offset,
-		Filters: Filters{FieldList: []FilterField{{
-			FieldName: "trace_id", Value: []string{traceID}, Operator: "eq",
-		}}},
+		Filters: Filters{FieldList: []FilterField{
+			{FieldName: "app_id", Value: []string{"7"}, Operator: "eq"},
+			{FieldName: "trace_id", Value: []string{traceID}, Operator: "eq"},
+		}, ConditionList: []string{"and"}},
 	}
 	first, err := executor.Execute(ctx, request, scope)
 	if err != nil || first.Total != 2 || len(first.Items) != 1 || first.Items[0]["span_id"] != newerSpan {
@@ -176,7 +178,13 @@ func TestSpanProfileReadsRealDorisVariantArraysAndExactTotal(t *testing.T) {
 func createSpanRealTable(t *testing.T, ctx context.Context, db *sql.DB,
 	database, table, upperDate string) {
 	t.Helper()
-	statement := fmt.Sprintf(`CREATE TABLE %s.%s (
+	if _, err := db.ExecContext(ctx, spanRealTableStatement(database, table, upperDate)); err != nil {
+		t.Fatalf("create isolated Span table: %v", err)
+	}
+}
+
+func spanRealTableStatement(database, table, upperDate string) string {
+	return fmt.Sprintf(`CREATE TABLE %s.%s (
   span_date DATE NOT NULL, app_id VARCHAR(128) NOT NULL, trace_id VARCHAR(32) NOT NULL,
   span_id VARCHAR(32) NOT NULL, space_uid VARCHAR(128) NOT NULL,
   bk_biz_id BIGINT NOT NULL, data_id BIGINT NOT NULL, app_name VARCHAR(255) NOT NULL,
@@ -193,26 +201,33 @@ PARTITION BY RANGE (span_date) (PARTITION p_recent VALUES LESS THAN ('%s'))
 DISTRIBUTED BY HASH (trace_id) BUCKETS 1
 PROPERTIES ("replication_num"="1", "enable_unique_key_merge_on_write"="true",
   "function_column.sequence_col"="ingest_time")`, database, table, upperDate)
-	if _, err := db.ExecContext(ctx, statement); err != nil {
-		t.Fatalf("create isolated Span table: %v", err)
-	}
 }
 
 func insertSpanRealRow(t *testing.T, ctx context.Context, db *sql.DB,
-	database, table, date, tenant, domain, traceID, spanID string, startUS int64) {
+	database, table, date, spaceUID string, bizID int64, traceID, spanID string, startUS int64) {
 	t.Helper()
-	statement := fmt.Sprintf(`INSERT INTO %s.%s VALUES
-('%s','7','%s','%s','%s','%s','bkcc__7',7,42,'checkout','','',
+	statement := spanRealRowStatement(database, table, date, spaceUID, bizID, traceID, spanID, startUS)
+	if _, err := db.ExecContext(ctx, statement); err != nil {
+		t.Fatalf("insert isolated Span row: %v", err)
+	}
+}
+
+func spanRealRowStatement(database, table, date, spaceUID string, bizID int64,
+	traceID, spanID string, startUS int64) string {
+	return fmt.Sprintf(`INSERT INTO %s.%s (
+  span_date, app_id, trace_id, span_id, space_uid, bk_biz_id, data_id, app_name,
+  parent_span_id, trace_state, span_name, span_kind, status_code, status_message,
+  start_time_us, end_time_us, duration_us, event_time_ms,
+  service_namespace, service_name, service_instance_id, deployment_environment,
+  resource, attributes, events, links, ingest_time) VALUES
+('%s','7','%s','%s','%s',%d,42,'checkout','','',
 'GET /checkout',2,2,'boom',%d,%d,250000,%d,
 'payments','checkout','checkout-1','test',
 '{"service.name":"checkout","counter":9007199254740993}',
 '{"http.route":"/checkout","nested":{"counter":9007199254740993}}',
 '[{"name":"exception","timestamp":%d,"attributes":{"exception.message":"boom"}}]',
 '[{"trace_id":"%s","span_id":"1112131415161718","trace_state":"","attributes":{}}]',%d)`,
-		database, table, date, traceID, spanID, tenant, domain,
+		database, table, date, traceID, spanID, spaceUID, bizID,
 		startUS, startUS+250_000, startUS/1_000, startUS+200_000,
 		strings.Repeat("d", 32), startUS/1_000+1)
-	if _, err := db.ExecContext(ctx, statement); err != nil {
-		t.Fatalf("insert isolated Span row: %v", err)
-	}
 }

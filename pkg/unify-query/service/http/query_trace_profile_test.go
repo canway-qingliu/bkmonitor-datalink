@@ -34,7 +34,7 @@ func typedTraceBody(profile, domain string) string {
 		`` +
 		`"expected_scope_fingerprint":"` + strings.Repeat("a", 64) + `",` +
 		`"start_time":"1758585600000000","end_time":"1758672000000000",` +
-		`"filters":{"field_list":[],"condition_list":[]},"order_by":[],"limit":100}}`
+		`"filters":{"field_list":[{"field_name":"app_id","op":"eq","value":["7"]}],"condition_list":[]},"order_by":[],"limit":100}}`
 }
 
 func TestTypedCountAggregationUsesAggregateCompiler(t *testing.T) {
@@ -58,9 +58,9 @@ func TestDefaultTraceProfileBudgetCoversThirtyDayInclusiveWindow(t *testing.T) {
 	start := end - 30*24*int64(time.Hour/time.Microsecond) - 1000
 	request := traceprofile.Request{
 		Profile: metadata.TraceProfileSpan, StartUS: start, EndUS: end,
-		Limit: 50,
+		Limit: 50, Filters: traceprofile.Filters{FieldList: []traceprofile.FilterField{{FieldName: "app_id", Operator: "eq", Value: []string{"7"}}}},
 	}
-	target := traceprofile.DorisTarget{ClusterID: "18", Database: "system_kapm", Table: "otel_trace_span_42"}
+	target := traceprofile.DorisTarget{ClusterID: "18", Database: "system_kapm", Table: "cw_trace_span_app_7"}
 	limits := traceprofile.Limits{MaxRangeUS: traceprofile.MaxWindowUS(defaultTraceProfileMaxRangeDays)}
 	if _, err := traceprofile.CompileList(metadata.TraceProfileSpan, target, scope, request, limits); err != nil {
 		t.Fatalf("30-day inclusive product window was rejected: %v", err)
@@ -132,8 +132,8 @@ func traceProfileRuntimeConfig() map[string]any {
 		"max_range_days":         7,
 		"read_routes": []any{
 			map[string]any{
-				"bk_tenant_id": "system", "bk_biz_id": 42, "profile": "trace_span",
-				"database": "system_kapm", "cluster_id": "18", "schema_version": "2026-09-24", "published_route_version": 7,
+				"bk_tenant_id": "system", "bk_biz_id": 42, "app_id": 7, "profile": "trace_span",
+				"database": "system_kapm", "table": "cw_trace_span_app_7", "cluster_id": "18", "schema_version": "2026-09-24", "published_route_version": 7,
 			},
 		},
 		"readonly_connections": []any{
@@ -332,6 +332,72 @@ func TestNewTraceProfileRuntimeParsesOnlyCompleteConfiguration(t *testing.T) {
 	}
 }
 
+func TestNewTraceProfileRuntimeRejectsBusinessRoutesAndImplicitTargets(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		appID int64
+		table string
+	}{
+		{name: "implicit business target"},
+		{name: "explicit business target", table: "cw_trace_span_42"},
+		{name: "business target with app", appID: 7, table: "cw_trace_span_42"},
+		{name: "shared target without app", table: "cw_trace_span"},
+		{name: "exclusive target without app", table: "cw_trace_span_app_7"},
+		{name: "implicit application target", appID: 7},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := traceProfileRuntimeConfig()
+			route := config["read_routes"].([]any)[0].(map[string]any)
+			route["app_id"] = tc.appID
+			route["table"] = tc.table
+			runtime, err := newTraceProfileRuntime(config)
+			if runtime != nil {
+				runtime.close()
+			}
+			if err == nil || runtime != nil {
+				t.Fatalf("retired or implicit target built a runtime: err=%v", err)
+			}
+		})
+	}
+}
+
+func TestStaticTraceRouteSourceIdentityIsOptionalAndPaired(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		fields map[string]any
+		valid  bool
+	}{
+		{name: "absent metadata", valid: true},
+		{name: "paired metadata", fields: map[string]any{"result_table_id": "system.apm_trace_span", "data_id": 901}, valid: true},
+		{name: "missing DataID", fields: map[string]any{"result_table_id": "system.apm_trace_span"}},
+		{name: "missing RT", fields: map[string]any{"data_id": 901}},
+		{name: "empty pair", fields: map[string]any{"result_table_id": "", "data_id": 0}},
+		{name: "null pair", fields: map[string]any{"result_table_id": nil, "data_id": nil}},
+		{name: "negative DataID", fields: map[string]any{"result_table_id": "system.apm_trace_span", "data_id": -1}},
+		{name: "fractional DataID", fields: map[string]any{"result_table_id": "system.apm_trace_span", "data_id": 901.5}},
+		{name: "string DataID", fields: map[string]any{"result_table_id": "system.apm_trace_span", "data_id": "901"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := traceProfileRuntimeConfig()
+			route := config["read_routes"].([]any)[0].(map[string]any)
+			for key, value := range tc.fields {
+				route[key] = value
+			}
+			runtime, err := newTraceProfileRuntime(config)
+			if runtime != nil {
+				t.Cleanup(runtime.close)
+			}
+			if tc.valid {
+				if err != nil || runtime == nil {
+					t.Fatalf("valid optional source identity was rejected: %v", err)
+				}
+			} else if err == nil || runtime != nil {
+				t.Fatalf("invalid source identity built a runtime: %v", err)
+			}
+		})
+	}
+}
+
 func TestTraceProfileDirectReadRequiresVerifiedAllowlistedWorkload(t *testing.T) {
 	withTraceProfileRuntime(t, traceProfileRuntimeConfig())
 	body := typedTraceBody("trace_span", "system_kapm")
@@ -372,6 +438,15 @@ func TestTraceProfileDirectReadEnforcesAuthorizedScope(t *testing.T) {
 			t.Fatalf("got %s, want %s", code, traceprofile.CodeUnsupportedSchemaCapability)
 		}
 	})
+
+	for _, fields := range []string{`"result_table_id":"system.apm_trace_span",`, `"data_id":901,`} {
+		t.Run("source metadata is not client input/"+fields, func(t *testing.T) {
+			body := strings.Replace(typedTraceBody("trace_span", ""), `"trace_request":{`, `"trace_request":{`+fields, 1)
+			if code := decodeTraceProfileError(t, runTraceProfileRequest(t, body, "kingeye-apm")); code != traceprofile.CodeUnsupportedSchemaCapability {
+				t.Fatalf("client source metadata was accepted: %s", code)
+			}
+		})
+	}
 
 	t.Run("tenant without route", func(t *testing.T) {
 		config := traceProfileRuntimeConfig()

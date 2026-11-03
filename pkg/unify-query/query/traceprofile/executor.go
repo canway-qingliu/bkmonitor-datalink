@@ -63,9 +63,10 @@ func (e *Executor) RouteVersion() int64 {
 	return e.snapshot.Version()
 }
 
-// exactSpanRouteAppID 只从闭合的单应用 AND 条件选路；其他请求保留旧业务路由。
+// exactSpanRouteAppID 只从闭合的单应用 AND 条件选路；其它请求明确拒绝。
 func exactSpanRouteAppID(request Request) int64 {
-	if request.Profile != metadata.TraceProfileSpan || len(request.Filters.FieldList) == 0 {
+	if request.Profile != metadata.TraceProfileSpan || len(request.Filters.FieldList) == 0 ||
+		len(request.Filters.ConditionList) != len(request.Filters.FieldList)-1 {
 		return 0
 	}
 	for _, connector := range request.Filters.ConditionList {
