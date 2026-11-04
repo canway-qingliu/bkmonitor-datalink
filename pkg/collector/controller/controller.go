@@ -27,6 +27,7 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/pingserver"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/pipeline"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/processor"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/profiling"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/proxy"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/pusher"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/receiver"
@@ -154,6 +155,12 @@ func New(conf *confengine.Config, buildInfo define.BuildInfo) (*Controller, erro
 	}
 
 	if err = cache.Install(conf); err != nil {
+		return nil, err
+	}
+
+	// profiling.disabled 仅控制客户端是否采集，配置接口始终可用，
+	// 主配置禁用采集时仍需加载应用子配置，以便按 token 覆盖。
+	if err = profiling.New(conf); err != nil {
 		return nil, err
 	}
 
@@ -357,6 +364,10 @@ func (c *Controller) Reload(conf *confengine.Config) error {
 
 	if c.receiverMgr != nil {
 		c.receiverMgr.Reload(conf)
+	}
+
+	if err := profiling.Reload(conf); err != nil {
+		logger.Warnf("failed to reload profiling config: %v", err)
 	}
 
 	since := time.Since(t0)

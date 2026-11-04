@@ -43,6 +43,7 @@ const (
 	SourceBeat        = "beat"
 	SourceTars        = "tars"
 	SourceLogPush     = "logpush"
+	SourceProfiling   = "profiling"
 
 	ResourceAttributeDataSource = "bk.data.source"
 	SourceSkywalkingMeterData   = "skywalking_meterdata"

@@ -568,3 +568,41 @@ instance:
 {%- endif %}
 {%- endfor %}
 {%- endif %}
+
+{% if profiling_config is defined %}
+profiling:
+  {% if profiling_config.disabled is defined %}
+  # 与 Kingeye 总开关一致：true 不采集，false 允许采集
+  disabled: {{ profiling_config.disabled }}
+  {%- endif %}
+  {% if profiling_config.cpu is defined %}
+  cpu:
+    {% if profiling_config.cpu.enabled is defined %}
+    enabled: {{ profiling_config.cpu.enabled }}
+    {%- endif %}
+    {% if profiling_config.cpu.collection_period is defined %}
+    collection_period: "{{ profiling_config.cpu.collection_period }}"
+    {%- endif %}
+    {% if profiling_config.cpu.collection_window is defined %}
+    collection_window: "{{ profiling_config.cpu.collection_window }}"
+    {%- endif %}
+    {% if profiling_config.cpu.sampling_frequency is defined %}
+    sampling_frequency: "{{ profiling_config.cpu.sampling_frequency }}"
+    {%- endif %}
+  {%- endif %}
+  {% if profiling_config.memory is defined %}
+  memory:
+    {% if profiling_config.memory.enabled is defined %}
+    enabled: {{ profiling_config.memory.enabled }}
+    {%- endif %}
+    {% if profiling_config.memory.collection_period is defined %}
+    collection_period: "{{ profiling_config.memory.collection_period }}"
+    {%- endif %}
+    {% if profiling_config.memory.collection_window is defined %}
+    collection_window: "{{ profiling_config.memory.collection_window }}"
+    {%- endif %}
+    {% if profiling_config.memory.allocation_threshold is defined %}
+    allocation_threshold: "{{ profiling_config.memory.allocation_threshold }}"
+    {%- endif %}
+  {%- endif %}
+{%- endif %}

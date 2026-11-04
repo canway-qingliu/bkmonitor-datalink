@@ -238,6 +238,10 @@ bk-collector 有三种类型的配置，程序的最终配置结果是三者的�
 * [example.yml](./example/example.yml): 主配置示例文件
 * [platform.yml](./example/platform.yml): 平台配置文件
 
+各功能模块的配置说明：
+
+* [profiling.md](./docs/profiling.md): profiling 采集参数下发（主配置 / per-token 覆盖 / 排查清单）
+
 ### 1）配置层级
 
 配置层级跟随业务层级，所有的 processor 和 pipeline 配置遵循同名覆盖规则，子配置优先级高于父配置。
