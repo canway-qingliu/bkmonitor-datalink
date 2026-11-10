@@ -25,6 +25,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/function"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/mock"
 )
@@ -172,6 +173,80 @@ func TestPreparedFieldMetadataFieldsMapReturnsDeepCopy(t *testing.T) {
 	assert.Equal(t, []string{"whitespace"}, second["log"].TokenizeOnChars)
 }
 
+func TestDecodePreparedRawResultESNativeHighlight(t *testing.T) {
+	instance := exactTotalTestInstance(t)
+	query := exactTotalTestQuery(false)
+	query.HighLight = &metadata.HighLight{Enable: true}
+	query.FieldAlias = metadata.FieldAlias{"log_alias": "log"}
+	prepared, err := instance.PrepareRawQuery(
+		metadata.InitHashID(context.Background()), query,
+		time.UnixMilli(1723593608000), time.UnixMilli(1723679962000), nil,
+	)
+	require.NoError(t, err)
+
+	var response elastic.SearchResult
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"hits": {
+			"total": {"value": 1, "relation": "eq"},
+			"hits": [
+				{
+					"_index": "es_index",
+					"_id": "one",
+					"_source": {"dtEventTimeStamp": 1723679900000, "log": "containerd", "__ext": {"container_name": "containerd"}},
+					"highlight": {
+						"log": ["<mark>containerd</mark>"],
+						"log.keyword": ["<mark>containerd</mark>"],
+						"__ext.container_name": ["<mark>containerd</mark>"]
+					}
+				}
+			]
+		}
+	}`), &response))
+
+	rows := make(chan map[string]any, 1)
+	_, _, _, err = decodePreparedRawResult(prepared, &response, rows)
+	require.NoError(t, err)
+	close(rows)
+
+	got := drainRawRows(rows)
+	require.Len(t, got, 1)
+	highlight, ok := got[0][function.KeyHighLight].(map[string]any)
+	require.True(t, ok)
+	// 字段别名映射到展示字段；对象字段保留 dotted key；未展示的多重字段被过滤
+	assert.Equal(t, []string{"<mark>containerd</mark>"}, highlight["log_alias"])
+	assert.Equal(t, []string{"<mark>containerd</mark>"}, highlight["__ext.container_name"])
+	assert.NotContains(t, highlight, "log")
+	assert.NotContains(t, highlight, "log.keyword")
+}
+
+func TestDecodePreparedRawResultWithoutHighlight(t *testing.T) {
+	instance := exactTotalTestInstance(t)
+	query := exactTotalTestQuery(false)
+	query.HighLight = &metadata.HighLight{Enable: true}
+	prepared, err := instance.PrepareRawQuery(
+		metadata.InitHashID(context.Background()), query,
+		time.UnixMilli(1723593608000), time.UnixMilli(1723679962000), nil,
+	)
+	require.NoError(t, err)
+
+	var response elastic.SearchResult
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"hits": {
+			"total": {"value": 1, "relation": "eq"},
+			"hits": [{"_index": "es_index", "_id": "one", "_source": {"dtEventTimeStamp": 1723679900000, "log": "containerd"}}]
+		}
+	}`), &response))
+
+	rows := make(chan map[string]any, 1)
+	_, _, _, err = decodePreparedRawResult(prepared, &response, rows)
+	require.NoError(t, err)
+	close(rows)
+
+	got := drainRawRows(rows)
+	require.Len(t, got, 1)
+	assert.NotContains(t, got[0], function.KeyHighLight)
+}
+
 func TestCloneRawMetadataQueryDeepCopiesNestedAggregates(t *testing.T) {
 	source := &metadata.Query{
 		Aggregates: metadata.Aggregates{{
@@ -187,6 +262,19 @@ func TestCloneRawMetadataQueryDeepCopiesNestedAggregates(t *testing.T) {
 
 	assert.Equal(t, []string{"service"}, cloned.Aggregates[0].Dimensions)
 	assert.Equal(t, []any{"argument"}, cloned.Aggregates[0].Args)
+}
+
+func TestCloneRawMetadataQueryCopiesHighLight(t *testing.T) {
+	source := &metadata.Query{
+		HighLight: &metadata.HighLight{Enable: true, Mode: metadata.HighLightModeES},
+	}
+
+	cloned := cloneRawMetadataQuery(source)
+	require.NotNil(t, cloned.HighLight)
+	require.NotSame(t, source.HighLight, cloned.HighLight)
+
+	source.HighLight.Mode = metadata.HighLightModeRegex
+	assert.Equal(t, metadata.HighLightModeES, cloned.HighLight.Mode)
 }
 
 func TestPrepareRawQueryPrefetchCompletenessControlsMetadataLookup(t *testing.T) {

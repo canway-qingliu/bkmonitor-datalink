@@ -262,6 +262,13 @@ func queryRawWithResolvedInstance(ctx context.Context, queryTs *structured.Query
 	if err != nil {
 		return total, list, resultTableOptions, routeInfo, err
 	}
+	// ES 存储走 ES 原生高亮，Doris/混合存储继续使用正则高亮
+	useESNativeHighlight := rawQueryUsesESNativeHighlight(queryTs, queryRef)
+	if useESNativeHighlight {
+		queryRef.Range("", func(qry *metadata.Query) {
+			qry.HighLight = queryTs.HighLight
+		})
+	}
 	// IsSearchAfter is deliberately scoped to the raw execution path. QueryTs is
 	// also used by time-series/reference endpoints, where Doris must keep its
 	// normal aggregate/series query behavior.
@@ -356,7 +363,7 @@ func queryRawWithResolvedInstance(ctx context.Context, queryTs *structured.Query
 		span.Set("query-highlight", queryTs.HighLight)
 
 		var hlF *function.HighLightFactory
-		if queryTs.HighLight != nil && queryTs.HighLight.Enable && len(allLabelMap) > 0 {
+		if !useESNativeHighlight && queryTs.HighLight != nil && queryTs.HighLight.Enable && len(allLabelMap) > 0 {
 			hlF = function.NewHighLightFactory(allLabelMap, allFieldsMap, queryTs.HighLight.MaxAnalyzedOffset)
 		}
 
@@ -370,8 +377,11 @@ func queryRawWithResolvedInstance(ctx context.Context, queryTs *structured.Query
 			}
 
 			if hlF != nil {
-				if highlightResult := hlF.Process(item); len(highlightResult) > 0 {
-					item[function.KeyHighLight] = highlightResult
+				// ES 原生高亮已经写入 __highlight，避免二次包裹 <mark>
+				if _, ok := item[function.KeyHighLight]; !ok {
+					if highlightResult := hlF.Process(item); len(highlightResult) > 0 {
+						item[function.KeyHighLight] = highlightResult
+					}
 				}
 			}
 			list = append(list, item)
@@ -492,8 +502,8 @@ func queryRawWithResolvedInstance(ctx context.Context, queryTs *structured.Query
 					return
 				}
 
-				// 如果开启了高亮，收集字段映射信息用于判断大小写敏感性
-				if queryTs.HighLight != nil && queryTs.HighLight.Enable {
+				// 如果开启了正则高亮，收集字段映射信息用于判断大小写敏感性
+				if !useESNativeHighlight && queryTs.HighLight != nil && queryTs.HighLight.Enable {
 					if fieldsMap, fmErr := instance.QueryFieldMap(ctx, &localQry, qb.Start, qb.End); fmErr == nil && fieldsMap != nil {
 						lock.Lock()
 						for k, v := range fieldsMap {
@@ -552,6 +562,28 @@ func queryRawWithResolvedInstance(ctx context.Context, queryTs *structured.Query
 	}
 
 	return total, list, resultTableOptions, routeInfo, err
+}
+
+func rawQueryUsesESNativeHighlight(queryTs *structured.QueryTs, queryRef metadata.QueryReference) bool {
+	if queryTs == nil || queryTs.HighLight == nil || !queryTs.HighLight.Enable {
+		return false
+	}
+	if queryTs.HighLight.Mode == metadata.HighLightModeRegex {
+		return false
+	}
+	// auto/es：只有全部路由都是 ES 存储时才使用 ES 原生高亮，避免 ES 与 Doris 语义混用
+	allES := true
+	hasQuery := false
+	queryRef.Range("", func(qry *metadata.Query) {
+		if qry == nil {
+			return
+		}
+		hasQuery = true
+		if qry.StorageType != metadata.ElasticsearchStorageType {
+			allES = false
+		}
+	})
+	return hasQuery && allES
 }
 
 func hasRawPaginationCursor(option *metadata.ResultTableOption) bool {

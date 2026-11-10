@@ -1774,6 +1774,9 @@ const docTemplate = `{
                 },
                 "max_analyzed_offset": {
                     "type": "integer"
+                },
+                "mode": {
+                    "type": "string"
                 }
             }
         },

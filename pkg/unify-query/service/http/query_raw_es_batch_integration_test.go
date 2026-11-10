@@ -1086,8 +1086,8 @@ func TestQueryRawESBatchHighlightReusesPreparedFieldMappings(t *testing.T) {
 			return httpmock.NewStringResponse(
 				http.StatusOK,
 				`{"responses":[`+
-					`{"status":200,"_shards":{"total":1,"successful":1,"failed":0},"hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_index":"`+firstIndex+`","_id":"first","_source":{"start_time":2,"log":"Needle first"}}]}},`+
-					`{"status":200,"_shards":{"total":1,"successful":1,"failed":0},"hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_index":"`+secondIndex+`","_id":"second","_source":{"start_time":1,"log":"second needle"}}]}}`+
+					`{"status":200,"_shards":{"total":1,"successful":1,"failed":0},"hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_index":"`+firstIndex+`","_id":"first","_source":{"start_time":2,"log":"Needle first"},"highlight":{"log":["<mark>Needle</mark> first"]}}]}},`+
+					`{"status":200,"_shards":{"total":1,"successful":1,"failed":0},"hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_index":"`+secondIndex+`","_id":"second","_source":{"start_time":1,"log":"second needle"},"highlight":{"log":["second <mark>needle</mark>"]}}]}}`+
 					`]}`,
 			), nil
 		},

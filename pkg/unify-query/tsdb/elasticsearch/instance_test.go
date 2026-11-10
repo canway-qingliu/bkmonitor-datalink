@@ -19,6 +19,7 @@ import (
 
 	"github.com/jarcoal/httpmock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/function"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/json"
@@ -1603,6 +1604,82 @@ func TestBuildESQuerySourceTagValuesQueryString(t *testing.T) {
 			assert.JSONEq(t, tc.expected, body)
 		})
 	}
+}
+
+func TestBuildESQuerySourceESNativeHighlight(t *testing.T) {
+	ctx := metadata.InitHashID(context.Background())
+	start := time.UnixMilli(1723593608000)
+	end := time.UnixMilli(1723679962000)
+
+	buildBody := func(t *testing.T, query *metadata.Query) map[string]any {
+		t.Helper()
+		fact := NewFormatFactory(ctx).
+			WithQuery("log", metadata.TimeField{Name: "dtEventTimeStamp", Type: TimeFieldTypeTime, Unit: "ms"}, start, end, "ms", 10).
+			WithFieldMap(metadata.FieldsMap{
+				"log": {FieldName: "log", FieldType: Text},
+			})
+		_, _, body, err := buildESQuerySource(ctx, query, fact, nil)
+		require.NoError(t, err)
+		var bodyMap map[string]any
+		require.NoError(t, json.Unmarshal([]byte(body), &bodyMap))
+		return bodyMap
+	}
+	baseQuery := func() *metadata.Query {
+		return &metadata.Query{
+			StorageType: metadata.ElasticsearchStorageType,
+			QueryString: "*tainer*",
+			Size:        10,
+			TimeField:   metadata.TimeField{Name: "dtEventTimeStamp", Type: TimeFieldTypeTime, Unit: "ms"},
+			HighLight:   &metadata.HighLight{Enable: true},
+		}
+	}
+
+	t.Run("整词高亮参数与 BKLog 对齐", func(t *testing.T) {
+		body := buildBody(t, baseQuery())
+		highlight, ok := body["highlight"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, []any{"<mark>"}, highlight["pre_tags"])
+		assert.Equal(t, []any{"</mark>"}, highlight["post_tags"])
+		assert.Equal(t, false, highlight["require_field_match"])
+		fields, ok := highlight["fields"].(map[string]any)
+		require.True(t, ok)
+		field, ok := fields["*"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, float64(0), field["number_of_fragments"])
+		assert.NotContains(t, highlight, "max_analyzed_offset")
+	})
+
+	t.Run("字段查询 require_field_match 为 true", func(t *testing.T) {
+		query := baseQuery()
+		query.QueryString = "log:*tainer*"
+		highlight := buildBody(t, query)["highlight"].(map[string]any)
+		assert.Equal(t, true, highlight["require_field_match"])
+	})
+
+	t.Run("max_analyzed_offset 透传", func(t *testing.T) {
+		query := baseQuery()
+		query.HighLight.MaxAnalyzedOffset = 1000000
+		highlight := buildBody(t, query)["highlight"].(map[string]any)
+		assert.Equal(t, float64(1000000), highlight["max_analyzed_offset"])
+	})
+
+	t.Run("关闭高亮不生成 highlight", func(t *testing.T) {
+		query := baseQuery()
+		query.HighLight.Enable = false
+		assert.NotContains(t, buildBody(t, query), "highlight")
+	})
+
+	t.Run("非 ES 存储不生成 highlight", func(t *testing.T) {
+		query := baseQuery()
+		query.StorageType = metadata.BkSqlStorageType
+		assert.NotContains(t, buildBody(t, query), "highlight")
+	})
+
+	t.Run("regex 模式不生成 highlight", func(t *testing.T) {
+		query := baseQuery()
+		query.HighLight.Mode = metadata.HighLightModeRegex
+		assert.NotContains(t, buildBody(t, query), "highlight")
+	})
 }
 
 func TestInstance_QuerySeries(t *testing.T) {

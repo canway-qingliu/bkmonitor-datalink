@@ -1635,6 +1635,7 @@ func TestQueryRawWithInstance(t *testing.T) {
 				End:           "1749460022",
 				HighLight: &metadata.HighLight{
 					Enable: true,
+					Mode:   metadata.HighLightModeRegex,
 				},
 			},
 			total:    1e4,
@@ -1921,6 +1922,7 @@ func TestQueryRawWithInstance(t *testing.T) {
 				End:   end,
 				HighLight: &metadata.HighLight{
 					Enable: true,
+					Mode:   metadata.HighLightModeRegex,
 				},
 			},
 			total:    1,
@@ -1951,6 +1953,7 @@ func TestQueryRawWithInstance(t *testing.T) {
 				End:   end,
 				HighLight: &metadata.HighLight{
 					Enable: true,
+					Mode:   metadata.HighLightModeRegex,
 				},
 			},
 			total:    1,
@@ -1980,6 +1983,7 @@ func TestQueryRawWithInstance(t *testing.T) {
 				End:   end,
 				HighLight: &metadata.HighLight{
 					Enable: true,
+					Mode:   metadata.HighLightModeRegex,
 				},
 			},
 			total:    1e4,
@@ -2011,6 +2015,7 @@ func TestQueryRawWithInstance(t *testing.T) {
 				End:   end,
 				HighLight: &metadata.HighLight{
 					Enable: true,
+					Mode:   metadata.HighLightModeRegex,
 				},
 			},
 			total:    1,
@@ -2042,6 +2047,7 @@ func TestQueryRawWithInstance(t *testing.T) {
 				End:   end,
 				HighLight: &metadata.HighLight{
 					Enable: true,
+					Mode:   metadata.HighLightModeRegex,
 				},
 			},
 			total:    1,
@@ -2073,6 +2079,7 @@ func TestQueryRawWithInstance(t *testing.T) {
 				End:   end,
 				HighLight: &metadata.HighLight{
 					Enable: true,
+					Mode:   metadata.HighLightModeRegex,
 				},
 			},
 			total:    1,
@@ -2083,6 +2090,7 @@ func TestQueryRawWithInstance(t *testing.T) {
 			queryTs: &structured.QueryTs{
 				HighLight: &metadata.HighLight{
 					Enable: true,
+					Mode:   metadata.HighLightModeRegex,
 				},
 				SpaceUid: spaceUid,
 				QueryList: []*structured.Query{
@@ -2121,6 +2129,7 @@ func TestQueryRawWithInstance(t *testing.T) {
 			queryTs: &structured.QueryTs{
 				HighLight: &metadata.HighLight{
 					Enable: true,
+					Mode:   metadata.HighLightModeRegex,
 				},
 				SpaceUid: spaceUid,
 				QueryList: []*structured.Query{
@@ -2175,6 +2184,7 @@ func TestQueryRawWithInstance(t *testing.T) {
 				},
 				HighLight: &metadata.HighLight{
 					Enable: true,
+					Mode:   metadata.HighLightModeRegex,
 				},
 				Limit: 3,
 				Start: start,
@@ -2208,6 +2218,7 @@ func TestQueryRawWithInstance(t *testing.T) {
 				},
 				HighLight: &metadata.HighLight{
 					Enable: true,
+					Mode:   metadata.HighLightModeRegex,
 				},
 				Limit: 3,
 				Start: start,
@@ -2238,6 +2249,7 @@ func TestQueryRawWithInstance(t *testing.T) {
 				},
 				HighLight: &metadata.HighLight{
 					Enable: true,
+					Mode:   metadata.HighLightModeRegex,
 				},
 				Limit: 1,
 				Start: start,
@@ -2268,6 +2280,7 @@ func TestQueryRawWithInstance(t *testing.T) {
 				},
 				HighLight: &metadata.HighLight{
 					Enable: true,
+					Mode:   metadata.HighLightModeRegex,
 				},
 				Limit: 1,
 				Start: start,
@@ -2298,6 +2311,7 @@ func TestQueryRawWithInstance(t *testing.T) {
 				},
 				HighLight: &metadata.HighLight{
 					Enable: true,
+					Mode:   metadata.HighLightModeRegex,
 				},
 				Limit: 1,
 				Start: start,

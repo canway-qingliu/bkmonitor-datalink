@@ -319,7 +319,7 @@ func TestQueryRawHighlightPrefetchFailureDoesNotPoisonSearchMapping(t *testing.T
 	})
 
 	qts := queryRawCharacterizationQuery(virtualTable)
-	qts.HighLight = &metadata.HighLight{Enable: true}
+	qts.HighLight = &metadata.HighLight{Enable: true, Mode: metadata.HighLightModeRegex}
 	qts.QueryList[0].Conditions = structured.Conditions{
 		FieldList: []structured.ConditionField{
 			{

@@ -323,6 +323,22 @@ func (i *Instance) fieldMapWithIndexFields(ctx context.Context, fieldAlias metad
 	return iof.FieldsMap(), physicalIndexes, indexFields, nil
 }
 
+// newESHighlight 构造与 BKLog 一致的 ES 原生高亮参数。
+// 高亮单位是 ES 分词后的完整 term，因此 *tainer* 会命中并标记 containerd 整体。
+func newESHighlight(qb *metadata.Query) *elastic.Highlight {
+	// 与 BKLog 保持一致：字段查询（query_string 含冒号）只高亮命中字段
+	requireFieldMatch := qb.QueryString != "" && strings.Contains(qb.QueryString, ":")
+	highlight := elastic.NewHighlight().
+		PreTags("<mark>").
+		PostTags("</mark>").
+		RequireFieldMatch(requireFieldMatch).
+		Fields(elastic.NewHighlighterField("*").NumOfFragments(0))
+	if qb.HighLight != nil && qb.HighLight.MaxAnalyzedOffset > 0 {
+		highlight.MaxAnalyzedOffset(qb.HighLight.MaxAnalyzedOffset)
+	}
+	return highlight
+}
+
 func buildESQuerySource(ctx context.Context, qb *metadata.Query, fact *FormatFactory, forceUnmappedTypes map[string]string) (*elastic.SearchSource, elastic.Query, string, error) {
 	filterQueries := make([]elastic.Query, 0)
 
@@ -353,6 +369,9 @@ func buildESQuerySource(ctx context.Context, qb *metadata.Query, fact *FormatFac
 	source := elastic.NewSearchSource()
 	if qb.ExactTotal {
 		source.TrackTotalHits(true)
+	}
+	if qb.HighLight != nil && qb.HighLight.UseESNative(qb.StorageType) {
+		source.Highlight(newESHighlight(qb))
 	}
 	for _, order := range fact.Orders() {
 		fs := elastic.NewFieldSort(order.Name).Order(order.Ast)

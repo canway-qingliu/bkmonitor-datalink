@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -313,6 +314,10 @@ func cloneRawMetadataQuery(source *metadata.Query) *metadata.Query {
 	cloned.Orders = append(metadata.Orders(nil), source.Orders...)
 	cloned.SelectDistinct = append([]string(nil), source.SelectDistinct...)
 	cloned.ResultTableOption = source.ResultTableOption.Clone()
+	if source.HighLight != nil {
+		highlight := *source.HighLight
+		cloned.HighLight = &highlight
+	}
 
 	if source.FieldAlias != nil {
 		cloned.FieldAlias = make(metadata.FieldAlias, len(source.FieldAlias))
@@ -353,6 +358,12 @@ func decodePreparedRawResult(
 		From:      &from,
 	}
 
+	// 原始字段名 -> 展示别名字段名，保证 __highlight 的 key 和返回数据一致
+	reverseAlias := make(map[string]string, len(rawQuery.FieldAlias))
+	for alias, original := range rawQuery.FieldAlias {
+		reverseAlias[original] = alias
+	}
+
 	if sr == nil {
 		if rawQuery.ExactTotal {
 			return size, total, option, fmt.Errorf("ES exact total unavailable: search response is missing")
@@ -385,6 +396,24 @@ func decodePreparedRawResult(
 			fact.data[metadata.KeyIndex] = d.Index
 			rawQuery.DataReload(fact.data)
 
+			// ES 原生高亮：直接透传 hits[].highlight，避免网关侧再次按检索词切分
+			if len(d.Highlight) > 0 && rawQuery.HighLight != nil && rawQuery.HighLight.UseESNative(rawQuery.StorageType) {
+				highlight := make(map[string]any, len(d.Highlight))
+				for field, values := range d.Highlight {
+					outputField := field
+					if alias, ok := reverseAlias[field]; ok {
+						outputField = alias
+					}
+					if !highlightFieldVisible(fact.data, outputField) {
+						continue
+					}
+					highlight[outputField] = values
+				}
+				if len(highlight) > 0 {
+					fact.data[function.KeyHighLight] = highlight
+				}
+			}
+
 			if timeValue, ok := data[fact.GetTimeField().Name]; ok {
 				fact.data[FieldTime] = timeValue
 			}
@@ -413,4 +442,23 @@ func decodePreparedRawResult(
 	}
 
 	return size, total, option, nil
+}
+
+// highlightFieldVisible 判断高亮字段是否对当前返回数据可见。
+// 普通字段要求 key 存在；对象字段保留 dotted key（如 __ext.container_name），
+// 交给下游合并到嵌套结构；log.keyword 这类多重字段不展示也不保留。
+func highlightFieldVisible(data map[string]any, field string) bool {
+	if _, ok := data[field]; ok {
+		return true
+	}
+	top, _, found := strings.Cut(field, ".")
+	if !found {
+		return false
+	}
+	value, ok := data[top]
+	if !ok {
+		return false
+	}
+	_, isObject := value.(map[string]any)
+	return isObject
 }

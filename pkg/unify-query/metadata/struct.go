@@ -221,6 +221,9 @@ type Query struct {
 	QueryString string `json:"query_string,omitempty"`
 	IsPrefix    bool   `json:"is_prefix,omitempty"`
 
+	// HighLight 高亮配置，仅原始数据查询使用；nil 表示不开启
+	HighLight *HighLight `json:"-"`
+
 	// sql 查询
 	SQL string `json:"sql,omitempty"`
 
@@ -315,7 +318,29 @@ func (q *Query) VMExpand() *VmExpand {
 type HighLight struct {
 	MaxAnalyzedOffset int       `json:"max_analyzed_offset,omitempty"`
 	Enable            bool      `json:"enable,omitempty"`
-	FieldsMap         FieldsMap `json:"-"` // 用于高亮时判断字段的大小写敏感性
+	Mode              string    `json:"mode,omitempty"` // auto|es|regex；空值等同 auto
+	FieldsMap         FieldsMap `json:"-"`              // 用于高亮时判断字段的大小写敏感性
+}
+
+const (
+	// HighLightModeAuto ES 存储走 ES 原生高亮，其余存储沿用正则高亮
+	HighLightModeAuto = "auto"
+	// HighLightModeES 强制使用 ES 原生高亮
+	HighLightModeES = "es"
+	// HighLightModeRegex 强制使用正则高亮
+	HighLightModeRegex = "regex"
+)
+
+// UseESNative 判断目标存储是否应该使用 ES 原生高亮。
+// 空 mode 视为 auto；auto 仅在目标存储为 ES 时启用原生高亮。
+func (h *HighLight) UseESNative(storageType string) bool {
+	if h == nil || !h.Enable {
+		return false
+	}
+	if h.Mode == HighLightModeRegex {
+		return false
+	}
+	return storageType == ElasticsearchStorageType
 }
 
 type Collapse struct {
