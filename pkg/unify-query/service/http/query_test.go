@@ -5418,6 +5418,7 @@ func TestRedis(t *testing.T) {
 	// 清理
 	session, err := redisUtil.GetOrCreateScrollSession(ctx, key, ScrollWindowTimeout, ScrollSessionLockTimeout, 3, 100)
 	if session != nil {
+		_ = session.Stop(ctx, nil)
 		_ = session.Clear(ctx)
 	}
 
@@ -5444,6 +5445,7 @@ func TestRedis(t *testing.T) {
 			},
 		}
 		_ = session.Update(ctx)
+		_ = session.Stop(ctx, nil)
 	}
 	session, err = redisUtil.GetOrCreateScrollSession(ctx, key, ScrollWindowTimeout, ScrollSessionLockTimeout, 3, 100)
 	if err != nil {
@@ -5456,6 +5458,7 @@ func TestRedis(t *testing.T) {
 
 	// 清理
 	if session != nil {
+		assert.NoError(t, session.Stop(ctx, nil))
 		err = session.Clear(ctx)
 		assert.Nil(t, err)
 	}
@@ -5469,6 +5472,8 @@ func TestRedis(t *testing.T) {
 	assert.Nil(t, err)
 	actual, _ = json.Marshal(session)
 	assert.Equal(t, newSession, string(actual))
+	assert.NoError(t, session.Stop(ctx, nil))
+	assert.NoError(t, session.Clear(ctx))
 }
 
 func TestQueryRawWithScroll_ES(t *testing.T) {

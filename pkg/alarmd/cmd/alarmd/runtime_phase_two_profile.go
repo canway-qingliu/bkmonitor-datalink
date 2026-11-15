@@ -154,7 +154,7 @@ func phaseTwoRuntimeProfile(cfg config.Config, cpuSource string, procs int) (obs
 			DynamicGroupKeyPrefix:     targetGroupPrefix(cfg),
 			PlatformSettingsKeyPrefix: cfg.PhaseTwo.PlatformSettings.RedisKeyPrefix,
 		},
-		Linkd:     observability.RuntimeLinkdFacts{ConsoleConfigured: cfg.PhaseTwo.Linkd.ConsoleURL != ""},
+		Linkd:     observability.RuntimeLinkdFacts{ControlPlaneConfigured: cfg.PhaseTwo.Linkd.ControlPlane.Configured()},
 		UQCodec:   phaseTwoUQCodecFacts(),
 		Retention: phaseTwoRuntimeRetention(cfg),
 	}
@@ -211,7 +211,7 @@ func phaseTwoRuntimeCapacity(cfg config.Config, inputs config.CapacityInputs) ob
 		RedisPoolSize: cfg.Redis.PoolSize,
 		ReadyQueue:    s.ReadyQueueCapacity, RecoveryQueue: s.RecoveryQueueCapacity, QueuedPerQG: s.MaxQueuedItemsPerQG,
 		TickNS: int64(s.TickInterval), ReplaySlots: s.MaxReplaySlots, ReplayAgeNS: int64(s.MaxReplayAge),
-		RetryMinNS: int64(s.RetryMinDelay), RetryMaxNS: int64(s.RetryMaxDelay),
+		RetryMinNS: int64(s.RetryMinDelay), RetryMaxNS: int64(s.RetryMaxDelay), TakeoverDivertNS: int64(s.TakeoverDivertFloor),
 		SequencerReservations: c.MaxSequencerReservations, Series: c.MaxSeries, RetainedBytes: c.MaxRetainedBytes,
 		StateMutations: c.MaxStateMutations, Events: c.MaxEvents, GapMutations: c.MaxGapMutations, GapFacts: c.MaxGapMutations,
 		SlotStateMutations: execution.SlotMutationCap(uint64(cfg.Limits.Store.MaxKeysPerBatch), c.MaxStateMutations),
@@ -224,7 +224,7 @@ func phaseTwoRuntimeCapacity(cfg config.Config, inputs config.CapacityInputs) ob
 		GoGCPercent:                 goRuntime.GCPercent,
 		EvaluatorMaxLevels:          uint64(cfg.Limits.Compiler.MaxLevelsPerPlan), EvidenceBytes: cfg.TriggerLimits().MaxEvidenceBytesPerEvent,
 		OutputMessageBytes: cfg.Kafka.TriggerEvent.MaxMessageBytes,
-		UQBodyBytes:        uq.MaxBodyBytes, UQSeriesBytes: uq.MaxSeriesBytes, UQSeries: uq.MaxSeries, UQRecords: uq.MaxRecords,
+		UQSeriesBytes:      uq.MaxSeriesBytes, UQSeries: uq.MaxSeries, UQRecords: uq.MaxRecords,
 	}
 }
 

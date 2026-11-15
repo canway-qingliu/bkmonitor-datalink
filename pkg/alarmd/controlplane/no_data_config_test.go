@@ -218,7 +218,7 @@ func TestFrozenNoDataConfigFollowsTheBackendReadSites(t *testing.T) {
 func TestNoDataRosterUnsupportedNamesOnlyWhatThisBuildCannotDerive(t *testing.T) {
 	hostScope := &contract.TargetScopeV2{Groups: []contract.TargetScopeGroupV2{{
 		Conditions: []contract.TargetScopeConditionV2{{
-			Field: contract.TargetScopeHost, Method: contract.TargetScopeInclude, Keys: []string{"10.0.0.1|0"},
+			Field: contract.TargetScopeHost, Method: contract.TargetScopeInclude, Keys: []string{"192.0.2.1|0"},
 		}},
 	}}}
 	topoScope := &contract.TargetScopeV2{Groups: []contract.TargetScopeGroupV2{{
@@ -263,7 +263,7 @@ func TestNoDataRosterUnsupportedNamesOnlyWhatThisBuildCannotDerive(t *testing.T)
 		"host and topology together": {
 			scope: &contract.TargetScopeV2{Groups: []contract.TargetScopeGroupV2{{
 				Conditions: []contract.TargetScopeConditionV2{
-					{Field: contract.TargetScopeHost, Method: contract.TargetScopeInclude, Keys: []string{"10.0.0.1|0"}},
+					{Field: contract.TargetScopeHost, Method: contract.TargetScopeInclude, Keys: []string{"192.0.2.1|0"}},
 					{Field: contract.TargetScopeTopoNode, Method: contract.TargetScopeInclude, Keys: []string{"module|1"}},
 				},
 			}}},
@@ -464,5 +464,30 @@ func TestIsEnabledIsReadWithPythonsTruthiness(t *testing.T) {
 				t.Fatalf("is_enabled %s reads %s (config %+v, error %v), want %s", value, got, config, err, want)
 			}
 		})
+	}
+}
+
+// An item's no-data alert is written not to recover as the detect at its
+// level says, and with no detect at that level only where every detect
+// says so: the strategy page writes one switch onto every detect, and a
+// level the item declares nothing for follows it only where it is
+// unanimous. No detects, or the switch unstated, recovers.
+func TestTheNoDataAlertFollowsTheRecoverySwitchOfItsLevel(t *testing.T) {
+	off, on := json.RawMessage(`{"check_window":3,"disable_recovery":true}`), json.RawMessage(`{"check_window":3}`)
+	for name, test := range map[string]struct {
+		detects []legacyDetect
+		level   uint32
+		want    bool
+	}{
+		"its level off":                      {detects: []legacyDetect{{Level: 1, Recovery: on}, {Level: 2, Recovery: off}}, level: 2, want: true},
+		"its level on, another off":          {detects: []legacyDetect{{Level: 1, Recovery: off}, {Level: 2, Recovery: on}}, level: 2},
+		"no detect at its level, all off":    {detects: []legacyDetect{{Level: 1, Recovery: off}, {Level: 3, Recovery: off}}, level: 2, want: true},
+		"no detect at its level, one on":     {detects: []legacyDetect{{Level: 1, Recovery: off}, {Level: 3, Recovery: on}}, level: 2},
+		"no detects":                         {level: 2},
+		"its level unstated, all others off": {detects: []legacyDetect{{Level: 2, Recovery: on}, {Level: 1, Recovery: off}}, level: 2},
+	} {
+		if got := noDataRecoveryDisabled(test.detects, test.level); got != test.want {
+			t.Errorf("%s: disabled = %v, want %v", name, got, test.want)
+		}
 	}
 }

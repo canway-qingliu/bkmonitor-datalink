@@ -259,6 +259,10 @@ func runControlledG4Golden(
 	uqClient := controlledG4UQClient(t, base, table)
 
 	cfg := controlledG4RuntimeConfig(address, "http://controlled-uq", fmt.Sprintf("alarmd-g4-controlled-%d", strategyID))
+	// A revisioned snapshot goes out on the consumer's protocol, whose
+	// RECOVERY the gate passes on this process's own send: the copy is built
+	// from the link's control plane.
+	cfg.PhaseTwo.Linkd.ControlPlane = quietLinkControlPlane(t)
 	events := &recordingPhaseTwoEventSink{}
 	var observationsMu sync.Mutex
 	var observations []observability.Observation
@@ -511,7 +515,7 @@ func controlledG4Base(t *testing.T) int64 {
 	t.Helper()
 	wall := time.Now()
 	if remaining := time.Until(wall.Truncate(time.Minute).Add(time.Minute)); remaining < 10*time.Second {
-		time.Sleep(remaining + 10*time.Millisecond)
+		time.Sleep(remaining + 10*time.Millisecond) // fixed-wait: aligns the case to a wall-clock minute boundary, the behaviour the case is built on
 		wall = time.Now()
 	}
 	base := wall.Unix()

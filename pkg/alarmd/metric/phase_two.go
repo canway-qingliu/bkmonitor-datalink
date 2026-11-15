@@ -8,6 +8,7 @@ package metric
 import (
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/observability"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/ownership"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/redisfailure"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/sourceliveness"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/targetplan"
 )
 
@@ -31,6 +33,7 @@ type phaseTwoMetrics struct {
 	workflow                       workflowMetrics
 	shortPeriod                    shortPeriodMetrics
 	queryStatus                    queryStatusMetrics
+	flow                           flowMetrics
 	queryCodec                     queryCodecMetrics
 	queryTruncation                queryTruncationMetrics
 	queryUnavailable               queryUnavailableMetrics
@@ -45,6 +48,7 @@ type phaseTwoMetrics struct {
 	stateWriteReuse                *prometheus.CounterVec
 	stateAlreadyApplied            *prometheus.CounterVec
 	stateVersionConflict           *prometheus.CounterVec
+	stateSuperseded                *prometheus.CounterVec
 	ownershipRefusals              *prometheus.CounterVec
 	sourceObservations             *prometheus.CounterVec
 	sourceRefreshes                *prometheus.CounterVec
@@ -56,10 +60,13 @@ type phaseTwoMetrics struct {
 	activationFailures             *prometheus.CounterVec
 	ownedQueryGroups               *prometheus.GaugeVec
 	ownershipTransitions           *prometheus.CounterVec
+	leaseRenewals                  *prometheus.CounterVec
 	queryAdmission                 *prometheus.CounterVec
 	queryDownstreamDistress        *prometheus.CounterVec
 	noDataSlotPlans                *prometheus.CounterVec
 	noDataAbsences                 *prometheus.CounterVec
+	noDataManualCloseDropped       prometheus.Counter
+	noDataManualCloseReadFailures  *prometheus.CounterVec
 	targetPlanResolutions          *prometheus.CounterVec
 	targetSelectorResolutions      *prometheus.CounterVec
 	targetExcludedAbsentMembers    prometheus.Counter
@@ -81,6 +88,7 @@ type phaseTwoMetrics struct {
 	outputRejectedStrategies       *boundedLabels
 	frozenStateRenewals            *prometheus.CounterVec
 	frozenStateCensus              *prometheus.CounterVec
+	inputSeriesDiscarded           *prometheus.CounterVec
 	segmentContent                 *prometheus.CounterVec
 	inPlaceWaits                   *prometheus.CounterVec
 	inPlaceHeldInputBytes          prometheus.Histogram
@@ -93,17 +101,28 @@ type phaseTwoMetrics struct {
 	scheduleTimelineBytes          prometheus.Histogram
 	scheduleSegmentsPruned         prometheus.Counter
 	retainedShareApproaching       prometheus.Counter
+	inputSlices                    *prometheus.CounterVec
+	slicedSlots                    prometheus.Counter
+	firstSeenUnseen                *prometheus.CounterVec
+	sliceReadAhead                 *prometheus.CounterVec
+	inputSliceTimeouts             *prometheus.CounterVec
+	inputSliceShapes               *prometheus.CounterVec
+	noDataStagesAhead              *prometheus.CounterVec
+	noDataGroupsStagedAhead        prometheus.Counter
+	noDataStageAheadDiffers        *prometheus.CounterVec
 	schedulePruneSkipped           *prometheus.CounterVec
 	scheduleCutoverDuration        *prometheus.HistogramVec
 	scheduleCutovers               *prometheus.CounterVec
 	replayExpiries                 *prometheus.CounterVec
 	replayTakeovers                *prometheus.CounterVec
+	slotDiversions                 *prometheus.CounterVec
 	rangeGateDecisions             *prometheus.CounterVec
 	statePreflights                *prometheus.CounterVec
 	stateAdmissions                *prometheus.CounterVec
 	scheduleCutoverQueryGroups     *prometheus.CounterVec
 	scheduleCutoverReadHoldLinks   *prometheus.CounterVec
 	fleetOverdueEpisodes           *prometheus.CounterVec
+	fleetRestoreUnread             *prometheus.CounterVec
 	scheduleCutoverTimelinesRead   prometheus.Gauge
 	// The last successful cutover's exact duration, set with its payload and
 	// timelines read so the three describe one cutover; the first
@@ -117,6 +136,7 @@ type phaseTwoMetrics struct {
 	scheduleCutoverFirstSeen        *atomic.Bool
 	queryFailures                   *prometheus.CounterVec
 	objectCatalogObjects            *prometheus.CounterVec
+	catalogRenewals                 *prometheus.CounterVec
 	objectCatalogRedis              *prometheus.HistogramVec
 	objectCatalogManifestBytes      prometheus.Gauge
 	objectCatalogWrittenBytes       *prometheus.CounterVec
@@ -129,9 +149,16 @@ type phaseTwoMetrics struct {
 	shardUnawareReadyReplicas       *loadedGauge
 	rebalanceGap                    *loadedGauge
 	assignmentMoves                 *prometheus.CounterVec
+	byteOverloadedWorkers           *loadedGauge
+	byteMostLoadedShare             *loadedGauge
+	byteUnreadGroups                *loadedGauge
+	placementUnfit                  prometheus.Counter
 	rebalancePaused                 *prometheus.CounterVec
 	controlReadRoundTrips           *prometheus.CounterVec
 	controlReadKeys                 *prometheus.CounterVec
+	controlRecordReads              *prometheus.CounterVec
+	controlRecordMismatches         *prometheus.CounterVec
+	controlRecordConflicts          *prometheus.CounterVec
 	controlReadDuration             *prometheus.HistogramVec
 	assignmentIndexStaleRounds      *loadedGauge
 	assignmentIndexWrites           *prometheus.CounterVec
@@ -143,12 +170,14 @@ type phaseTwoMetrics struct {
 	activationHeldAgeSecondsMax     *loadedGauge
 	algorithmEvaluations            *prometheus.CounterVec
 	recoveryBeside                  *prometheus.CounterVec
+	recoveryWithheld                *prometheus.CounterVec
+	noDataEnd                       *prometheus.CounterVec
 	levelAbnormal                   *prometheus.CounterVec
 	historyCoverageRejected         *prometheus.CounterVec
 	historyCoverageUnsummarised     *prometheus.CounterVec
 	levelOutcomes                   *prometheus.CounterVec
 	openAlertGate                   *prometheus.CounterVec
-	openAlertSet                    *openAlertSetCollector
+	activeCopy                      *activeCopyCollector
 	fleetTracker                    *fleetTrackerCollector
 	effectiveTimeRefresh            *effectiveTimeRefreshCollector
 	activationRebuild               *activationRebuildCollector
@@ -157,20 +186,40 @@ type phaseTwoMetrics struct {
 	timelineUnreadableReports       prometheus.Counter
 	activationHeader                *activationHeaderCollector
 	activationBlocked               *activationBlockedCollector
+	liveReserve                     *liveReserveCollector
 	roundMemory                     *roundMemoryCollector
+	stateSeriesHeld                 *stateSeriesHeldCollector
 	targetGroup                     *targetGroupCollector
 	effectiveClose                  *effectiveCloseCollector
 	logLines                        *logLinesCollector
 	observerPanics                  *observerPanicsCollector
 	absentClose                     *absentCloseCollector
+	editClose                       *editCloseCollector
+	noDataCloseAPI                  *outcomeCounterCollector
+	linkdFilterClose                *outcomeCounterCollector
+	openEpisodeRecord               *outcomeCounterCollector
+	newOpens                        *outcomeCounterCollector
+	frontRefused                    *outcomeCounterCollector
+	processMemory                   *processMemoryCollector
+	strategyScopeClose              *outcomeCounterCollector
 	targetScopeClose                *targetScopeCloseCollector
-	linkdConsole                    *linkdConsoleCollector
 	controlSourceRounds             *prometheus.CounterVec
+	apmCarried                      *prometheus.CounterVec
+	apmCarriedBytes                 *prometheus.HistogramVec
+	sourceLivenessChecks            *prometheus.CounterVec
+	sourceLivenessSeconds           *prometheus.HistogramVec
+	sourceLivenessDeferred          prometheus.Counter
+	sourceLivenessEvicted           prometheus.Counter
+	sourceLivenessHeldEvicted       prometheus.Counter
 	strategiesReturnedAfterRemoval  prometheus.Counter
 	queryCooldownSaves              *prometheus.CounterVec
 	controlFactsWrites              *prometheus.CounterVec
+	planCarriesReads                *prometheus.CounterVec
+	linkdFilterCloseRequests        *prometheus.HistogramVec
 	queryCooldownLoads              *prometheus.CounterVec
 	eventBusinessAttribution        *prometheus.CounterVec
+	detectionSnapshots              *prometheus.CounterVec
+	detectionSnapshotStates         *prometheus.CounterVec
 	diagnosticRedisFailures         *prometheus.CounterVec
 	diagnosticRedisDialRetries      *prometheus.CounterVec
 	leaderForward                   *prometheus.HistogramVec
@@ -190,7 +239,10 @@ type phaseTwoMetrics struct {
 	legacyPodCache                  *prometheus.CounterVec
 	redisPool                       *redisPoolCollector
 	renewalGate                     *renewalGateCollector
+	stateCache                      *stateCacheCollector
+	stateWitness                    *stateWitnessCollector
 	canonicalEncoding               *canonicalEncodingCollector
+	datasetRecordIDs                *datasetRecordIDCollector
 	algorithmInputs                 *prometheus.CounterVec
 	seriesAdmission                 *prometheus.CounterVec
 	cmdbAddressDiffers              *prometheus.CounterVec
@@ -212,12 +264,15 @@ type phaseTwoMetrics struct {
 	hostDisableMonitorStates        prometheus.Gauge
 	unmappedSeverity                *prometheus.CounterVec
 	cmdbIndexAge                    *prometheus.GaugeVec
+	cmdbIndexPublish                *prometheus.GaugeVec
 	cmdbIndexDegraded               *prometheus.GaugeVec
 	cmdbIndexReads                  *prometheus.CounterVec
 	dueIndex                        dueIndexMetrics
 	handover                        handoverMetrics
 	sreActions                      *sreActionMetrics
+	cliAuth                         *cliAuthMetrics
 	controlFacts                    controlFactsMetrics
+	traceExport                     traceExportMetrics
 	startupDependencyWaits          *prometheus.CounterVec
 	liveness                        *livenessCollector
 	// catalogComposition reports what the Catalog the leader last built is
@@ -241,7 +296,7 @@ var leaderForwardBuckets = []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 2.5, 5}
 // route or result "other" would be, which is not at all.
 var (
 	LeaderForwardRoutes  = []string{"strategy", "diagnosis", "directory", "absent"}
-	LeaderForwardResults = []string{"answered", "timeout", "refused", "error", "no_leader", "canceled"}
+	LeaderForwardResults = []string{"answered", "timeout", "refused", "error", "no_leader", "canceled", "self"}
 )
 
 // controlReadDurationBuckets spans a single pipelined batch on a healthy
@@ -287,7 +342,10 @@ var phaseTwoBudgets = func() []string {
 	}
 	return append(names, string(observability.CapacityBudgetOther))
 }()
-var phaseTwoCapacityResults = []string{"admitted", "rejected", "other"}
+
+// phaseTwoCapacityResults is the closed vocabulary of capacity_transition_total:
+// admitted is a Slot that completed holding the budget, rejected a refusal.
+var phaseTwoCapacityResults = []string{"admitted", "rejected"}
 var phaseTwoSourceResults = []string{"degraded", "recovered"}
 
 // sourceCompileResults is the closed vocabulary of how a refresh round
@@ -295,6 +353,17 @@ var phaseTwoSourceResults = []string{"degraded", "recovered"}
 var sourceCompileResults = []string{"compiled", "reused"}
 var phaseTwoReadyQueueKinds = []string{"normal", "recovery"}
 var phaseTwoQueryInflightKinds = []string{"normal", "retry", "replay", "probe"}
+
+// QueryPermitKindLookback is the lookback's column in the permit readings:
+// the one name the source that fills it and the collector that publishes it
+// both use, so the two cannot spell it differently.
+const QueryPermitKindLookback = "lookback"
+
+// phaseTwoQueryPermitKinds are the holders of a query permit: every operation,
+// and the lookback, which borrows permits from the same pool without being an
+// operation or passing admission. The permit readings carry it so the pool's
+// occupancy adds up and a reader can tell how much of it re-reads take.
+var phaseTwoQueryPermitKinds = append(append([]string(nil), phaseTwoQueryInflightKinds...), QueryPermitKindLookback)
 var phaseTwoQueryAdmissionResults = []observability.Result{
 	observability.ResultStarted,
 	observability.ResultSuccess,
@@ -313,23 +382,28 @@ var phaseTwoOwnershipTransitions = []observability.Stage{
 func newPhaseTwoMetrics() phaseTwoMetrics {
 	metrics := phaseTwoMetrics{
 		work: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "worker_work_total",
+			Subsystem: metricSubsystem, Name: "worker_work_total",
 			Help: "Bounded phase-two worker business work by stable work kind.",
 		}, []string{"work_kind"}),
 		busy: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "worker_busy_seconds_total",
+			Subsystem: metricSubsystem, Name: "worker_busy_seconds_total",
 			Help: "Phase-two worker busy time by coarse workflow stage.",
 		}, []string{"stage"}),
 		lastProgress: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "last_progress_timestamp_seconds",
+			Subsystem: metricSubsystem, Name: "last_progress_timestamp_seconds",
 			Help: "Unix timestamp of the latest successful phase-two completion boundary.",
 		}, []string{"kind"}),
 		capacity: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "capacity_transition_total",
-			Help: "Process-wide phase-two capacity admission outcomes by fixed budget kind.",
+			Subsystem: metricSubsystem, Name: "capacity_transition_total",
+			Help: "Capacity outcomes by budget, counted process-wide. rejected is one refusal - the pool, the " +
+				"share or a per-Slot cap - as its resource line reports it, whatever Slot it refused. admitted is " +
+				"one Slot that completed holding something of the budget: a Slot is counted once per budget it " +
+				"reserved, at its completion, so rejected over admitted plus rejected is the share of Slots " +
+				"refused at that budget. What the pool holds now is capacity_reserved; which Slot held what is " +
+				"the slot_budget_usage of its slot_completed line.",
 		}, []string{"budget", "result"}),
 		stateWriteReuse: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "state_write_reuse_total",
+			Subsystem: metricSubsystem, Name: "state_write_reuse_total",
 			Help: "Runtime State mutations admitted for writing, by how much of what the write carries was " +
 				"already stored. Nothing is skipped: this measures what a skip could save before the write " +
 				"path changes. identical is the whole blob reproduced; decision_stable is the Level state " +
@@ -351,7 +425,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 				"pipelined evalsha count over the same window, and it has to be measured before it is used.",
 		}, []string{"class", "stored"}),
 		stateAlreadyApplied: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "state_already_applied_total",
+			Subsystem: metricSubsystem, Name: "state_already_applied_total",
 			Help: "Runtime State mutations found already on disk, by where that was decided and how. " +
 				"site: preflight is the view the Slot loaded before evaluating, apply is the bytes the CAS " +
 				"met when it tried to write. kind: stable is the ordinary retry that read the stored " +
@@ -365,7 +439,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 				"apart. Population is mutations, not Redis commands.",
 		}, []string{"site", "kind"}),
 		stateVersionConflict: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "state_version_conflict_total",
+			Subsystem: metricSubsystem, Name: "state_version_conflict_total",
 			Help: "Runtime State mutations refused STATE_VERSION_CONFLICT, by where that was decided and which " +
 				"comparison refused them. site: preflight is the view the Slot loaded before evaluating, apply " +
 				"is the bytes the write met. kind: missing is a key the mutation expected at a revision and did " +
@@ -380,48 +454,62 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 				"them and each points at a different fix. Every pair is published at zero so absent and zero " +
 				"read apart. Population is mutations, not Redis commands.",
 		}, []string{"site", "kind"}),
+		stateSuperseded: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Subsystem: metricSubsystem, Name: "state_superseded_total",
+			Help: "What a Slot did not write because a later Slot had already written it, by site and the Slot's " +
+				"operation. site: state is a series whose Runtime State is a later Slot's -- it compared " +
+				"PERSISTED_NEWER and its evaluation time is after this Slot's -- so it was not evaluated, sent " +
+				"nothing and wrote nothing, and the rest of the Slot went on; gap is a Plan gap marker a later " +
+				"Slot wrote, left as it was. These used to be refused as STATE_STALE_VERSION or " +
+				"GAP_APPLY_STALE_VERSION and retried until the replay expired. Non-zero says the store went " +
+				"back behind Progress -- a Redis failover that lost a Slot's tail while the next Slot ran on " +
+				"what was left -- or a replay crossed a later write: read operation=normal against the time of " +
+				"a failover. A newer state apply epoch at a time not after the Slot's is not counted here; it " +
+				"is still refused. Every pair is published at zero.",
+		}, []string{"site", "operation"}),
 		sourceObservations: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "source_observation_total",
+			Subsystem: metricSubsystem, Name: "source_observation_total",
 			Help: "Phase-two source health episode transitions by bounded source, result and reason class.",
 		}, []string{"source_kind", "result", "reason_class"}),
 		sourceRefreshes: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "source_refresh_total",
+			Subsystem: metricSubsystem, Name: "source_refresh_total",
 			Help: "Phase-two source refresh outcomes by fixed status.",
 		}, []string{"status"}),
 		sourceReads: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "source_read_total",
+			Subsystem: metricSubsystem, Name: "source_read_total",
 			Help: "Source refresh rounds by whether they read the strategy documents (full) or reused the previous " +
 				"round's observation (skipped), and why: the change signal or active set moved (changed), the previous " +
 				"round did not end unchanged (pending), the periodic bound on unsignalled changes passed (periodic), " +
 				"the source offered no change signal (missing), or the process remembered no earlier read (elected).",
 		}, []string{"mode", "reason"}),
 		sourceRefreshBuilds: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "source_refresh_build_total",
+			Subsystem: metricSubsystem, Name: "source_refresh_build_total",
 			Help: "Source refresh rounds by whether they built their Catalog (rebuilt) or published the previous " +
 				"round's again because nothing it was built from had moved (reused): a skipped read, the same round " +
 				"key, no absence grace ending, and the activation still at that Catalog. On a steady leader almost every " +
 				"round is reused; the periodic full read always rebuilds.",
 		}, []string{"build"}),
 		sourceCompiles: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "source_compile_total",
+			Subsystem: metricSubsystem, Name: "source_compile_total",
 			Help: "Strategies a source refresh round asked the compiler about, by whether they were compiled " +
 				"or taken from an earlier round's compilation of the same document; the two add up to the " +
 				"strategies of the round, and a round whose source did not change is all reused.",
 		}, []string{"result"}),
 		activationFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "activation_failure_total",
+			Subsystem: metricSubsystem, Name: "activation_failure_total",
 			Help: "Control activation failures by fixed stage and class.",
 		}, []string{"activation_failure_stage", "activation_failure_class"}),
 		ownedQueryGroups: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "worker_owned_query_groups",
+			Subsystem: metricSubsystem, Name: "worker_owned_query_groups",
 			Help: "Query groups currently owned by this complete worker role.",
 		}, []string{"worker_role"}),
 		ownershipTransitions: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "ownership_transition_total",
+			Subsystem: metricSubsystem, Name: "ownership_transition_total",
 			Help: "Ownership lifecycle transitions by bounded transition, result and reason class.",
 		}, []string{"transition", "result", "reason_class"}),
+		leaseRenewals: newLeaseRenewals(),
 		ownershipRefusals: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "ownership_refusals_total",
+			Subsystem: metricSubsystem, Name: "ownership_refusals_total",
 			Help: "Refusals the ownership store answered, by which of its four words and where it was met. " +
 				"refusal: OWNERSHIP_STALE_FENCE (the fence's epoch, token or deadline no longer match the lease), " +
 				"OWNERSHIP_NOT_DESIRED (the assignment names another worker), OWNERSHIP_LEASE_BUSY (another " +
@@ -429,7 +517,8 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 				"moved while the lease is live; at renewal, the lease ran out at a content switch because the " +
 				"holder was still on the old content when the change fell due). site: admission is the " +
 				"side-effect admission check before a Slot's writes, state_apply the fenced State write itself, " +
-				"lease the worker's acquire, release and takeover, renewal the lease renewal, control the control " +
+				"lease the worker's acquire, release and takeover, renewal the renewal of a Query Group's or the " +
+				"control leader's lease, control the control " +
 				"leader's assignment writes. Every pair is created at startup, so a zero is never happened and " +
 				"not an absent series. A content change reads as follows: a holder already on the new content " +
 				"when the change falls due keeps its lease across it and nothing here moves; one still on the " +
@@ -439,7 +528,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 				"observation, not per key: a fenced batch refused as a whole is one.",
 		}, []string{"site", "refusal"}),
 		targetPlanResolutions: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "target_plan_resolution_total",
+			Subsystem: metricSubsystem, Name: "target_plan_resolution_total",
 			Help: "Target plans resolved, once per Plan per Slot, by the composed state the admission filter and " +
 				"the absence judgement both read: Complete is every selector answered and every member validated; " +
 				"Incomplete is every selector answered with members dropped in validation, so the records of the kept " +
@@ -448,7 +537,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 				"Unavailable with a steady Complete is one Plan's selector, not the caches.",
 		}, []string{"state"}),
 		targetSelectorResolutions: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "target_selector_resolutions_total",
+			Subsystem: metricSubsystem, Name: "target_selector_resolutions_total",
 			Help: "Selectors of target plans resolved, once per selector per Plan per Slot, by kind, state and the " +
 				"closed reason: key_missing, json_invalid, " +
 				"structure_invalid, model_mismatch, read_failed, stale, index_unavailable, node_missing, " +
@@ -461,19 +550,22 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 				"canonical identity on its records. A group whose writer states member_list [] is OKEmpty. The last three are ip_cloud plans: " +
 				"tenant_mismatch is a referenced group of another tenant, address_unresolved a selector none of " +
 				"whose hosts has an address inside the plan's tenant yet, address_ambiguous members left out " +
-				"because another host of the tenant shares their address. An unavailable exclusion blocks the whole " +
+				"because another host of the tenant shares their address (on an exclude, OK: the shared address is " +
+				"excluded, and with it every host at it). An unavailable exclusion blocks the whole " +
 				"target; excluded_absent is a normal no-op from a complete host snapshot.",
 		}, []string{"kind", "state", "reason"}),
 		targetExcludedAbsentMembers: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "target_excluded_absent_members_total",
+			Subsystem: metricSubsystem, Name: "target_excluded_absent_members_total",
 			Help: "Excluded members absent from a complete current host snapshot, counted per member per Plan per Slot. " +
 				"These exclusions are normal no-ops and do not make the target unavailable.",
 		}),
 		noDataSlotPlans: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "worker_no_data_slot_plans_total",
+			Subsystem: metricSubsystem, Name: "worker_no_data_slot_plans_total",
 			Help: "Plans that detect no-data, counted once per Slot by what happened to that detection. " +
 				"The outcomes partition: every such Plan lands on exactly one every Slot, so their sum is " +
-				"the no-data Plans this worker evaluated. EVALUATED is the only one that judged anything. " +
+				"the no-data Plans this worker evaluated. EVALUATED is the only one that judged absence; " +
+				"SKIPPED_QUERY_NOT_FULL and SKIPPED_ANSWER_TRUNCATED still judge the groups that arrived " +
+				"present, and judge no group absent. " +
 				"The others are different kinds of not judging and must be read apart, because once " +
 				"the round is over they look identical. Among them: SKIPPED_QUERY_NOT_FULL is a query that did not " +
 				"cover the period and resolves itself next round; SKIPPED_MEMORY_UNREADABLE is a record " +
@@ -492,15 +584,32 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 				"leader and the worker looks like, and it looks like nothing else: the Plans still " +
 				"execute, nothing fails, and every label here reads as a computed zero.",
 		}, []string{"outcome"}),
+		noDataManualCloseDropped: prometheus.NewCounter(prometheus.CounterOpts{
+			Subsystem: metricSubsystem, Name: "worker_no_data_manual_close_dropped_total",
+			Help: "No-data alerts the output check held back because a user closed their absence while the round " +
+				"that produced them ran (decision-024). One per alert not sent; the round after applies the close " +
+				"to the memory and counts it as worker_no_data_absences_total{outcome=\"manual_closed\"}.",
+		}),
+		noDataManualCloseReadFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Subsystem: metricSubsystem, Name: "worker_no_data_manual_close_read_failures_total",
+			Help: "Reads of a strategy's manual closes (decision-024) that failed, by where. memory_load is a " +
+				"Plan's no-data memory read whose closes could not be: the round ran on its memory without them. " +
+				"output_check is a batch sent unchecked. Both fail open - an alert nobody closed is never held " +
+				"back over a failed read - and a close missed by one is applied by the next round that reads it. " +
+				"Both labels are created at startup.",
+		}, []string{"site"}),
 		noDataAbsences: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "worker_no_data_absences_total",
+			Subsystem: metricSubsystem, Name: "worker_no_data_absences_total",
 			Help: "Groups of the Plans that detect no-data, summed over every Slot that judged them, by what " +
 				"the round counted each group as. expected is the roster's size and present what arrived; " +
 				"absent is the groups tracked and reported absent this round; unavailable the groups a round " +
 				"that did not see the whole period could not judge; dropped the series whose dimensions did " +
 				"not match the item. expired is the absences the tracking horizon stopped this round and " +
 				"suppressed the groups the round met already stopped -- the standing size of what the horizon " +
-				"is holding down. Read the last two against each other: expired moving is the horizon acting, " +
+				"holds down and of what manual closes hold down. manual_closed is the absences a round stopped " +
+				"because a user closed their alert by hand (decision-024); each is in suppressed from the next " +
+				"round on unless its history roster forgot it. Read expired and suppressed against each other: " +
+				"expired moving is the horizon acting, " +
 				"suppressed is what it has acted on and is still holding; a deployment that switched the " +
 				"horizon on and reads zero on both has a horizon nothing reached. Both are counted where each " +
 				"group is decided, never by differencing one round's memory against the last, so the round " +
@@ -510,7 +619,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 				"Plan for the round it last decided.",
 		}, []string{"outcome"}),
 		noDataPlansSeen: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "worker_no_data_plans_seen_total",
+			Subsystem: metricSubsystem, Name: "worker_no_data_plans_seen_total",
 			Help: "Plans that detect no-data, counted once per Slot where this worker finds them, before " +
 				"anything is decided about them. " +
 				"Read it against sum(worker_no_data_slot_plans_total): the two are produced by one pass " +
@@ -524,7 +633,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 				"many exist, this says how many arrived.",
 		}),
 		noDataPlansByHop: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "no_data_plans_by_hop_total",
+			Subsystem: metricSubsystem, Name: "no_data_plans_by_hop_total",
 			Help: "Plans that detect no-data, counted at each hop between the leader's Catalog and the " +
 				"Slot that judges them, so the hop where they stop existing is a number rather than an " +
 				"argument. published is what decodes back out of the bytes the leader wrote; assembled " +
@@ -545,7 +654,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 				"while production read zero at the end of it.",
 		}, []string{"hop"}),
 		inPlaceWaits: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "access_inplace_readiness_waits_total",
+			Subsystem: metricSubsystem, Name: "access_inplace_readiness_waits_total",
 			Help: "Slot executions that waited in place, holding their execution slot, for a later query of the Slot to become readable, by their total wait. " +
 				"A Slot whose queries become readable at different times is not deferred as a whole; its dispatch waits for each later query while keeping its " +
 				"slot, its prepared plan and the input its earlier queries delivered. Its slot_completed line carries the wait (inplace_wait_ms, inplace_waits, " +
@@ -554,7 +663,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 				"reference, which is shared and held without the wait. Every cell exists from the start.",
 		}, []string{"wait"}),
 		inPlaceHeldInputBytes: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "access_inplace_held_input_bytes",
+			Subsystem: metricSubsystem, Name: "access_inplace_held_input_bytes",
 			Help: "Retained input bytes a Slot execution held while it waited in place for a later query of the Slot, one observation per execution " +
 				"that waited (the ones access_inplace_readiness_waits_total counts). Exact, from the Slot's own retention accounting: the most input " +
 				"it held at any of its waits. The same value is inplace_held_input_bytes on the slot_completed line, which log admission mostly " +
@@ -563,7 +672,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 			Buckets: inPlaceHeldInputBytesBuckets,
 		}),
 		segmentContent: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "segment_content_freshness_total",
+			Subsystem: metricSubsystem, Name: "segment_content_freshness_total",
 			Help: "Slots frozen against a Segment, by whether that Segment names the execution object the " +
 				"latest publication names for its Query Group. current is what a converged fleet " +
 				"reports. stale means the fleet is executing content the control plane no longer " +
@@ -581,7 +690,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 				"every execution field stops at the Segment the same way.",
 		}, []string{"state"}),
 		sourceWithheldLines: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "control_source_withheld_lines_total",
+			Subsystem: metricSubsystem, Name: "control_source_withheld_lines_total",
 			Help: "Source objects whose disposition changed in a refresh round, by whether the round named " +
 				"the object in a log line or its line budget cut it. A partition of the changed objects: " +
 				"each one is named or dropped, never both, so their sum is how much changed. " +
@@ -595,7 +704,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 				"leader only: no other replica refreshes the source.",
 		}, []string{"result"}),
 		queryAdmission: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "worker_query_admission_total",
+			Subsystem: metricSubsystem, Name: "worker_query_admission_total",
 			Help: "Process-wide physical query permit admission outcomes by fixed operation and result. " +
 				"started is not one of the outcomes and does not partition with them: it is recorded only " +
 				"when the acquisition found no free permit and had to join the waiter queue, and the same " +
@@ -608,7 +717,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 				"permits being off.",
 		}, []string{"operation", "result"}),
 		queryDownstreamDistress: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "query_downstream_distress_total",
+			Subsystem: metricSubsystem, Name: "query_downstream_distress_total",
 			Help: "Physical queries whose answer said the query service is overloaded or unreachable, by how and by " +
 				"whether the query had queued for its permit. class is timeout (no answer in time), throttled (HTTP " +
 				"429), unavailable (HTTP 502, 503 or 504) or unreachable (a connection refused, reset or cut short); " +
@@ -627,7 +736,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 		}
 	}
 	metrics.noDataStalls = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "worker_no_data_persistent_skips_total",
+		Subsystem: metricSubsystem, Name: "worker_no_data_persistent_skips_total",
 		Help: "Plans whose no-data detection stopped rather than missed a round, by the outcome it is " +
 			"stuck on. Counted once per stall and not once per round: a Plan skipping for a day and a " +
 			"hundred Plans each missing one round are the same increment on " +
@@ -638,18 +747,25 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 			"stall has a label at startup, so a zero is a zero rather than a label nothing wrote.",
 	}, []string{"outcome"})
 	metrics.noDataMemoryRefusals = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "worker_no_data_memory_refusals_total",
-		Help: "Absence-memory writes the store refused deterministically, by reason and by which record " +
-			"was measured when the reason was size. A refusal does not fail the Slot, so nothing else " +
+		Subsystem: metricSubsystem, Name: "worker_no_data_memory_refusals_total",
+		Help: "Absence-memory writes the store refused deterministically, and memories the worker refused for " +
+			"what they hold, by reason and by which record was measured when the reason was size. A refusal does not fail the Slot, so nothing else " +
 			"in this family moves when it happens: the Plan evaluated, reported and was counted as " +
 			"evaluated, and only the record it would have written was lost. That is why this exists - " +
 			"without it a Plan whose memory has stopped being writable is indistinguishable from one " +
 			"whose memory is fine, for as long as it lasts. Rising and staying up is one object the " +
 			"store will not take, and the line beside it carries the bytes and the bound. record is " +
-			"empty for a refusal that was not about size.",
+			"empty for a refusal that was not about size. The group bound (record GROUPS) defaults to " +
+			"100,000 and may be raised to 1,000,000 for the deployment or one strategy; a raised bound " +
+			"costs Redis once per state generation, on the Plan's first whole-record write: measured " +
+			"about 120-180 ms at 100,000 groups, 610 ms at 200,000 and 2.9 s at 1,000,000. record BYTES is " +
+			"a memory past the share one Query Group's Slot may hold of the retained pool - a whole-record " +
+			"write as the worker builds it, or a loaded memory beside what the Slot already holds - refused " +
+			"for that Plan alone, its threshold detection unchanged; one within the share that the pool has " +
+			"no room for is a RESOURCE_HARD_STOP instead.",
 	}, []string{"reason", "record"})
 	metrics.noDataMemoryWrites = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "worker_no_data_memory_writes_total",
+		Subsystem: metricSubsystem, Name: "worker_no_data_memory_writes_total",
 		Help: "Absence-memory writes by what became of them, counting the ones that worked. " +
 			"APPLIED and ALREADY_APPLIED mean the store now holds what the round wanted; " +
 			"STALE_VERSION, CONFLICT and RETRYABLE_IO mean it does not, and each is a different " +
@@ -660,15 +776,16 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 			"Every outcome has a label at startup, so a zero is a zero rather than a label nothing wrote.",
 	}, []string{"outcome"})
 	metrics.noDataMemoryReads = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "worker_no_data_memory_reads_total",
-		Help: "One per Plan per round that read its absence memory, by which stored shape it came " +
+		Subsystem: metricSubsystem, Name: "worker_no_data_memory_reads_total",
+		Help: "One per Plan per execution that read its absence memory -- a normal round, a replay or a supplement alike, " +
+			"so the count runs above Plans times rounds whenever replays or supplements ran -- by which stored shape it came " +
 			"from. PER_GROUP is the record this build writes, NONE is a Plan with no memory yet or one " +
 			"whose read failed. The two add up to the Plans that were asked for, so the sum is " +
 			"checkable rather than assumed, and every label exists at startup so a zero is a zero " +
 			"rather than a label nothing wrote.",
 	}, []string{"representation"})
 	metrics.noDataMemoryRenewals = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "worker_no_data_memory_renewals_total",
+		Subsystem: metricSubsystem, Name: "worker_no_data_memory_renewals_total",
 		Help: "Absence-memory key renewals that reached the store, by result and reason. Under the " +
 			"per-group representation a Plan whose groups are steady writes nothing at all, so this " +
 			"is the only thing keeping its memory alive and the only signal that says whether that " +
@@ -678,7 +795,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 			"fail the round; it means memories are on their way to expiring.",
 	}, []string{"result", "reason"})
 	metrics.frozenStateRenewals = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "worker_frozen_state_renewals_total",
+		Subsystem: metricSubsystem, Name: "worker_frozen_state_renewals_total",
 		Help: "Runtime State keys a Slot read and did not write, by what the renewal found. A key's " +
 			"life is set by its write and by nothing else, so a series whose Levels stay frozen -- " +
 			"incomplete inputs, a held trigger -- has its state deleted while the Plan is still " +
@@ -692,8 +809,19 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 			"independently as state_load minus state_apply -- the two disagreeing is the reading " +
 			"that says the candidate set is wrong rather than that nothing is frozen.",
 	}, []string{"result"})
+	metrics.inputSeriesDiscarded = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: metricSubsystem, Name: "input_series_discarded_total",
+		Help: "Series a Slot was answered and let go of before evaluating them, by why. " +
+			"dependency_without_primary is a series a dependency query (a Plan's history or other non-PRIMARY " +
+			"input) answered that no PRIMARY input of the same Plan named: nothing evaluates a dependency " +
+			"without its series, so it is let go at the completion rather than held to the Slot's end. " +
+			"Steadily non-zero says the dependency query reads wider than the PRIMARY one - a filter or a " +
+			"window that differs - not that data was lost. Added from each completed Slot's " +
+			"dependency_series_discarded.",
+	}, []string{"reason"})
+	metrics.inputSeriesDiscarded.WithLabelValues(inputSeriesDiscardedDependencyWithoutPrimary)
 	metrics.frozenStateCensus = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "worker_frozen_state_census_total",
+		Subsystem: metricSubsystem, Name: "worker_frozen_state_census_total",
 		Help: "Where a Slot's series went, counted at the three places the decisions are made, over one " +
 			"population: the series the Slot prepared for evaluation, real and synthetic no-data alike. due " +
 			"is what it meant to evaluate, read is what it issued a Runtime State preflight for, written is " +
@@ -708,7 +836,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 			"out and shipped a renewal that renewed almost nothing.",
 	}, []string{"stage"})
 	metrics.gapGuardScopeRounds = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "worker_gap_guard_scope_rounds_total",
+		Subsystem: metricSubsystem, Name: "worker_gap_guard_scope_rounds_total",
 		Help: "One per held gap scope per round that read it, by status, by why it is held, and by " +
 			"where its count stands against its requirement. The rate is how many scopes are being " +
 			"held; progress=none holding up is a guard that has had no complete round since it was " +
@@ -722,7 +850,9 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	metrics.dueIndex = newDueIndexMetrics()
 	metrics.handover = newHandoverMetrics()
 	metrics.sreActions = newSREActionMetrics()
+	metrics.cliAuth = newCLIAuthMetrics()
 	metrics.controlFacts = newControlFactsMetrics()
+	metrics.traceExport = newTraceExportMetrics()
 	metrics.startupDependencyWaits = newStartupDependencyWaits()
 	metrics.liveness = newLivenessCollector()
 	metrics.redisCalls = newRedisCallMetrics()
@@ -732,16 +862,20 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	metrics.localView = newLocalViewCollector()
 	metrics.viewStream = newViewStreamCollector()
 	metrics.viewClient = newViewClientCollector()
-	metrics.legacyPodCache = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "legacy_pod_cache_total", Help: "Existing Python Pod cache reads by bounded result."}, []string{"result"})
+	metrics.legacyPodCache = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "legacy_pod_cache_total", Help: "Existing Python Pod cache reads by bounded result."}, []string{"result"})
 	metrics.redisPool = newRedisPoolCollector()
 	metrics.renewalGate = newRenewalGateCollector()
+	metrics.stateCache = newStateCacheCollector()
+	metrics.stateWitness = newStateWitnessCollector()
 	metrics.canonicalEncoding = newCanonicalEncodingCollector()
+	metrics.datasetRecordIDs = newDatasetRecordIDCollector()
 	metrics.shortPeriod = newShortPeriodMetrics()
 	metrics.queryStatus = newQueryStatusMetrics()
+	metrics.flow = newFlowMetrics(metrics.work)
 	metrics.queryCodec = newQueryCodecMetrics()
 	metrics.queryTruncation = newQueryTruncationMetrics()
 	metrics.queryUnavailable = newQueryUnavailableMetrics()
-	metrics.queryCooldown = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "query_cooldown_events_total", Help: "External source_backend query cooldown transitions and failed real probes by bounded event."}, []string{"event"})
+	metrics.queryCooldown = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "query_cooldown_events_total", Help: "External source_backend query cooldown transitions and failed real probes by bounded event."}, []string{"event"})
 	// Every event and other at zero from the start: a Runner restores its
 	// pool record on its first round, before the first scrape, and a series
 	// created by that restore would read as no increase.
@@ -756,38 +890,115 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 		metrics.slotWait.WithLabelValues(wait)
 	}
 	metrics.workflow = newWorkflowMetrics()
-	metrics.activeQGSetCount = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "active_qg_set_query_groups", Help: "Query groups in the current immutable Active Set."})
-	metrics.activeQGSetBytes = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "active_qg_set_object_bytes", Help: "Encoded bytes in the current immutable Active Set."})
-	metrics.activeQGSetRedis = prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "active_qg_set_redis_duration_seconds", Help: "Active Set Redis operation duration.", Buckets: activeQGSetDurationBuckets}, []string{"operation", "result"})
-	metrics.scheduleCutoverPayload = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "schedule_cutover_payload_bytes", Help: "Bytes the Control Leader sent in the last publication cutover compare-and-set call."})
-	metrics.scheduleCutoverTimelineMax = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "schedule_timeline_bytes_max", Help: "Largest Schedule timeline written by the last publication cutover. Rising across cutovers means some timeline is never pruned."})
-	metrics.scheduleTimelineBytes = prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "schedule_timeline_bytes", Help: "Schedule timeline sizes as written by publication cutovers.", Buckets: scheduleTimelineBytesBuckets})
-	metrics.scheduleSegmentsPruned = prometheus.NewCounter(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "schedule_segments_pruned_total", Help: "Closed Schedule Segments dropped by publication cutovers because no Slot in them is read anymore."})
+	metrics.activeQGSetCount = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "active_qg_set_query_groups", Help: "Query groups in the current immutable Active Set."})
+	metrics.activeQGSetBytes = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "active_qg_set_object_bytes", Help: "Encoded bytes in the current immutable Active Set."})
+	metrics.activeQGSetRedis = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: metricSubsystem, Name: "active_qg_set_redis_duration_seconds", Help: "Active Set Redis operation duration.", Buckets: activeQGSetDurationBuckets}, []string{"operation", "result"})
+	metrics.scheduleCutoverPayload = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "schedule_cutover_payload_bytes", Help: "Bytes the Control Leader sent in the last publication cutover compare-and-set call."})
+	metrics.scheduleCutoverTimelineMax = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "schedule_timeline_bytes_max", Help: "Largest Schedule timeline written by the last publication cutover. Rising across cutovers means some timeline is never pruned."})
+	metrics.scheduleTimelineBytes = prometheus.NewHistogram(prometheus.HistogramOpts{Subsystem: metricSubsystem, Name: "schedule_timeline_bytes", Help: "Schedule timeline sizes as written by publication cutovers.", Buckets: scheduleTimelineBytesBuckets})
+	metrics.scheduleSegmentsPruned = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "schedule_segments_pruned_total", Help: "Closed Schedule Segments dropped by publication cutovers because no Slot in them is read anymore."})
 	// Completed Slots at or past the threshold of their one-object share of
 	// the retained pool. A counter, not a gauge per object: the objects are
 	// named on the page and in fleet.get, and a label per Query Group would
-	// grow with the fleet. What this answers is whether any Slot on this
-	// replica is near the wall at all - a rate above zero - which is the
-	// alerting question; the share refusal after it stops a strategy whole.
-	metrics.retainedShareApproaching = prometheus.NewCounter(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem,
+	// grow with the fleet. A Slot applied in windows reaches the share by
+	// construction and is counted, so on a replica running a Query Group in
+	// windows the rate is above zero every round and says the windows are in
+	// use; a Slot near the wall is the page line's, which leaves those out,
+	// and the share refusal after it stops a strategy whole.
+	// Whether slicing and its read ahead happen at all, which the completion
+	// row alone says on a sampled line. Bounded labels only: which Query
+	// Group is the control API's.
+	metrics.inputSlices = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem,
+		Name: "worker_input_slices_total", Help: "Slices the input of completed Slots read in slices was read in, by outcome: landed, read and " +
+			"evaluated, and discarded, let go past the slice limit while they streamed and split. A Slot read " +
+			"whole counts nothing. Read beside worker_sliced_slots_total: their ratio is the slices a sliced Slot " +
+			"reads."}, []string{"outcome"})
+	metrics.slicedSlots = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricSubsystem,
+		Name: "worker_sliced_slots_total", Help: "Completed Slots whose input was read in more than one slice or had a slice let go: the Slots slicing " +
+			"reached. Which Query Group is not a label here."})
+	metrics.firstSeenUnseen = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem,
+		Name: "worker_first_seen_unseen_total", Help: "What completed Slots wrote as first-seen before a later slice found the Plan had run, by unit: " +
+			"slices and series. Those series were written without warming up; a rate above zero says the " +
+			"first-seen judgement changed within Slots read in slices."}, []string{"unit"})
+	metrics.sliceReadAhead = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem,
+		Name: "worker_slice_read_ahead_total", Help: "How the slices read ahead - read while the slice before completed - ended, by outcome: replayed, " +
+			"handed to the Slot; other_leaf, let go because the next slice was another; yielded, let go for a " +
+			"reservation of the Slot's own the share or the pool would otherwise refuse; failed, let go because " +
+			"the read failed before it was handed on. Every slice let go is read again on the Slot's goroutine. " +
+			"Counted from completed Slots."}, []string{"outcome"})
+	for _, outcome := range []string{"landed", "discarded"} {
+		metrics.inputSlices.WithLabelValues(outcome)
+	}
+	for _, unit := range []string{"slices", "series"} {
+		metrics.firstSeenUnseen.WithLabelValues(unit)
+	}
+	for _, outcome := range observability.SliceReadAheadOutcomes {
+		metrics.sliceReadAhead.WithLabelValues(outcome)
+	}
+	metrics.inputSliceTimeouts = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem,
+		Name: "worker_input_slice_timeouts_total", Help: "Slices of Slots read in slices whose read ran out of time, by how each ended: split_succeeded, split and its " +
+			"children read in its place, the Slot's query completing; split_failed, split and the Slot's query failing " +
+			"after; not_split, failed as before - the query cooldown held, its time could not be put on its size, the " +
+			"window left was too short for its children, or the Slot had split once. A Slot splits so once. Which Query " +
+			"Group is not a label here."}, []string{"outcome"})
+	for _, outcome := range observability.InputSliceTimeoutOutcomes {
+		metrics.inputSliceTimeouts.WithLabelValues(outcome)
+	}
+	metrics.inputSliceShapes = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem,
+		Name: "worker_input_slice_shapes_total", Help: "Slots by what they did with their Query Group's shape, the leaves a " +
+			"slice that ran out of time for its size was split into, which the next Slot starts in: started, read in it; " +
+			"kept, a slice split for its time kept in it; merged, its last kept split taken back after three quick rounds; " +
+			"voided_revision, voided_dimensions, voided_max_leaves, dropped as the query revision or the dimensions " +
+			"changed or it grew past a starting tree's leaves; refused_not_a_leaf, refused_not_a_partition, " +
+			"refused_max_leaves, dropped as its leaves were not a partition of every value. A dropped shape's Slot " +
+			"starts in slices counted anew. evicted_idle counts the Query Groups whose slice memory, shape or none, " +
+			"was dropped for no Slot started on this replica for ten of their periods and ten minutes at least. Which " +
+			"Query Group is not a label here."}, []string{"outcome"})
+	for _, outcome := range observability.InputSliceShapeOutcomes {
+		metrics.inputSliceShapes.WithLabelValues(outcome)
+	}
+	metrics.noDataStagesAhead = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem,
+		Name: "worker_no_data_stage_ahead_total", Help: "No-data first writes staged as their windows landed, a Plan each, by how " +
+			"the staging ended: carried, the statement put the stage in place with it; differs, the round kept a staged " +
+			"group otherwise and wrote every group with the statement; discarded, the round wrote no statement and the " +
+			"stage was taken back; stopped, a segment could not be staged and the groups after it went with the statement. " +
+			"Counted from completed Slots. Which Query Group is not a label here."}, []string{"outcome"})
+	for _, outcome := range observability.NoDataStageAheadOutcomes {
+		metrics.noDataStagesAhead.WithLabelValues(outcome)
+	}
+	metrics.noDataStageAheadDiffers = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem,
+		Name: "worker_no_data_stage_ahead_differs_total", Help: "No-data first writes staged as their windows landed whose round wrote every group with the statement instead, " +
+			"by why: kept_otherwise, a staged group the round kept otherwise or not at all; count_mismatch, the stage's " +
+			"groups not the ones the round marked and kept; present_as_of, the round's present-as-of not the one they were " +
+			"staged against. A rate above zero is a shape the staging does not cover, held whole to the tail as before. " +
+			"Counted from completed Slots."}, []string{"reason"})
+	for _, reason := range nodata.StagedDiffersReasons {
+		metrics.noDataStageAheadDiffers.WithLabelValues(reason)
+	}
+	metrics.noDataGroupsStagedAhead = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricSubsystem,
+		Name: "worker_no_data_groups_staged_ahead_total", Help: "Groups of no-data first writes staged as their windows " +
+			"landed, ahead of the statements: what the worker held no longer to the tail. Counted from completed Slots."})
+	metrics.retainedShareApproaching = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricSubsystem,
 		Name: "state_retained_share_approaching_slots_total",
-		Help: "Completed Slots whose retained bytes reached at least 95 percent of the one-object share of the " +
-			"retained pool they were admitted under. A Slot past the share is refused as QG_BUDGET_SHARE_EXCEEDED " +
-			"every round and its strategy stops; these are the Slots before that. The objects are listed by name " +
-			"under RETAINED_SHARE_APPROACHING on the page and in fleet.get."})
-	metrics.schedulePruneSkipped = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "schedule_prune_skipped_total", Help: "Schedule timelines a cutover left unpruned, by reason."}, []string{"reason"})
-	metrics.scheduleCutoverDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "schedule_cutover_duration_seconds", Help: "Publication cutover compare-and-set duration.", Buckets: scheduleCutoverDurationBuckets}, []string{"result"})
+		Help: "Slots whose retained bytes reached at least 95 percent of the one-object share of the retained " +
+			"pool they were admitted under: completed Slots at or past the threshold, and Slots given up because " +
+			"the share refused them (RESOURCE_SHARE_EXCEEDED), which are past it. The objects are listed by name " +
+			"under RETAINED_SHARE_APPROACHING on the page and in fleet.get, except a completed Slot applied in more " +
+			"than one window: its windows are bounded by the share, so it reaches the share by construction and is " +
+			"counted here but not listed."})
+	metrics.schedulePruneSkipped = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "schedule_prune_skipped_total", Help: "Schedule timelines a cutover left unpruned, by reason."}, []string{"reason"})
+	metrics.scheduleCutoverDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: metricSubsystem, Name: "schedule_cutover_duration_seconds", Help: "Publication cutover compare-and-set duration.", Buckets: scheduleCutoverDurationBuckets}, []string{"result"})
 	metrics.scheduleCutoverFirstSeen = new(atomic.Bool)
-	metrics.scheduleCutoverFirstDuration = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "schedule_cutover_first_duration_seconds",
+	metrics.scheduleCutoverFirstDuration = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "schedule_cutover_first_duration_seconds",
 		Help: "Exact duration of this process's first successful publication cutover, which reads every timeline: the full read is decided once per process and not again when leadership is lost and regained, so a later term's first cutover does not read everything and is not this one. Set once and never overwritten; see schedule_cutover_first_timelines_read for whether it has run."})
-	metrics.scheduleCutoverFirstTimelines = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "schedule_cutover_first_timelines_read",
+	metrics.scheduleCutoverFirstTimelines = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "schedule_cutover_first_timelines_read",
 		Help: "Timelines this process's first successful publication cutover read; set once with schedule_cutover_first_duration_seconds. Zero means this process has not completed a cutover yet: a successful one reads at least one timeline."})
 	for _, reason := range observability.SchedulePruneSkipReasons {
 		metrics.schedulePruneSkipped.WithLabelValues(reason)
 	}
-	metrics.scheduleCutoverQueryGroups = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "schedule_cutover_query_groups_total", Help: "Query Groups by what a publication cutover did with them: kept (content and contexts unchanged, no write), revised (contexts changed, one output context revision appended), cut (content changed, Segment closed and reopened), retired, added, blocked (a precondition only a write outside the cutover could break failed; this Query Group keeps its records and is judged again at the next cutover, the rest of the publication goes ahead), reopened (the timeline key was gone; a new one was opened), retired_unwritten (left the publication with a timeline that failed a precondition; retired without writing it)."}, []string{"decision"})
+	metrics.scheduleCutoverQueryGroups = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "schedule_cutover_query_groups_total", Help: "Query Groups by what a publication cutover did with them: kept (content and contexts unchanged, no write), revised (contexts changed, one output context revision appended), cut (content changed, Segment closed and reopened), retired, added, blocked (a precondition only a write outside the cutover could break failed; this Query Group keeps its records and is judged again at the next cutover, the rest of the publication goes ahead), reopened (the timeline key was gone; a new one was opened), retired_unwritten (left the publication with a timeline that failed a precondition; retired without writing it)."}, []string{"decision"})
 	metrics.scheduleCutovers = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "schedule_cutover_total",
+		Subsystem: metricSubsystem, Name: "schedule_cutover_total",
 		Help: "Publication cutovers by result and, when they failed, why. The cutover is what moves the " +
 			"fleet onto newly published execution content: it closes the open Segment of every Query " +
 			"Group whose content changed and opens a new one naming the new object. A cutover that " +
@@ -808,7 +1019,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 			"Reported by the leader only.",
 	}, []string{"result", "reason"})
 	metrics.queryFreeCompletions = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "query_free_completion_total",
+		Subsystem: metricSubsystem, Name: "query_free_completion_total",
 		Help: "Slots finished without querying, by kind and by what an earlier attempt at the same Slot " +
 			"was found to have done. STATE_APPLIED means every due Plan was already evaluated and " +
 			"alerted and only the bookkeeping was lost, which is not a gap; MIXED means some of them " +
@@ -821,7 +1032,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 			"says nothing until every replica is on this version.",
 	}, []string{"kind", "evidence"})
 	metrics.executionEvidenceWrites = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "execution_evidence_written_total",
+		Subsystem: metricSubsystem, Name: "execution_evidence_written_total",
 		Help: "Marks left by an attempt that wrote state and then could not write its Slot down, by " +
 			"result. It is the only sign the mark-writing works: nothing downstream fails when it " +
 			"does not, so without this a deployment where every such write fails looks exactly like " +
@@ -829,7 +1040,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 			"query-free completion will have no evidence and record a gap it does not owe.",
 	}, []string{"result"})
 	metrics.outputEventsByWireFormat = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "output_events_by_wire_format_total",
+		Subsystem: metricSubsystem, Name: "output_events_by_wire_format_total",
 		Help: "Events handed to the output sink, by the wire format they were published as: " +
 			"python_compatible is the event the Python alert builder reads, standard_raw_event the raw " +
 			"event the alert pipeline consumes, _other an event whose word this build does not name or " +
@@ -844,7 +1055,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 		metrics.outputEventsByWireFormat.WithLabelValues(format)
 	}
 	metrics.outputEventsWithoutMessage = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "output_events_without_message_total",
+		Subsystem: metricSubsystem, Name: "output_events_without_message_total",
 		Help: "Events decided that the protocol has no message for, by the event's resolved wire format " +
 			"and kind, counted at the output write that would have carried them. Under python_compatible " +
 			"that is every RECOVERY: the Python protocol carries anomaly points and nothing else, so the " +
@@ -863,7 +1074,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 		}
 	}
 	metrics.outputEventsRejected = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "output_events_rejected_total",
+		Subsystem: metricSubsystem, Name: "output_events_rejected_total",
 		Help: "Events the output sink would not write because of their own content, one each, by the " +
 			"rule the event broke and the strategy it was decided for. The rest of the batch is written: " +
 			"a refused event takes its own series with it (the series' State stays where it was and the " +
@@ -877,14 +1088,14 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 		metrics.outputEventsRejected.WithLabelValues(rule, observability.OutputRejectOther)
 	}
 	metrics.outputRejectedStrategyOverflow = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "output_events_rejected_strategies_overflow_total",
+		Subsystem: metricSubsystem, Name: "output_events_rejected_strategies_overflow_total",
 		Help: "Rejected events whose strategy did not get a label of its own on output_events_rejected_total " +
 			"because OutputRejectedStrategyLabels strategies already had one. Non-zero means the per-strategy " +
 			"split is partial: read which strategies through the event_acked lines.",
 	})
 	metrics.outputRejectedStrategies = &boundedLabels{limit: OutputRejectedStrategyLabels}
 	metrics.outputEventsByKind = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "output_events_by_kind_total",
+		Subsystem: metricSubsystem, Name: "output_events_by_kind_total",
 		Help: "Events handed to the output sink, by the wire format they were published as and their " +
 			"kind: output_events_by_wire_format_total split once more, the same events counted at the " +
 			"same site. It exists for one question the format alone cannot answer: whether a RECOVERY " +
@@ -909,19 +1120,24 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	for _, decision := range observability.ScheduleCutoverDecisions {
 		metrics.scheduleCutoverQueryGroups.WithLabelValues(decision)
 	}
-	metrics.scheduleCutoverReadHoldLinks = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "schedule_cutover_read_hold_links_total", Help: "Moved Plans' links to the Query Group they left, by what a publication cutover did with them: linked (the state generation is unchanged, so the new group's first Slots keep the old group's last deadline), linked_generation_unknown (a generation could not be read; linked to keep ordering), generation_changed (no state shared; no link), dropped_self (a carried link named the group it is in), dropped_expired (a carried link past its lifetime)."}, []string{"decision"})
+	metrics.scheduleCutoverReadHoldLinks = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "schedule_cutover_read_hold_links_total", Help: "Moved Plans' links to the Query Group they left, by what a publication cutover did with them: linked (the state generation is unchanged, so the new group's first Slots keep the old group's last deadline), linked_generation_unknown (a generation could not be read; linked to keep ordering), generation_changed (no state shared; no link), dropped_self (a carried link named the group it is in), dropped_expired (a carried link past its lifetime)."}, []string{"decision"})
 	for _, decision := range observability.ScheduleCutoverReadHoldLinks {
 		metrics.scheduleCutoverReadHoldLinks.WithLabelValues(decision)
 	}
-	metrics.fleetOverdueEpisodes = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "fleet_overdue_episodes_total", Help: "Objects this replica's rows found overdue, each time one began to be, by its read hold then: zero, positive (its Slots were held), unknown. " +
+	metrics.fleetOverdueEpisodes = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "fleet_overdue_episodes_total", Help: "Objects this replica's rows found overdue, each time one began to be, by its read hold then: zero, positive (its Slots were held), unknown. " +
 		"Counted among the objects the rows list: the due index lists only its oldest overdue wakes, and an object past that list is counted when it reaches it, so in a mass overdue the count runs late and low. " +
 		"Each replica counts its own objects, and an object handed over begins again on the replica it moves to; the deployment's is the sum. " +
 		"Which objects they were is in the diagnosis's overdue_episodes, kept in the replica's memory: a restart or a rollout starts it empty."}, []string{"hold"})
 	for _, hold := range fleet.OverdueHoldClasses {
 		metrics.fleetOverdueEpisodes.WithLabelValues(hold)
 	}
+	metrics.fleetRestoreUnread = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "fleet_restore_unread_total", Help: "Objects whose recorded Progress the fleet restore read did not get, by why: redis_error, Redis answered the object's key with an error (LOADING while it loads a dataset, BUSY behind a script); unreached, the read did not reach Redis. " +
+		"Such an object spends none of its restore attempts and is read again at the next publish, so a count that keeps rising is restore that is not happening, not records that are bad: a record read and found unusable is not counted here."}, []string{"reason"})
+	for _, reason := range FleetRestoreUnreadReasons {
+		metrics.fleetRestoreUnread.WithLabelValues(reason)
+	}
 	metrics.replayExpiries = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "replay_expired_total",
+		Subsystem: metricSubsystem, Name: "replay_expired_total",
 		Help: "Slots the scheduler gave up replaying, by reason. REPLAY_AGE_EXCEEDED and " +
 			"REPLAY_DISTANCE_EXCEEDED are ordinary: the Slot is older than the replay window, or too " +
 			"many grid points have passed since it. REPLAY_RANGE_EXPIRED is a persisted range of such " +
@@ -939,12 +1155,14 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 		metrics.replayExpiries.WithLabelValues(reason)
 	}
 	metrics.replayTakeovers = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "replay_takeover_slots_total",
+		Subsystem: metricSubsystem, Name: "replay_takeover_slots_total",
 		Help: "Slots evaluated before this process took their Query Group over from another owner, by outcome, " +
 			"counted once per Slot and outcome however often it is classified, and not for a Query Group the " +
 			"degraded pool holds, whose Slots are given up on for distance as before: " +
 			"replayed, because nobody here could have run them and they are within the replay age; " +
-			"age_exceeded, given up on like any Slot that old. The distance rule, which gives up on Slots a " +
+			"age_exceeded, given up on like any Slot that old; diverted, not yet at its query deadline but with " +
+			"less budget left than its query takes (the group's own reading, the previous owner's as the group's read-hold record keeps it, or the configured floor), sent to " +
+			"replay before it started instead of a normal attempt that could not finish. The distance rule, which gives up on Slots a " +
 			"Query Group fell behind on while it held them, does not apply to these. A rollout's handover " +
 			"is read here: replayed near the Slots its restart made the new owners miss, age_exceeded at zero " +
 			"while a handover takes less than the replay age. Compared on the Slot's evaluation time, not on " +
@@ -953,6 +1171,20 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	for _, outcome := range observability.ReplayTakeoverOutcomes {
 		metrics.replayTakeovers.WithLabelValues(outcome)
 	}
+	metrics.slotDiversions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: metricSubsystem, Name: "slot_diversions_total",
+		Help: "Slots of Query Groups this process holds that were sent to replay before their normal read " +
+			"started, by reason, counted once per Slot: readiness_late, the Slot's readiness - its settling wait " +
+			"and read hold - landed so near its query deadline that less time was left than its query takes " +
+			"(the group's own reading, the previous owner's as the group's read-hold record keeps it, or the configured floor), so a normal read would have been cut off at " +
+			"the deadline with no data; replay reads it late but whole under a deadline of its own. A Slot due " +
+			"before a takeover is counted under replay_takeover_slots_total{outcome=\"diverted\"} instead. " +
+			"Read with progress_completion_causes_total{cause=\"PRIMARY_INPUT_UNAVAILABLE\",reason=\"QUERY_TIMEOUT\"}: " +
+			"the rounds counted here are the ones that no longer appear there.",
+	}, []string{"reason"})
+	for _, reason := range observability.SlotDiversionReasons {
+		metrics.slotDiversions.WithLabelValues(reason)
+	}
 	// The word each round that gave up on a Slot puts on its range_gate line,
 	// as a series: the log had the thirteen words and the metric had none, so
 	// "which refusal is holding the Query Groups that never catch up" could
@@ -960,7 +1192,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	// startup, applied included -- the rounds that did reach the builder are
 	// the denominator the refusals are read against.
 	metrics.rangeGateDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "range_gate_total",
+		Subsystem: metricSubsystem, Name: "range_gate_total",
 		Help: "Rounds that gave up on a Slot, by what the catch-up path did with it. applied is a " +
 			"range built and handed on; every other word is the condition that refused one, the same " +
 			"word the round's range_gate_decided line carries as reason_code. Read the refusals " +
@@ -976,10 +1208,11 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	// nothing about how they ended. Every cell from startup, so a read that
 	// has never timed out reads as zero rather than as an absent family.
 	metrics.statePreflights = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "state_preflight_total",
+		Subsystem: metricSubsystem, Name: "state_preflight_total",
 		Help: "Runtime State preflight reads by how they ended: success when every series' state came back; " +
-			"degraded when some did not for a retryable reason (STATE_READ_TIMEOUT is this process's own read " +
-			"deadline, REDIS_UNAVAILABLE the store not answering); terminal when some cannot be read " +
+			"degraded when some did not for a retryable reason (STATE_READ_TIMEOUT is the connection's own read " +
+			"timeout, STATE_READ_DEADLINE a deadline on the call that ran out first, REDIS_UNAVAILABLE the store " +
+			"not answering); terminal when some cannot be read " +
 			"(STATE_CORRUPT, STATE_BUDGET_EXCEEDED); failed when the store refused the request outright. One " +
 			"per preflight call, not per series; the series it covered are in worker_work_total{work_kind=\"state_load\"}.",
 	}, []string{"result", "reason"})
@@ -992,7 +1225,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	// preflight's are: a Plan whose every round is refused at admission ends
 	// each round terminal and moves nothing else fleet-wide.
 	metrics.stateAdmissions = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "state_admission_total",
+		Subsystem: metricSubsystem, Name: "state_admission_total",
 		Help: "Runtime State admission calls by how they ended: success when every mutation was admitted; " +
 			"terminal when some were refused (STATE_BUDGET_EXCEEDED: the Plan's state lifetime is past the " +
 			"store's ceiling or a record is past the value limit; STATE_CORRUPT: the record breaks the framed " +
@@ -1005,33 +1238,45 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 			metrics.stateAdmissions.WithLabelValues(string(result), string(reason))
 		}
 	}
-	metrics.scheduleCutoverTimelinesRead = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "schedule_cutover_timelines_read", Help: "Schedule timelines the last publication cutover read to decide. Equal to the population on the first cutover of a Control Leader process, the changed set afterwards."})
+	metrics.scheduleCutoverTimelinesRead = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "schedule_cutover_timelines_read", Help: "Schedule timelines the last publication cutover read to decide. Equal to the population on the first cutover of a Control Leader process, the changed set afterwards."})
 	// The failure code itself is an open vocabulary and stays in the log and
 	// the fleet view; the counter carries the bounded stage and category so a
 	// family of failures that produces no completion at all still has a rate.
-	metrics.queryFailures = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "query_failure_total", Help: "Slot attempts that failed before producing a completion, by the Coordinator stage that failed and the failure category. The failure code is in the log line and the fleet view."}, []string{"stage", "category"})
+	metrics.queryFailures = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "query_failure_total", Help: "Slot attempts that failed before producing a completion, by the Coordinator stage that failed and the failure category. The failure code is in the log line and the fleet view."}, []string{"stage", "category"})
 	for _, stage := range observability.QueryFailureStages {
 		for _, category := range observability.QueryFailureCategories {
 			metrics.queryFailures.WithLabelValues(stage, category)
 		}
 	}
-	metrics.objectCatalogObjects = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "object_catalog_objects_total", Help: "Content-addressed catalog objects by what a write or renewal did with them: written, present (already stored under their digest) or missing (referenced but not found on renewal)."}, []string{"operation", "outcome"})
-	metrics.objectCatalogRedis = prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "object_catalog_redis_duration_seconds", Help: "Object catalog write or renewal duration.", Buckets: activeQGSetDurationBuckets}, []string{"operation", "result"})
-	metrics.objectCatalogManifestBytes = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "object_catalog_manifest_bytes", Help: "Encoded bytes of the manifest written for the latest publication."})
+	metrics.objectCatalogObjects = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "object_catalog_objects_total", Help: "Content-addressed catalog objects by what a write or renewal did with them: written, present (already stored under their digest) or missing (referenced but not found on renewal)."}, []string{"operation", "outcome"})
+	// Keys, where redis_caller_operation_total under the three catalog
+	// renewal callers counts pipelined batches: a renewal that is due for a
+	// handful of timelines and one due for every one of them are a batch each.
+	metrics.catalogRenewals = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "catalog_renewals_total",
+		Help: "Catalog keys the Control Leader renewed, by kind and why: timeline aged (this term last renewed or wrote it a third of " +
+			"the catalog TTL ago or more) or first (this term had not); object (the Query Group objects and the manifest) " +
+			"and context (the output contexts) periodic, on the first refresh round of the term and every tenth after. A key a " +
+			"renewal found missing is counted here and in object_catalog_objects_total{outcome=\"missing\"}."},
+		[]string{"kind", "reason"})
+	for _, cell := range [][2]string{{"timeline", "aged"}, {"timeline", "first"}, {"object", "periodic"}, {"context", "periodic"}} {
+		metrics.catalogRenewals.WithLabelValues(cell[0], cell[1])
+	}
+	metrics.objectCatalogRedis = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: metricSubsystem, Name: "object_catalog_redis_duration_seconds", Help: "Object catalog write or renewal duration.", Buckets: activeQGSetDurationBuckets}, []string{"operation", "result"})
+	metrics.objectCatalogManifestBytes = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "object_catalog_manifest_bytes", Help: "Encoded bytes of the manifest written for the latest publication."})
 	// The bytes behind object_catalog_objects_total{outcome="written"}: what a
 	// publication added to the control plane's store. It is the churn rate;
 	// the current catalog's objects are renewed and resident on top of it. The count alone could not answer what a longer
 	// retention costs or how large a one-off rewrite was; both are bytes.
-	metrics.objectCatalogWrittenBytes = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "object_catalog_written_bytes_total",
+	metrics.objectCatalogWrittenBytes = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "object_catalog_written_bytes_total",
 		Help: "Bytes the Control Leader wrote to the object catalog, by kind: object (Query Group execution objects and output contexts stored for the first time under their digest) and manifest (the manifest of a publication's revision, counted on every successful write, which a revision written again by a new Leader counts twice though the store renewed it). This counts churn: objects the current catalog still references are renewed every round and stay resident, apart from this rate; objects a publication replaced stay for the catalog retention, about this rate times the retention. What the store holds is the current catalog's bytes plus that. Objects stored by a batch whose pipeline then failed as a whole are not counted, so a failed round can undercount."},
 		[]string{"kind"})
 	for _, kind := range []string{"object", "manifest"} {
 		metrics.objectCatalogWrittenBytes.WithLabelValues(kind)
 	}
-	metrics.objectReads = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "object_read_total", Help: "Catalog object reads by a Worker, by object kind and outcome; for a Segment, whether its Query Group was read by content and if not, why."}, []string{"kind", "result"})
+	metrics.objectReads = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "object_read_total", Help: "Catalog object reads by a Worker, by object kind and outcome; for a Segment, whether its Query Group was read by content and if not, why."}, []string{"kind", "result"})
 	// Pre-created so that "no skew" reads as zeros, not as an absent family.
-	metrics.stateGenerationSkew = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "state_generation_skew_total", Help: "Due Plans whose activation record names a state generation that disagrees with one derived elsewhere: formula (this process compiles the same Plan to another generation than the Control Leader that published it; tolerated, the record's generation governs the Slot; expected while a release rolls, a version mismatch if it persists), record (the record names a generation the Query Group object published with it does not carry; the Slot is refused)."}, []string{"kind"})
-	metrics.stateCarry = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "state_generation_carry_total", Help: "History carried across a state generation that moved while its Plan stayed active. scope=plan: the Control Leader's decision per activation (carried: every Level's detection is unchanged, the Plan warms up for one full Slot and its series keep their results; partial and none_*: the Plan warms up whole, as before). scope=series: what a Worker did for each series with no record under the new generation (carried: results with the new detect fingerprint kept; nothing_kept: none were; skipped_active_guard: the old record still guarded holes and the series starts over; old_missing: the old generation held nothing)."}, []string{"scope", "result"})
+	metrics.stateGenerationSkew = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "state_generation_skew_total", Help: "Due Plans whose activation record names a state generation that disagrees with one derived elsewhere: formula (this process compiles the same Plan to another generation than the Control Leader that published it; tolerated, the record's generation governs the Slot; expected while a release rolls, a version mismatch if it persists), record (the record names a generation the Query Group object published with it does not carry; the Slot is refused)."}, []string{"kind"})
+	metrics.stateCarry = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "state_generation_carry_total", Help: "History carried across a state generation that moved while its Plan stayed active. scope=plan: the Control Leader's decision per activation that commits, counted once its cutover commits (carried: every Level both versions have is carried and none's detection changed, the Plan warms up for one full Slot and its series keep their results; carried_detect_changed: the same, and some Level's detection changed, its results kept as they were decided, as Python keeps its check results across an edit; none_group_changed: the edit moved the Plan to another Query Group - its query facts changed: the query, its delay, the detection step (detect_interval), shard, named outputs, normalization or global business scope - so its old results are about other data and the Plan warms up whole; none_no_common_level: the previous version was read and shares no Level id with the new one; none_previous_unreadable: the previous version could not be read back or compiled; none_discontinuous: the Query Group is back from retirement; every none_* warms the Plan up whole). scope=series: what a Worker did on each evaluation of a series with no record under the new generation yet - counted per evaluation, not per series: a series is counted again on every evaluation until its first record under the new generation is written, so one series usually counts more than once (carried: the carried Levels' results kept; carried_across_detect: kept, some decided by the Level's previous detection; nothing_kept: none were; skipped_guard_warming and skipped_guard_gapped: a guard other than the activation's own drift guard held a carried Level of the old record WARMING, or GAPPED; each of the two starts the series over - a Level WARMING or GAPPED for its window's own holes, or under its activation's drift guard (CONFIG_DRIFT), is carried, its holes with it; old_missing: the old generation held nothing). scope=no_data_plan: the Control Leader's decision about the Plan's no-data memory and no-data end index, from the two versions of the Plan (carried: the same query, projection and alert identity, and for the memory the same no-data section, so both are read from the old generation while the new one holds none; carried_ends_only: the end index is, the memory is not because the no-data section changed; not_carried_semantics_changed: the query, projection or alert identity changed, or the edit moved the Plan to another Query Group, and the edit decides what the open alerts become; not_carried_previous_unreadable: the previous version could not be read back). scope=no_data_load: what a Worker found reading that state from the old generation (memory_carried and ends_carried: something was read; *_previous_empty: the old generation held nothing; *_previous_unreadable: it could not be read, and the Plan runs on the new generation's own state; ends_previous_not_cleared: carried entries could not be removed from the old index after they were written to the new one)."}, []string{"scope", "result"})
 	for _, scope := range observability.StateCarryScopes {
 		for _, result := range observability.StateCarryResults[scope] {
 			metrics.stateCarry.WithLabelValues(scope, result)
@@ -1049,54 +1294,95 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	for _, build := range observability.SourceRefreshBuilds {
 		metrics.sourceRefreshBuilds.WithLabelValues(string(build))
 	}
-	metrics.drainingCursorPrunedQueryGroups = newLoadedGauge(prometheus.GaugeOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "draining_cursor_pruned_query_groups", Help: "Replicated per-Pod view of draining Query Groups whose Progress cursor lies before the earliest Slot their Schedule timeline still holds. Such a Query Group can never find the Slot its cursor asks for, so it cannot drain by itself; the count is reported before anything acts on it. Aggregate replicas with max, not sum."})
-	metrics.rebalancePlannedMoves = newLoadedGauge(prometheus.GaugeOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "rebalance_planned_moves", Help: "Assignments the latest rebalance round on this Control Leader planned to move from the most to the least loaded ready worker. Read beside assignment_moves_total: planned and not published for more than one stabilisation window is a ready set that keeps changing. Meaningful on the Control Leader only; aggregate replicas with max, not sum."})
-	metrics.shardUnawareReadyReplicas = newLoadedGauge(prometheus.GaugeOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "shard_unaware_ready_replicas",
+	metrics.drainingCursorPrunedQueryGroups = newLoadedGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "draining_cursor_pruned_query_groups", Help: "Replicated per-Pod view of draining Query Groups whose Progress cursor lies before the earliest Slot their Schedule timeline still holds. Such a Query Group can never find the Slot its cursor asks for, so it cannot drain by itself; the count is reported before anything acts on it. Aggregate replicas with max, not sum."})
+	metrics.rebalancePlannedMoves = newLoadedGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "rebalance_planned_moves", Help: "Assignments the latest rebalance round on this Control Leader planned to move from the most to the least loaded ready worker. Read beside assignment_moves_total: planned and not published for more than one stabilisation window is a ready set that keeps changing. Meaningful on the Control Leader only; aggregate replicas with max, not sum."})
+	metrics.shardUnawareReadyReplicas = newLoadedGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "shard_unaware_ready_replicas",
 		Help: "Ready replicas whose registration does not declare the strategy-split contract (shard-aware.v1), as the latest " +
 			"reconcile round on this Control Leader saw them. A split is published only while this is zero, and a split fleet " +
 			"is collapsed to one piece per strategy while it is not. Across a rolling release it goes 0, n, 0; a rollback puts " +
 			"the rolled-back replica back on it. Which replicas they are is on /api/health rebalance.shard_aware.unaware. " +
 			"Meaningful on the Control Leader only; aggregate replicas with max, not sum."})
-	metrics.rebalanceGap = newLoadedGauge(prometheus.GaugeOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "rebalance_gap", Help: "Owned Query Groups on the most loaded ready worker minus those on the least loaded, as the latest rebalance round on this Control Leader saw them. Zero is even; a gap that stays above five percent of the even share across rounds is a writer that is not moving. Meaningful on the Control Leader only; aggregate replicas with max, not sum."})
-	metrics.assignmentMoves = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "assignment_moves_total", Help: "Assignments the Control Leader moved to another ready worker, by reason. reason=rebalance is a move to even the owned counts out; each costs the Query Group at most one Slot on the old holder."}, []string{"reason"})
-	metrics.rebalancePaused = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "rebalance_paused_total", Help: "Rebalance rounds that planned moves and published none, by reason. reason=set_unstable is the ready set having changed within the stabilisation window, which is what a rolling update or a replica joining looks like; rising without end is a set that never settles."}, []string{"reason"})
-	metrics.assignmentMoves.WithLabelValues("rebalance")
+	metrics.rebalanceGap = newLoadedGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "rebalance_gap", Help: "Owned Query Groups on the most loaded ready worker minus those on the least loaded, as the latest rebalance round on this Control Leader saw them. Zero is even; a gap that stays above five percent of the even share across rounds is a writer that is not moving. Meaningful on the Control Leader only; aggregate replicas with max, not sum."})
+	metrics.assignmentMoves = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "assignment_moves_total", Help: "Assignments the Control Leader moved to another ready worker, by reason: rebalance, a move to even the owned counts out; bytes, a feasibility move off a worker whose Query Groups' retained-byte peaks sum past its share of the pool, one per overloaded worker per round; ineligible, a move off a holder alive and READY but not eligible (a rollout that changed the capability digest); holder_gone, a placement off a holder not in the round's ready set (not READY, registration lapsed, or declining the Query Group). A Query Group placed for the first time is not a move. Each costs the Query Group at most one Slot on the old holder. holder is what held the Query Group's lease: session for a holder holding it under a worker session, no_session for one renewing its own lease (an older binary) or none."}, []string{"reason", "holder"})
+	metrics.rebalancePaused = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "rebalance_paused_total", Help: "Rebalance rounds that planned moves and published none, by reason. reason=set_unstable is the ready set having changed within the stabilisation window, which is what a rolling update or a replica joining looks like; rising without end is a set that never settles."}, []string{"reason"})
+	for _, reason := range AssignmentMoveReasons {
+		for _, holder := range []string{"session", "no_session"} {
+			metrics.assignmentMoves.WithLabelValues(reason, holder)
+		}
+	}
+	metrics.byteOverloadedWorkers = newLoadedGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "rebalance_byte_overloaded_workers", Help: "Ready workers whose Query Groups' retained-byte peaks sum past their share of the pool, as the latest round on this Control Leader judged them; each gives one Query Group away per round (assignment_moves_total{reason=\"bytes\"}). Meaningful on the Control Leader only; aggregate replicas with max, not sum."})
+	metrics.byteMostLoadedShare = newLoadedGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "rebalance_byte_most_loaded_share", Help: "The largest judged worker's sum of retained-byte peaks over the share of its pool the byte constraint allows, as the latest round on this Control Leader read it; above one is overloaded. A lower bound while rebalance_byte_unread_groups is not zero. Meaningful on the Control Leader only; aggregate replicas with max, not sum."})
+	metrics.placementUnfit = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "placement_unfit_total", Help: "Placements the Control Leader made although the Query Group fit no eligible ready worker under the byte constraint's projection (retained-byte peaks reported, each unread Query Group at the round's estimate), so it went to its rendezvous choice: a placement cannot wait on a fit, and the byte constraint moves it on a later round if the worker is then overloaded. Not counted while the round has no estimate, when nothing is judged."})
+	metrics.byteUnreadGroups = newLoadedGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "rebalance_byte_unread_groups", Help: "Query Groups with no reported retained-byte peak in the latest round on this Control Leader: they count nothing toward their worker's sum, so the byte readings beside it are lower bounds. Meaningful on the Control Leader only; aggregate replicas with max, not sum."})
 	metrics.rebalancePaused.WithLabelValues("set_unstable")
-	metrics.controlReadRoundTrips = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "control_read_round_trips_total", Help: "Redis round trips the Control Leader's reconcile round spent reading the records it places Query Groups from, by read: assignment (one Assignment record per Query Group of the population) or registry (the index plus one registration per ready worker). Counted where the calls are issued, so it is this round's own number and not a share of a client-wide total. Read it against control_read_keys_total on the same read: keys rising while round trips stay flat is the batch doing its job, both rising together is a batch that is not batching."}, []string{"read"})
-	metrics.controlReadKeys = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "control_read_keys_total", Help: "Records the Control Leader's reconcile round asked for, by read. The denominator for control_read_round_trips_total; before the reads were batched the two were equal by construction."}, []string{"read"})
-	metrics.controlReadDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "control_read_duration_seconds", Help: "Wall time one reconcile round spent inside each control-plane read, by read. Reported for failed rounds too: a round that took far longer than the others is the one most likely to have failed, and leaving those out would drop them from the distribution somebody is looking at them in.", Buckets: controlReadDurationBuckets}, []string{"read"})
+	metrics.controlReadRoundTrips = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "control_read_round_trips_total", Help: "Redis round trips the Control Leader's reconcile round spent reading the records it places Query Groups from, by read: assignment (one Assignment record per Query Group of the population) or registry (the index plus one registration per ready worker). Counted where the calls are issued, so it is this round's own number and not a share of a client-wide total. Read it against control_read_keys_total on the same read: keys rising while round trips stay flat is the batch doing its job, both rising together is a batch that is not batching."}, []string{"read"})
+	metrics.controlRecordReads = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "control_record_reads_total",
+		Help: "Assignment records the Control Leader read, by why. It keeps a copy of the records for its term and reads one only when the " +
+			"copy cannot say: term_start (a new term's first reads), entered (the Query " +
+			"Group entered the population), backstop (the round's share of every record, each read at least once in sixty rounds), " +
+			"conflict (a publication over it was refused as changed), unknown_outcome (a publication over it failed without saying " +
+			"whether it was written), foreign_cutover (another process's activation rewrote its timeline revision, or a delta that " +
+			"could not say which it rewrote had every record the copy holds read again)."}, []string{"reason"})
+	metrics.controlRecordMismatches = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "control_record_cache_mismatch_total",
+		Help: "Fields a backstop read found the Control Leader's copy of a record wrong on, once a record each field; presence is a " +
+			"record there that the copy had absent or the other way round. content_scope, pending_content_scope and effective_at_ms " +
+			"are written by a Worker promoting its pending content and are expected; any other is a write the copy missed, and the " +
+			"control_reads_spent line names the Query Group and both values."}, []string{"field"})
+	metrics.controlRecordConflicts = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "control_record_conflicts_total",
+		Help: "Records whose publication in a reconcile round was refused because they had changed since read: settled (read again and " +
+			"settled in the same round) or again (refused again, left as read for the next round). Only a write that moves the " +
+			"record's revision refuses one: a publication whose answer the Leader did not get, another Leader's publication, or a " +
+			"sweep that removed the record. A Worker promoting its pending content and an activation writing the timeline revision " +
+			"do not, so conflicts are not the usual case of any round."}, []string{"outcome"})
+	for _, reason := range observability.RecordReadReasons {
+		metrics.controlRecordReads.WithLabelValues(reason)
+	}
+	for _, field := range observability.RecordFields {
+		metrics.controlRecordMismatches.WithLabelValues(field)
+	}
+	for _, outcome := range []string{"settled", "again"} {
+		metrics.controlRecordConflicts.WithLabelValues(outcome)
+	}
+	metrics.controlReadKeys = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "control_read_keys_total", Help: "Records the Control Leader's reconcile round asked for, by read. The denominator for control_read_round_trips_total; before the reads were batched the two were equal by construction."}, []string{"read"})
+	metrics.controlReadDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: metricSubsystem, Name: "control_read_duration_seconds", Help: "Wall time one reconcile round spent inside each control-plane read, by read. Reported for failed rounds too: a round that took far longer than the others is the one most likely to have failed, and leaving those out would drop them from the distribution somebody is looking at them in.", Buckets: controlReadDurationBuckets}, []string{"read"})
 	for _, read := range ControlReadKinds {
 		metrics.controlReadRoundTrips.WithLabelValues(read)
 		metrics.controlReadKeys.WithLabelValues(read)
 	}
-	metrics.assignmentIndexStaleRounds = newLoadedGauge(prometheus.GaugeOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "assignment_index_stale_rounds", Help: "Consecutive reconcile rounds in which this worker read the same Assignment index round number. Healthy values are zero and one: the Leader writes once per reconcile interval and workers read on their own interval of the same length, so a reader that runs just before the writer sees the previous round once. Two or more means the index has stopped advancing, which reads exactly like an unchanged fleet otherwise. Per worker; aggregate with max."})
-	metrics.assignmentIndexWrites = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "assignment_index_write_total", Help: "Assignment index rounds the Control Leader attempted, by result."}, []string{"result"})
-	metrics.assignmentIndexReads = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "assignment_index_read_total", Help: "Assignment index reads by this worker, by result: fresh (round advanced), stale (same round), missing (no index or no set), invalid (unreadable)."}, []string{"result"})
-	metrics.assignmentIndexConfirm = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "assignment_index_confirm_total", Help: "Changes a worker took from the Assignment index and confirmed against the Assignment records, by outcome: opened (a candidate the record confirmed), rejected (a candidate the record refused), released (a held Query Group the record confirmed gone), retained (a held Query Group the index dropped but the record still assigns here). The record always wins; rejected and retained measure how often the index was behind it."}, []string{"result"})
-	metrics.assignmentRecordReads = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "assignment_record_read_total", Help: "Assignment records this worker read to learn what it owns, by path: index (only the changes the index named) or full (every record of the population, when no usable index was there). The index exists to keep the index path near zero in a quiet round."}, []string{"path"})
-	metrics.scheduleCursorAdvances = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "schedule_cursor_advance_total", Help: "Attempts to move a Progress cursor that points into a pruned part of its timeline to the earliest Slot the timeline still holds, by outcome; a conflict also carries the one fact that refused it (refusal), which is empty for every other outcome."}, []string{"result", "refusal"})
-	// Every outcome and every refusal of a conflict publishes a zero from the
-	// start, so a refusal that never happens reads as zero and not as absent.
+	metrics.assignmentIndexStaleRounds = newLoadedGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "assignment_index_stale_rounds", Help: "Consecutive reconcile rounds in which this worker read the same Assignment index round number. Healthy values are zero and one: the Leader writes once per reconcile interval and workers read on their own interval of the same length, so a reader that runs just before the writer sees the previous round once. Two or more means the index has stopped advancing, which reads exactly like an unchanged fleet otherwise. Per worker; aggregate with max."})
+	metrics.assignmentIndexWrites = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "assignment_index_write_total", Help: "Assignment index rounds the Control Leader attempted, by result."}, []string{"result"})
+	metrics.assignmentIndexReads = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "assignment_index_read_total", Help: "Assignment index reads by this worker, by result: fresh (round advanced), stale (same round), missing (no index or no set), invalid (unreadable)."}, []string{"result"})
+	metrics.assignmentIndexConfirm = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "assignment_index_confirm_total", Help: "Changes a worker took from the Assignment index and confirmed against the Assignment records, by outcome: opened (a candidate the record confirmed), rejected (a candidate the record refused), released (a held Query Group the record confirmed gone), retained (a held Query Group the index dropped but the record still assigns here). The record always wins; rejected and retained measure how often the index was behind it."}, []string{"result"})
+	metrics.assignmentRecordReads = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "assignment_record_read_total", Help: "Assignment records this worker read to learn what it owns, by path: index (only the changes the index named) or full (every record of the population, when no usable index was there). The index exists to keep the index path near zero in a quiet round."}, []string{"path"})
+	metrics.scheduleCursorAdvances = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "schedule_cursor_advance_total", Help: "Attempts to move a Progress cursor past Slots nobody evaluated to the earliest Slot its timeline still holds, by outcome and by the word the skip is recorded under (reason: SCHEDULE_PRUNED, PLAN_NOT_ACTIVE, SCHEDULE_REPAIRED, SCHEDULE_REOPENED). An applied attempt is one skipped span, of however many Slots, not one Slot; in_flight says whether it also threw away a Slot in flight - a Slot that ended, named by in_flight_slot on its slot_skipped line - and is false for every other outcome. A conflict also carries the one fact that refused it (refusal), which is empty for every other outcome. Every cell exists from the start, so a zero is a reading."}, []string{"result", "refusal", "reason", "in_flight"})
+	// Every outcome, every refusal of a conflict, every reason and, for an
+	// applied skip, both in_flight values publish a zero from the start, so a
+	// skip that never happens reads as zero and not as absent.
 	for _, status := range observability.CursorAdvanceStatuses {
+		refusals := []string{""}
 		if status == observability.CursorAdvanceConflict {
-			for _, refusal := range observability.CursorRefusals {
-				metrics.scheduleCursorAdvances.WithLabelValues(status, refusal)
-			}
-			continue
+			refusals = observability.CursorRefusals
 		}
-		metrics.scheduleCursorAdvances.WithLabelValues(status, "")
+		for _, refusal := range refusals {
+			for _, reason := range execution.ForwardSkipReasons {
+				metrics.scheduleCursorAdvances.WithLabelValues(status, refusal, string(reason), "false")
+				if status == observability.CursorAdvanceApplied {
+					metrics.scheduleCursorAdvances.WithLabelValues(status, refusal, string(reason), "true")
+				}
+			}
+		}
 	}
-	metrics.undrainedDrainingQueryGroups = newLoadedGauge(prometheus.GaugeOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "undrained_draining_query_groups", Help: "Replicated per-Pod view of retired Query Groups still requiring ownership until their retirement boundary is drained; aggregate replicas with max, not sum."})
-	metrics.activationHeldQueryGroups = newLoadedGauge(prometheus.GaugeOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "activation_held_query_groups", Help: "Query Groups the publication brings back from retirement that have not drained and were held out of the activation, which went ahead for everyone else. Reported by the Control Leader on every activation attempt and on every reconcile of a publication that still holds some, so it follows the held set down to zero; a value that does not fall is a retirement that is not draining."})
-	metrics.sourceStrategiesRead = prometheus.NewCounter(prometheus.CounterOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "source_strategies_read_total", Help: "Strategy documents source refresh rounds asked the source for. A skipped round adds nothing; a full read adds the whole active set."})
-	metrics.sourceChangeSignalAge = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "source_change_signal_age_seconds", Help: "How long ago the source's publisher last moved its change signal, in seconds by the Control Leader's clock, as of the latest refresh round. NaN when the latest round found no signal. A value that keeps growing while strategies are being saved means the signal has stopped following the source, and every skipped round since is a round that read nothing for a wrong reason."})
-	metrics.activationHeldAgeSecondsMax = newLoadedGauge(prometheus.GaugeOpts{Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "activation_held_age_seconds_max", Help: "How long the oldest held retirement of the latest activation attempt has waited, in seconds; zero when nothing is held."})
+	metrics.undrainedDrainingQueryGroups = newLoadedGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "undrained_draining_query_groups", Help: "Replicated per-Pod view of retired Query Groups still requiring ownership until their retirement boundary is drained; aggregate replicas with max, not sum."})
+	metrics.activationHeldQueryGroups = newLoadedGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "activation_held_query_groups", Help: "Query Groups the publication brings back from retirement that have not drained and were held out of the activation, which went ahead for everyone else. Reported by the Control Leader on every activation attempt and on every reconcile of a publication that still holds some, so it follows the held set down to zero; a value that does not fall is a retirement that is not draining."})
+	metrics.sourceStrategiesRead = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricSubsystem, Name: "source_strategies_read_total", Help: "Strategy documents source refresh rounds asked the source for. A skipped round adds nothing; a full read adds the whole active set."})
+	metrics.sourceChangeSignalAge = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "source_change_signal_age_seconds", Help: "How long ago the source's publisher last moved its change signal, in seconds by the Control Leader's clock, as of the latest refresh round. NaN when the latest round found no signal. A value that keeps growing while strategies are being saved means the signal has stopped following the source, and every skipped round since is a round that read nothing for a wrong reason."})
+	metrics.activationHeldAgeSecondsMax = newLoadedGauge(prometheus.GaugeOpts{Subsystem: metricSubsystem, Name: "activation_held_age_seconds_max", Help: "How long the oldest held retirement of the latest activation attempt has waited, in seconds; zero when nothing is held."})
 	metrics.algorithmEvaluations = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "algorithm_evaluation_total",
+		Subsystem: metricSubsystem, Name: "algorithm_evaluation_total",
 		Help: "Algorithm evaluation outcomes by fixed source family and result.",
 	}, []string{"algorithm_family", "result"})
 	metrics.algorithmInputs = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "algorithm_input_total",
+		Subsystem: metricSubsystem, Name: "algorithm_input_total",
 		Help: "Named algorithm input completion by fixed source family, input, dependency point and result.",
 	}, []string{"algorithm_family", "input_name", "dependency_point", "result"})
 	// A RECOVERY envelope resolves the alert on its series at the consumer
@@ -1108,7 +1394,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	// this counter the refusal was silent, and a deployment could not say
 	// whether the shape had ever occurred, let alone which rule it fell to.
 	metrics.historyCoverageRejected = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "history_coverage_rejected_total",
+		Subsystem: metricSubsystem, Name: "history_coverage_rejected_total",
 		Help: "Coverage fact sets the observer refused as not describing one run, by the rule they " +
 			"broke -- a count that could not have come from counting the same windows, a named window " +
 			"that does not add up to its own shortfall, and so on. The refused set leaves no counts " +
@@ -1128,7 +1414,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	// shape has not occurred; a cell that runs with Levels low is the reading
 	// that says a round described part of an object rather than all of it.
 	metrics.historyCoverageUnsummarised = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "history_coverage_unsummarised_total",
+		Subsystem: metricSubsystem, Name: "history_coverage_unsummarised_total",
 		Help: "Series a run produced Level outcomes for without summarising a detection window, by cause. " +
 			"resumed: State was already applied at this Slot's version, so the round was bookkeeping and not an " +
 			"evaluation. constrained: State could not be loaded, so there was nothing to evaluate. Read beside " +
@@ -1146,32 +1432,48 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	// outcomes with no reason, UNKNOWN and TERMINAL over the observation
 	// catalog and other.
 	metrics.levelOutcomes = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "level_outcome_total",
+		Subsystem: metricSubsystem, Name: "level_outcome_total",
 		Help: "Level outcomes the evaluation concluded, by outcome kind and, for UNKNOWN and TERMINAL, by reason. " +
-			"NORMAL, ABNORMAL and RECOVERY carry no reason. UNKNOWN by reason is the reading for a Level that was not " +
+			"ABNORMAL and RECOVERY carry no reason. NORMAL carries one only where the Level met its recovery windows " +
+			"and was held NORMAL on an open alert: the trigger_recovery_withheld_total reason (zero_count, " +
+			"no_data_last_point_unknown, source_unknown), origin derived, so a shift from RECOVERY to NORMAL is read on this family " +
+			"by the rule that made it; every other NORMAL has reason empty. A reason on NORMAL is not an unjudged " +
+			"Level: read UNKNOWN by outcome=\"UNKNOWN\", never by reason!=\"\". UNKNOWN by reason is the reading for a Level that was not " +
 			"judged: EFFECTIVE_TIME_INACTIVE is its configured hours, EFFECTIVE_TIME_UNKNOWN a schedule that could not " +
 			"be resolved, HISTORY_WARMING a window not yet full, GAP_* a guard. This counts Level outcomes per series " +
 			"per evaluation, not alerts and not strategies; read a reason against level_outcome_total summed over " +
-			"every cell for its share.",
-	}, []string{"outcome", "reason"})
+			"every cell for its share. origin says whose the reason is: physical for what this round met itself, " +
+			"carried for a stored guard's reason repeated on a later round (an UNKNOWN Level held by a guard an " +
+			"earlier round raised; the origin Slot is on the evaluation_completed line), derived for alarmd's own " +
+			"judgement from configuration, schedule or State (EFFECTIVE_TIME_INACTIVE, HISTORY_WARMING, a withheld " +
+			"recovery's reason, ...). Only UNKNOWN is ever carried.",
+	}, []string{"outcome", "reason", "origin"})
 	for _, outcome := range observability.LevelOutcomeKinds {
 		if outcome == "UNKNOWN" || outcome == "TERMINAL" {
 			for _, reason := range observability.LevelOutcomeReasons() {
-				metrics.levelOutcomes.WithLabelValues(outcome, reason)
+				metrics.levelOutcomes.WithLabelValues(outcome, reason, observability.ReasonOriginOf(observability.ReasonCode(reason), false))
+				if outcome == "UNKNOWN" {
+					metrics.levelOutcomes.WithLabelValues(outcome, reason, observability.ReasonOriginCarried)
+				}
 			}
 			continue
 		}
-		metrics.levelOutcomes.WithLabelValues(outcome, "")
+		metrics.levelOutcomes.WithLabelValues(outcome, "", observability.ReasonOriginPhysical)
+		if outcome == "NORMAL" {
+			// A withheld recovery's reason, derived (LevelOutcomeLabels).
+			for _, reason := range observability.RecoveryWithheldReasons {
+				metrics.levelOutcomes.WithLabelValues(outcome, string(reason), observability.ReasonOriginDerived)
+			}
+		}
 	}
 	metrics.levelAbnormal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "level_abnormal_total",
+		Subsystem: metricSubsystem, Name: "level_abnormal_total",
 		Help: "Level verdicts of ABNORMAL, by whether the detection window they were reached on was " +
-			"full. The trigger decides ABNORMAL before it reads completeness, and the output contract " +
-			"pins that order: WARMING and GAPPED history permit only monotonic ABNORMAL. Under N-of-M " +
-			"that is sound -- anomalies counted across a hole are a lower bound, so an incomplete window " +
-			"never over-fires -- but an alert opened on one cannot close until the window is FULL again, " +
-			"and a window that stays short holds it open for ever. window=incomplete is how much alerting " +
-			"rides on that; read it against window=full, never alone, because zero of zero and zero of " +
+			"full. The trigger decides ABNORMAL before it reads completeness: under N-of-M anomalies " +
+			"counted across a hole are a lower bound, so an incomplete window never over-fires. An alert " +
+			"opened on one closes by a RECOVERY whose own window evidence carries it (decision-022); " +
+			"only NORMAL waits for the window to be FULL again. window=incomplete is how much alerting " +
+			"rides on incomplete windows; read it against window=full, never alone, because zero of zero and zero of " +
 			"ten thousand are different readings. Both series exist from start so zero is a reading. " +
 			"This is the number a decision to discard state on leaving the degraded pool is judged " +
 			"against: after such a change the incomplete cell should stop moving.",
@@ -1185,7 +1487,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	// is left to read is how often a RECOVERY goes on beside a Level that
 	// used to hold it.
 	metrics.recoveryBeside = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "trigger_recovery_beside_level_total",
+		Subsystem: metricSubsystem, Name: "trigger_recovery_beside_level_total",
 		Help: "RECOVERY records decided while another Level of the same record was in the named state: " +
 			"level_unavailable (its state could not be established this round), level_recovering (it read " +
 			"NORMAL with a triggering window still inside its recovery span), level_without_recovery (it read " +
@@ -1198,32 +1500,76 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	for _, cause := range []observability.RecoveryGateCause{observability.RecoveryGateLevelUnavailable, observability.RecoveryGateLevelRecovering, observability.RecoveryGateLevelWithoutRecovery} {
 		metrics.recoveryBeside.WithLabelValues(string(cause))
 	}
+	metrics.recoveryWithheld = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: metricSubsystem, Name: "trigger_recovery_withheld_total",
+		Help: "Level outcomes that met their recovery windows and stayed NORMAL while the consumer holds an open " +
+			"alert on the series, by why: zero_count (the " +
+			"round's own value was a count of zero from an event count, or a log count with no grouping, " +
+			"whose zero is no observation; the alert recovers on a round with a count above zero, or ends by " +
+			"-nodata or close), no_data_last_point_unknown (the same, on a Level written to end on no data " +
+			"whose last real point is not known - opened on a build that did not keep it - so no data ends " +
+			"nothing until the next real point), source_unknown (a Level written to end on no data was due to " +
+			"end, and the probe of its source - the same table in the same space, the strategy's conditions " +
+			"removed - could not show the source alive: an answer with a status, partial, failed, not in " +
+			"time, or empty without a status; the alert stays open, and the quiet-group zero count path is " +
+			"never probed). Counted per Level per evaluation, so one alert held open adds one " +
+			"each round it stays open; a quiet series with no open alert is not counted, though its decision " +
+			"window still carries recovery.withheld. A round whose window is not whole is unavailable with its " +
+			"history reason instead, and not counted here. A zero here is a reading: every reason exists from start.",
+	}, []string{"reason"})
+	for _, reason := range observability.RecoveryWithheldReasons {
+		metrics.recoveryWithheld.WithLabelValues(string(reason))
+	}
+	metrics.noDataEnd = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: metricSubsystem, Name: "no_data_end_total",
+		Help: "What the no-data end index did, by outcome: sent (series whose end event the sink took, for a level " +
+			"written to end on no data, the series absent from complete answers through the recovery span - taken " +
+			"by the broker, not ended by the link, which finds no active alert for one already closed), not_open " +
+			"(entries removed because the consumer no longer holds their alert - closed by hand, by effective " +
+			"time, by the absent or superseded-identity close - nothing sent), overflow (open alerts not indexed, " +
+			"the Plan's index full; they stay open while their group is absent), unavailable (Plans whose index " +
+			"could not be read or written that round; nothing decided on it), send_failed (series whose end the " +
+			"sink did not take; sent again on the next complete round), undecodable (entries this build could not " +
+			"read, left to the alert's own end), unjudged (absent entries a complete round could not decide on " +
+			"because the consumer's set could not be judged - not read yet after a handover, or no Console; " +
+			"nothing sent or removed), source_unknown (absent entries whose end was due and was held because the " +
+			"source could not be shown alive; the entry stays, " +
+			"nothing is sent, the next round asks again), level_not_open (absent series none of whose due levels is " +
+			"the level the alert is at, the lowest open level id: the consumer ends an alert only on its own level, " +
+			"so nothing is sent and the entries are removed). Counted in series or entries, per round. Every outcome " +
+			"exists from start.",
+	}, []string{"outcome"})
+	for _, outcome := range observability.NoDataEndOutcomes {
+		metrics.noDataEnd.WithLabelValues(outcome)
+	}
 	// The recovery gate: does the consumer hold an open alert on the series
 	// at all. Every outcome is pre-created so
 	// a zero reads as "never happened", and not_configured in particular has
 	// to be readable at zero: on a production worker it is the wiring having
 	// come apart, and an absent series would hide exactly that.
 	metrics.openAlertGate = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "trigger_open_alert_gate_total",
-		Help: "RECOVERY records, by what the consumer's open alert set decided: " +
+		Subsystem: metricSubsystem, Name: "trigger_open_alert_gate_total",
+		Help: "RECOVERY records, by what alarmd's copy of the consumer's active alerts decided: " +
 			"passed (an open alert on the series; the envelope went), passed_one_time_close (the one close of a " +
 			"group the target dropped, let through without the consumer's copy vouching for it: about one per " +
 			"dropped group, more only when that round's no-data memory write failed and the round ran again; an " +
 			"orphan at the consumer where it holds no such alert), held_no_open_alert (none; nothing to " +
 			"resolve, no envelope), held_fingerprint_unknown (the series identity the consumer keys alerts by " +
-			"could not be built; held and named rather than read as absent), not_configured (the evaluation ran " +
+			"could not be built; held and named rather than read as absent), held_level_not_open (every Level the " +
+			"record recovers is one the series' open alert does not have open, so the consumer would drop it as an " +
+			"orphan; held, no envelope), not_configured (the evaluation ran " +
 			"without a set; the envelope went as before the gate -- on a production worker this is a wiring " +
 			"fault), protocol_not_gated (the Plan publishes the compatibility protocol, which has no RECOVERY " +
 			"message: the set was not asked and the envelope is not built; output_events_without_message_total " +
 			"counts it). " +
 			"It counts records per evaluation, not alerts. Which of passed and held_no_open_alert " +
-			"dominates says nothing on its own; read it against open_alert_set_lookup_total, whose " +
-			"self_maintained and passed_through answers are this process's own knowledge, not the consumer's.",
+			"dominates says nothing on its own; read it against active_copy_lookup_total, whose own_sent " +
+			"answers are this process's own knowledge, not the consumer's.",
 	}, []string{"outcome"})
 	for _, outcome := range observability.OpenAlertGateOutcomes {
 		metrics.openAlertGate.WithLabelValues(string(outcome))
 	}
-	metrics.openAlertSet = newOpenAlertSetCollector()
+	metrics.activeCopy = newActiveCopyCollector()
 	metrics.fleetTracker = newFleetTrackerCollector()
 	metrics.effectiveTimeRefresh = newEffectiveTimeRefreshCollector()
 	metrics.activationRebuild = newActivationRebuildCollector()
@@ -1232,22 +1578,32 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	metrics.timelineUnreadableReports = newTimelineUnreadableReports()
 	metrics.activationHeader = newActivationHeaderCollector()
 	metrics.activationBlocked = newActivationBlockedCollector()
+	metrics.liveReserve = newLiveReserveCollector()
 	metrics.roundMemory = newRoundMemoryCollector()
+	metrics.stateSeriesHeld = newStateSeriesHeldCollector()
 	metrics.targetGroup = newTargetGroupCollector()
 	metrics.effectiveClose = newEffectiveCloseCollector()
 	metrics.logLines = newLogLinesCollector()
 	metrics.observerPanics = newObserverPanicsCollector()
 	metrics.absentClose = newAbsentCloseCollector()
+	metrics.editClose = newEditCloseCollector()
+	metrics.noDataCloseAPI = newNoDataCloseAPICollector()
+	metrics.linkdFilterClose = newLinkdFilterCloseCollector()
+	metrics.linkdFilterCloseRequests = newLinkdFilterCloseRequests()
+	metrics.openEpisodeRecord = newOpenEpisodeRecordCollector()
+	metrics.newOpens = newNewOpensCollector()
+	metrics.frontRefused = newFrontRefusedCollector()
+	metrics.processMemory = newProcessMemoryCollector()
+	metrics.strategyScopeClose = newStrategyScopeCloseCollector()
 	metrics.targetScopeClose = newTargetScopeCloseCollector()
-	metrics.linkdConsole = newLinkdConsoleCollector()
 	metrics.strategiesReturnedAfterRemoval = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "catalog_strategy_returned_after_removal_total",
+		Subsystem: metricSubsystem, Name: "catalog_strategy_returned_after_removal_total",
 		Help: "Strategies the source listed again after their Plan had already left the Catalog: absent past the " +
 			"removal grace, withdrawn, then back. A return inside the grace is not one. Counted by the Control " +
 			"Leader's source-set ledger; read it summed over replicas, since only the Leader counts.",
 	})
 	metrics.queryCooldownSaves = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "query_cooldown_saves_total",
+		Subsystem: metricSubsystem, Name: "query_cooldown_saves_total",
 		Help: "Writes of a Query Group's query cooldown pool record, by result: written; superseded (a later " +
 			"owner's record is there, so this owner's write was refused -- the successor's pool state stands); " +
 			"failed (the runtime store did not take the write, and the pool state it carried is lost to the " +
@@ -1257,7 +1613,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 		metrics.queryCooldownSaves.WithLabelValues(result)
 	}
 	metrics.controlFactsWrites = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "fleet_control_facts_writes_total",
+		Subsystem: metricSubsystem, Name: "fleet_control_facts_writes_total",
 		Help: "Writes of the Control Leader's fleet control record, by result: written; invalid (the record " +
 			"lacked its identity or term and was not sent); oversized (past the fleet byte budget, refused whole); " +
 			"failed (the store did not take it). While the Leader writes none, views fall back to the control facts " +
@@ -1266,8 +1622,18 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	for _, result := range ControlFactsWriteResults {
 		metrics.controlFactsWrites.WithLabelValues(result)
 	}
+	metrics.planCarriesReads = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: metricSubsystem, Name: "fleet_plan_carries_reads_total",
+		Help: "Reads of where an object's Plans' Runtime State comes from (plan_carries on an object detail), " +
+			"from the Query Group's timeline, by result: read; no_open_segment (the timeline holds no open " +
+			"Segment, so the object runs no Plan here now); failed (the timeline or an output context it names " +
+			"did not read back: the detail answers plan_carries_unavailable read_failed). Made on request only.",
+	}, []string{"result"})
+	for _, result := range PlanCarriesReadResults {
+		metrics.planCarriesReads.WithLabelValues(result)
+	}
 	metrics.queryCooldownLoads = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "query_cooldown_loads_total",
+		Subsystem: metricSubsystem, Name: "query_cooldown_loads_total",
 		Help: "Reads of a Query Group's query cooldown pool record, made on a Runner's first round holding the " +
 			"Query Group, by result: found; absent; undecodable (the record is there and does not decode, read as " +
 			"none and replaced by the next write); failed (the runtime store did not answer: the Runner reads " +
@@ -1279,7 +1645,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 		metrics.queryCooldownLoads.WithLabelValues(result)
 	}
 	metrics.eventBusinessAttribution = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "event_business_attribution_total",
+		Subsystem: metricSubsystem, Name: "event_business_attribution_total",
 		Help: "Events of global business strategies by where the business they are filed under came from: " +
 			"target (the host's business, or the business configured on the matched Kubernetes static target), " +
 			"dimension (the record's bk_biz_id aggregation dimension), namespace (the business the platform " +
@@ -1295,8 +1661,35 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	for _, source := range contract.BusinessAttributionSources {
 		metrics.eventBusinessAttribution.WithLabelValues(source)
 	}
+	metrics.detectionSnapshots = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: metricSubsystem, Name: "event_detection_snapshots_total",
+		Help: "Detection snapshots built onto events, by result: whole; truncated (past the snapshot's size " +
+			"bound, the algorithm facts of the least severe levels were dropped; its ref_values and windows " +
+			"never are); dropped (the snapshot was past its size bound with no algorithm facts left to drop, " +
+			"so the event was sent without it - detection is never held for it). Only the ABNORMAL and " +
+			"RECOVERY events of strategies with named outputs carry one. " +
+			"Counted once per event built, where it is built and before the output sends it, so this is " +
+			"snapshots built, not sent; a retried Slot counts again. Every result exists from the start.",
+	}, []string{"result"})
+	for _, result := range DetectionSnapshotResults {
+		metrics.detectionSnapshots.WithLabelValues(result)
+	}
+	metrics.detectionSnapshotStates = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: metricSubsystem, Name: "event_detection_snapshot_ref_states_total",
+		Help: "Named outputs on the detection snapshots of ABNORMAL events, one per output per event, by the " +
+			"state the output was in at the decided record: SUCCESS or PARTIAL (it answered there, whole or " +
+			"in part), MISSING (it answered, not at the record's time under its labels - an output aggregated " +
+			"to other labels than the one detection reads lands here), ERROR (the query service failed to " +
+			"compute it), UNSUPPORTED (the query service answered as if no output was asked for), _other a " +
+			"state this build does not name. Only snapshots an event carries count; a dropped one counts " +
+			"none. Read against event_detection_snapshots_total for the events. " +
+			"Every state exists from the start.",
+	}, []string{"state"})
+	for _, state := range DetectionSnapshotStates {
+		metrics.detectionSnapshotStates.WithLabelValues(state)
+	}
 	metrics.diagnosticRedisFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "diagnostic_redis_failures_total",
+		Subsystem: metricSubsystem, Name: "diagnostic_redis_failures_total",
 		Help: "Calls to Redis by the diagnostic clients that were not answered, by client -- evidence (the CLI's " +
 			"store reads), auth (the CLI's authorization store), lifecycle (the start and stop record) -- and by " +
 			"reason: connection_closed (the connection was closed under the call; a pooled connection the network " +
@@ -1310,7 +1703,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 		}
 	}
 	metrics.diagnosticRedisDialRetries = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "diagnostic_redis_dial_retries_total",
+		Subsystem: metricSubsystem, Name: "diagnostic_redis_dial_retries_total",
 		Help: "Connections a diagnostic client dialled a second time because the first dial failed, by client and " +
 			"by why the first failed, in the words of diagnostic_redis_failures_total. A dial sends no command, so " +
 			"the second one repeats nothing; one that fails as well is counted there too, under its own reason. " +
@@ -1325,13 +1718,14 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 		}
 	}
 	metrics.leaderForward = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "leader_forward_duration_seconds",
+		Subsystem: metricSubsystem, Name: "leader_forward_duration_seconds",
 		Help: "Requests a replica handed to the Control Leader's listener because it could not answer them itself, " +
 			"by route (strategy: one strategy's standing; diagnosis: an environment diagnosis page) and result: " +
 			"answered (the Leader replied, whatever its status), timeout (the hop's own bound ran out, which " +
 			"includes a Leader still reading what the reply needs), refused (nothing listening at the Leader's " +
 			"endpoint), error (any other failure of the hop), no_leader (discovery named none, or none with an " +
-			"endpoint), canceled (the reader went away first, so nothing is known of the Leader). The duration is the replica's wait, the Leader's work included. Before this the hop's " +
+			"endpoint), canceled (the reader went away first, so nothing is known of the Leader), self (the Leader discovery named is " +
+			"this replica: nothing was sent, the request is answered here). The duration is the replica's wait, the Leader's work included. Before this the hop's " +
 			"failure was one word on the reply, FORWARD_FAILED, and which of these it was was not kept anywhere.",
 		Buckets: leaderForwardBuckets,
 	}, []string{"route", "result"})
@@ -1343,8 +1737,85 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 			metrics.leaderForward.WithLabelValues(route, result)
 		}
 	}
+	metrics.apmCarried = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: metricSubsystem, Name: "apm_app_carried_responses_total",
+		Help: "Query responses read with the APM application carried (app_name added to the group-by of a query whose " +
+			"clauses all read one APM table), by table kind (metric or trace) and outcome: unique, every identity came back " +
+			"once and the series were handed on; not_unique, an identity came back more than once -- a table holding two " +
+			"applications, whose extra key split one series -- so the response was discarded and the query read again " +
+			"without the application. not_unique above zero is the premise the carry rests on not holding.",
+	}, []string{"table", "outcome"})
+	metrics.apmCarriedBytes = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Subsystem: metricSubsystem, Name: "apm_app_carried_response_bytes",
+		Help: "Bytes of each query response read with the APM application carried, held whole before its series were " +
+			"handed on, by table kind: the cost of checking that the carry split nothing.",
+		Buckets: prometheus.ExponentialBuckets(1024, 4, 10),
+	}, []string{"table"})
+	for _, table := range APMCarriedTables {
+		metrics.apmCarriedBytes.WithLabelValues(table)
+		for _, outcome := range APMCarriedOutcomes {
+			metrics.apmCarried.WithLabelValues(table, outcome)
+		}
+	}
+	metrics.sourceLivenessChecks = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: metricSubsystem, Name: "source_liveness_checks_total",
+		Help: "Verdicts on the source of a Level written to end on no data, asked on the round its end is due and on no " +
+			"other, by source kind (log, event, time_series), result and reason. alive: the source - the same table in the " +
+			"same space, the strategy's conditions removed - has data within the Level's no-data span, read from a " +
+			"period after its first empty one to the judged period, at most the span, and never over the last period " +
+			"with data; the " +
+			"Level ends as configured. unknown: it could not be shown alive, and the Level stays open: status (the answer " +
+			"carried a status, such as a table, field or space the query service does not know), partial (a route " +
+			"failed), timeout (no answer in time: past the probe's own bound, or not yet back when the round asked - a " +
+			"probe runs beside the round, never inside it; this includes probes not started because the in-flight cap " +
+			"was full, source_liveness_probe_deferred_total), error (transport, an HTTP status, an answer that does not " +
+			"decode or lacks is_partial, or no query facts to probe from), empty_without_status (answered whole with no " +
+			"data and no status; the shape a source that stopped should have, not yet confirmed by a real sample, so not " +
+			"called silent). unsupported: no probe is expressed for this source in this version, and the Level ends as it " +
+			"did before: promql, bkdata, apm, multi_table, data_label, event_sparse (an event source: a quiet event " +
+			"table and a broken one answer the probe alike). Counted per Level per round, so a probe that serves " +
+			"many Levels counts once for each; probes themselves are source_liveness_check_seconds. A Level held unknown " +
+			"for longer than its bound is on the fleet's SOURCE_UNKNOWN_HELD line. Every cell exists from start.",
+	}, []string{"source_kind", "result", "reason"})
+	metrics.sourceLivenessSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Subsystem: metricSubsystem, Name: "source_liveness_check_seconds",
+		Help: "How long each source liveness probe took, by source kind: one per source and period, whichever Levels " +
+			"asked, run beside the round. Bounded by the probe's own 20 s, inside the query service's 30 s; a probe at " +
+			"the top bucket is one that timed out.",
+		Buckets: sourceLivenessBuckets,
+	}, []string{"source_kind"})
+	metrics.sourceLivenessDeferred = prometheus.NewCounter(prometheus.CounterOpts{
+		Subsystem: metricSubsystem, Name: "source_liveness_probe_deferred_total",
+		Help: "Source liveness probes not started because the process already ran its in-flight cap of them " +
+			"(sourceliveness.MaxInFlight, 16): many distinct sources due at once. Each one's round reads unknown by " +
+			"timeout in source_liveness_checks_total, though no probe was sent, and the next round asks again. Above " +
+			"zero is the cap being reached.",
+	})
+	metrics.sourceLivenessEvicted = prometheus.NewCounter(prometheus.CounterOpts{
+		Subsystem: metricSubsystem, Name: "source_liveness_answers_evicted_total",
+		Help: "Source liveness answers dropped from the process's cache to keep a newer source's, the cache holding " +
+			"its bound of them (sourceliveness.MaxAnswers, 4096 sources): the oldest goes, the one whose window ends " +
+			"first. Its source is probed again when next asked. Above zero is more sources due at once than the cache " +
+			"holds.",
+	})
+	metrics.sourceLivenessHeldEvicted = prometheus.NewCounter(prometheus.CounterOpts{
+		Subsystem: metricSubsystem, Name: "source_liveness_held_evicted_total",
+		Help: "Held Levels - no-data ends held on a source that could not be shown alive - the process stopped " +
+			"remembering to keep a newer one, its account holding its bound of them (sourceliveness.MaxHeldLevels, " +
+			"4096): the one asked about least recently goes. Its end stays held; only the fleet's SOURCE_UNKNOWN_HELD " +
+			"line no longer counts it until it is asked about again. Above zero is more held Levels than the account " +
+			"holds.",
+	})
+	for _, kind := range sourceliveness.Kinds {
+		metrics.sourceLivenessSeconds.WithLabelValues(string(kind))
+		for _, result := range sourceliveness.Results {
+			for _, reason := range sourceliveness.ReasonsOf(result) {
+				metrics.sourceLivenessChecks.WithLabelValues(string(kind), string(result), string(reason))
+			}
+		}
+	}
 	metrics.controlSourceRounds = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "control_source_refresh_total",
+		Subsystem: metricSubsystem, Name: "control_source_refresh_total",
 		Help: "Refresh rounds of the control plane's strategy source on this process, every round, by outcome " +
 			"and, for a failed round, the exit it stopped at. Counted on the round, not on the transition into " +
 			"an episode: the transition counter records one increment for an episode of any length, so a source " +
@@ -1370,7 +1841,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	metrics.lookback = newLookbackCollector()
 	metrics.platformSettings = newPlatformSettingsCollector()
 	metrics.controlSourceRetainedStale = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "control_source_retained_stale_revisions_total",
+		Subsystem: metricSubsystem, Name: "control_source_retained_stale_revisions_total",
 		Help: "Last-good Plans a Catalog build refused to retain because their persisted facts no longer hold under " +
 			"this binary: the current formula derives another revision from them (disposition " +
 			"LAST_GOOD_REVISION_STALE) or the current rules no longer accept them (LAST_GOOD_FACTS_INVALID). Within " +
@@ -1379,7 +1850,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 			"compiles again, instead of the whole Catalog failing to build as it did before.",
 	})
 	metrics.controlSourceLastGoodIdentity = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "control_source_last_good_identity_changed_total",
+		Subsystem: metricSubsystem, Name: "control_source_last_good_identity_changed_total",
 		Help: "Last-good Plans a Catalog build refused to retain because the source now states another tenant, " +
 			"business, space or global switch for the strategy than the Plan was built for (disposition " +
 			"LAST_GOOD_IDENTITY_CHANGED): the number is the same and the strategy is not, as when a writer's " +
@@ -1390,7 +1861,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	})
 	metrics.catalogComposition = newCatalogCompositionCollector()
 	metrics.seriesAdmission = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "series_admission_total",
+		Subsystem: metricSubsystem, Name: "series_admission_total",
 		Help: "Access-path admission decisions by filter, outcome and bounded reason.",
 	}, []string{"filter", "result", "reason"})
 	// Both cells exist from start: "about zero" is the reading this exists
@@ -1404,7 +1875,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	// Retire when: no deployment is left whose Python-opened alerts alarmd
 	// would have to continue; both counters and the sample row go together.
 	metrics.cmdbAddressDiffers = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "admission_cmdb_address_differs_total",
+		Subsystem: metricSubsystem, Name: "admission_cmdb_address_differs_total",
 		Help: "Admitted series a Plan read whose host CMDB placed by bk_host_id or bk_agent_id while the record's own " +
 			"bk_target_ip was not that host's address (another one, empty or missing), by whether the Plan's alert " +
 			"identity groups by bk_target_ip. Python's fuller overwrites bk_target_ip with the host's address on that " +
@@ -1424,7 +1895,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 			"the series counted here are the ones whose Python-opened alerts alarmd would not recover.",
 	}, []string{"grouped_by_target_ip", "cause"})
 	metrics.cmdbPlacedByHostID = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "admission_cmdb_placed_by_host_id_total",
+		Subsystem: metricSubsystem, Name: "admission_cmdb_placed_by_host_id_total",
 		Help: "Admitted series a Plan read whose host CMDB placed by bk_host_id or bk_agent_id, whatever the record's own " +
 			"bk_target_ip, by whether the Plan's alert identity groups by bk_target_ip: the branch Python's fuller " +
 			"overwrites bk_target_ip on, and the count admission_cmdb_address_differs_total is a part of. Counted at " +
@@ -1439,16 +1910,16 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 		metrics.cmdbPlacedByHostID.WithLabelValues(grouped)
 	}
 	metrics.cmdbIndexHosts = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "cmdb_host_index_hosts",
+		Subsystem: metricSubsystem, Name: "cmdb_host_index_hosts",
 		Help: "Hosts in the in-memory CMDB index the target filter decides on.",
 	})
 	metrics.cmdbIndexServiceInstances = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "cmdb_service_instance_index_instances",
+		Subsystem: metricSubsystem, Name: "cmdb_service_instance_index_instances",
 		Help: "Service instances in the in-memory CMDB index the target filter decides on; zero while a series " +
 			"names an instance is an instance cache nobody writes, and such series are admitted with the gap named.",
 	})
 	metrics.cmdbIndexBusinessMappings = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "cmdb_index_business_mappings",
+		Subsystem: metricSubsystem, Name: "cmdb_index_business_mappings",
 		Help: "The published business mappings in the in-memory CMDB index, read in the same load as the hosts: " +
 			"bcs_cluster (cluster -> business) and bcs_namespace (cluster + namespace -> business), through which " +
 			"a global business strategy's Kubernetes events are attributed. By state: held (entries in use), " +
@@ -1466,7 +1937,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 		}
 	}
 	metrics.cmdbIndexRecordsRefused = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "cmdb_index_records_refused",
+		Subsystem: metricSubsystem, Name: "cmdb_index_records_refused",
 		Help: "What the latest CMDB index load read and could not use, set on every refresh: host (fields of the " +
 			"host hash whose record does not decode), service_instance (fields of the service instance hash whose " +
 			"record does not decode), topo_node (topology nodes of decoded records that do not decode to an object " +
@@ -1489,17 +1960,17 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	// the true size of one replica's snapshot, which the read cost is a
 	// multiple of.
 	metrics.fleetSnapshotBytes = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "fleet_snapshot_bytes",
+		Subsystem: metricSubsystem, Name: "fleet_snapshot_bytes",
 		Help: "Bytes of the fleet snapshot this replica last published to the snapshot store. A fleet view on any replica " +
 			"reads every replica's snapshot, so one view costs about the sum of this across the fleet.",
 	})
 	metrics.fleetViewSnapshotLoads = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "fleet_view_snapshot_loads_total",
+		Subsystem: metricSubsystem, Name: "fleet_view_snapshot_loads_total",
 		Help: "Fleet snapshot store reads this replica made to build a fleet view: one per /api or OB channel request that " +
 			"needed the view. Written only by the fleet store, so a difference over a window is the views' alone.",
 	})
 	metrics.fleetViewSnapshotBytes = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "fleet_view_snapshot_bytes_total",
+		Subsystem: metricSubsystem, Name: "fleet_view_snapshot_bytes_total",
 		Help: "Bytes of fleet snapshots this replica read from the snapshot store to build fleet views. Divided by " +
 			"fleet_view_snapshot_loads_total it is the true per-view read size.",
 	})
@@ -1509,25 +1980,25 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	// Owned reads over summary reads is how often a view saw a handover or
 	// an object nobody held.
 	metrics.fleetSummaryBytes = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "fleet_summary_bytes",
+		Subsystem: metricSubsystem, Name: "fleet_summary_bytes",
 		Help: "Bytes of the fleet summary this replica last published beside its snapshot. A summarized fleet view reads " +
 			"every replica's summary, so one costs about the sum of this across the fleet.",
 	})
 	metrics.fleetViewSummaryLoads = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "fleet_view_summary_loads_total",
+		Subsystem: metricSubsystem, Name: "fleet_view_summary_loads_total",
 		Help: "Fleet summary reads this replica made to build a summarized fleet view: the health route and the verdict.",
 	})
 	metrics.fleetViewSummaryBytes = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "fleet_view_summary_bytes_total",
+		Subsystem: metricSubsystem, Name: "fleet_view_summary_bytes_total",
 		Help: "Bytes of fleet summaries this replica read. Divided by fleet_view_summary_loads_total it is the per-view read size.",
 	})
 	metrics.fleetViewOwnedLoads = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "fleet_view_owned_loads_total",
+		Subsystem: metricSubsystem, Name: "fleet_view_owned_loads_total",
 		Help: "Owned-list reads a summarized fleet view made because the replicas' owned digests did not add up to the " +
 			"expected objects' digest: an object held by several replicas, held unexpected, or expected unheld.",
 	})
 	metrics.fleetViewOwnedBytes = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "fleet_view_owned_bytes_total",
+		Subsystem: metricSubsystem, Name: "fleet_view_owned_bytes_total",
 		Help: "Bytes of owned lists this replica read for summarized fleet views.",
 	})
 	// The heartbeat's cost census: how many Query Groups it holds a reading
@@ -1536,11 +2007,11 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	// report, so the overflow is zero on a replica anything reports to; it
 	// is readable here because a number nobody can read is not a bound.
 	metrics.retainedPeakCensusGroups = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "retained_peak_census_groups",
+		Subsystem: metricSubsystem, Name: "retained_peak_census_groups",
 		Help: "Query Groups the heartbeat's retained-peak census holds a reading for on this replica, after the roster pruned it.",
 	})
 	metrics.retainedPeakCensusOverflow = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "retained_peak_census_overflow",
+		Subsystem: metricSubsystem, Name: "retained_peak_census_overflow",
 		Help: "Observations the retained-peak census dropped since the process started because it was full. Non-zero is a " +
 			"replica whose census no roster has pruned; read as a counter, published from the census's own count.",
 	})
@@ -1548,7 +2019,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	// without alarmd noticing. Publishing how many states it is filtering on
 	// makes that drift a one-query check instead of a shadow reconcile.
 	metrics.hostDisableMonitorStates = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "host_disable_monitor_states",
+		Subsystem: metricSubsystem, Name: "host_disable_monitor_states",
 		Help: "Host states the access path treats as not monitored; zero means the filter is not installed.",
 	})
 	// An alert level this build has no name for arrives at the consumer under
@@ -1557,21 +2028,31 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	// grow more, so the moment one appears has to be visible here rather than
 	// in whatever noticed the alerts looked wrong.
 	metrics.unmappedSeverity = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "unmapped_severity_total",
+		Subsystem: metricSubsystem, Name: "unmapped_severity_total",
 		Help: "Events published with a severity derived from the level number, because no name was known for it.",
 	}, []string{"level"})
 	metrics.cmdbIndexAge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "cmdb_host_index_age_seconds",
+		Subsystem: metricSubsystem, Name: "cmdb_host_index_age_seconds",
 		Help: "Age of the CMDB index alarmd holds, by kind: index, since alarmd read it; published, since the " +
 			"writer published what was read, which staleness is judged on when the writer says (0 when it does " +
 			"not); source, since another writer's last full-pass attempt, shown and not judged on.",
 	}, []string{"kind"})
+	metrics.cmdbIndexPublish = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Subsystem: metricSubsystem, Name: "cmdb_host_index_publish_seconds",
+		Help: "The CMDB writer's publish cadence as alarmd observes it, by kind: max_gap, the longest gap between " +
+			"its last 24 distinct publishes (0 before two were seen, and where the writer publishes no time); " +
+			"stale_bound, the published age past which the index is stale - twice max_gap, at least 15 minutes " +
+			"and at most 2 hours, and 15 minutes before two publishes were seen.",
+	}, []string{"kind"})
+	for _, kind := range []string{"stale_bound", "max_gap"} {
+		metrics.cmdbIndexPublish.WithLabelValues(kind)
+	}
 	metrics.cmdbIndexDegraded = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "cmdb_host_index_degraded",
+		Subsystem: metricSubsystem, Name: "cmdb_host_index_degraded",
 		Help: "Whether the CMDB index is unusable for filtering, by bounded reason.",
 	}, []string{"reason"})
 	metrics.cmdbIndexReads = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricNamespace, Subsystem: metricSubsystem, Name: "cmdb_host_index_reads_total",
+		Subsystem: metricSubsystem, Name: "cmdb_host_index_reads_total",
 		Help: "Refreshes of the CMDB index, by how they read the cache: full, every hash read into a new " +
 			"index; unchanged, the writer's publish time was where the held index has it and the held index " +
 			"was kept without reading the hashes (only for a writer that publishes whole snapshots with a " +
@@ -1600,9 +2081,21 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 			metrics.stateVersionConflict.WithLabelValues(string(site), string(kind))
 		}
 	}
+	for _, site := range observability.AllStateSupersededSites() {
+		for _, operation := range observability.StateSupersededOperations {
+			metrics.stateSuperseded.WithLabelValues(string(site), string(operation))
+		}
+	}
 	for _, site := range ownershipRefusalSites {
 		for _, refusal := range ownership.RefusalReasons {
 			metrics.ownershipRefusals.WithLabelValues(site, refusal)
+		}
+	}
+	// A budget that never rejected reads as zero rather than absent, so a
+	// rejection rate over this family has a denominator from the first scrape.
+	for _, budget := range phaseTwoBudgets {
+		for _, result := range phaseTwoCapacityResults {
+			metrics.capacity.WithLabelValues(budget, result)
 		}
 	}
 	for _, outcome := range nodata.SlotOutcomes {
@@ -1610,6 +2103,9 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 	}
 	for _, outcome := range observability.NoDataAbsenceOutcomes {
 		metrics.noDataAbsences.WithLabelValues(outcome)
+	}
+	for _, site := range noDataManualCloseReadSites {
+		metrics.noDataManualCloseReadFailures.WithLabelValues(site)
 	}
 	for _, state := range targetplan.ResolutionStates {
 		metrics.targetPlanResolutions.WithLabelValues(string(state))
@@ -1635,7 +2131,7 @@ func newPhaseTwoMetrics() phaseTwoMetrics {
 		{targetplan.SelectorKindExclude, string(targetplan.SelectorUnavailable), targetplan.ReasonReadFailed},
 		{targetplan.SelectorKindExclude, string(targetplan.SelectorUnavailable), targetplan.ReasonStale},
 		{targetplan.SelectorKindExclude, string(targetplan.SelectorUnavailable), targetplan.ReasonAddressUnresolved},
-		{targetplan.SelectorKindExclude, string(targetplan.SelectorUnavailable), targetplan.ReasonAddressAmbiguous},
+		{targetplan.SelectorKindExclude, string(targetplan.SelectorOK), targetplan.ReasonAddressAmbiguous},
 		{targetplan.SelectorKindExclude, string(targetplan.SelectorOK), targetplan.ReasonExcludedAbsent},
 		{targetplan.SelectorKindExclude, string(targetplan.SelectorOKEmpty), targetplan.ReasonExcludedAbsent},
 	} {
@@ -1734,37 +2230,42 @@ func (m phaseTwoMetrics) collectors() []prometheus.Collector {
 	return append(append(m.workflow.collectors(), []prometheus.Collector{
 		m.shortPeriod.completed, m.shortPeriod.duration, m.shortPeriod.lag,
 		m.queryStatus.responses,
+		m.flow.queryDuration, m.flow.answerBytes, m.flow.answerSeries, m.flow.answerRecords, m.flow.answerSeconds, m.flow.queryFailures, m.flow.decisionLag, m.flow.outputRejectedAll,
 		m.queryCodec.responses,
 		m.queryTruncation.truncated,
 		m.queryUnavailable.attributions,
 		m.queryCooldown,
 		m.slotReadiness.slack, m.slotReadiness.boundary,
 		m.slotTiming, m.slotWait,
-		m.work, m.busy, m.lastProgress, m.capacity, m.stateWriteReuse, m.stateAlreadyApplied, m.stateVersionConflict, m.sourceObservations, m.sourceRefreshes, m.sourceCompiles,
+		m.work, m.busy, m.lastProgress, m.capacity, m.stateWriteReuse, m.stateAlreadyApplied, m.stateVersionConflict, m.stateSuperseded, m.sourceObservations, m.sourceRefreshes, m.sourceCompiles,
 		m.sourceReads, m.sourceRefreshBuilds, m.sourceStrategiesRead, m.sourceChangeSignalAge,
 		m.activationFailures, m.unmappedSeverity,
-		m.ownedQueryGroups, m.ownershipTransitions, m.ownershipRefusals,
+		m.ownedQueryGroups, m.ownershipTransitions, m.leaseRenewals, m.ownershipRefusals,
 		m.queryAdmission, m.queryDownstreamDistress,
-		m.noDataSlotPlans, m.noDataAbsences, m.targetPlanResolutions, m.targetSelectorResolutions, m.targetExcludedAbsentMembers, m.noDataStalls, m.noDataMemoryRefusals, m.noDataMemoryWrites, m.gapGuardScopeRounds, m.noDataPlansSeen, m.noDataPlansByHop, m.segmentContent, m.inPlaceWaits, m.inPlaceHeldInputBytes, m.sourceWithheldLines,
+		m.noDataSlotPlans, m.noDataAbsences, m.noDataManualCloseDropped, m.noDataManualCloseReadFailures, m.targetPlanResolutions, m.targetSelectorResolutions, m.targetExcludedAbsentMembers, m.noDataStalls, m.noDataMemoryRefusals, m.noDataMemoryWrites, m.gapGuardScopeRounds, m.noDataPlansSeen, m.noDataPlansByHop, m.segmentContent, m.inPlaceWaits, m.inPlaceHeldInputBytes, m.sourceWithheldLines,
 		m.activeQGSetCount, m.activeQGSetBytes, m.activeQGSetRedis,
-		m.scheduleCutoverPayload, m.scheduleCutoverTimelineMax, m.scheduleTimelineBytes, m.scheduleSegmentsPruned, m.retainedShareApproaching, m.schedulePruneSkipped, m.scheduleCutoverDuration,
+		m.scheduleCutoverPayload, m.scheduleCutoverTimelineMax, m.scheduleTimelineBytes, m.scheduleSegmentsPruned, m.retainedShareApproaching, m.inputSlices, m.slicedSlots, m.firstSeenUnseen, m.sliceReadAhead, m.inputSliceTimeouts, m.inputSliceShapes, m.noDataStagesAhead, m.noDataStageAheadDiffers, m.noDataGroupsStagedAhead, m.schedulePruneSkipped, m.scheduleCutoverDuration,
 		m.scheduleCutovers,
-		m.scheduleCutoverQueryGroups, m.scheduleCutoverReadHoldLinks, m.fleetOverdueEpisodes, m.scheduleCutoverTimelinesRead, m.scheduleCutoverFirstDuration,
-		m.scheduleCutoverFirstTimelines, m.replayExpiries, m.replayTakeovers, m.rangeGateDecisions, m.statePreflights, m.stateAdmissions,
+		m.scheduleCutoverQueryGroups, m.scheduleCutoverReadHoldLinks, m.fleetOverdueEpisodes, m.fleetRestoreUnread, m.scheduleCutoverTimelinesRead, m.scheduleCutoverFirstDuration,
+		m.scheduleCutoverFirstTimelines, m.replayExpiries, m.replayTakeovers, m.slotDiversions, m.rangeGateDecisions, m.statePreflights, m.stateAdmissions,
 		m.queryFailures,
-		m.objectCatalogObjects, m.objectCatalogRedis, m.objectCatalogManifestBytes, m.objectCatalogWrittenBytes, m.objectReads, m.stateGenerationSkew, m.stateCarry,
-		m.undrainedDrainingQueryGroups, m.drainingCursorPrunedQueryGroups, m.rebalancePlannedMoves, m.shardUnawareReadyReplicas, m.rebalanceGap, m.assignmentMoves, m.rebalancePaused, m.controlReadRoundTrips, m.controlReadKeys, m.controlReadDuration, m.assignmentIndexStaleRounds, m.assignmentIndexWrites, m.assignmentIndexReads, m.assignmentIndexConfirm, m.assignmentRecordReads, m.scheduleCursorAdvances, m.activationHeldQueryGroups, m.activationHeldAgeSecondsMax,
-		m.algorithmEvaluations, m.algorithmInputs, m.levelAbnormal, m.levelOutcomes, m.historyCoverageRejected, m.historyCoverageUnsummarised, m.recoveryBeside, m.openAlertGate,
-	}...), append(append(append(append(m.redisCalls.collectors(), m.dueIndex.collectors()...), append(m.handover.collectors(), m.sreActions.actions, m.sreActions.rollouts, m.sreActions.watched, m.sreActions.receipts)...), m.controlFacts.collectors()...),
-		m.startupDependencyWaits, m.liveness, m.controlCache, m.dispatchRotation, m.localView, m.viewStream, m.viewClient, m.openAlertSet, m.fleetTracker, m.effectiveTimeRefresh, m.activationRebuild, m.timelineRepair, m.activationSkippedTimelines, m.timelineUnreadableReports, m.activationHeader, m.activationBlocked, m.roundMemory, m.targetGroup, m.effectiveClose, m.logLines, m.observerPanics, m.absentClose, m.targetScopeClose, m.linkdConsole, m.controlSourceRounds, m.strategiesReturnedAfterRemoval, m.queryCooldownSaves, m.controlFactsWrites, m.queryCooldownLoads, m.eventBusinessAttribution, m.diagnosticRedisFailures, m.diagnosticRedisDialRetries, m.leaderForward, m.controlSource, m.leaderRound, m.lookback,
+		m.objectCatalogObjects, m.catalogRenewals, m.objectCatalogRedis, m.objectCatalogManifestBytes, m.objectCatalogWrittenBytes, m.objectReads, m.stateGenerationSkew, m.stateCarry,
+		m.undrainedDrainingQueryGroups, m.drainingCursorPrunedQueryGroups, m.rebalancePlannedMoves, m.shardUnawareReadyReplicas, m.rebalanceGap, m.assignmentMoves, m.byteOverloadedWorkers, m.byteMostLoadedShare, m.byteUnreadGroups, m.placementUnfit, m.rebalancePaused, m.controlReadRoundTrips, m.controlReadKeys, m.controlRecordReads, m.controlRecordMismatches, m.controlRecordConflicts, m.controlReadDuration, m.assignmentIndexStaleRounds, m.assignmentIndexWrites, m.assignmentIndexReads, m.assignmentIndexConfirm, m.assignmentRecordReads, m.scheduleCursorAdvances, m.activationHeldQueryGroups, m.activationHeldAgeSecondsMax,
+		m.algorithmEvaluations, m.algorithmInputs, m.levelAbnormal, m.levelOutcomes, m.historyCoverageRejected, m.historyCoverageUnsummarised, m.recoveryBeside, m.recoveryWithheld, m.noDataEnd, m.openAlertGate,
+	}...), append(append(append(append(m.redisCalls.collectors(), m.dueIndex.collectors()...), append(m.handover.collectors(), m.sreActions.actions, m.sreActions.rollouts, m.sreActions.watched, m.sreActions.receipts, m.cliAuth.total, m.cliAuth.rosterApplied)...), append(m.controlFacts.collectors(), m.traceExport.collectors()...)...),
+		m.startupDependencyWaits, m.liveness, m.controlCache, m.dispatchRotation, m.localView, m.viewStream, m.viewClient, m.activeCopy, m.fleetTracker, m.effectiveTimeRefresh, m.activationRebuild, m.timelineRepair, m.activationSkippedTimelines, m.timelineUnreadableReports, m.activationHeader, m.activationBlocked, m.liveReserve, m.roundMemory, m.stateSeriesHeld, m.targetGroup, m.effectiveClose, m.logLines, m.observerPanics, m.absentClose, m.editClose, m.noDataCloseAPI, m.linkdFilterClose, m.linkdFilterCloseRequests, m.openEpisodeRecord, m.newOpens, m.frontRefused, m.processMemory, m.strategyScopeClose, m.targetScopeClose, m.controlSourceRounds, m.apmCarried, m.apmCarriedBytes, m.sourceLivenessChecks, m.sourceLivenessSeconds, m.sourceLivenessDeferred, m.sourceLivenessEvicted, m.sourceLivenessHeldEvicted, m.strategiesReturnedAfterRemoval, m.queryCooldownSaves, m.controlFactsWrites, m.planCarriesReads, m.queryCooldownLoads, m.eventBusinessAttribution, m.detectionSnapshots, m.detectionSnapshotStates, m.diagnosticRedisFailures, m.diagnosticRedisDialRetries, m.leaderForward, m.controlSource, m.leaderRound, m.lookback,
 		m.controlSourceRetainedStale, m.controlSourceLastGoodIdentity, m.platformSettings,
-		m.redisPool, m.renewalGate, m.canonicalEncoding, m.legacyPodCache,
-		m.seriesAdmission, m.cmdbAddressDiffers, m.cmdbPlacedByHostID, m.cmdbIndexHosts, m.cmdbIndexServiceInstances, m.cmdbIndexBusinessMappings, m.cmdbIndexRecordsRefused, m.hostDisableMonitorStates, m.cmdbIndexAge,
+		m.redisPool, m.renewalGate, m.stateCache, m.stateWitness, m.canonicalEncoding, m.datasetRecordIDs, m.legacyPodCache,
+		m.seriesAdmission, m.cmdbAddressDiffers, m.cmdbPlacedByHostID, m.cmdbIndexHosts, m.cmdbIndexServiceInstances, m.cmdbIndexBusinessMappings, m.cmdbIndexRecordsRefused, m.hostDisableMonitorStates, m.cmdbIndexAge, m.cmdbIndexPublish,
 		m.fleetSnapshotBytes, m.fleetViewSnapshotLoads, m.fleetViewSnapshotBytes,
 		m.fleetSummaryBytes, m.fleetViewSummaryLoads, m.fleetViewSummaryBytes, m.fleetViewOwnedLoads, m.fleetViewOwnedBytes, m.retainedPeakCensusGroups, m.retainedPeakCensusOverflow,
 		m.cmdbIndexDegraded, m.cmdbIndexReads, m.catalogComposition, m.noDataMemoryReads, m.noDataMemoryRenewals,
-		m.queryFreeCompletions, m.executionEvidenceWrites, m.outputEventsByWireFormat, m.outputEventsWithoutMessage, m.outputEventsByKind, m.outputEventsRejected, m.outputRejectedStrategyOverflow, m.frozenStateRenewals, m.frozenStateCensus)...)
+		m.queryFreeCompletions, m.executionEvidenceWrites, m.outputEventsByWireFormat, m.outputEventsWithoutMessage, m.outputEventsByKind, m.outputEventsRejected, m.outputRejectedStrategyOverflow, m.frozenStateRenewals, m.frozenStateCensus, m.inputSeriesDiscarded)...)
 }
+
+// inputSeriesDiscardedDependencyWithoutPrimary is input_series_discarded_total's
+// one reason.
+const inputSeriesDiscardedDependencyWithoutPrimary = "dependency_without_primary"
 
 func (m phaseTwoMetrics) observe(observation observability.Observation) {
 	m.workflow.observe(observation)
@@ -1827,6 +2328,14 @@ func (m phaseTwoMetrics) observe(observation observability.Observation) {
 			m.controlReadRoundTrips.WithLabelValues(read).Add(float64(spent.roundTrips))
 			m.controlReadDuration.WithLabelValues(read).Observe(spent.elapsed / 1000)
 		}
+		for reason, count := range facts.RecordReads {
+			m.controlRecordReads.WithLabelValues(reason).Add(float64(count))
+		}
+		for field, count := range facts.RecordMismatches {
+			m.controlRecordMismatches.WithLabelValues(field).Add(float64(count))
+		}
+		m.controlRecordConflicts.WithLabelValues("settled").Add(float64(facts.RecordConflicts - facts.RecordConflictsAgain))
+		m.controlRecordConflicts.WithLabelValues("again").Add(float64(facts.RecordConflictsAgain))
 	}
 	if facts := observation.Rebalance; facts != nil && observation.Result == observability.ResultSuccess {
 		m.rebalancePlannedMoves.Set(float64(facts.PlannedMoves))
@@ -1834,8 +2343,17 @@ func (m phaseTwoMetrics) observe(observation observability.Observation) {
 		if facts.ShardAware != nil {
 			m.shardUnawareReadyReplicas.Set(float64(len(facts.ShardAware.Unaware)))
 		}
-		if facts.PublishedMoves > 0 {
-			m.assignmentMoves.WithLabelValues("rebalance").Add(float64(facts.PublishedMoves))
+		m.addAssignmentMoves(AssignmentMoveRebalance, facts.PublishedMoves, facts.PublishedFromSessionHolders)
+		m.addAssignmentMoves(AssignmentMoveIneligible, facts.Replaced, facts.ReplacedFromSessionHolders)
+		m.addAssignmentMoves(AssignmentMoveHolderGone, facts.Placed, facts.PlacedFromSessionHolders)
+		if facts.Unfit > 0 {
+			m.placementUnfit.Add(float64(facts.Unfit))
+		}
+		if bytes := facts.Bytes; bytes != nil {
+			m.addAssignmentMoves(AssignmentMoveBytes, bytes.PublishedMoves, bytes.PublishedFromSessionHolders)
+			m.byteOverloadedWorkers.Set(float64(len(bytes.Overloaded)))
+			m.byteMostLoadedShare.Set(bytes.MostLoadedShare)
+			m.byteUnreadGroups.Set(float64(bytes.Unread))
 		}
 		if facts.Paused {
 			m.rebalancePaused.WithLabelValues("set_unstable").Inc()
@@ -1870,7 +2388,14 @@ func (m phaseTwoMetrics) observe(observation observability.Observation) {
 		}
 	}
 	if facts := observation.CursorAdvance; facts != nil {
-		m.scheduleCursorAdvances.WithLabelValues(facts.Status, facts.Refusal).Inc()
+		reason := string(observability.ReasonOther)
+		for _, known := range execution.ForwardSkipReasons {
+			if facts.Reason == string(known) {
+				reason = facts.Reason
+			}
+		}
+		inFlight := facts.Status == observability.CursorAdvanceApplied && facts.InFlightSlot != 0
+		m.scheduleCursorAdvances.WithLabelValues(facts.Status, facts.Refusal, reason, strconv.FormatBool(inFlight)).Inc()
 	}
 	if facts := observation.ActivationHold; facts != nil && observation.Stage == observability.StageActivationHold {
 		m.activationHeldQueryGroups.Set(float64(facts.Held))
@@ -1884,15 +2409,27 @@ func (m phaseTwoMetrics) observe(observation observability.Observation) {
 				m.activeQGSetBytes.Set(float64(facts.ObjectBytes))
 			}
 		}
+		if facts.Operation == "renew" {
+			// Counted on failure too: the batches renewed before the one that
+			// failed were renewed.
+			m.catalogRenewals.WithLabelValues("timeline", "aged").Add(float64(facts.TimelinesAged))
+			m.catalogRenewals.WithLabelValues("timeline", "first").Add(float64(facts.TimelinesFirst))
+		}
 	}
 	if facts := observation.QueryFailure; facts != nil && observation.Result == observability.ResultFailed {
 		m.queryFailures.WithLabelValues(facts.Stage, facts.Category).Inc()
+		if facts.SliceTimeout != "" {
+			m.inputSliceTimeouts.WithLabelValues(facts.SliceTimeout).Inc()
+		}
 	}
 	if facts := observation.ReplayExpiry; facts != nil {
 		m.replayExpiries.WithLabelValues(facts.Reason).Inc()
 	}
 	if facts := observation.ReplayTakeover; facts != nil {
 		m.replayTakeovers.WithLabelValues(facts.Outcome).Inc()
+	}
+	if facts := observation.SlotDiversion; facts != nil {
+		m.slotDiversions.WithLabelValues(facts.Reason).Inc()
 	}
 	if facts := observation.RangeGate; facts != nil {
 		// The normalized word: an outcome outside the list has already been
@@ -1913,6 +2450,16 @@ func (m phaseTwoMetrics) observe(observation observability.Observation) {
 			observability.RetainedShareApproaching(usage.RetainedBytes, usage.RetainedShareBytes) {
 			m.retainedShareApproaching.Inc()
 		}
+		if usage := observation.SlotBudgetUsage; usage != nil {
+			m.observeSlicing(usage)
+		}
+	}
+	// A Slot given up at its share is past the threshold, not short of it:
+	// counted here too, or an object refused on every Slot - the one this
+	// counter exists to warn about - would leave it at zero, since none of
+	// its Slots complete. One per Slot given up, not per refused attempt.
+	if skipped := observation.SlotSkipped; observation.Stage == observability.StageSlotSkipped && skipped != nil && skipped.Share != nil {
+		m.retainedShareApproaching.Add(float64(max(skipped.SlotCount, 1)))
 	}
 	m.observeSlotWait(observation)
 	if facts := observation.ScheduleCutover; facts != nil {
@@ -1946,6 +2493,10 @@ func (m phaseTwoMetrics) observe(observation observability.Observation) {
 		m.objectCatalogObjects.WithLabelValues(facts.Operation, "written").Add(float64(facts.Written))
 		m.objectCatalogObjects.WithLabelValues(facts.Operation, "present").Add(float64(facts.Present))
 		m.objectCatalogObjects.WithLabelValues(facts.Operation, "missing").Add(float64(facts.Missing))
+		if facts.Operation == "renew" {
+			m.catalogRenewals.WithLabelValues("object", "periodic").Add(float64(facts.RenewedObjects))
+			m.catalogRenewals.WithLabelValues("context", "periodic").Add(float64(facts.RenewedContexts))
+		}
 		if facts.Operation == "write" {
 			// Objects are counted whenever they were written, success or not:
 			// a write that stored them and then failed on the manifest still
@@ -1969,7 +2520,7 @@ func (m phaseTwoMetrics) observe(observation observability.Observation) {
 	for _, fact := range observation.AlgorithmEvaluations {
 		m.algorithmEvaluations.WithLabelValues(
 			string(fact.SourceAlgorithmFamily), string(fact.Result),
-		).Inc()
+		).Add(float64(max(1, fact.Count)))
 	}
 	if rejected := observation.HistoryCoverageRejected; rejected != nil {
 		m.historyCoverageRejected.WithLabelValues(string(rejected.Rule)).Inc()
@@ -1987,14 +2538,17 @@ func (m phaseTwoMetrics) observe(observation observability.Observation) {
 		m.levelAbnormal.WithLabelValues("incomplete").Add(float64(facts.AbnormalOnIncomplete))
 	}
 	for _, fact := range observation.LevelOutcomes {
-		reason := ""
-		if fact.Outcome == "UNKNOWN" || fact.Outcome == "TERMINAL" {
-			reason = observability.LevelOutcomeReasonLabel(fact.Reason)
-		}
-		m.levelOutcomes.WithLabelValues(fact.Outcome, reason).Add(float64(fact.Count))
+		reason, origin := observability.LevelOutcomeLabels(fact)
+		m.levelOutcomes.WithLabelValues(fact.Outcome, reason, origin).Add(float64(fact.Count))
 	}
 	for _, fact := range observation.RecoveryGates {
 		m.recoveryBeside.WithLabelValues(string(fact.Cause)).Add(float64(fact.Records))
+	}
+	if observation.Stage == observability.StageNoDataEnd && observation.NoDataEnd != "" {
+		m.noDataEnd.WithLabelValues(observation.NoDataEnd).Add(float64(observation.Counts.Keys))
+	}
+	for _, fact := range observation.RecoveryWithheld {
+		m.recoveryWithheld.WithLabelValues(string(fact.Reason)).Add(float64(fact.Levels))
 	}
 	for _, fact := range observation.OpenAlertGates {
 		m.openAlertGate.WithLabelValues(string(fact.Outcome)).Add(float64(fact.Records))
@@ -2006,7 +2560,7 @@ func (m phaseTwoMetrics) observe(observation observability.Observation) {
 		m.algorithmInputs.WithLabelValues(
 			string(fact.SourceAlgorithmFamily), string(fact.InputName),
 			string(fact.DependencyPoint), string(fact.Result),
-		).Inc()
+		).Add(float64(max(1, fact.Count)))
 	}
 	if observation.Component == observability.ComponentScheduler &&
 		observation.Stage == observability.StageQueryAdmission && observation.QueryPermit != nil {
@@ -2017,6 +2571,10 @@ func (m phaseTwoMetrics) observe(observation observability.Observation) {
 		m.observeNoDataSlot(observation)
 		m.observeNoDataStall(observation)
 		m.observeNoDataAbsence(observation)
+	}
+	if observation.Component == observability.ComponentOutput &&
+		observation.Stage == observability.StageNoDataManualCloseChecked {
+		m.observeNoDataManualClose(observation)
 	}
 	if facts := observation.TargetResolution; facts != nil {
 		m.observeTargetResolution(facts)
@@ -2046,6 +2604,7 @@ func (m phaseTwoMetrics) observe(observation observability.Observation) {
 					m.outputRejectedStrategyOverflow.Inc()
 				}
 				m.outputEventsRejected.WithLabelValues(observability.NormalizeOutputRejectRule(rejected.Rule), strategy).Inc()
+				m.flow.outputRejectedAll.Inc()
 			}
 			for _, bucket := range write.WithoutMessageBy {
 				m.outputEventsWithoutMessage.WithLabelValues(
@@ -2067,6 +2626,9 @@ func (m phaseTwoMetrics) observe(observation observability.Observation) {
 	}
 	if facts := observation.NoDataMemoryRead; facts != nil {
 		m.noDataMemoryReads.WithLabelValues(facts.Representation).Inc()
+		if facts.ManualClosesUnread {
+			m.noDataManualCloseReadFailures.WithLabelValues("memory_load").Inc()
+		}
 	}
 	if observation.Stage == observability.StageNoDataMemoryRenewed && observation.NoDataMemoryRenewal != nil {
 		m.noDataMemoryRenewals.WithLabelValues(
@@ -2123,6 +2685,9 @@ func (m phaseTwoMetrics) observe(observation observability.Observation) {
 			string(observation.Stage), string(observation.Result), string(reasonClass),
 		).Inc()
 	}
+	if lease, result, reason, renewal := leaseRenewalCell(observation); renewal {
+		m.leaseRenewals.WithLabelValues(lease, result, reason).Inc()
+	}
 	if site := ownershipRefusalSite(observation); site != "" {
 		m.ownershipRefusals.WithLabelValues(site, string(observation.ReasonCode)).Inc()
 	}
@@ -2144,14 +2709,29 @@ func (m phaseTwoMetrics) observe(observation observability.Observation) {
 			m.stateVersionConflict.WithLabelValues(string(key.Site), string(observability.NormalizeStateVersionConflictKind(key.Kind))).Add(float64(count))
 		}
 	}
-	if observation.Component == observability.ComponentResource && observation.CapacityBudget != "" {
-		result := "other"
-		if observation.Result == observability.ResultPaused || observation.Result == observability.ResultFailed {
-			result = "rejected"
-		} else if observation.Result == observability.ResultSuccess || observation.Result == observability.ResultResumed {
-			result = "admitted"
+	if facts := observation.StateSuperseded; facts != nil && facts.Count > 0 {
+		m.stateSuperseded.WithLabelValues(string(observability.NormalizeStateSupersededSite(facts.Site)),
+			string(observability.NormalizeStateSupersededOperation(observation.Operation))).Add(float64(facts.Count))
+	}
+	if observation.Component == observability.ComponentResource && observation.Stage == observability.StageResourceHard &&
+		observation.CapacityBudget != "" {
+		// The resource line is a refusal and nothing else.
+		m.capacity.WithLabelValues(normalizePhaseTwoBudget(observation.CapacityBudget), "rejected").Inc()
+	}
+	if usage := observation.SlotBudgetUsage; observation.Stage == observability.StageSlotCompleted && observation.Err == nil &&
+		usage != nil {
+		if usage.DependencySeriesDiscarded > 0 {
+			m.inputSeriesDiscarded.WithLabelValues(inputSeriesDiscardedDependencyWithoutPrimary).Add(float64(usage.DependencySeriesDiscarded))
 		}
-		m.capacity.WithLabelValues(normalizePhaseTwoBudget(observation.CapacityBudget), result).Inc()
+		for budget, held := range map[observability.CapacityBudget]uint64{
+			observability.CapacityBudgetSeries: usage.Series, observability.CapacityBudgetRetainedBytes: usage.RetainedBytes,
+			observability.CapacityBudgetStateMutations: usage.StateMutations, observability.CapacityBudgetEvents: usage.Events,
+			observability.CapacityBudgetGapMutations: usage.GapMutations,
+		} {
+			if held > 0 {
+				m.capacity.WithLabelValues(string(budget), "admitted").Inc()
+			}
+		}
 	}
 	stage := phaseTwoBusyStage(observation.Stage)
 	if stage == "" {
@@ -2252,9 +2832,27 @@ func (m phaseTwoMetrics) observeNoDataAbsence(observation observability.Observat
 	for outcome, count := range map[string]uint64{
 		"expected": facts.Expected, "present": facts.Present, "absent": facts.Absent,
 		"unavailable": facts.Unavailable, "dropped": facts.Dropped,
-		"expired": facts.Expired, "suppressed": facts.Suppressed,
+		"expired": facts.Expired, "suppressed": facts.Suppressed, "manual_closed": facts.ManualClosed,
 	} {
 		m.noDataAbsences.WithLabelValues(outcome).Add(float64(count))
+	}
+}
+
+// noDataManualCloseReadSites is where a strategy's manual closes are read.
+var noDataManualCloseReadSites = []string{"memory_load", "output_check"}
+
+// observeNoDataManualClose counts what the output's manual-close check did
+// with one batch, from the check's own line.
+func (m phaseTwoMetrics) observeNoDataManualClose(observation observability.Observation) {
+	facts := observation.NoDataManualClose
+	if facts == nil {
+		return
+	}
+	if facts.Dropped > 0 {
+		m.noDataManualCloseDropped.Add(float64(facts.Dropped))
+	}
+	if facts.CheckFailed {
+		m.noDataManualCloseReadFailures.WithLabelValues("output_check").Inc()
 	}
 }
 
@@ -2421,7 +3019,7 @@ func phaseTwoBusyStage(stage observability.Stage) string {
 	case observability.StageEventACKed:
 		return "event"
 	case observability.StageStatePreflight, observability.StageGapLoaded, observability.StageSideEffectAdmission,
-		observability.StageGapGuardCommitted, observability.StageMutationCompared,
+		observability.StagePlanActivationChecked, observability.StageGapGuardCommitted, observability.StageMutationCompared,
 		observability.StageStateAdmission, observability.StageStateApplied:
 		return "state"
 	case observability.StageProgressCommitted:
@@ -2542,6 +3140,47 @@ func (r *Recorder) FleetOverdueEpisodeBegan(hold string) {
 	r.phaseTwo.fleetOverdueEpisodes.WithLabelValues(hold).Inc()
 }
 
+// The reasons a fleet restore read did not get an object's record, closed.
+const (
+	FleetRestoreUnreadRedisError = "redis_error"
+	FleetRestoreUnreadUnreached  = "unreached"
+)
+
+// FleetRestoreUnreadReasons is the closed list fleet_restore_unread_total's
+// reason comes from.
+var FleetRestoreUnreadReasons = []string{FleetRestoreUnreadRedisError, FleetRestoreUnreadUnreached}
+
+// FleetRestoreUnread counts an object whose record the restore read did not
+// get, by reason (FleetRestoreUnreadReasons).
+func (r *Recorder) FleetRestoreUnread(reason string) {
+	if r == nil || r.phaseTwo.fleetRestoreUnread == nil {
+		return
+	}
+	r.phaseTwo.fleetRestoreUnread.WithLabelValues(reason).Inc()
+}
+
+// The reasons assignment_moves_total names, closed.
+const (
+	AssignmentMoveRebalance  = "rebalance"
+	AssignmentMoveBytes      = "bytes"
+	AssignmentMoveIneligible = "ineligible"
+	AssignmentMoveHolderGone = "holder_gone"
+)
+
+// AssignmentMoveReasons is every reason, for closed label sets.
+var AssignmentMoveReasons = []string{AssignmentMoveRebalance, AssignmentMoveBytes, AssignmentMoveIneligible, AssignmentMoveHolderGone}
+
+// addAssignmentMoves counts moves of one reason, the part taken from a holder
+// under a worker session as session and the rest as no_session.
+func (m *phaseTwoMetrics) addAssignmentMoves(reason string, moves, fromSession int) {
+	if fromSession > 0 {
+		m.assignmentMoves.WithLabelValues(reason, "session").Add(float64(fromSession))
+	}
+	if rest := moves - fromSession; rest > 0 {
+		m.assignmentMoves.WithLabelValues(reason, "no_session").Add(float64(rest))
+	}
+}
+
 func (r *Recorder) ControlLeaderStepDown() {
 	if r == nil {
 		return
@@ -2549,6 +3188,7 @@ func (r *Recorder) ControlLeaderStepDown() {
 	for _, gauge := range []*loadedGauge{
 		r.phaseTwo.rebalancePlannedMoves, r.phaseTwo.rebalanceGap, r.phaseTwo.shardUnawareReadyReplicas,
 		r.phaseTwo.activationHeldQueryGroups, r.phaseTwo.activationHeldAgeSecondsMax,
+		r.phaseTwo.byteOverloadedWorkers, r.phaseTwo.byteMostLoadedShare, r.phaseTwo.byteUnreadGroups,
 	} {
 		if gauge != nil {
 			gauge.Unload()
@@ -2639,6 +3279,23 @@ func (r *Recorder) ObserveControlFactsWrite(result string) {
 	}
 }
 
+// PlanCarriesReadResults is every result of a plan carries read, closed.
+var PlanCarriesReadResults = []string{"read", "no_open_segment", "failed"}
+
+// ObservePlanCarriesRead counts one plan carries read by its result; a result
+// outside PlanCarriesReadResults is dropped rather than creating a series.
+func (r *Recorder) ObservePlanCarriesRead(result string) {
+	if r == nil || r.phaseTwo.planCarriesReads == nil {
+		return
+	}
+	for _, known := range PlanCarriesReadResults {
+		if result == known {
+			r.phaseTwo.planCarriesReads.WithLabelValues(result).Inc()
+			return
+		}
+	}
+}
+
 // ObserveQueryCooldownSave counts one pool record write by its result; a
 // result outside QueryCooldownSaveResults is dropped rather than creating a
 // series.
@@ -2685,6 +3342,46 @@ func (r *Recorder) ObserveEventBusinessAttribution(source string) {
 	}
 }
 
+// DetectionSnapshotResults and DetectionSnapshotStates are the closed label
+// values of the detection snapshot families: a snapshot whole, truncated or
+// dropped, and the states a named output can be in on one, with _other for
+// a state this build does not name.
+var (
+	DetectionSnapshotResults = contract.DetectionSnapshotResults
+	DetectionSnapshotStates  = []string{string(execution.NamedOutputSuccess), string(execution.NamedOutputPartial),
+		string(execution.NamedOutputMissing), string(execution.NamedOutputError), string(execution.NamedOutputUnsupported), "_other"}
+)
+
+// ObserveDetectionSnapshot counts one detection snapshot an event was to
+// carry by its result, and each named output of one it carries by its
+// state; a result outside contract.DetectionSnapshotResults is not counted.
+func (r *Recorder) ObserveDetectionSnapshot(states []string, result string) {
+	if r == nil || r.phaseTwo.detectionSnapshots == nil {
+		return
+	}
+	known := false
+	for _, candidate := range DetectionSnapshotResults {
+		known = known || candidate == result
+	}
+	if !known {
+		return
+	}
+	r.phaseTwo.detectionSnapshots.WithLabelValues(result).Inc()
+	if result == contract.DetectionSnapshotDropped {
+		return
+	}
+	for _, state := range states {
+		label := "_other"
+		for _, known := range DetectionSnapshotStates {
+			if state == known {
+				label = state
+				break
+			}
+		}
+		r.phaseTwo.detectionSnapshotStates.WithLabelValues(label).Inc()
+	}
+}
+
 func (r *Recorder) AddStrategiesReturnedAfterRemoval(n int) {
 	if r == nil || r.phaseTwo.strategiesReturnedAfterRemoval == nil || n <= 0 {
 		return
@@ -2695,9 +3392,113 @@ func (r *Recorder) AddStrategiesReturnedAfterRemoval(n int) {
 // ObserveLeaderForward records one hop a replica handed to the Control
 // Leader, by route and result from the closed lists; a value outside them
 // is dropped rather than creating a series.
+// APMCarriedTables and APMCarriedOutcomes are the closed label values of
+// apm_app_carried_responses_total.
+var (
+	APMCarriedTables   = []string{"metric", "trace"}
+	APMCarriedOutcomes = []string{"unique", "not_unique"}
+)
+
+// sourceLivenessBuckets are source_liveness_check_seconds' buckets, up to the
+// probe's own bound.
+var sourceLivenessBuckets = []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20}
+
+// SourceLivenessChecked counts one verdict a no-data end was decided on
+// (sourceliveness.Observer). A kind, result or reason outside the closed
+// sets is dropped rather than creating a series.
+func (r *Recorder) SourceLivenessChecked(kind sourceliveness.Kind, verdict sourceliveness.Verdict) {
+	if r == nil || r.phaseTwo.sourceLivenessChecks == nil || !slices.Contains(sourceliveness.Kinds, kind) ||
+		!slices.Contains(sourceliveness.ReasonsOf(verdict.Result), verdict.Reason) || !slices.Contains(sourceliveness.Results, verdict.Result) {
+		return
+	}
+	r.phaseTwo.sourceLivenessChecks.WithLabelValues(string(kind), string(verdict.Result), string(verdict.Reason)).Inc()
+}
+
+// SourceLivenessProbed records how long one probe took (sourceliveness
+// .Observer).
+func (r *Recorder) SourceLivenessProbed(kind sourceliveness.Kind, elapsed time.Duration) {
+	if r == nil || r.phaseTwo.sourceLivenessSeconds == nil || !slices.Contains(sourceliveness.Kinds, kind) {
+		return
+	}
+	r.phaseTwo.sourceLivenessSeconds.WithLabelValues(string(kind)).Observe(elapsed.Seconds())
+}
+
+// SourceLivenessDeferred counts a probe not started at the in-flight cap
+// (sourceliveness.Observer).
+func (r *Recorder) SourceLivenessDeferred(sourceliveness.Kind) {
+	if r == nil || r.phaseTwo.sourceLivenessDeferred == nil {
+		return
+	}
+	r.phaseTwo.sourceLivenessDeferred.Inc()
+}
+
+// SourceLivenessEvicted counts an answer dropped at the cache's bound
+// (sourceliveness.Observer).
+func (r *Recorder) SourceLivenessEvicted() {
+	if r == nil || r.phaseTwo.sourceLivenessEvicted == nil {
+		return
+	}
+	r.phaseTwo.sourceLivenessEvicted.Inc()
+}
+
+// SourceLivenessHeldEvicted counts a held Level let go at the account's
+// bound (sourceliveness.Observer).
+func (r *Recorder) SourceLivenessHeldEvicted() {
+	if r == nil || r.phaseTwo.sourceLivenessHeldEvicted == nil {
+		return
+	}
+	r.phaseTwo.sourceLivenessHeldEvicted.Inc()
+}
+
+var _ sourceliveness.Observer = (*Recorder)(nil)
+
+// ObserveAPMCarriedResponse records one response read with the APM
+// application carried: its table kind, whether an identity repeated, and
+// the bytes held before its series were handed on.
+func (r *Recorder) ObserveAPMCarriedResponse(table string, notUnique bool, bytes uint64) {
+	if r == nil || r.phaseTwo.apmCarried == nil || !slices.Contains(APMCarriedTables, table) {
+		return
+	}
+	outcome := "unique"
+	if notUnique {
+		outcome = "not_unique"
+	}
+	r.phaseTwo.apmCarried.WithLabelValues(table, outcome).Inc()
+	r.phaseTwo.apmCarriedBytes.WithLabelValues(table).Observe(float64(bytes))
+}
+
 func (r *Recorder) ObserveLeaderForward(route, result string, duration time.Duration) {
 	if r == nil || r.phaseTwo.leaderForward == nil || !slices.Contains(LeaderForwardRoutes, route) || !slices.Contains(LeaderForwardResults, result) {
 		return
 	}
 	r.phaseTwo.leaderForward.WithLabelValues(route, result).Observe(duration.Seconds())
+}
+
+// observeSlicing counts a completed Slot's slices, its first-seen writes a
+// later slice overturned, and how its reads ahead ended.
+func (m phaseTwoMetrics) observeSlicing(usage *observability.SlotBudgetUsageFacts) {
+	if usage.InputSlices > 1 || usage.InputSlicesDiscarded > 0 {
+		m.slicedSlots.Inc()
+		m.inputSlices.WithLabelValues("landed").Add(float64(usage.InputSlices))
+		m.inputSlices.WithLabelValues("discarded").Add(float64(usage.InputSlicesDiscarded))
+	}
+	m.firstSeenUnseen.WithLabelValues("slices").Add(float64(usage.FirstSeenUnseenSlices))
+	m.firstSeenUnseen.WithLabelValues("series").Add(float64(usage.FirstSeenUnseenSeries))
+	for outcome, count := range [...]uint64{usage.InputSlicesReadAhead, usage.InputSlicesReadAheadOtherLeaf,
+		usage.InputSlicesReadAheadYielded, usage.InputSlicesReadAheadFailed} {
+		m.sliceReadAhead.WithLabelValues(observability.SliceReadAheadOutcomes[outcome]).Add(float64(count))
+	}
+	m.inputSliceTimeouts.WithLabelValues(observability.InputSliceTimeoutSplitSucceeded).Add(float64(usage.InputSliceTimeouts))
+	for outcome, count := range [...]uint64{usage.InputSliceShapeStarted, usage.InputSliceShapeKept, usage.InputSliceShapeMerged, usage.InputSliceShapeVoidedRevision, usage.InputSliceShapeVoidedDimensions, usage.InputSliceShapeVoidedMaxLeaves, usage.InputSliceShapeRefusedNotALeaf, usage.InputSliceShapeRefusedNotAPartition, usage.InputSliceShapeRefusedMaxLeaves, usage.InputSliceShapeEvictedIdle} {
+		m.inputSliceShapes.WithLabelValues(observability.InputSliceShapeOutcomes[outcome]).Add(float64(count))
+	}
+	for outcome, count := range [...]uint64{usage.NoDataStagesAheadCarried, usage.NoDataStagesAheadDiffers,
+		usage.NoDataStagesAheadDiscarded, usage.NoDataStagesAheadStopped} {
+		m.noDataStagesAhead.WithLabelValues(observability.NoDataStageAheadOutcomes[outcome]).Add(float64(count))
+	}
+	for reason, count := range [...]uint64{usage.NoDataStageAheadDiffersKeptOtherwise,
+		usage.NoDataStageAheadDiffersCountMismatch, usage.NoDataStageAheadDiffersPresentAsOf} {
+		m.noDataStageAheadDiffers.WithLabelValues(nodata.StagedDiffersReasons[reason]).Add(float64(count))
+	}
+	m.noDataGroupsStagedAhead.Add(float64(usage.NoDataGroupsStagedAhead))
 }

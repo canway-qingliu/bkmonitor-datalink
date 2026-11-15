@@ -29,7 +29,6 @@ func TestNormalizeObservationBoundsCatalogAndCounts(t *testing.T) {
 		Stage:     Stage("dynamic-stage"),
 		Result:    Result("dynamic-result"),
 		Operation: Operation("dynamic-operation"),
-		Direction: Direction("dynamic-direction"),
 		ReasonCode: ReasonCode(
 			"dynamic-reason",
 		),
@@ -43,8 +42,8 @@ func TestNormalizeObservationBoundsCatalogAndCounts(t *testing.T) {
 	if got.Component != ComponentOther || got.Stage != StageOther || got.Result != ResultOther {
 		t.Fatalf("normalized identity = %q/%q/%q", got.Component, got.Stage, got.Result)
 	}
-	if got.Operation != OperationOther || got.Direction != DirectionOther || got.ReasonCode != ReasonOther {
-		t.Fatalf("normalized operation/direction/reason = %q/%q/%q", got.Operation, got.Direction, got.ReasonCode)
+	if got.Operation != OperationOther || got.ReasonCode != ReasonOther {
+		t.Fatalf("normalized operation/reason = %q/%q", got.Operation, got.ReasonCode)
 	}
 	if got.Duration != -time.Second || got.Counts.Messages != 0 || got.Counts.Records != 2 {
 		t.Fatalf("normalized duration/counts = %v/%#v", got.Duration, got.Counts)
@@ -289,6 +288,7 @@ func TestOwnershipLifecycleLogCarriesExactOperationalIdentity(t *testing.T) {
 			QueryGroupKey: "qg-exact-identity",
 			OwnerID:       "worker-exact-identity",
 			OwnerEpoch:    7,
+			SessionEpoch:  1758400000123,
 		},
 	})
 	for _, field := range []string{
@@ -296,10 +296,24 @@ func TestOwnershipLifecycleLogCarriesExactOperationalIdentity(t *testing.T) {
 		`"query_group_key":"qg-exact-identity"`,
 		`"owner_id":"worker-exact-identity"`,
 		`"owner_epoch":7`,
+		`"session_epoch":1758400000123`,
 	} {
 		if !strings.Contains(output.String(), field) {
 			t.Fatalf("ownership lifecycle log missing %s: %s", field, output.String())
 		}
+	}
+}
+
+// A lease its holder renews itself was taken under no session: the line says
+// nothing of one rather than a session epoch of zero.
+func TestASelfRenewedTakeoverLogNamesNoSession(t *testing.T) {
+	var output bytes.Buffer
+	renderTo(&output, Observation{
+		Component: ComponentOwnership, Stage: StageAssignmentAcquired, Result: ResultSuccess,
+		Trace: TraceFields{QueryGroupKey: "qg-self-renewed", OwnerID: "worker-1", OwnerEpoch: 3},
+	})
+	if !strings.Contains(output.String(), `"owner_epoch":3`) || strings.Contains(output.String(), "session_epoch") {
+		t.Fatalf("self-renewed takeover log = %s, want owner_epoch and no session_epoch", output.String())
 	}
 }
 
@@ -396,7 +410,6 @@ func TestObservationLoggerUsesBoundedEnvelope(t *testing.T) {
 		Stage:      StageResourceHard,
 		Result:     ResultTerminal,
 		Operation:  OperationTransition,
-		Direction:  DirectionOutput,
 		ReasonCode: ReasonRSS,
 		Duration:   1500 * time.Millisecond,
 		Counts: Counts{
@@ -419,7 +432,6 @@ func TestObservationLoggerUsesBoundedEnvelope(t *testing.T) {
 		"stage":          string(StageResourceHard),
 		"result":         string(ResultTerminal),
 		"operation":      string(OperationTransition),
-		"direction":      string(DirectionOutput),
 		"reason_code":    string(ReasonRSS),
 		"duration_ms":    float64(1500),
 		"records":        float64(2),

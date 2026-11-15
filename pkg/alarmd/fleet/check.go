@@ -66,7 +66,9 @@ const (
 	// take: the round is fine -- it judged, its threshold results were sent
 	// -- and what it learned about absence is not written down, so every
 	// round after reads a memory one round old, a group that goes absent is
-	// never recorded as first absent, and its no-data alert never fires. In
+	// never recorded as first absent: under a HISTORY roster its no-data
+	// alert never fires, under a static roster it fires with its absence
+	// always one period long and no recovery once the roster drops it. In
 	// the family of detection that stopped, not of defects: the Plan runs,
 	// and only its absence detection is silently gone.
 	CheckNoDataMemoryRefused Check = "NO_DATA_MEMORY_REFUSED"
@@ -143,21 +145,80 @@ const (
 	// one module while its target named another read EMPTY_EVERY_ROUND for a
 	// day.
 	CheckEmptyAfterTarget Check = "EMPTY_AFTER_TARGET"
+	// IdentityUnmatched is rounds that come back empty because every series
+	// the query returned was one the target's identity could not read: its
+	// key dimensions were missing or its model gate did not hold. The data
+	// is there and names its instance, only not the way the target reads
+	// it -- the strategy's identity fields or the collection's labels are
+	// to align. Named after a few such rounds, not the hour. Three MySQL
+	// strategies whose target gated on a legacy label the data no longer
+	// carried matched nothing for a day, one of them reading DETECTING.
+	CheckIdentityUnmatched Check = "IDENTITY_UNMATCHED"
 	// Quiet is an event count of groups answered whole with no group: no
 	// event in the range asked. Detecting, nothing to do: the row is there
 	// so that "no data" is never read into an event stream at rest, and so
 	// that a storage that failed silently - which answers the same way - is
 	// one look away.
 	CheckQuiet Check = "QUIET"
+	// LogCountEmpty is a log count, grouped or not, answered whole and empty for
+	// as long as NO_DATA_PERSISTENT or EMPTY_EVERY_ROUND would wait: empty;
+	// log counts aren't zero-filled, so quiet and missing look the same. Its
+	// provider leaves a group with no document out of the answer instead of
+	// counting it zero, and the line does not claim either reading.
+	CheckLogCountEmpty Check = "LOG_COUNT_EMPTY"
+	// FilteredEmpty is a primary whose expression filters its values,
+	// answered whole and filtered empty for as long as NO_DATA_PERSISTENT or
+	// EMPTY_EVERY_ROUND would wait, while the unfiltered witness of the same
+	// source had data: nothing passed the filter - for an OsRestart, no host
+	// restarted within the hour. Detecting, nothing to do.
+	CheckFilteredEmpty Check = "FILTERED_EMPTY"
 	// AnswerTruncated is an answer that may have been cut at the query
 	// service's terms cap: thresholds evaluate the groups that came back,
-	// and a Plan that detects no data judges nothing that round
-	// (SKIPPED_ANSWER_TRUNCATED). The strategy groups by something wider than
-	// the cap.
-	CheckAnswerTruncated   Check = "ANSWER_TRUNCATED"
-	CheckSeriesChurning    Check = "SERIES_CHURNING"
-	CheckSeriesDataMissing Check = "SERIES_DATA_MISSING"
-	CheckWindowUndecided   Check = "WINDOW_UNDECIDED"
+	// and a Plan that detects no data judges no absence that round
+	// (SKIPPED_ANSWER_TRUNCATED) - the groups that came back are judged
+	// present. The strategy groups by something wider than the cap.
+	CheckAnswerTruncated Check = "ANSWER_TRUNCATED"
+	// SourceUnknownHeld is a Level written to end on no data whose end has
+	// been held past its bound (sourceliveness.HeldBound) because the source
+	// it reads could not be shown alive: the alert stays open, as the
+	// recovery ruling says, and is named here instead of staying open with
+	// nobody told. The row names the source kind, the table, when the Level
+	// was first held and the last probe's outcome. Undetermined: an answer
+	// with a status, a partial one, a timeout or an empty one does not say
+	// whether the data link, the query service or a retired source is why.
+	CheckSourceUnknownHeld Check = "SOURCE_UNKNOWN_HELD"
+	// NewAlertsBurst is a strategy that opened more alerts in a clock hour,
+	// added up across replicas, than newopens.Threshold (5,000), named with
+	// the dimension that took the most distinct values among them and how
+	// many. Each replica holds about 30 B per distinct value of the hour it
+	// counts (one strategy at every bound about 19 MB), nothing in Redis. The threshold is
+	// measured, not chosen: per strategy and hour, one deployment
+	// peaked at 14,249 for a strategy opening one alert per span_name and at
+	// 182 for every other; another deployment's five largest businesses
+	// at about 1,053 for a no-data storm across a heartbeat strategy's
+	// tasks and at 248 for the next. 5,000 is about five times the highest
+	// strategy working as meant. Detecting: nothing is limited or closed.
+	// Not counted for Plans on the python-compatible protocol, which carries
+	// no open signal, nor without the link.
+	CheckNewAlertsBurst Check = "NEW_ALERTS_BURST"
+	CheckSeriesChurning Check = "SERIES_CHURNING"
+	// SeriesSparserThanWindow is a long-lived series that reports less often
+	// than its window has positions (HistoryCoverage.SparserThanWindow), folded
+	// on about how many steps lie between its points. Detecting: an anomaly
+	// fires, and an alert closes when Python's recovery check would close it,
+	// because a settled hole counts as a minute with no anomaly. Only NORMAL
+	// never comes, since that needs a whole window. The strategy's cadence
+	// against the data's, nothing to fix on either side unless the owner wants
+	// whole windows.
+	CheckSeriesSparserThanWindow Check = "SERIES_SPARSER_THAN_WINDOW"
+	CheckSeriesDataMissing       Check = "SERIES_DATA_MISSING"
+	CheckWindowUndecided         Check = "WINDOW_UNDECIDED"
+	// WindowRewarming is a window held by a guard this process's own state
+	// change raised -- the Plan's activation moved under a Slot, or its
+	// restart or takeover skipped Slots catching up -- still within the
+	// rounds refilling a window takes (Rewarm). This deployment's doing,
+	// and it ends by itself; past the bound it is WINDOW_UNDECIDED again.
+	CheckWindowRewarming Check = "WINDOW_REWARMING"
 	// CoverageReadingRefused is a window reason whose counts the observer
 	// refused: the round's own window facts broke one of the observer's
 	// rules, so nothing can say whether the window is filling. It is this
@@ -226,7 +287,7 @@ var sourceChecks = map[string]Check{
 // a reason nobody has read.
 var DeclaredCapabilities = []string{
 	// Query sources and query features not yet carried over.
-	"QUERY_SOURCE_NOT_MIGRATED", "QUERY_MIXED_PROMQL_NOT_MIGRATED", "QUERY_CMDB_LEVEL_BYPASSES_UQ",
+	"QUERY_SOURCE_NOT_MIGRATED", "QUERY_MIXED_PROMQL_NOT_MIGRATED", "QUERY_OUTPUT_CONFIG_NOT_MIGRATED", "QUERY_CMDB_LEVEL_BYPASSES_UQ",
 	"QUERY_BK_DATA_LOCAL_TIME_NOT_MIGRATED", "QUERY_FUNCTION_NOT_MIGRATED", "EXPRESSION_FUNCTION_NOT_MIGRATED",
 	// Detection algorithms (the AIOps ones among them) not carried over.
 	"ALGORITHM_NOT_MIGRATED", "ALGORITHM_UNSUPPORTED",
@@ -245,7 +306,7 @@ var DeclaredCapabilities = []string{
 // the strategy owner moves the strategy to another data source. Filed as a
 // capability they would promise a build that is not coming; filed as this
 // deployment's, a fix it will not make.
-var strategyOwnedCapabilityReasons = []string{"QUERY_FTA_UNSUPPORTED"}
+var strategyOwnedCapabilityReasons = []string{"QUERY_FTA_UNSUPPORTED", "QUERY_SOURCE_RETIRED", "QUERY_PROMQL_FORM_RETIRED"}
 
 // sourceCheckOf is the line a withheld disposition and its reason are filed
 // under: the disposition's own, except that the capability disposition goes
@@ -279,6 +340,10 @@ const (
 	GroupByDetail   GroupBy = "detail"
 	GroupByStrategy GroupBy = "strategy"
 	GroupByGapKind  GroupBy = "gap_kind"
+	// GroupByCadence folds on how often a series reports, in its window's
+	// steps (HistoryCoverage.PointEverySteps): "every_5_steps" is a point
+	// about every five steps, five minutes on a one minute step.
+	GroupByCadence GroupBy = "cadence"
 	// GroupByCause folds on what the window counts say happened: the reason
 	// the detection could not use the record, or that the series are a mix of
 	// new and old. It is the fold for the one check whose objects share a
@@ -299,7 +364,7 @@ const (
 // GroupBys is the closed list of folds, for the page's completeness test:
 // a fold the page has no words for renders as its key on the line a reader
 // opens a check with.
-var GroupBys = []GroupBy{GroupByReplica, GroupByReasonCode, GroupByDetail, GroupByStrategy, GroupByGapKind, GroupByCause, GroupByDegradation, GroupByLoss, GroupByBlocked, GroupByHour}
+var GroupBys = []GroupBy{GroupByReplica, GroupByReasonCode, GroupByDetail, GroupByStrategy, GroupByGapKind, GroupByCause, GroupByDegradation, GroupByLoss, GroupByBlocked, GroupByHour, GroupByCadence}
 
 // checkAnswers is the closed table: who acts on each check and what its
 // objects fold on. Twenty rows, and a test holds the count there. A check
@@ -338,15 +403,26 @@ var checkAnswers = map[Check]struct {
 	CheckNoDataPersistent: {OwnerData, GroupByStrategy},
 	CheckSeriesSparse:     {OwnerData, GroupByStrategy},
 
-	CheckEmptyEveryRound:    {OwnerStrategy, GroupByStrategy},
-	CheckEmptyAfterTarget:   {OwnerStrategy, GroupByStrategy},
-	CheckQuiet:              {OwnerStrategy, GroupByStrategy},
-	CheckAnswerTruncated:    {OwnerStrategy, GroupByStrategy},
-	CheckSeriesChurning:     {OwnerStrategy, GroupByStrategy},
-	CheckPlanUnevaluable:    {OwnerStrategy, GroupByStrategy},
-	CheckQueryTargetMissing: {OwnerStrategy, GroupByDetail},
+	CheckEmptyEveryRound:   {OwnerStrategy, GroupByStrategy},
+	CheckEmptyAfterTarget:  {OwnerStrategy, GroupByStrategy},
+	CheckIdentityUnmatched: {OwnerStrategyOrCollection, GroupByStrategy},
+	CheckQuiet:             {OwnerStrategy, GroupByStrategy},
+	// The strategy's, as QUIET is: whether a quiet group is expected is the
+	// strategy owner's to say, and the data owner can say whether data went
+	// missing; the answer alone cannot.
+	CheckLogCountEmpty:   {OwnerStrategy, GroupByStrategy},
+	CheckFilteredEmpty:   {OwnerStrategy, GroupByStrategy},
+	CheckAnswerTruncated: {OwnerStrategy, GroupByStrategy},
+	CheckSeriesChurning:  {OwnerStrategy, GroupByStrategy},
+	// The strategy's: its grouping is what opens an alert per value.
+	CheckNewAlertsBurst: {OwnerStrategy, GroupByStrategy},
+	// The strategy's: its window and step against how often its series
+	// report. Folded on the cadence, which is what its owner reads.
+	CheckSeriesSparserThanWindow: {OwnerStrategy, GroupByCadence},
+	CheckPlanUnevaluable:         {OwnerStrategy, GroupByStrategy},
+	CheckQueryTargetMissing:      {OwnerStrategy, GroupByDetail},
 	// The strategy's, as the refusal it warns of is: what fits in a share is
-	// the strategy's size, and the remedy is to shard or reshape it.
+	// the strategy's size, and the remedy is to reshape it.
 	CheckRetainedShareApproaching: {OwnerStrategy, GroupByStrategy},
 	// The strategy's: its time_delay decides when its window is read.
 	CheckReadBeforeComplete: {OwnerStrategy, GroupByStrategy},
@@ -354,17 +430,21 @@ var checkAnswers = map[Check]struct {
 	CheckLatePastRound:      {OwnerStrategy, GroupByStrategy},
 	// The data's: its late tail is past what a supplement reaches.
 	CheckLateSeriesMissed: {OwnerData, GroupByStrategy},
-	// The strategy's: the backend read the query and rejected it - a
-	// condition value its storage refuses, an expression it cannot parse -
-	// and the platform's own detector is refused the same way. The owner
-	// rests on the cases checked on 2026-09-29: five refused queries, each
-	// compared with the platform detector's request for the same strategy,
-	// all five refused there too (four condition values opening with control
-	// characters, one expression that did not parse). Folded by the stage
-	// and class the refusal was blocked at.
-	CheckQueryRefused: {OwnerStrategy, GroupByBlocked},
+	// The query provider answered and refused, without naming a missing
+	// table or field. Its status alone does not say whose that is: a
+	// condition value its storage refuses is the strategy's input, a backend
+	// fault the provider reports the same way (a bkbase result=false answers
+	// 400 as well) is the provider's, and the evidence does not decide
+	// between them -- the same owner as the provider not answering
+	// (BACKEND_NOT_ANSWERING). The row keeps the provider's excerpt and trace
+	// id to read the refusal by. Folded by the stage and class the refusal
+	// was blocked at.
+	CheckQueryRefused: {OwnerUndetermined, GroupByBlocked},
 
-	CheckWindowUndecided:  {OwnerUndetermined, GroupByCause},
+	CheckWindowUndecided: {OwnerUndetermined, GroupByCause},
+	// This deployment's: its own state change opened the window again.
+	// Folded on what opened it and when.
+	CheckWindowRewarming:  {OwnerAlarmd, GroupByCause},
 	CheckConfigUnresolved: {OwnerUndetermined, GroupByStrategy},
 	// A client-side timeout does not establish a fault on the data side: the
 	// query's budget, the network and the backend's own latency all have to
@@ -372,7 +452,10 @@ var checkAnswers = map[Check]struct {
 	// because this deployment did not fetch them. Both were handed to the
 	// data owner as confirmed; a live review found neither confirmed.
 	CheckBackendNotAnswering: {OwnerUndetermined, GroupByBlocked},
-	CheckSeriesDataMissing:   {OwnerUndetermined, GroupByStrategy},
+	// Whose the source is not answering alive - the link's, the query
+	// service's, or a source retired - the probe's answer does not decide.
+	CheckSourceUnknownHeld: {OwnerUndetermined, GroupByStrategy},
+	CheckSeriesDataMissing: {OwnerUndetermined, GroupByStrategy},
 }
 
 // checkOrder is the order the first screen lists the checks in, and the order
@@ -405,18 +488,25 @@ var checkOrder = []Check{
 	CheckDefect,
 	CheckObservationGap,
 	CheckCoverageReadingRefused,
+	CheckWindowRewarming,
 	CheckWindowUndecided,
 	CheckConfigUnresolved,
 	CheckBackendNotAnswering,
+	CheckQueryRefused,
+	// Detecting; only an alert's no-data end is held, on a source whose
+	// state the probe could not say, past its bound.
+	CheckSourceUnknownHeld,
 	CheckSeriesDataMissing,
 	CheckNoDataPersistent,
 	CheckSeriesSparse,
 	CheckEmptyEveryRound,
 	CheckEmptyAfterTarget,
+	CheckIdentityUnmatched,
 	CheckSeriesChurning,
+	// Detecting; the strategy opens an alert per value of a dimension.
+	CheckNewAlertsBurst,
 	CheckPlanUnevaluable,
 	CheckQueryTargetMissing,
-	CheckQueryRefused,
 	CheckConfigRejected,
 	// Below the lines that stop detection, above the one that only warns:
 	// this one detects, from data read before it was all there.
@@ -433,6 +523,12 @@ var checkOrder = []Check{
 	// The event counts at rest: detecting, with nothing to judge. Any other
 	// row of the strategy decides it.
 	CheckQuiet,
+	// A log count answered empty: detecting, quiet or missing unknown.
+	CheckLogCountEmpty,
+	// A filtered primary answered empty with its data there: detecting.
+	CheckFilteredEmpty,
+	// Detecting and recovering as Python does; only NORMAL never comes.
+	CheckSeriesSparserThanWindow,
 	// An answer that may have been cut: thresholds evaluate what came back,
 	// and no data is judged that round.
 	CheckAnswerTruncated,
@@ -532,6 +628,13 @@ func groupKeyOf(anomaly Anomaly, check Check) string {
 		}
 		return groupNoDetail
 	case GroupByStrategy:
+		// A storage's per-query sample limit folds on the class, not per
+		// strategy: one strategy reaching it is that strategy's query to
+		// narrow, and several at once is the storage's limit set too low
+		// for the cluster, which only shows as one group.
+		if check == CheckPlanUnevaluable && refusalNamesStrategyQuery(anomaly.Failure) {
+			return anomaly.Failure.Rejection.Class
+		}
 		// The strategy the row's evidence is about when it names one;
 		// otherwise the smallest id, so the same row always folds under the
 		// same key. On an object running six Plans the fold had named the
@@ -555,7 +658,12 @@ func groupKeyOf(anomaly Anomaly, check Check) string {
 		// in ReportChecks.
 		return gapRestoredWithoutCause
 	case GroupByCause:
+		if check == CheckWindowRewarming {
+			return rewarmCause(anomaly)
+		}
 		return windowCause(anomaly.Coverage, anomaly.CauseReason)
+	case GroupByCadence:
+		return fmt.Sprintf("every_%d_steps", anomaly.Coverage.PointEverySteps())
 	case GroupByLoss:
 		// An object a column put on the line folds on the code that put it
 		// there, which for these lines is a budget rejection -- the fold a
@@ -1543,8 +1651,10 @@ type Todo struct {
 	Retained         int        `json:"retained"`
 	RetainedLastHour int        `json:"retained_last_hour"`
 	RetainedNewest   *time.Time `json:"retained_newest,omitempty"`
-	// RecentWindowSeconds is the window the counts above are decided on,
-	// so the page prints the bound it was measured with.
+	// RecentWindowSeconds is the floor of the window the counts above are
+	// decided on: each record is recent for three of its object's periods,
+	// and for at least this long (RecentWindow), so a short-period object's
+	// window is this and a long-period one's is longer.
 	RecentWindowSeconds int `json:"recent_window_seconds"`
 	// Governance is the lines already confirmed as somebody else's, and the
 	// distinct objects under them.
@@ -1855,16 +1965,30 @@ func skippedRows(view *View, listed map[string]struct{}, now time.Time) ([]Anoma
 			consequences[line].note(skip.At, now, skip.IntervalSeconds)
 			return
 		}
-		if _, already := listed[underKey(check, queryGroup)]; already {
-			return
-		}
-		listed[underKey(check, queryGroup)] = struct{}{}
 		record := skip
 		item := Anomaly{QueryGroup: queryGroup, Kind: KindSkippedSpan, ReasonCode: reason,
 			Since: skip.At, SinceFrom: SinceSnapshotContinuity, Replica: skip.Replica, Skip: &record,
 			Strategies: skip.Strategies, Loss: loss}
+		// A record a cooldown held, read after the object left the pool, is
+		// the consequence of the line its cooldown's failure puts it on, when
+		// that line is not this deployment's: a query target that does not
+		// exist cooled the object, its skips were the strategy's, and on
+		// DETECTION_ABANDONED they read as this deployment giving up.
+		cooled := Check("")
+		if loss == LossAfterCooldown && check == CheckDetectionAbandoned && skip.HeldByFailure != nil {
+			if line := cooldownLine(skip.HeldByFailure); checkAnswers[line].Owner != OwnerAlarmd {
+				cooled, check, item.Failure = line, line, skip.HeldByFailure
+			}
+		}
+		if _, already := listed[underKey(check, queryGroup)]; already {
+			return
+		}
+		listed[underKey(check, queryGroup)] = struct{}{}
 		group := string(loss)
-		if check == CheckBookkeepingAbandoned {
+		switch {
+		case cooled != "":
+			group = groupKeyOf(item, cooled)
+		case check == CheckBookkeepingAbandoned:
 			// Folded on the replica whose Progress write was lost: which store
 			// client is failing is the question, not what kind of loss -- there
 			// is no detection loss.
@@ -1954,4 +2078,14 @@ func truncatedColumns(truncated map[string]bool) uint8 {
 		}
 	}
 	return mask
+}
+
+// columnCut says the truncation mask has column's bit set (truncatedColumns).
+func columnCut(mask uint8, column string) bool {
+	for index, name := range columnNames {
+		if name == column {
+			return mask&(1<<index) != 0
+		}
+	}
+	return false
 }

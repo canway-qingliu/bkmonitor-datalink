@@ -47,6 +47,11 @@ type Evaluator interface {
 // publishing events.
 type SideEffectAdmitter interface {
 	Check(context.Context, SideEffectAdmissionRequest) (SideEffectAdmissionResult, error)
+	// CheckActivation is Check without the owner fence: the activation facts
+	// alone. It is for an admission whose next write runs the full fence in
+	// its own script -- the Progress commit -- so the fence is read once, at
+	// the write, rather than once before it and again inside it.
+	CheckActivation(context.Context, SideEffectAdmissionRequest) (SideEffectAdmissionResult, error)
 }
 
 type GapGuardStore interface {
@@ -104,9 +109,18 @@ func HostBusinessFor(hosts HostBusiness, tenant string) HostBusiness {
 }
 
 // PlanNoDataStore holds what each Plan remembers about absence between Slots.
+// A Slot's round reads it in parts (PlanNoDataRosterReader); LoadNoData reads
+// a record whole, for the readers that want one whole and small.
 type PlanNoDataStore interface {
+	PlanNoDataRosterReader
 	LoadNoData(context.Context, NoDataLoadRequest) (NoDataLoadResult, error)
 	ApplyNoData(context.Context, NoDataApplyRequest) (NoDataApplyResult, error)
+}
+
+// NoDataManualCloseReader reads, for some fingerprints, the time a user's
+// manual close of each was recorded (decision-024); absent when none was.
+type NoDataManualCloseReader interface {
+	ReadNoDataManualCloses(ctx context.Context, tenantID, strategyID string, fingerprints []string) (map[string]int64, error)
 }
 
 type EventSink interface {

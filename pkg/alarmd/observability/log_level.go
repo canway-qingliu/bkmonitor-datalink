@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/contract"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/editclose"
 )
 
 // warnReasons are the reasons a result that is not a failure is written at
@@ -31,13 +32,14 @@ var warnReasons = makeReasonSet([]ReasonCode{
 	"KAFKA_UNAVAILABLE", "MESSAGE_BUDGET_EXCEEDED", "OUTPUT_ACK_UNKNOWN", "OUTPUT_CLIENT_REJECTED",
 	"OUTPUT_CONVERSION_REJECTED", "OUTPUT_LEASE_EXPIRING", "OWNERSHIP_LEASE_BUSY",
 	"OWNERSHIP_NOT_DESIRED", "OWNERSHIP_STALE_FENCE", "PROGRESS_BEGIN_FAILED",
-	"PROGRESS_BEGIN_REJECTED", "PROVIDER_UNAVAILABLE", "QUERY_PARTIAL", "QUERY_TIMEOUT",
+	"PROGRESS_BEGIN_REJECTED", "PROVIDER_UNAVAILABLE", "QUERY_PARTIAL", "QUERY_TIMEOUT", "QUERY_DELIVERY_TIMEOUT",
 	"QUERY_UNAVAILABLE", "READINESS_BUDGET_INVALID", "RECORD_TOO_LARGE", "REDIS_UNAVAILABLE",
-	"RESOURCE_HARD_STOP", "SCHEDULE_PRUNED", "SCHEDULE_REPAIRED", "SCHEDULE_REOPENED", "SLOT_BUDGET_EXCEEDED", "SLOT_SOURCE_RETRY",
+	"RESOURCE_HARD_STOP", "RESOURCE_POOL_HELD_BY_OTHERS", "SCHEDULE_PRUNED", "SCHEDULE_REPAIRED", "SCHEDULE_REOPENED", "SLOT_BUDGET_EXCEEDED", "SLOT_SOURCE_RETRY",
 	"SNAPSHOT_RETENTION_INSUFFICIENT", "SNAPSHOT_RETRY_PENDING", "SNAPSHOT_UNAVAILABLE",
 	"STATE_BUDGET_EXCEEDED", "STATE_CORRUPT", "STATE_LEVEL_CONTRACT_MISMATCH", "STATE_READ_DEADLINE",
 	"STATE_READ_TIMEOUT", "STATE_SCHEMA_UNSUPPORTED", "STATE_STALE_VERSION", "STATE_VERSION_CONFLICT",
-	"STATE_WRITE_RETRYABLE", "TRIGGER_INVARIANT", "VALIDATION_BUDGET_EXCEEDED", "VIEW_NOT_EXECUTABLE",
+	"STATE_WRITE_RETRYABLE", "SUPPLEMENT_KEPT_READ_ABSENT", "TARGET_RESOLUTION_UNAVAILABLE",
+	"TRIGGER_INVARIANT", "VALIDATION_BUDGET_EXCEEDED", "VIEW_NOT_EXECUTABLE",
 	"view_not_executable", "QUERY_PERMIT_DEADLINE", "QUERY_PERMIT_QUEUE_FULL", "QUERY_PERMIT_RECOVERY_OFF",
 	"QUERY_REASON_UNRECORDED",
 	// A Plan's no-data detection that kept skipping until it counted as
@@ -60,15 +62,42 @@ var warnReasons = makeReasonSet([]ReasonCode{
 var infoActivationKinds = map[string]bool{"not_drained": true, "cas_conflict": true}
 
 // warnViewStreamReasons are the view stream's words for a configuration or a
-// defect -- a token, a protocol, a digest, a registry that does not answer.
+// defect -- a token, a protocol, a digest, a registry that does not answer --
+// and for a Worker that found its Leader and could not reach it or send it
+// its Hello (LEADER_UNAVAILABLE, CONNECT_FAILED, DIAL_FAILED,
+// HELLO_SEND_FAILED). Those four were written at WARN as reason_not_reported
+// before they had words, and keep it: a Leader restart that sets every
+// Worker off is bounded by the repeated-line limiter, not by a lower level.
 // Its other words are a session's ordinary life: no leader yet, not the
-// leader, a stream closed, replaced or idle.
+// leader, a stream closed, replaced or idle, and SEND_FAILED, the Leader's
+// own end of a session.
 var warnViewStreamReasons = makeReasonSet([]ReasonCode{
 	"LISTENER_UNPARSABLE", "DELTA_BASE_MISMATCH", "DELTA_DIGEST_MISMATCH", "SNAPSHOT_INVALID",
 	"SNAPSHOT_INCOMPLETE", "VIEW_FOR_ANOTHER_WORKER", "UNKNOWN_WORKER", "BAD_TOKEN", "PROTOCOL_VERSION",
 	"HELLO_EXPECTED", "REGISTRY_UNAVAILABLE", "DISCOVERY_FAILED", "NO_ROUTE", "RECV_FAILED",
 	"LEADER_NO_ENDPOINT", "LEADER_UNREGISTERED",
+	"LEADER_UNAVAILABLE", "CONNECT_FAILED", "DIAL_FAILED", "HELLO_SEND_FAILED",
 })
+
+// warnRunOutcomes are the Runner round outcomes the fleet page files under
+// this deployment or a backend not answering: the source refusing, failing
+// or blocked, and a round that panicked or failed otherwise. The
+// runner_returned line that carries them is not written; the set keeps the
+// log's reading of the word the same as the page's.
+var warnRunOutcomes = makeReasonSet([]ReasonCode{"source_retry", "source_blocked", "source_error", "panic", "other_error"})
+
+// warnCursorRefusals are a store's refusals of a pruned cursor's skip: the
+// cursor stays where nothing can read it and the Query Group evaluates
+// nothing until a later skip goes through. They were written at WARN as
+// reason_not_reported and keep it.
+var warnCursorRefusals = makeReasonSet([]ReasonCode{
+	CursorRefusalProgressMissing, CursorRefusalRangeInFlight, CursorRefusalCursorMoved, CursorRefusalCASConflict,
+})
+
+// warnSlotPathReasons are the Slot path's own words for a Slot attempt held
+// up: a wait inside it that outlasted a settling wait. It was written at
+// WARN as reason_not_reported and keeps it.
+var warnSlotPathReasons = makeReasonSet([]ReasonCode{ReasonSlotWaitSlow})
 
 // warnDecisionReasons are the scheduler decisions that say it could not
 // decide or could not do what it decided; the others are a replay or range
@@ -76,11 +105,11 @@ var warnViewStreamReasons = makeReasonSet([]ReasonCode{
 var warnDecisionReasons = makeReasonSet([]ReasonCode{"unexplained", "freeze_failed", "proof_too_large"})
 
 // warnMaintenanceReasons are effective-time maintenance outcomes that are a
-// close or a plan failing; the others are a close acknowledged, contention
-// or a wait.
+// close or a plan failing, or a link that closes nothing; the others are a
+// close run or settled later, contention or a wait.
 var warnMaintenanceReasons = makeReasonSet([]ReasonCode{
-	"close_precheck_failed", "close_send_failed", "maintenance_plan_uncompilable",
-	"close_identity_invalid", "unavailable", "unsupported_runner",
+	"close_precheck_failed", "maintenance_plan_uncompilable", "close_identity_invalid",
+	"unavailable", "unsupported_runner", "filter_close_unsupported",
 })
 
 // warnAbsentCloseReasons are absent-strategy close outcomes that could not
@@ -88,8 +117,18 @@ var warnMaintenanceReasons = makeReasonSet([]ReasonCode{
 // deferred, within its grace, or refused by design.
 var warnAbsentCloseReasons = makeReasonSet([]ReasonCode{
 	"index_unreadable", "evidence_unavailable", "send_failed", "memory_full", "link_unavailable",
-	"link_unhealthy", "snapshot_unusable", "snapshot_empty", "snapshot_stale",
+	"snapshot_unusable", "snapshot_empty", "snapshot_stale",
 })
+
+// warnEditCloseReasons are edit close outcomes that could not read, could
+// not send or ran out of memory (editclose.Failures).
+var warnEditCloseReasons = func() map[ReasonCode]struct{} {
+	reasons := make([]ReasonCode, 0, len(editclose.Failures))
+	for _, failure := range editclose.Failures {
+		reasons = append(reasons, ReasonCode(failure))
+	}
+	return makeReasonSet(reasons)
+}()
 
 // ReasonLogLevel is the level a result that is neither a success nor a
 // failure is written at for its reason.
@@ -98,7 +137,9 @@ func ReasonLogLevel(reason ReasonCode) slog.Level {
 	case reason == ReasonNone:
 		return slog.LevelInfo
 	case inReasonSet(warnReasons, reason), inReasonSet(warnViewStreamReasons, reason), inReasonSet(warnDecisionReasons, reason),
-		inReasonSet(warnMaintenanceReasons, reason), inReasonSet(warnAbsentCloseReasons, reason):
+		inReasonSet(warnRunOutcomes, reason), inReasonSet(warnCursorRefusals, reason), inReasonSet(warnSlotPathReasons, reason),
+		inReasonSet(warnMaintenanceReasons, reason), inReasonSet(warnAbsentCloseReasons, reason),
+		inReasonSet(warnEditCloseReasons, reason), inReasonSet(strategyScopeCloseReasonSet, reason):
 		return slog.LevelWarn
 	case inReasonSet(activationFailureReasonSet, reason):
 		if _, kind, ok := strings.Cut(string(reason), "/"); ok && infoActivationKinds[kind] {
@@ -152,6 +193,9 @@ func observationLevel(observation Observation) slog.Level {
 	if failedResult(observation.Result) {
 		return slog.LevelError
 	}
+	if observation.RetryingAfterFailure {
+		return slog.LevelWarn
+	}
 	if observation.HeldBy != nil || observation.AwaitingView {
 		return slog.LevelInfo
 	}
@@ -172,10 +216,14 @@ var routineStages = map[Stage]bool{
 	StageSlotSourceCompleted: true, StageRunnerCompleted: true, StageGapLoaded: true, StageGapGuardCommitted: true,
 	StageGapGuardProgress: true, StageNoDataDecided: true, StageNoDataMemoryRead: true, StageNoDataMemoryWritten: true,
 	StageNoDataMemoryRenewed: true, StageProgressCommitted: true, StageStatePreflight: true, StageStateAdmission: true,
-	StageStateApplied: true, StageFrozenStateRenewed: true, StageSideEffectAdmission: true, StageFenceChecked: true,
+	StageStateApplied: true, StageFrozenStateRenewed: true, StageSideEffectAdmission: true, StagePlanActivationChecked: true, StageFenceChecked: true,
 	StageEventACKed: true, StageTargetResolved: true,
 	StageLeaseRenewed: true, StageAssignmentAcquired: true, StageAssignmentLost: true,
-	StageTakeoverStarted: true, StageTakeoverCompleted: true,
+	// A takeover's start is counted and not written: every one is followed at
+	// the same site by its completion, which carries the outcome and the
+	// epochs, so a start line would only double a rollout's lines. Its
+	// completion is written (takeoverHeld).
+	StageTakeoverStarted: true,
 }
 
 // unwrittenStage is a stage that has lines counted and not written.
@@ -191,15 +239,35 @@ var roundStages = map[Stage]bool{
 	StageControlReadsSpent: true, StageActiveQGSet: true, StageObjectCatalog: true,
 }
 
+// cutoverChanged says a publication cutover did something to a Query Group
+// other than keep it. Each of those is written, as a round that changed
+// something is: its line names the Query Groups an edit reached, and under
+// the hourly sample a second edit within the hour named none of its own. A
+// cutover that kept every Query Group stays under the sample. It is asked of
+// successes only (Admit); a failure keeps the failures' limit.
+func cutoverChanged(observation Observation) bool {
+	facts := observation.ScheduleCutover
+	if observation.Stage != StageScheduleCutover || facts == nil {
+		return false
+	}
+	for decision, count := range facts.QueryGroups {
+		if decision != "kept" && count > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // roundChanged says a Control Leader round line has something new on it: the
 // round moved, rewrote or found missing something, read the source changed,
-// or holds Query Groups draining. Three of the stages carry no facts at all
-// on their line and never have anything new.
+// holds Query Groups draining, or found a record changed under it. Two of the
+// stages carry no facts at all on their line and never have anything new.
 func roundChanged(observation Observation) bool {
 	switch observation.Stage {
 	case StageRebalancePlanned:
 		facts := observation.Rebalance
-		return facts != nil && (facts.PlannedMoves > 0 || facts.PublishedMoves > 0 || facts.Conflicts > 0 || facts.Paused)
+		return facts != nil && (facts.PlannedMoves > 0 || facts.PublishedMoves > 0 || facts.Conflicts > 0 || facts.Paused ||
+			facts.Placed > 0 || facts.Replaced > 0 || facts.Unfit > 0 || (facts.Bytes != nil && facts.Bytes.PublishedMoves > 0))
 	case StageAssignmentIndexRead:
 		// A worker that reads just before the Leader writes sees the previous
 		// round once: stale for one round is the ordinary race, the same
@@ -226,6 +294,19 @@ func roundChanged(observation Observation) bool {
 		return observation.SourceRefresh == nil || observation.SourceRefresh.Status != SourceRefreshUnchanged
 	case StageDrainingQGReconciled:
 		return observation.DrainingQG != nil && observation.DrainingQG.Total > 0
+	case StageControlReadsSpent:
+		// A conflict, or a field the Leader's copy of the records missed a
+		// write on: the sample names the Query Group and both values.
+		facts := observation.ControlReads
+		if facts == nil {
+			return false
+		}
+		for field, count := range facts.RecordMismatches {
+			if count > 0 && !RecordFieldWorkerWritten(field) {
+				return true
+			}
+		}
+		return facts.RecordConflicts > 0
 	default:
 		return false
 	}

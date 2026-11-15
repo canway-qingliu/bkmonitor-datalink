@@ -11,6 +11,7 @@ package trace
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -186,11 +187,10 @@ func (s *Service) Start(ctx context.Context) {
 	// 这里的wg不是用于goroutine运行判断，需要注意
 	s.wg.Add(1)
 
-	s.tracerProvider = sdktrace.NewTracerProvider(
-		sdktrace.WithSampler(sdktrace.AlwaysSample()),
-		sdktrace.WithBatcher(exporter),
-		sdktrace.WithResource(s.newResource()),
-	)
+	s.tracerProvider, err = newTracerProvider(exporter, s.newResource())
+	if err != nil {
+		panic(err)
+	}
 	otel.SetTracerProvider(s.tracerProvider)
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 
@@ -220,4 +220,31 @@ func (s *Service) Close() {
 // Wait
 func (s *Service) Wait() {
 	s.wg.Wait()
+}
+
+// newSampler 按配置构造采样器。always 记录所有请求；parent_based 时带上游 traceparent 的请求按其
+// sampled 标志决定，标志为 00 的请求只建不记录的 span，span context 仍带上游的 trace id，
+// 日志行照样能用它关联；没有上游的请求照旧全记录。
+func newSampler(name string) (sdktrace.Sampler, error) {
+	switch name {
+	case "", SamplerAlways:
+		return sdktrace.AlwaysSample(), nil
+	case SamplerParentBased:
+		return sdktrace.ParentBased(sdktrace.AlwaysSample()), nil
+	default:
+		return nil, fmt.Errorf("unknown trace sampler %q: want %s or %s", name, SamplerAlways, SamplerParentBased)
+	}
+}
+
+// newTracerProvider 按当前配置（trace.sampler）构造 provider，Start 与用例走同一处。
+func newTracerProvider(exporter sdktrace.SpanExporter, res *resource.Resource) (*sdktrace.TracerProvider, error) {
+	sampler, err := newSampler(Sampler)
+	if err != nil {
+		return nil, err
+	}
+	return sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sampler),
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res),
+	), nil
 }

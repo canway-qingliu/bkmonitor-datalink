@@ -8,6 +8,7 @@ import (
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/config"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/internal/testwait"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/observability"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/scheduler"
 )
@@ -35,6 +36,8 @@ func (r occupancyRunner) NextReadyAt() time.Time { return time.Time{} }
 
 func (r occupancyRunner) DueBound() scheduler.RunnerDueBound { return scheduler.RunnerDueBound{} }
 func (r occupancyRunner) NextDeadline() time.Time            { return time.Time{} }
+func (occupancyRunner) HeldEpochs() (uint64, uint64)         { return 0, 0 }
+
 func (occupancyRunner) DeclineHung(time.Time, time.Duration) (string, time.Time, bool) {
 	return "", time.Time{}, false
 }
@@ -67,12 +70,12 @@ func occupancyDispatcher(observer observability.Observer) (*phaseTwoRunnerDispat
 
 func awaitExecuting(t *testing.T, dispatcher *phaseTwoRunnerDispatcher, want int64) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := testwait.Deadline(t)
 	for time.Now().Before(deadline) {
 		if dispatcher.executing.Load() == want {
 			return
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(time.Millisecond) // fixed-wait: the poll interval of a condition wait bounded by the test deadline
 	}
 	t.Fatalf("occupancy stayed at %d, want %d", dispatcher.executing.Load(), want)
 }

@@ -48,11 +48,35 @@ func slotFailureReason(err error) (observability.ReasonCode, string) {
 	// A Slot whose query never reached its backend because the permit wait
 	// ran out at the query's deadline: the query's own word, which the query
 	// failure facts have carried all along.
+	// A host-placed series whose alert identity no CMDB index could read
+	// fails its query as a query that could not be answered
+	// (series_identity, QUERY_UNAVAILABLE).
+	// A query that ran out of its time at the provider - its request
+	// cancelled or expired at its own deadline, or the provider stopping
+	// partway - names the provider's word too, as its query_completed line
+	// does, rather than reading as an internal error.
 	var admission interface{ QueryFailure() (string, string) }
 	if errors.As(err, &admission) {
-		if category, code := admission.QueryFailure(); category == observability.QueryFailureCategoryAdmission {
+		if category, code := admission.QueryFailure(); category == observability.QueryFailureCategoryAdmission ||
+			category == observability.QueryFailureCategoryProviderTransport || category == observability.QueryFailureCategoryDelivery ||
+			category == observability.QueryFailureCategorySeriesIdentity {
 			reason = observability.ReasonCode(code)
 		}
+	}
+	// The Slot's own retained bytes over its Query Group's share: the same
+	// word the capacity rejection line already gives it. It arrived here as
+	// internal_unknown on every retry of a Slot no retry could fit.
+	if _, refused := execution.ShareRefusalOf(err); refused {
+		reason = observability.ReasonCode(contract.ReasonQGBudgetShareExceeded)
+	}
+	// Within its share and refused for what others hold of the pool: the
+	// capacity rejection line's word, not internal_unknown.
+	if worker.PoolHeldByOthers(err) {
+		reason = observability.ReasonCode(contract.ReasonResourcePoolHeldByOthers)
+	}
+	// A Slot that has to be read in slices and cannot be, by why.
+	if word, sliced := worker.InputSliceRefusal(err); sliced {
+		reason = observability.ReasonCode(word)
 	}
 	if conflict, named := worker.GapGuardConflictReason(err); named {
 		reason = observability.ReasonCode(conflict)
@@ -89,6 +113,12 @@ func slotFailureReason(err error) (observability.ReasonCode, string) {
 	// were internal_unknown, so a Query Group conflicting on every other Slot
 	// for half an hour arrived as an unclassified defect that the same-Slot
 	// retry then cleared.
+	// A no-data memory read in parts that moved under the read, or a part
+	// the store could not answer: retried, and named rather than
+	// internal_unknown (worker.NoDataRosterMovedError).
+	if refusal, named := worker.NoDataRosterReadReason(err); named {
+		reason = observability.ReasonCode(refusal)
+	}
 	if refusal, named := worker.GapApplyReason(err); named {
 		reason = observability.ReasonCode(refusal)
 		// The site goes on the line as its own field, not only inside the

@@ -4,6 +4,7 @@
 package controlplane
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -78,24 +79,12 @@ func TestDeparturesRefusedByTheBoundAreCounted(t *testing.T) {
 	memory := newDepartedMemory()
 	memory.entries = make(map[string]DepartedStrategy, MaxDepartedStrategies)
 	for i := 0; i < MaxDepartedStrategies; i++ {
-		memory.entries[departedKey("system", "filler-"+string(rune('a'+i%26))+itoaTest(i))] = DepartedStrategy{At: time.Now()}
+		memory.entries[departedKey("system", "filler-"+string(rune('a'+i%26))+strconv.Itoa(i))] = DepartedStrategy{At: time.Now()}
 	}
 	memory.record(groupsOf(planOf("system", "2", "10", 7)), nil, time.Now())
 	if memory.refusedCount() != 1 {
 		t.Fatalf("a departure the bound refused was not counted: refused=%d", memory.refusedCount())
 	}
-}
-
-func itoaTest(value int) string {
-	if value == 0 {
-		return "0"
-	}
-	digits := ""
-	for value > 0 {
-		digits = string(rune('0'+value%10)) + digits
-		value /= 10
-	}
-	return digits
 }
 
 // A strategy whose business does not parse is still recorded. Leaving it
@@ -108,5 +97,20 @@ func TestAStrategyWithAnUnparsableBusinessIsStillRemembered(t *testing.T) {
 	departed := memory.departed()
 	if len(departed) != 1 || departed[0].BusinessID != 0 || departed[0].Revision != 7 {
 		t.Fatalf("the departure was dropped instead of recorded with what parsed: %+v", departed)
+	}
+}
+
+// A global business strategy's alerts are each filed under the business
+// they are about; the memory keeps that the strategy was one, which no
+// other place knows once it is gone.
+func TestADepartureRemembersWhetherTheStrategyWasAGlobalBusinessOne(t *testing.T) {
+	memory := newDepartedMemory()
+	at := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	global := planOf("system", "9", "10", 7)
+	global.Plan.GlobalBusiness = true
+	memory.record(groupsOf(global, planOf("system", "2", "11", 9)), nil, at)
+	departed := memory.departed()
+	if len(departed) != 2 || !departed[0].GlobalBusiness || departed[1].GlobalBusiness {
+		t.Fatalf("departures %+v, want strategy 10 global and 11 not", departed)
 	}
 }

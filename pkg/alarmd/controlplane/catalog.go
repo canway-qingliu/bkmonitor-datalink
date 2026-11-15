@@ -68,6 +68,9 @@ type PrimaryQuerySource struct {
 	IdentityFields    []string
 	Functions         []json.RawMessage
 	QueryConfigs      []json.RawMessage
+	// QueryOutputConfig is the item's query_output_config as the strategy
+	// cache carries it, absent for an item without named outputs.
+	QueryOutputConfig json.RawMessage
 }
 
 type PrimaryQueryCompiler interface {
@@ -174,7 +177,11 @@ type FrozenPlan struct {
 	// the object digest is taken over, so a field that serialized on every
 	// Plan would change every digest in the deployment at once and cost a
 	// republication and a Segment recut for content that did not change.
-	NoDataSuspended      string `json:",omitempty"`
+	NoDataSuspended string `json:",omitempty"`
+	// DataUnitFacts says how the Plan's values are compared, for a reader
+	// (DataUnitFacts). Omitted when nil, for the same reason NoDataSuspended
+	// is: this struct is inside the object digest.
+	DataUnitFacts        *DataUnitFacts `json:",omitempty"`
 	ScheduleSpec         execution.ScheduleSpec
 	ScheduleRevision     execution.PlanScheduleRevision
 	RequirementTemplates []execution.DataRequirementTemplate                    `json:"RequirementTemplates,omitempty"`
@@ -273,6 +280,7 @@ type planCompileFacts struct {
 	// NoDataSuspended is empty for a Plan whose no-data detection is attached
 	// and for one that never configured it. See FrozenPlan.
 	NoDataSuspended string
+	DataUnitFacts   *DataUnitFacts
 }
 
 type QueryGroup struct {
@@ -322,6 +330,17 @@ const ReasonEffectiveTimeRangeInvalid = "EFFECTIVE_TIME_RANGE_INVALID"
 // reads it as (itemInterval).
 const ReasonAggIntervalDefaulted = "AGG_INTERVAL_DEFAULTED"
 
+// The agg_method fallbacks of the platform's metric source, one reason each
+// (aggMethodFallbackOf): a metric query config whose agg_method holds "$"
+// (an unfilled dashboard variable), starts "undefined", or ends
+// _without_time and is none of the five such methods, compiled as the sum
+// or sum_without_time the platform runs in its place.
+const (
+	ReasonAggMethodVariableDefaulted    = "AGG_METHOD_VARIABLE_DEFAULTED"
+	ReasonAggMethodUndefinedDefaulted   = "AGG_METHOD_UNDEFINED_DEFAULTED"
+	ReasonAggMethodWithoutTimeDefaulted = "AGG_METHOD_WITHOUT_TIME_DEFAULTED"
+)
+
 // ReasonNoDataTriggerBeyondHorizon names a Plan whose no-data trigger needs
 // at least as long as the tracking horizon lets an absence be tracked, so it
 // can never alert: the N-th consecutive absent point lands (N-1) periods
@@ -330,11 +349,31 @@ const ReasonAggIntervalDefaulted = "AGG_INTERVAL_DEFAULTED"
 // owner's choice to make and the warning tells them it is one.
 const ReasonNoDataTriggerBeyondHorizon = "NO_DATA_TRIGGER_BEYOND_HORIZON"
 
+// ReasonNoDataGroupBoundAboveDefault names a Plan whose own no-data group
+// bound is above the default. The Plan runs with it; the note carries the
+// one-off Redis cost of its first whole-record write, which the owner chose
+// by raising the bound.
+const ReasonNoDataGroupBoundAboveDefault = "NO_DATA_GROUP_BOUND_ABOVE_DEFAULT"
+
 // ReasonRecoveryConfigDefaulted names a Level whose recovery takes the
 // platform's default of 5 windows because the backend cannot read a recovery
 // window for it - its own, or another level's, since one unreadable detect
 // defaults the whole strategy there (recover.py:253-267).
 const ReasonRecoveryConfigDefaulted = "RECOVERY_CONFIG_DEFAULTED"
+
+// ReasonRecoveryStatusSetterDefaulted names a Level whose
+// recovery_config.status_setter is none of recovery, close, recovery-nodata
+// and close-nodata, read the way the recovery checker reads it: closed when
+// the part before "-" is "close", recovered otherwise.
+const ReasonRecoveryStatusSetterDefaulted = "RECOVERY_STATUS_SETTER_DEFAULTED"
+
+// ReasonRecoveryDisabledByConfig names a Level whose recovery_config states
+// disable_recovery: its alerts are not recovered - neither on the recovery
+// window nor on no data - and end only by a control-plane close (the
+// strategy deleted or disabled, its target removed, a capability refusal,
+// the effective-time close). The level runs as its owner wrote it; the note
+// says alarmd honours the switch.
+const ReasonRecoveryDisabledByConfig = "RECOVERY_DISABLED_BY_CONFIG"
 
 // The item fields a strategy cannot be compiled without, each refused under
 // its own name with the field it names, as a rejected configuration (the
@@ -1296,6 +1335,7 @@ func buildCandidate(ctx context.Context, planner PrimaryQueryCompiler, source So
 		Identity: source.Identity, StrategyID: source.SourceID, ItemID: strconv.FormatInt(item.ID, 10),
 		TimeDelaySeconds: item.TimeDelay, QueryMD5: item.QueryMD5, Expression: primaryExpression, IdentityFields: identityFields,
 		Functions: functions, QueryConfigs: append([]json.RawMessage(nil), item.QueryConfigs...),
+		QueryOutputConfig: append(json.RawMessage(nil), item.QueryOutputConfig...),
 	}
 	// The step decides how the query reads; compilePlan reads it again and
 	// is where a step that cannot run is refused and a warned one noted.
@@ -1304,7 +1344,13 @@ func buildCandidate(ctx context.Context, planner PrimaryQueryCompiler, source So
 			querySource.DetectStepSeconds = step.Seconds
 		}
 	}
-	facts, err := planner.CompilePrimaryQuery(ctx, querySource)
+	var facts execution.QueryPlanFacts
+	var fallbacks []aggMethodFallback
+	if noting, ok := planner.(aggMethodNotingCompiler); ok {
+		facts, fallbacks, err = noting.compilePrimaryQueryNoted(querySource)
+	} else {
+		facts, err = planner.CompilePrimaryQuery(ctx, querySource)
+	}
 	if err != nil {
 		var compileFailure *QueryPlanCompileError
 		if errors.As(err, &compileFailure) && compileFailure.Disposition != "" && compileFailure.Reason != "" {
@@ -1323,12 +1369,12 @@ func buildCandidate(ctx context.Context, planner PrimaryQueryCompiler, source So
 	if err := validateQueryIdentity(source.Identity, facts); err != nil {
 		return candidate, err
 	}
-	if refusal, word := globalBusinessRefusal(source.SourceID, source.Identity, targetScope, facts); refusal != nil {
+	if refusal, word := globalBusinessRefusal(source.SourceID, source.Identity, targetScope, facts, querySource.QueryConfigs); refusal != nil {
 		candidate.dispositions = append(candidate.dispositions, *refusal)
 		candidate.globalRefusal = word
 		return candidate, errors.New(ReasonGlobalStrategyUnsupported + ": " + refusal.Detail)
 	}
-	compiledInputs := compiledPlanInputs{primary: facts}
+	compiledInputs := compiledPlanInputs{primary: facts, aggMethodFallbacks: fallbacks}
 	for _, label := range itemDataTypes(item) {
 		if label == "log" || label == "event" {
 			compiledInputs.missingHistoryAsZero = true
@@ -1354,6 +1400,11 @@ func buildCandidate(ctx context.Context, planner PrimaryQueryCompiler, source So
 	if err != nil {
 		candidate.dispositions = append(candidate.dispositions, dispositions...)
 		return candidate, err
+	}
+	if refusal := globalBusinessDimensionRefusal(source.SourceID, source.Identity, facts, plan); refusal != nil {
+		candidate.dispositions = append(candidate.dispositions, *refusal)
+		candidate.globalRefusal = GlobalBusinessBusinessDimension
+		return candidate, errors.New(ReasonGlobalStrategyUnsupported + ": " + refusal.Detail)
 	}
 	// The protocol is decided here, once, and frozen with the Plan: a Slot that
 	// is retried must not change wire format between attempts.
@@ -1416,6 +1467,7 @@ func buildCandidate(ctx context.Context, planner PrimaryQueryCompiler, source So
 		ScheduleSpec: compiled.ScheduleSpec, ScheduleRevision: compiled.ScheduleRevision,
 		NoDataSuspended:      compiled.NoDataSuspended,
 		RequirementTemplates: compiledInputs.requirements, QueryPlans: compiledInputs.queryPlans,
+		DataUnitFacts: compiled.DataUnitFacts,
 	}
 	candidate.dispositions = append(candidate.dispositions, dispositions...)
 	if priorityIgnored {
@@ -1554,14 +1606,6 @@ func legacyPriorityApplies(legacy legacyStrategy) bool {
 	return value != "" && value != "null" && legacy.PriorityGroupKey != ""
 }
 
-// itemUnit is the item's data unit, derived the way Python derives it: the
-// first non-empty unit among the item's query configs.
-//
-// Python builds the same value with list(set(...))[0] over the non-empty ones,
-// which is unordered when the configs disagree. This takes the first in the
-// stored order instead, so one document always compiles to one Plan. The
-// disagreement itself is not refused here -- Python does not refuse it, and a
-// new refusal would take strategies out that run today.
 // itemDataTypes is the data_type_label of every query config of one item, in
 // the stored order, including the empty ones.
 //
@@ -1576,21 +1620,6 @@ func itemDataTypes(item legacyItem) []string {
 		labels = append(labels, config.DataTypeLabel)
 	}
 	return labels
-}
-
-func itemUnit(item legacyItem) string {
-	for _, raw := range item.QueryConfigs {
-		var config struct {
-			Unit string `json:"unit"`
-		}
-		if err := json.Unmarshal(raw, &config); err != nil {
-			continue
-		}
-		if config.Unit != "" {
-			return config.Unit
-		}
-	}
-	return ""
 }
 
 func primaryQueryContract(item legacyItem) (string, []string) {
@@ -1703,7 +1732,19 @@ type legacyItem struct {
 	Expression     string            `json:"expression"`
 	Functions      []json.RawMessage `json:"functions"`
 	QueryConfigs   []json.RawMessage `json:"query_configs"`
-	Algorithms     []legacyAlgorithm `json:"algorithms"`
+	// QueryOutputConfig is the item's named outputs (namedOutputsOf). Raw
+	// and omitted when absent, for the same reason as DetectInterval: a
+	// field that encoded itself when absent would move the revision of every
+	// strategy taken from a digest of this struct.
+	QueryOutputConfig json.RawMessage   `json:"query_output_config,omitempty"`
+	Algorithms        []legacyAlgorithm `json:"algorithms"`
+	// ExpressionUnit is the unit the item's expression declares for its own
+	// result (unitOfDetectedExpression). A pointer and omitted when absent:
+	// absent and declared-empty mean different things -- no declaration falls
+	// back to the query's unit, a declared empty unit says there is none -- and
+	// a field that encoded itself when absent would move the revision of every
+	// strategy taken from a digest of this struct.
+	ExpressionUnit *string `json:"expression_unit,omitempty"`
 	// Unit is deliberately absent from this struct. The strategy cache has no
 	// unit on an item: Python's Item.unit is a derived property that walks
 	// query_configs and takes the first non-empty one, so reading a "unit" key
@@ -1715,7 +1756,7 @@ type legacyItem struct {
 	// behind that one missing key, none of them evaluating at all, and the
 	// only symptom was a count of withheld objects that named no field.
 	//
-	// Read it with itemUnit.
+	// Read it with unitOfDetectedExpression.
 	// Target is the strategy's monitoring scope. It was silently ignored here
 	// until 2026-09-09, which is how alarmd came to alert on hosts outside
 	// every scoped strategy's target while Python filtered them out.
@@ -1788,9 +1829,14 @@ type legacyNoDataConfig struct {
 	AggDimension []json.RawMessage `json:"agg_dimension"`
 	Level        json.RawMessage   `json:"level"`
 	// TrackingHorizonSeconds is this item's own horizon, overriding the
-	// deployment's. Absent means the deployment's applies; a stated zero is an
-	// opt-out and is not the same as absent.
+	// deployment's: a positive whole number of seconds. Absent (or null)
+	// means the deployment's applies; a stated zero or less is refused as
+	// NO_DATA_CONFIG_INVALID, not taken as an opt-out (legacyNoDataHorizon,
+	// and why in the compiler's note on the effective horizon).
 	TrackingHorizonSeconds json.RawMessage `json:"tracking_horizon_seconds"`
+	// MaxGroups is this item's own bound on its no-data groups, overriding the
+	// deployment's. Absent means the deployment's applies.
+	MaxGroups json.RawMessage `json:"max_groups"`
 }
 
 // legacyNoDataEnabled reads is_enabled the way the backend's truthiness test
@@ -1907,6 +1953,32 @@ func legacyNoDataHorizon(raw json.RawMessage) (int64, bool, error) {
 	return value, true, nil
 }
 
+// legacyNoDataMaxGroups reads an item's max_groups the way legacyNoDataHorizon
+// reads its horizon: absent or null is not stated; a positive whole number,
+// written as a JSON integer or as text holding one, up to the ceiling, is the
+// item's bound; anything else is refused by name for this item alone.
+func legacyNoDataMaxGroups(raw json.RawMessage) (uint32, bool, error) {
+	text := strings.TrimSpace(string(raw))
+	if text == "" || text == "null" {
+		return 0, false, nil
+	}
+	if quoted, err := strconv.Unquote(text); err == nil {
+		text = strings.TrimSpace(quoted)
+		if text == "" {
+			return 0, false, nil
+		}
+	}
+	value, err := strconv.ParseInt(text, 10, 64)
+	if err != nil || value <= 0 {
+		return 0, false, fmt.Errorf("no_data_config max_groups %s must be a positive whole number written as a JSON "+
+			"integer; remove the field to inherit the platform's", text)
+	}
+	if value > contract.MaxNoDataGroupsCeiling {
+		return 0, false, fmt.Errorf("no_data_config max_groups %s is past the ceiling %d", text, contract.MaxNoDataGroupsCeiling)
+	}
+	return uint32(value), true, nil
+}
+
 // defaultNoDataLevel is the backend's read-side default for a level the item
 // omits: mixins/nodata.py reads .get("level", NO_DATA_LEVEL). continuous has no
 // counterpart here on purpose - the same dict literal that defaults level
@@ -2009,6 +2081,13 @@ func frozenNoDataConfig(item legacyItem, policy NoDataPolicy) (*contract.NoDataC
 		// know whose it is.
 		config.TrackingHorizonSeconds = horizon
 		config.TrackingHorizonSource = contract.NoDataHorizonSourceStrategy
+	}
+	maxGroups, statedGroups, err := legacyNoDataMaxGroups(source.MaxGroups)
+	if err != nil {
+		return nil, fmt.Errorf("alarmd controlplane: item %d %w", item.ID, err)
+	}
+	if statedGroups {
+		config.MaxGroups = maxGroups
 	}
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("alarmd controlplane: item %d no_data_config: %w", item.ID, err)
@@ -2143,6 +2222,25 @@ func legacyTriggerNumber(field string, raw json.RawMessage) (uint32, string) {
 	return uint32(value), ""
 }
 
+// noDataRecoveryDisabled is whether an item's no-data alert is written not to
+// recover: as the detect at its level says (legacyRecoveryDisabled), or, with
+// no detect at that level, as every detect says - the strategy page writes
+// one switch onto every detect of an item, and an alert at a level the item
+// declares nothing for follows that switch only where it is unanimous.
+func noDataRecoveryDisabled(detects []legacyDetect, level uint32) bool {
+	for _, detect := range detects {
+		if detect.Level == level {
+			return legacyRecoveryDisabled(detect.Recovery)
+		}
+	}
+	for _, detect := range detects {
+		if !legacyRecoveryDisabled(detect.Recovery) {
+			return false
+		}
+	}
+	return len(detects) > 0
+}
+
 // legacyRecoveryWindow is one detect's recovery check_window as
 // get_recovery_configs reads it: int(detect["recovery_config"]["check_window"])
 // (strategy.py:379-392). Not readable when that raises - the section absent,
@@ -2269,10 +2367,13 @@ func compileTargetPlanDocument(source SourceStrategy) compiledTargetPlan {
 type compiledPlanInputs struct {
 	missingHistoryAsZero bool
 	primary              execution.QueryPlanFacts
-	osRestartHistory     *execution.QueryPlanFacts
-	requirements         []execution.DataRequirementTemplate
-	queryPlans           map[execution.LogicalQueryRef]execution.QueryPlanFacts
-	seenRequirements     map[execution.RequirementID]struct{}
+	// aggMethodFallbacks are the agg_method fallbacks compiling primary ran,
+	// each noted on the Plan.
+	aggMethodFallbacks []aggMethodFallback
+	osRestartHistory   *execution.QueryPlanFacts
+	requirements       []execution.DataRequirementTemplate
+	queryPlans         map[execution.LogicalQueryRef]execution.QueryPlanFacts
+	seenRequirements   map[execution.RequirementID]struct{}
 }
 
 // frozenSubjectFacts freezes the strategy facts the subject projection reads
@@ -2347,10 +2448,22 @@ func compilePlan(
 			return contract.EvaluationPlanV2{}, planCompileFacts{}, nil, errors.New("alarmd controlplane: invalid strategy_revision")
 		}
 	}
-	unit := itemUnit(item)
+	// Every rule of an item detects its one expression today, so the item's
+	// expression is the one asked about.
+	expressionUnit := unitOfDetectedExpression(item, item.Expression)
+	unit := expressionUnit.projectionUnit()
+	var rawLevels []DataUnitRawLevel
 	dimensionFields := append([]string(nil), dataset.IdentityFields...)
 	if itemHasAlgorithm(item, strategy.DetectorKindProcPort) {
 		dimensionFields = []string{"bind_ip", "listen", "nonlisten", "not_accurate_listen", "protocol"}
+	}
+	// A global business PromQL Plan's records carry the labels its outermost
+	// aggregation groups by, and those are what its business is read from
+	// (admission.AttributeBusiness): bk_biz_id, else the cluster and
+	// namespace, else the Plan's own business. Ordinary PromQL Plans keep the
+	// empty list they had.
+	if identity.GlobalBusiness && inputs != nil && inputs.primary.PromQL != nil && len(dimensionFields) == 0 {
+		dimensionFields = promQLOutputGrouping(inputs.primary.PromQL.Expression)
 	}
 	projection := contract.InputProjectionV2{DynamicDimensions: dataset.DynamicDimensions, ValueFields: []string{"value"}, DimensionFields: dimensionFields, BusinessIdentityField: "bk_biz_id", MultiValueAlignment: "SINGLE_VALUE", DataUnit: unit, MissingValuePolicy: contract.MissingValuePolicyRequired}
 	detectByLevel := make(map[uint32]legacyDetect, len(source.Detects))
@@ -2384,14 +2497,24 @@ func compilePlan(
 			Reason: ReasonAggIntervalDefaulted, FieldPath: "items[0].query_configs[*].agg_interval",
 			Detail: fmt.Sprintf("agg_interval=%d", pythonDefaultAggInterval)})
 	}
+	for _, fallback := range inputs.aggMethodFallbacks {
+		dispositions = append(dispositions, ObjectDisposition{SourceID: sourceID, Scope: "PLAN", Disposition: DispositionConfigNoted,
+			Reason: fallback.reason, FieldPath: "items[0].query_configs[*].agg_method",
+			Detail: dispositionDetail(fmt.Sprintf("agg_method %s compiled as %s", strconv.Quote(fallback.written), fallback.method))})
+	}
 	if warning := step.warningDisposition(sourceID, interval); warning != nil {
 		dispositions = append(dispositions, *warning)
 	}
 	// get_recovery_configs reads every detect's recovery, and one it cannot
 	// read raises for the whole strategy: the checker then takes its default
 	// for every level (recover.py:253-267). Found once, before the levels.
+	// A level whose owner turned recovery off has no window to read - the
+	// page hides it, and writes none for a new item - so it defaults nobody.
 	recoveryDefaulted, unreadableRecovery := false, uint32(0)
 	for _, detect := range source.Detects {
+		if legacyRecoveryDisabled(detect.Recovery) {
+			continue
+		}
 		if _, readable := legacyRecoveryWindow(detect.Recovery); !readable {
 			recoveryDefaulted, unreadableRecovery = true, detect.Level
 			break
@@ -2471,7 +2594,16 @@ func compilePlan(
 				invalid = true
 				break
 			}
-			config, err := compileAlgorithmConfig(raw, unit, levelID, projection, dataset.IdentityFields, interval, step.Seconds, &levelInputs)
+			algorithmUnit := unit
+			if algorithmReadsUnit(raw.Type) {
+				reading := readAlgorithmUnit(expressionUnit, raw.UnitPrefix)
+				if reading.note != "" && algorithmReadsPrefix(raw.Type) && !levelNoted(rawLevels, levelID, reading.note) {
+					dispositions = append(dispositions, unitNote(sourceID, levelID, expressionUnit, raw.UnitPrefix, reading.note))
+					rawLevels = append(rawLevels, DataUnitRawLevel{LevelID: levelID, Reason: reading.note, Unit: expressionUnit.unit, Prefix: raw.UnitPrefix})
+				}
+				raw.UnitPrefix, algorithmUnit = reading.prefix, reading.dataUnit
+			}
+			config, err := compileAlgorithmConfig(raw, algorithmUnit, levelID, projection, dataset.IdentityFields, interval, step.Seconds, &levelInputs)
 			if err != nil {
 				reason := "ALGORITHM_CONFIG_INVALID"
 				if raw.Type == strategy.DetectorKindThreshold {
@@ -2513,7 +2645,15 @@ func compilePlan(
 		// what this build should do with it is a rule difference awaiting
 		// product, registered in the trigger review of 2026-10-09, section 6.
 		recoveryWindows := uint32(legacyDefaultRecoveryWindows)
-		if written, readable := legacyRecoveryWindow(detect.Recovery); readable && !recoveryDefaulted {
+		disabled := legacyRecoveryDisabled(detect.Recovery)
+		if disabled {
+			// No window is read and none defaulted: a level that does not
+			// recover has none, and an ending or -nodata written beside the
+			// switch does not run either.
+			recoveryWindows = 0
+			dispositions = append(dispositions, ObjectDisposition{SourceID: sourceID, Scope: "LEVEL", LevelID: levelID, Disposition: DispositionConfigNoted,
+				Reason: ReasonRecoveryDisabledByConfig, FieldPath: "detects[*].recovery_config.disable_recovery"})
+		} else if written, readable := legacyRecoveryWindow(detect.Recovery); readable && !recoveryDefaulted {
 			if written < 1 {
 				dispositions = append(dispositions, ObjectDisposition{SourceID: sourceID, Scope: "LEVEL", LevelID: levelID, Disposition: DispositionConfigRejected, Reason: "RECOVERY_CONFIG_INVALID",
 					Detail: fmt.Sprintf("recovery_config.check_window is %d", written)})
@@ -2528,6 +2668,27 @@ func compilePlan(
 			dispositions = append(dispositions, ObjectDisposition{SourceID: sourceID, Scope: "LEVEL", LevelID: levelID, Disposition: DispositionConfigNoted,
 				Reason: ReasonRecoveryConfigDefaulted, FieldPath: "detects[*].recovery_config.check_window", Detail: detail})
 		}
+		// The status_setter of a level the checker reads its own recovery
+		// for; a strategy-wide default and a borrowed trigger take
+		// "recovery" with the default window, as the checker does.
+		recoveryFields := map[string]any{"enabled": !disabled}
+		if !recoveryDefaulted && !borrowed && !disabled {
+			setter := readLegacyRecoveryStatusSetter(detect.Recovery)
+			if setter.close && !setter.malformed {
+				recoveryFields["end"] = contract.RecoveryEndClose
+			}
+			if setter.noData && !setter.malformed {
+				recoveryFields["missing_data"] = contract.RecoveryMissingDataEvaluateAsZero
+			}
+			if setter.malformed {
+				recoveryWindows = uint32(legacyDefaultRecoveryWindows)
+				dispositions = append(dispositions, ObjectDisposition{SourceID: sourceID, Scope: "LEVEL", LevelID: levelID, Disposition: DispositionConfigNoted,
+					Reason: ReasonRecoveryConfigDefaulted, FieldPath: "detects[*].recovery_config.status_setter",
+					Detail: fmt.Sprintf("recovery_windows=%d; status_setter %s is not read", legacyDefaultRecoveryWindows,
+						strconv.Quote(boundedRecoveryStatusSetter(setter.written)))})
+			}
+			dispositions = append(dispositions, setter.notes(sourceID, levelID)...)
+		}
 		triggerFields := map[string]any{"required_anomalies": count, "step_seconds": step.Seconds, "window_size": window}
 		if len(detect.Trigger.Uptime) > 0 && string(detect.Trigger.Uptime) != "null" {
 			triggerFields["uptime"] = detect.Trigger.Uptime
@@ -2540,7 +2701,8 @@ func compilePlan(
 			}
 		}
 		trigger, _ := json.Marshal(triggerFields)
-		recovery, _ := json.Marshal(map[string]any{"consecutive_windows": recoveryWindows, "enabled": true})
+		recoveryFields["consecutive_windows"] = recoveryWindows
+		recovery, _ := json.Marshal(recoveryFields)
 		connector := contract.LevelConnectorAND
 		if strings.EqualFold(detect.Connector, "or") {
 			connector = contract.LevelConnectorOR
@@ -2577,6 +2739,9 @@ func compilePlan(
 	if err != nil {
 		suspended, noData = contract.ReasonNoDataConfigInvalid, nil
 	}
+	if noData != nil {
+		noData.RecoveryDisabled = noDataRecoveryDisabled(source.Detects, noData.Level)
+	}
 	plan.NoData = noData
 	if reason := noDataRosterUnsupported(targetScope, targetPlan, noData); suspended == "" && reason != "" {
 		// Decided here rather than every round. The expected set is a function
@@ -2593,9 +2758,20 @@ func compilePlan(
 	if warning := noDataTriggerBeyondHorizon(sourceID, plan.NoData, step.Seconds); warning != nil {
 		dispositions = append(dispositions, *warning)
 	}
+	if note := noDataGroupBoundAboveDefault(sourceID, plan.NoData); note != nil {
+		dispositions = append(dispositions, *note)
+	}
 	if ref.SnapshotRevision > 0 {
 		plan.OutputIdentity = &contract.MonitorOutputIdentity{DynamicDimensions: dataset.DynamicDimensions, DimensionFields: append([]string{}, dataset.IdentityFields...)}
 		plan.SubjectFacts = frozenSubjectFacts(source, item)
+		// Nil when the query configs cannot be read the way the platform
+		// compares them: the events carry no facts, and the edit close names
+		// their alerts facts_missing rather than deciding on a guess.
+		grouping := contract.StrategyGrouping{Fields: dataset.IdentityFields, Dynamic: dataset.DynamicDimensions, NoData: plan.NoData != nil}
+		if plan.NoData != nil {
+			grouping.NoDataFields = plan.NoData.AggDimension
+		}
+		plan.StrategyFacts, _ = contract.DeriveStrategyFactsV2(item.QueryConfigs, grouping)
 	}
 	scheduleSpec, refusal, err := planScheduleSpec(sourceID, plan, step.Seconds)
 	if err != nil {
@@ -2605,7 +2781,8 @@ func compilePlan(
 		return contract.EvaluationPlanV2{}, planCompileFacts{}, dispositions, err
 	}
 	schedule, err := execution.DerivePlanScheduleRevision(scheduleSpec)
-	return plan, planCompileFacts{ScheduleSpec: scheduleSpec, ScheduleRevision: schedule, NoDataSuspended: suspended},
+	return plan, planCompileFacts{ScheduleSpec: scheduleSpec, ScheduleRevision: schedule, NoDataSuspended: suspended,
+			DataUnitFacts: dataUnitFactsOf(expressionUnit, rawLevels)},
 		dispositions, err
 }
 
@@ -2686,7 +2863,7 @@ func compileAlgorithmConfig(
 		if err := json.Unmarshal(raw.Config, &parameters); err != nil {
 			return nil, err
 		}
-		offsets, err := strategy.TraditionalHistoryOffsets(raw.Type, parameters, step)
+		offsets, err := strategy.TraditionalHistoryOffsets(raw.Type, parameters, strategy.RingHistoryInterval(step, interval))
 		if err != nil {
 			return nil, err
 		}
@@ -2864,16 +3041,18 @@ func (inputs *compiledPlanInputs) buildRequirements(
 
 	switch kind {
 	case strategy.DetectorKindSimpleRingRatio:
+		previous := strategy.RingHistoryInterval(step, interval)
 		dependency, err := execution.BuildDataRequirementTemplate(execution.DataRequirementTemplate{
 			DatasetName: "previous", Role: execution.InputRoleAlgorithmDependency, ConsumerLevelID: levelID,
 			LogicalQueryRef: primaryRef,
-			// The previous point is the previous detection, a step back, read
-			// over a whole aggregation window.
-			RelativeWindow: execution.RelativeQueryWindow{StartOffsetSeconds: -inputs.primary.QueryDelaySeconds - step - interval, EndOffsetSeconds: -inputs.primary.QueryDelaySeconds - step, HalfOpen: true},
+			// The previous point is the previous aggregation window, or the
+			// previous detection when that is further back, read over a
+			// whole aggregation window.
+			RelativeWindow: execution.RelativeQueryWindow{StartOffsetSeconds: -inputs.primary.QueryDelaySeconds - previous - interval, EndOffsetSeconds: -inputs.primary.QueryDelaySeconds - previous, HalfOpen: true},
 			StepMillis:     inputs.primary.StepMillis, AlignmentMillis: inputs.primary.AlignmentMillis,
 			ResultWindowPolicy: execution.ResultWindowExactHalfOpen, ReadinessClass: execution.ReadinessFinalizedRequired,
-			InputProjection: projection, PointOffsetsSeconds: []int64{step},
-			NamedPoints: []execution.NamedInputPoint{{Name: "previous", OffsetSeconds: step}},
+			InputProjection: projection, PointOffsetsSeconds: []int64{previous},
+			NamedPoints: []execution.NamedInputPoint{{Name: "previous", OffsetSeconds: previous}},
 		})
 		if err != nil {
 			return nil, err
@@ -2885,16 +3064,19 @@ func (inputs *compiledPlanInputs) buildRequirements(
 			return nil, errors.New("alarmd controlplane: OsRestart history query facts are missing")
 		}
 		historyRef := execution.LogicalQueryRef(inputs.osRestartHistory.QueryRevision)
+		// The window starts at the farthest point, so each point sits its
+		// distance from the farthest after the start (osRestartHistoryOnGrid).
+		offsets := strategy.OsRestartHistoryOffsets(step, interval)
 		dependency, err := execution.BuildDataRequirementTemplate(execution.DataRequirementTemplate{
 			DatasetName: "uptime_history", Role: execution.InputRoleAlgorithmDependency, ConsumerLevelID: levelID,
 			LogicalQueryRef: historyRef,
-			RelativeWindow:  execution.RelativeQueryWindow{StartOffsetSeconds: -inputs.primary.QueryDelaySeconds - (1500 + interval), EndOffsetSeconds: -inputs.primary.QueryDelaySeconds, HalfOpen: true},
+			RelativeWindow:  execution.RelativeQueryWindow{StartOffsetSeconds: -inputs.primary.QueryDelaySeconds - (offsets[2] + interval), EndOffsetSeconds: -inputs.primary.QueryDelaySeconds, HalfOpen: true},
 			StepMillis:      inputs.osRestartHistory.StepMillis, AlignmentMillis: inputs.osRestartHistory.AlignmentMillis,
 			ResultWindowPolicy: execution.ResultWindowExactHalfOpen, ReadinessClass: execution.ReadinessFinalizedRequired,
-			InputProjection: projection, PointOffsetsSeconds: []int64{step, 600, 1500},
+			InputProjection: projection, PointOffsetsSeconds: offsets,
 			NamedPoints: []execution.NamedInputPoint{
-				{Name: "previous", OffsetSeconds: step}, {Name: "previous_10m", OffsetSeconds: 600},
-				{Name: "previous_25m", OffsetSeconds: 1500},
+				{Name: "previous", OffsetSeconds: offsets[0]}, {Name: "previous_10m", OffsetSeconds: offsets[1]},
+				{Name: "previous_25m", OffsetSeconds: offsets[2]},
 			},
 		})
 		if err != nil {

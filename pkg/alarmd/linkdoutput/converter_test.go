@@ -141,7 +141,6 @@ func TestAnAbnormalDecisionIsWrittenAsAStandardEvent(t *testing.T) {
 		"evaluations":  `[{"severity":"warning","action":"triggered","action_reason":""}]`,
 		// Whole, with the target identity still in it.
 		"dimensions":  `{"bk_target_cloud_id":"0","bk_target_ip":"127.0.0.1","device":"sda"}`,
-		"subject":     `{"system":"cmdb","type":"host","id":"127.0.0.1|0"}`,
 		"occurred_at": `"2025-09-01T00:00:00Z"`,
 		"produced_at": `"2025-09-01T00:01:00Z"`,
 		"labels":      `{"strategy_id":123,"strategy_version":7,"bk_biz_id":2}`,
@@ -153,6 +152,10 @@ func TestAnAbnormalDecisionIsWrittenAsAStandardEvent(t *testing.T) {
 	// ones: the consumer does not read a top-level severity or action any
 	// more, and a message carrying both shapes would be read as whichever
 	// the reader happened to look at.
+	// A host placed by address and cloud has no host id to name: the consumer
+	// resolves it from the dimensions above, and a cmdb/host subject of
+	// "127.0.0.1|0" would be refused there as an invalid id.
+	assertAbsent(t, message, "subject")
 	assertAbsent(t, message, "severity", "action", "action_reason", "data_time", "occurred_time",
 		"observation", "strategy", "extra", "record_id", "received_at", "alarm_source_id")
 }
@@ -172,6 +175,82 @@ func TestARecoveryDecisionIsWrittenAsAStandardEvent(t *testing.T) {
 		"occurred_at": `"2025-09-01T00:00:00Z"`,
 		"produced_at": `"2025-09-01T00:06:00Z"`,
 	})
+}
+
+// A level written to end its alert closed recovers as closed, with the
+// platform's reason for it, in the evaluation, the title and the sink's
+// action; a level beside it written to recover still says resolved.
+func TestARecoveryWrittenToCloseIsWrittenClosed(t *testing.T) {
+	event := decision(func(event *contract.TriggerEventV1) {
+		event.EventKind = contract.TriggerEventRecovery
+		event.LevelResults[0].Result = contract.LevelResultRecovery
+		event.LevelResults[0].DecisionWindow.Recovery.End = contract.RecoveryEndClose
+		event.LevelResults = append(event.LevelResults, contract.LevelResultV1{LevelID: 1, Result: contract.LevelResultRecovery})
+	})
+	converter, err := NewConverter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	converted, err := converter.Convert(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if converted.Action != ActionClosed {
+		t.Fatalf("sink action = %q, want closed", converted.Action)
+	}
+	message := map[string]json.RawMessage{}
+	if err := json.Unmarshal(converted.Payload, &message); err != nil {
+		t.Fatal(err)
+	}
+	assertFields(t, message, map[string]string{
+		"evaluations": `[{"severity":"warning","action":"closed","action_reason":"recovery_close"},` +
+			`{"severity":"critical","action":"resolved","action_reason":""}]`,
+		"title": `"Strategy 123 level 2 closed"`,
+	})
+}
+
+// A level that no data ended says so in the platform's own words, recovered
+// or closed as it was written, not with the window line of an ordinary
+// recovery.
+func TestARecoveryNoDataEndedSaysSo(t *testing.T) {
+	for end, want := range map[string]string{"": `"在恢复检测周期内无数据上报，告警已恢复"`, contract.RecoveryEndClose: `"在恢复检测周期内无数据上报，告警已关闭"`} {
+		message := convert(t, decision(func(event *contract.TriggerEventV1) {
+			event.EventKind = contract.TriggerEventRecovery
+			event.LevelResults[0].Result = contract.LevelResultRecovery
+			event.LevelResults[0].DecisionWindow.Recovery.EndedBy = contract.RecoveryEndedByNoData
+			event.LevelResults[0].DecisionWindow.Recovery.End = end
+		}))
+		if string(message["content"]) != want {
+			t.Fatalf("end %q: content = %s, want %s", end, message["content"], want)
+		}
+	}
+	ordinary := convert(t, decision(func(event *contract.TriggerEventV1) {
+		event.EventKind = contract.TriggerEventRecovery
+		event.LevelResults[0].Result = contract.LevelResultRecovery
+	}))
+	if strings.Contains(string(ordinary["content"]), "无数据上报") {
+		t.Fatalf("an ordinary recovery said no data ended it: %s", ordinary["content"])
+	}
+}
+
+// An absent series' RECOVERY no data ended: the platform's no-data words, no
+// value, resolved as it was written.
+func TestAnAbsentSeriesNoDataEndIsWrittenWithNoValue(t *testing.T) {
+	message := convert(t, decision(func(event *contract.TriggerEventV1) {
+		event.EventKind = contract.TriggerEventRecovery
+		event.RecordRef.Absent = true
+		event.Observed.Values = map[string]json.RawMessage{}
+		event.LevelResults[0].Result = contract.LevelResultRecovery
+		event.LevelResults[0].DetectEvidence = nil
+		event.LevelResults[0].DecisionWindow.Recovery.EndedBy = contract.RecoveryEndedByNoData
+	}))
+	assertFields(t, message, map[string]string{
+		"evaluations": `[{"severity":"warning","action":"resolved","action_reason":""}]`,
+		"content":     `"在恢复检测周期内无数据上报，告警已恢复"`,
+	})
+	if _, valued := message["values"]; valued {
+		t.Fatalf("an absent series' end carries values: %s", message["values"])
+	}
 }
 
 // Every decided level is written and every undecided one is left out. The
@@ -507,8 +586,12 @@ func TestEverySubjectTypeTheProjectionProducesHasAConsumerSpelling(t *testing.T)
 		if !known || naming.System == "" || naming.Type == "" {
 			t.Fatalf("subject type %q has no consumer spelling", kind)
 		}
-		subject := wireSubjectFor(contract.MonitorSubject{Type: kind, ID: "x"})
-		if subject == nil || subject.System != naming.System || subject.Type != naming.Type || subject.ID != "x" {
+		id := "x"
+		if kind == contract.MonitorSubjectHost {
+			id = "42"
+		}
+		subject := wireSubjectFor(contract.MonitorSubject{Type: kind, ID: id})
+		if subject == nil || subject.System != naming.System || subject.Type != naming.Type || subject.ID != id {
 			t.Fatalf("subject type %q written as %+v", kind, subject)
 		}
 	}
@@ -551,6 +634,59 @@ func TestAnUnnamedSignalTypeIsOmittedRatherThanGuessed(t *testing.T) {
 	}
 }
 
+// The strategy facts are written as the Plan froze them, under
+// extra_data.strategy_facts; an event without them writes none.
+func TestTheStrategyFactsAreWrittenInExtraData(t *testing.T) {
+	facts := contract.StrategyFactsV2{Schema: "v2", MetricDigest: "3815df5a36678b1d738aa6f9a1522549", ConditionMD5: "92811130e44a4e5eb434d4dd5acbfdaa",
+		ConditionBasis: "snapshot_user"}
+	message := convert(t, decision(func(e *contract.TriggerEventV1) { e.StrategyFacts = &facts }))
+	var extra map[string]json.RawMessage
+	if err := json.Unmarshal(message["extra_data"], &extra); err != nil {
+		t.Fatal(err)
+	}
+	want := `{"schema":"v2","metric_digest":"3815df5a36678b1d738aa6f9a1522549","condition_md5":"92811130e44a4e5eb434d4dd5acbfdaa","condition_basis":"snapshot_user"}`
+	if string(extra["strategy_facts"]) != want {
+		t.Fatalf("extra_data.strategy_facts = %s, want %s", extra["strategy_facts"], want)
+	}
+	bare := convert(t, decision(nil))
+	var bareExtra map[string]json.RawMessage
+	if err := json.Unmarshal(bare["extra_data"], &bareExtra); err != nil {
+		t.Fatal(err)
+	}
+	if _, written := bareExtra["strategy_facts"]; written {
+		t.Fatalf("extra_data = %v, want no strategy facts on an event without them", bareExtra)
+	}
+}
+
+// An event writes the grouping of its own series: the Plan's for a
+// threshold event, the no-data one for a no-data event, and never both.
+func TestAnEventWritesTheGroupingOfItsOwnSeries(t *testing.T) {
+	facts := contract.StrategyFactsV2{Schema: "v2", MetricDigest: "m", ConditionMD5: "c", ConditionBasis: "query",
+		DimensionDigest: "threshold", NoDataDimensionDigest: "no-data"}
+	for _, noData := range []bool{false, true} {
+		message := convert(t, decision(func(e *contract.TriggerEventV1) {
+			e.StrategyFacts = &facts
+			if noData {
+				e.RecordRef.Dimensions[contract.NoDataDimensionTag] = json.RawMessage("true")
+				e.Observed = contract.TriggerObservedV1{Values: map[string]json.RawMessage{contract.NoDataPeriodFactField: json.RawMessage("5")}}
+			}
+		}))
+		var extra struct {
+			StrategyFacts map[string]string `json:"strategy_facts"`
+		}
+		if err := json.Unmarshal(message["extra_data"], &extra); err != nil {
+			t.Fatal(err)
+		}
+		want := "threshold"
+		if noData {
+			want = "no-data"
+		}
+		if extra.StrategyFacts["dimension_digest"] != want || len(extra.StrategyFacts) != 5 {
+			t.Fatalf("no-data %v: strategy_facts = %v, want dimension_digest %s and no other grouping", noData, extra.StrategyFacts, want)
+		}
+	}
+}
+
 // A decision over several values has no single observed value; none is
 // written rather than one picked.
 func TestSeveralObservedValuesWriteNoValue(t *testing.T) {
@@ -560,6 +696,26 @@ func TestSeveralObservedValuesWriteNoValue(t *testing.T) {
 	assertAbsent(t, message, "values")
 	if !strings.Contains(string(message["content"]), "other=1%") {
 		t.Fatalf("content = %s, want every value stated", message["content"])
+	}
+}
+
+// The observed value goes out as the record wrote it: 2^53+1 has no float64,
+// and read through one it would come out as 2^53. A value that is not a
+// finite number token is still no value.
+func TestTheObservedValueIsWrittenAsCarried(t *testing.T) {
+	for _, written := range []string{`9007199254740993`, `0.1000000000000000055511151231257827`, `-1.5e-7`} {
+		message := convert(t, decision(func(e *contract.TriggerEventV1) {
+			e.Observed.Values = map[string]json.RawMessage{"value": json.RawMessage(written)}
+		}))
+		if got, want := string(message["values"]), `{"value":`+written+`}`; got != want {
+			t.Fatalf("values = %s, want %s", got, want)
+		}
+	}
+	for _, refused := range []string{`1e999`, `"5"`, `null`, `true`} {
+		message := convert(t, decision(func(e *contract.TriggerEventV1) {
+			e.Observed.Values = map[string]json.RawMessage{"value": json.RawMessage(refused)}
+		}))
+		assertAbsent(t, message, "values")
 	}
 }
 
@@ -579,4 +735,26 @@ func TestADecisionWithNoAlertIdentityIsRefused(t *testing.T) {
 			t.Fatalf("%s: Convert() accepted a decision it cannot write", name)
 		}
 	}
+}
+
+// The consumer reads a cmdb/host subject as a host id and refuses anything
+// else as an invalid id, before it would look at the address and cloud in the
+// dimensions. So a host is a subject only by its id; placed by address and
+// cloud, it is not one, and the dimensions it is still carried in name it.
+func TestAHostIsASubjectOnlyByItsHostID(t *testing.T) {
+	for id, want := range map[string]bool{
+		"42": true, "1": true,
+		"127.0.0.1|0": false, "127.0.0.1": false, "0": false, "-1": false, "042": false, "4x": false,
+		"+42": false, "9223372036854775807": true, "9223372036854775808": false,
+	} {
+		subject := wireSubjectFor(contract.MonitorSubject{Type: contract.MonitorSubjectHost, ID: id})
+		if (subject != nil) != want {
+			t.Errorf("host id %q: subject %+v, want present %v", id, subject, want)
+		}
+	}
+	message := convert(t, decision(func(e *contract.TriggerEventV1) {
+		e.RecordRef.Dimensions["bk_host_id"] = json.RawMessage(`42`)
+		e.Subject.Subject = contract.MonitorSubject{Type: contract.MonitorSubjectHost, ID: "42"}
+	}))
+	assertFields(t, message, map[string]string{"subject": `{"system":"cmdb","type":"host","id":"42"}`})
 }

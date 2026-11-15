@@ -166,10 +166,7 @@ func TestLoadRejectsLegacyAndPhaseTwoFields(t *testing.T) {
 		"state CAS":     {contents: "state_cas: true\n", field: "state_cas"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := LoadWithRoles(writeConfig(t, testCase.contents), nil)
-			if err == nil || !strings.Contains(err.Error(), testCase.field) {
-				t.Fatalf("LoadWithRoles(, nil) error = %v, want strict rejection of %q", err, testCase.field)
-			}
+			requireIgnored(t, unknownKeysOf(t, testCase.contents), testCase.field)
 		})
 	}
 }
@@ -255,16 +252,41 @@ func TestTheDynamicGroupKeyPrefixIsAbsentOrSpelledAsTheWriterSpellsIt(t *testing
 
 // The top-level mode key is retired: shadow was its only value and the
 // process never behaved differently for it. A deployment that still writes it
-// is told so at load rather than having the key silently ignored.
-func TestLoadRejectsRetiredModeKey(t *testing.T) {
+// loads, and is told the key was ignored rather than having it vanish silently.
+func TestLoadIgnoresAndNamesRetiredModeKey(t *testing.T) {
 	for _, mode := range []string{"shadow", "owner"} {
 		t.Run(mode, func(t *testing.T) {
-			_, err := LoadWithRoles(writeConfig(t, "mode: "+mode+"\n"), nil)
-			if err == nil || !strings.Contains(err.Error(), "mode") {
-				t.Fatalf("LoadWithRoles(, nil) error = %v, want retired key rejection", err)
-			}
+			requireIgnored(t, unknownKeysOf(t, "mode: "+mode+"\n"), "mode")
 		})
 	}
+}
+
+// unknownKeysOf decodes contents onto the defaults, as Load does before it
+// validates, and returns the keys it ignored.
+func unknownKeysOf(t *testing.T, contents string) []string {
+	t.Helper()
+	cfg := Default()
+	if err := decodeDocument([]byte(contents), &cfg); err != nil {
+		t.Fatalf("decode %q: %v", contents, err)
+	}
+	return cfg.UnknownKeys
+}
+
+// requireIgnored fails unless keys names name as ignored.
+func requireIgnored(t *testing.T, keys []string, name string) {
+	t.Helper()
+	if !unknownKeyNamed(keys, name) {
+		t.Fatalf("ignored keys %q do not name %s", keys, name)
+	}
+}
+
+func unknownKeyNamed(keys []string, name string) bool {
+	for _, key := range keys {
+		if strings.Contains(key, "field "+name+" not found") {
+			return true
+		}
+	}
+	return false
 }
 
 func TestLoadRejectsInvalidHTTPAndTimeout(t *testing.T) {
@@ -314,9 +336,10 @@ func withCompatibilityServiceRedis(cfg *Config, address string) {
 	}
 }
 
-// A key kept "for one release" is gone once retired: decoding is strict, so
-// values that still carry one refuse to load, and the refusal names it.
-func TestRetiredKeysAreRefusedByName(t *testing.T) {
+// A key kept "for one release" is gone once retired. Values that still carry
+// one load, the key is ignored, and the load names it: an image is never kept
+// from starting by a key it no longer reads, so chart and image need no order.
+func TestRetiredKeysAreIgnoredAndNamed(t *testing.T) {
 	for _, retired := range []struct{ yaml, name string }{
 		{"phase_two:\n  control:\n    legacy_query_runtime:\n      access_bk_data: true\n", "legacy_query_runtime"},
 		{"phase_two:\n  access:\n    host_disable_monitor_states: [a]\n", "host_disable_monitor_states"},
@@ -329,8 +352,10 @@ func TestRetiredKeysAreRefusedByName(t *testing.T) {
 		{"kafka:\n  initial_offset: \"\"\n", "initial_offset"},
 		{"limits:\n  reader:\n    max_envelope_bytes: 1\n", "reader"},
 		{"phase_two:\n  linkd:\n    absent_close_send: true\n", "absent_close_send"},
-		// The link's coordinates come from its Console; values keep only the
-		// Console's address and credentials.
+		// The link is reached only by its control plane: no sets, no Console.
+		{"phase_two:\n  linkd:\n    console_url: https://console.example.test/api\n", "console_url"},
+		{"phase_two:\n  linkd:\n    username: reader\n", "username"},
+		{"phase_two:\n  linkd:\n    password_file: /secret\n", "password_file"},
 		{"phase_two:\n  linkd:\n    connection:\n      address: stated:6379\n", "connection"},
 		{"phase_two:\n  linkd:\n    key_prefix: stated\n", "key_prefix"},
 		{"phase_two:\n  linkd:\n    event_source_id: \"42\"\n", "event_source_id"},
@@ -344,10 +369,45 @@ func TestRetiredKeysAreRefusedByName(t *testing.T) {
 		{"phase_two:\n  scheduler:\n    maxreplayage: 1h\n", "maxreplayage"},
 		{"phase_two:\n  scheduler:\n    processquerypermits: 999\n", "processquerypermits"},
 	} {
-		_, err := LoadWithRoles(writeConfig(t, retired.yaml), nil)
-		if err == nil || !strings.Contains(err.Error(), "field "+retired.name+" not found") {
-			t.Errorf("values carrying %s loaded with %v, want it refused by name", retired.name, err)
-		}
+		requireIgnored(t, unknownKeysOf(t, retired.yaml), retired.name)
+	}
+}
+
+// A complete file carrying a retired key loads through Load, the whole path a
+// process takes, and reports the key.
+func TestAWholeFileWithARetiredKeyLoads(t *testing.T) {
+	cfg, err := LoadWithRoles(writeConfig(t, validGoAccessRuntimeConfigYAML("worker")+"mode: shadow\n"), nil)
+	if err != nil {
+		t.Fatalf("LoadWithRoles: %v", err)
+	}
+	requireIgnored(t, cfg.UnknownKeys, "mode")
+}
+
+// Ignoring a key does not ignore the rest of its document: a known key beside
+// it is still read.
+func TestAKnownKeyBesideAnUnknownOneIsStillRead(t *testing.T) {
+	cfg := Default()
+	if err := decodeDocument([]byte("http:\n  listen: 127.0.0.1:9090\n  retired_somewhere: true\n"), &cfg); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if cfg.HTTP.Listen != "127.0.0.1:9090" {
+		t.Fatalf("http.listen = %q, want the known key read beside the unknown one", cfg.HTTP.Listen)
+	}
+	if len(cfg.UnknownKeys) != 1 || !unknownKeyNamed(cfg.UnknownKeys, "retired_somewhere") {
+		t.Fatalf("unknown keys = %q, want exactly retired_somewhere", cfg.UnknownKeys)
+	}
+}
+
+// A value of the wrong type is still a refusal, also when an unknown key is
+// beside it: only an unread key is forgiven, never a misread one.
+func TestAWrongTypeIsStillRefusedBesideAnUnknownKey(t *testing.T) {
+	cfg := Default()
+	err := decodeDocument([]byte("http:\n  listen: [1]\nretired_somewhere: true\n"), &cfg)
+	if err == nil {
+		t.Fatal("a sequence for an address loaded")
+	}
+	if strings.Contains(err.Error(), "retired_somewhere") {
+		t.Fatalf("refusal %q names the ignored key as an error", err)
 	}
 }
 
@@ -366,12 +426,36 @@ func validGoAccessConfigObject() Config {
 	cfg.PhaseTwo.Control.Timezone = "Asia/Shanghai"
 	cfg.PhaseTwo.Access.UQEndpoint = "http://unify-query.service"
 	cfg.PhaseTwo.Access.QuerySource = "alarmd"
+	withLinkdControlPlane(&cfg)
 	return cfg
+}
+
+// linkdControlPlaneYAML is the link's control plane every business fixture
+// states, under phase_two: the fixtures are a deployment that sends its
+// alerts to the link, and a stated link does not load without its plane
+// (ErrLinkdControlPlaneRequired). writeConfig puts
+// a secret file where linkdJWTSecretFilePlaceholder stands.
+const linkdControlPlaneYAML = "  linkd:\n    control_plane:\n      url: http://192.0.2.10:8090\n      jwt_secret_file: " +
+	linkdJWTSecretFilePlaceholder + "\n"
+
+const linkdJWTSecretFilePlaceholder = "/linkd-jwt-secret-file-placeholder"
+
+// withLinkdControlPlane states the link's control plane on a fixture
+// object, as a loaded secret file leaves it.
+func withLinkdControlPlane(cfg *Config) {
+	cfg.PhaseTwo.Linkd.ControlPlane = LinkdControlPlaneConfig{URL: "http://192.0.2.10:8090", JWTSecret: "example-secret"}
 }
 
 func writeConfig(t *testing.T, contents string) string {
 	t.Helper()
 
+	if strings.Contains(contents, linkdJWTSecretFilePlaceholder) {
+		secret := filepath.Join(t.TempDir(), "linkd-jwt-secret")
+		if err := os.WriteFile(secret, []byte("example-secret\n"), 0o600); err != nil {
+			t.Fatalf("write the link's secret: %v", err)
+		}
+		contents = strings.ReplaceAll(contents, linkdJWTSecretFilePlaceholder, secret)
+	}
 	path := filepath.Join(t.TempDir(), "alarmd.yaml")
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -535,7 +619,7 @@ redis:
   db: 8
   state_prefix: alarmd:phase-two:g1:v1` + platformCache + `
 phase_two:
-  worker:
+` + linkdControlPlaneYAML + `  worker:
     id: alarmd-worker-0
   control:
     strategy_cache_prefix: alarm-config
@@ -579,12 +663,16 @@ func TestTheResolvedDestinationNamesCoordinatesAndNoCredentials(t *testing.T) {
 // keys stayed under the key it moved away from, so accepting it quietly would
 // write to the new instance with the old instance's shape.
 func TestTheRemovedRuntimeRedisKeyIsRefusedRatherThanIgnored(t *testing.T) {
-	_, err := LoadWithRoles(writeConfig(t, platformCacheConfigContents("")+`  runtime_redis:
+	cfg, err := LoadWithRoles(writeConfig(t, platformCacheConfigContents("")+`  runtime_redis:
     mode: standalone
     address: somewhere-else:6379
 `), nil)
-	if err == nil || !strings.Contains(err.Error(), "runtime_redis") {
-		t.Fatalf("LoadWithRoles(, nil) error = %v, want the removed key named", err)
+	if err != nil {
+		t.Fatalf("LoadWithRoles(, nil) error = %v, want the removed key ignored", err)
+	}
+	requireIgnored(t, cfg.UnknownKeys, "runtime_redis")
+	if strings.Contains(cfg.Redis.Address, "somewhere-else") {
+		t.Fatalf("the removed key was obeyed: runtime Redis %q", cfg.Redis.Address)
 	}
 }
 
@@ -662,5 +750,16 @@ func TestObservedNamespacesSplitsTheListTheChartRenders(t *testing.T) {
 	t.Setenv(ObserveNamespacesEnvironment, "")
 	if got := ObservedNamespaces(); len(got) != 0 {
 		t.Fatalf("unset list = %v, want none", got)
+	}
+}
+
+// The compiler's shape limits bound compile CPU, which the compile cache and
+// the trigger's compute cost already bound; they are generous, and a Plan
+// with a long IP list is not refused for its size.
+func TestCompilerLimitsAreGenerous(t *testing.T) {
+	c := Default().Limits.Compiler
+	if c.MaxAlgorithmsPerLevel != 64 || c.MaxGroupsPerAlgorithm != 256 || c.MaxConditionsPerAlgorithm != 1024 ||
+		c.MaxASTNodesPerLevel != 8192 || c.MaxPlanBytes != 2<<20 || c.MaxCompiledPlanBytes != 4<<20 {
+		t.Fatalf("compiler limits = %+v", c)
 	}
 }

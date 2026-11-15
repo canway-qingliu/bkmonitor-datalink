@@ -45,10 +45,13 @@ import (
 // Early read outcomes, closed: what became of each directed Slot's early
 // read. Every directed Slot comes to exactly one.
 const (
-	EarlyBeforeNext          = "before_next"
-	EarlyNothingLate         = "nothing_late"
-	EarlyRungFirst           = "rung_first"
-	EarlyMultiQuery          = "multi_query"
+	EarlyBeforeNext  = "before_next"
+	EarlyNothingLate = "nothing_late"
+	EarlyRungFirst   = "rung_first"
+	EarlyMultiQuery  = "multi_query"
+	// EarlyNamedOutputs is a Slot of a query with named outputs, which no
+	// supplement reads (UnobservedNamedOutputs).
+	EarlyNamedOutputs        = "named_outputs"
 	EarlyFirstReadIncomplete = "first_read_incomplete"
 	EarlyFirstReadRefused    = "first_read_refused"
 	EarlyOwnerLost           = "owner_lost"
@@ -62,6 +65,7 @@ const (
 	EarlyMemoryRefused       = "early_memory_refused"
 	EarlyFlightBusy          = "flight_busy"
 	EarlyContractExpired     = "contract_expired"
+	EarlyKeptReadAbsent      = "kept_read_absent"
 	EarlyFailed              = "failed"
 )
 
@@ -69,14 +73,16 @@ const (
 var EarlyOutcomes = []string{EarlyBeforeNext, EarlyNothingLate, EarlyRungFirst, EarlyMultiQuery, EarlyFirstReadIncomplete,
 	EarlyFirstReadRefused, EarlyOwnerLost, EarlyAnchorUnknown, EarlyOvertaken, EarlyOlderSlotPending, EarlyYielded,
 	EarlyPermitRefused, EarlyAnchorPassed, EarlyReadFailed, EarlyMemoryRefused, EarlyFlightBusy, EarlyContractExpired,
-	EarlyFailed}
+	EarlyKeptReadAbsent, EarlyFailed, EarlyNamedOutputs}
 
 // EarlyOutsideMechanism are the outcomes the early read's working is not
 // read by: a Slot it does not apply to, one it could not be anchored for,
-// or one read with nothing late. The rest are its attempts, before_next the
-// ones that worked.
+// one read with nothing late, or one whose kept read is not the Slot's
+// query - nothing a supplement could apply, whatever the timing. The rest
+// are its attempts, before_next the ones that worked.
 var EarlyOutsideMechanism = map[string]bool{EarlyNothingLate: true, EarlyRungFirst: true, EarlyMultiQuery: true,
-	EarlyFirstReadIncomplete: true, EarlyFirstReadRefused: true, EarlyOwnerLost: true, EarlyAnchorUnknown: true}
+	EarlyFirstReadIncomplete: true, EarlyFirstReadRefused: true, EarlyOwnerLost: true, EarlyAnchorUnknown: true,
+	EarlyKeptReadAbsent: true, EarlyNamedOutputs: true}
 
 // The early read's outcomes as the metric groups them: what its working is
 // read by, before_next over before_next and not_ahead, and the outcomes
@@ -120,6 +126,12 @@ func (readings *durations) add(value time.Duration) {
 	readings.count = min(readings.count+1, readingsKept)
 }
 
+// widenLatest makes the latest reading value when value is longer.
+func (readings *durations) widenLatest(value time.Duration) {
+	latest := (readings.next + readingsKept - 1) % readingsKept
+	readings.values[latest] = max(readings.values[latest], value)
+}
+
 func (readings *durations) longest() time.Duration {
 	longest := time.Duration(0)
 	for index := 0; index < readings.count; index++ {
@@ -151,15 +163,28 @@ type earlyRead struct {
 }
 
 // leadLocked is how long before the next Slot reads a Query Group's early
-// read starts at the latest: the longest of its last first reads and of its
-// last supplement holds, or of every supplement hold this process has seen
-// while the group has had none.
-func (engine *Engine) leadLocked(state *group) time.Duration {
+// read starts at the latest: the longest first read (tookLocked) and the
+// longest of its last supplement holds, or of every supplement hold this
+// process has seen while the group has had none.
+func (engine *Engine) leadLocked(state *group, slot *directedSlot) time.Duration {
 	hold := state.holds.longest()
 	if state.holds.count == 0 {
 		hold = engine.holdMax
 	}
-	return state.took.longest() + hold
+	return tookLocked(state, slot) + hold
+}
+
+// tookLocked is the longest of a Query Group's last first reads and, for a
+// Slot read in slices, of that Slot's slices' times summed so far: those are
+// counted among the group's only when the Slot is read again (rereadSlices),
+// after its early read is planned, and a group's first sliced Slot has no
+// other reading. A nil slot is the group's alone.
+func tookLocked(state *group, slot *directedSlot) time.Duration {
+	took := state.took.longest()
+	if slot != nil {
+		took = max(took, slot.sliceTook)
+	}
+	return took
 }
 
 // planEarlyLocked decides a directed Slot's early read once its first read
@@ -171,8 +196,10 @@ func (engine *Engine) planEarlyLocked(state *group, slot *directedSlot, now time
 	slot.early = &earlyRead{}
 	outcome := ""
 	switch {
-	case len(slot.queries) != 1:
+	case slot.physicalQueries() != 1:
 		outcome = EarlyMultiQuery
+	case slot.queries[0].spec.PlanFacts.NamedOutputs != nil:
+		outcome = EarlyNamedOutputs
 	case slot.queries[0].first.refused:
 		outcome = EarlyFirstReadRefused
 	case !slot.queries[0].complete:
@@ -189,7 +216,7 @@ func (engine *Engine) planEarlyLocked(state *group, slot *directedSlot, now time
 		engine.fileEarlyLocked(state, slot, EarlyRungFirst)
 		return
 	}
-	slot.early.latest = slot.early.next.Add(-engine.leadLocked(state))
+	slot.early.latest = slot.early.next.Add(-engine.leadLocked(state, slot))
 	if now.After(slot.early.latest) {
 		outcome := EarlyAnchorPassed
 		frozenNext := time.Unix(int64(slot.following), 0).Add(slot.readyAt.Sub(time.Unix(int64(slot.evaluation), 0)))
@@ -279,7 +306,7 @@ func (engine *Engine) dueEarlyLocked(now time.Time, free int) ([]*directedSlot, 
 		if state != nil && !slot.early.done && !slot.early.running {
 			next := engine.nextReadLocked(slot)
 			previous := slot.early.next
-			slot.early.next, slot.early.latest = next, next.Add(-engine.leadLocked(state))
+			slot.early.next, slot.early.latest = next, next.Add(-engine.leadLocked(state, slot))
 			if next.Before(previous) && now.After(slot.early.latest) {
 				engine.fileEarlyLocked(state, slot, EarlyOvertaken)
 			} else if !next.Before(slot.readAt.Add(rungDelay(slot.rung, slot.step))) {
@@ -302,7 +329,7 @@ func (engine *Engine) dueEarlyLocked(now time.Time, free int) ([]*directedSlot, 
 		pending = append(pending, slot)
 		second := slot.early.next.Unix()
 		bySecond[second] = append(bySecond[second], slot)
-		took[slot] = state.took.longest()
+		took[slot] = tookLocked(state, slot)
 	}
 	engine.earlyPending = pending
 	var due []*directedSlot
@@ -422,7 +449,7 @@ func (engine *Engine) StepEarly(ctx context.Context) {
 					continue
 				}
 				slot.early.tried = true
-				retry := now.Add(state.took.longest() / time.Duration(free))
+				retry := now.Add(tookLocked(state, slot) / time.Duration(free))
 				if retry.After(slot.early.latest) {
 					retry = slot.early.latest
 				}
@@ -439,8 +466,9 @@ func (engine *Engine) StepEarly(ctx context.Context) {
 				continue
 			}
 			trial.running = true
+			read := trial.readOfLocked()
 			engine.mu.Unlock()
-			go engine.earlierRead(ctx, trial, release, yield)
+			go engine.earlierRead(ctx, trial, read, release, yield)
 			continue
 		}
 		slot := work.slot
@@ -455,9 +483,10 @@ func (engine *Engine) StepEarly(ctx context.Context) {
 	}
 }
 
-// nextEarlyWake is when the loop is next needed for the early reads, zero
-// when none waits.
-func (engine *Engine) nextEarlyWake() time.Time {
+// NextEarlyWake is when the loop is next needed for the early reads, zero
+// when none waits: Run wakes then, and a caller that runs the engine on a
+// clock of its own steps that clock there for the same reads.
+func (engine *Engine) NextEarlyWake() time.Time {
 	if engine == nil {
 		return time.Time{}
 	}
@@ -480,7 +509,7 @@ func (engine *Engine) nextEarlyWake() time.Time {
 // flight against a next Slot that has begun. The permit is given back
 // before the supplement, as a directed read's is.
 func (engine *Engine) earlyRead(ctx context.Context, slot *directedSlot, release func(), yield <-chan struct{}) {
-	readCtx, cancel := context.WithTimeout(ctx, engine.rereadTimeout(slot.queryGroup))
+	readCtx, cancel := context.WithTimeout(ctx, engine.slotRereadTimeout(slot))
 	back := make(chan struct{})
 	if yield != nil {
 		go func() {
@@ -491,13 +520,11 @@ func (engine *Engine) earlyRead(ctx context.Context, slot *directedSlot, release
 			}
 		}()
 	}
-	captured := slot.queries[0]
-	engine.mu.Lock()
-	first := captured.first.set
-	engine.mu.Unlock()
-	sink := &keptSink{first: first, admit: engine.options.Memory}
 	readAt := engine.options.Now()
-	completion, err := engine.options.Recheck(readCtx, captured.spec, sink)
+	// Every slice the Slot read, each against its own first read, as the
+	// read at the rung does (rereadSlices).
+	queries, sinks, completion, err, refused := engine.rereadSlices(readCtx, slot)
+	sink := mergeKeptSinks(sinks)
 	close(back)
 	release()
 	cancel()
@@ -523,12 +550,12 @@ func (engine *Engine) earlyRead(ctx context.Context, slot *directedSlot, release
 		engine.fileEarlyLocked(state, slot, EarlyReadFailed)
 		engine.mu.Unlock()
 		return
-	case sink.refused:
+	case len(sinks) == 0 || refused == len(sinks):
 		engine.fileEarlyLocked(state, slot, EarlyMemoryRefused)
 		engine.mu.Unlock()
 		return
 	}
-	read, series := sink.kept(captured.spec, completion)
+	read, series := sink.kept(queries[0].spec, completion)
 	slot.early.readAt = readAt
 	// The late series are kept until the Slot is filed, whatever becomes of
 	// their supplement: the Slot's late count is both reads' together.
@@ -572,8 +599,11 @@ func (engine *Engine) earlyRead(ctx context.Context, slot *directedSlot, release
 	case outcome.Ran:
 		// What it supplemented is not the read at the rung's to supplement
 		// again: the series join the first read's, admitted as it grows.
-		for identity := range sink.series {
-			captured.first.add(hashString(string(identity)))
+		// Each slice's late series join that slice's first read.
+		for index, kept := range sinks {
+			for identity := range kept.series {
+				queries[index].first.add(hashString(string(identity)))
+			}
 		}
 		slot.facts = addFacts(slot.facts, outcome.Facts)
 		slot.supplemented = true
@@ -587,6 +617,8 @@ func (engine *Engine) earlyRead(ctx context.Context, slot *directedSlot, release
 		engine.fileEarlyLocked(state, slot, EarlyFlightBusy)
 	case outcome.Refused == DirectedContractExpired:
 		engine.fileEarlyLocked(state, slot, EarlyContractExpired)
+	case outcome.Refused == DirectedKeptReadAbsent:
+		engine.fileEarlyLocked(state, slot, EarlyKeptReadAbsent)
 	default:
 		engine.fileEarlyLocked(state, slot, EarlyFailed)
 	}

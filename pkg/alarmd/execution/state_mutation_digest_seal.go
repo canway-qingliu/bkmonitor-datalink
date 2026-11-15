@@ -15,12 +15,12 @@ import (
 // built from one declaration: a field that reaches the digest also reaches the
 // key, and a field that does not reach the key cannot reach the digest.
 type stateMutationDigestPayload struct {
-	Identity        StateKeyIdentity            `json:"identity"`
-	ApplyVersion    ApplyVersion                `json:"apply_version"`
-	AffectedRecords []RecordAnchor              `json:"affected_records"`
-	SeriesGuard     *StateGuardFact             `json:"series_guard,omitempty"`
-	Levels          []RuntimeLevelStateMutation `json:"levels"`
-	Points          []StateHistoryPoint         `json:"points"`
+	Identity        StateKeyIdentity    `json:"identity"`
+	ApplyVersion    ApplyVersion        `json:"apply_version"`
+	AffectedRecords []RecordAnchor      `json:"affected_records"`
+	SeriesGuard     *StateGuardFact     `json:"series_guard,omitempty"`
+	Levels          []digestLevelState  `json:"levels"`
+	Points          []StateHistoryPoint `json:"points"`
 	// The retention bound decides how much of the merged record survives the
 	// write, so two mutations that carry the same points under different bounds
 	// leave different bytes behind. A field that decides the stored content and
@@ -66,14 +66,57 @@ type sealedStateMutationDigest struct {
 	digest     MutationDigest
 }
 
+// holds reports whether the mutation carries a seal its build wrote for the
+// digest it carries (ValidateSealed). It proves the mutation came from a
+// build, nothing of its content: content changed after the build is the store
+// admission's whole check to catch. Nothing here may hold an address, a copy
+// of a mutation compares equal to the mutation (reflect.DeepEqual).
+func (sealed *sealedStateMutationDigest) holds(mutation StateMutation) bool {
+	return sealed != nil && sealed.digest == mutation.MutationDigest
+}
+
 // stateMutationDigestPayloadOf reports the digest input of mutation. Both the
 // derivation and the content key read it, so neither can drift from the other.
 func stateMutationDigestPayloadOf(mutation StateMutation) stateMutationDigestPayload {
 	return stateMutationDigestPayload{
 		Identity: mutation.Identity, ApplyVersion: mutation.ApplyVersion,
 		AffectedRecords: mutation.AffectedRecords, SeriesGuard: mutation.SeriesGuard,
-		Levels: mutation.Levels, Points: mutation.Points, RetentionPoints: mutation.RetentionPoints,
+		Levels: digestLevelStates(mutation.Levels), Points: mutation.Points, RetentionPoints: mutation.RetentionPoints,
 	}
+}
+
+// digestLevelState is the part of a Level's state the digest is derived over:
+// every field of RuntimeLevelStateMutation but the reason origin, under the
+// same names in the same order, so a mutation encodes to exactly the bytes it
+// did before the origin existed and keeps its digest.
+//
+// The origin is left out on purpose. It is a description of the guard, not a
+// decision: it changes nothing a later round reads to decide, and a build
+// that does not write it - the one being rolled back to, or the old half of
+// a rolling update - must reach the same digest for the same Slot's state, or
+// the store files the retry as a version conflict
+// (StateVersionConflictSameVersionOtherStatement) instead of the write it
+// already holds.
+type digestLevelState struct {
+	LevelID                 uint32
+	LevelStateCompatibility string
+	HistoryCompleteness     HistoryCompleteness
+	GapReasonCode           ReasonCode
+	WarmupRequirementRef    string
+	LastProcessedEventTime  int64
+}
+
+func digestLevelStates(levels []RuntimeLevelStateMutation) []digestLevelState {
+	if levels == nil {
+		return nil
+	}
+	projected := make([]digestLevelState, len(levels))
+	for index, level := range levels {
+		projected[index] = digestLevelState{LevelID: level.LevelID, LevelStateCompatibility: level.LevelStateCompatibility,
+			HistoryCompleteness: level.HistoryCompleteness, GapReasonCode: level.GapReasonCode,
+			WarmupRequirementRef: level.WarmupRequirementRef, LastProcessedEventTime: level.LastProcessedEventTime}
+	}
+	return projected
 }
 
 // stateMutationContentKey reports the content key of payload. A payload that

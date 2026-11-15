@@ -13,6 +13,7 @@ import (
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/config"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/internal/testwait"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/ownership"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/roles"
 )
@@ -56,7 +57,14 @@ func TestControlRoleStopsRenewalAndWaitsForControlWritesBeforeRelease(t *testing
 		t.Run(fmt.Sprintf("ignore_cancel=%v", ignoreCancel), func(t *testing.T) {
 			cfg := validGoAccessRuntimeConfig()
 			cfg.Roles = roles.Set{roles.Control}
+			// A round that ignores its cancellation must outlast the budget,
+			// so that budget is short; one that honours it must finish within
+			// it, which a machine running the whole suite did not do in 50 ms
+			// (gate on 74f2a91d4, 2026-10-28), so that budget is the test's.
 			cfg.ShutdownTimeout = config.Duration(50 * time.Millisecond)
+			if !ignoreCancel {
+				cfg.ShutdownTimeout = config.Duration(5 * time.Second)
+			}
 			cfg.PhaseTwo.Control.RefreshInterval = config.Duration(5 * time.Millisecond)
 			cfg.PhaseTwo.Control.ReconcileInterval = config.Duration(time.Hour)
 			control := &blockedRoleControl{fakePhaseTwoControl: &fakePhaseTwoControl{},
@@ -72,7 +80,7 @@ func TestControlRoleStopsRenewalAndWaitsForControlWritesBeforeRelease(t *testing
 			go func() { done <- bundle.runControlRole(ctx) }()
 			select {
 			case <-control.entered:
-			case <-time.After(time.Second):
+			case <-testwait.Expired(t):
 				t.Fatal("control round did not enter")
 			}
 			cancel()
@@ -81,12 +89,12 @@ func TestControlRoleStopsRenewalAndWaitsForControlWritesBeforeRelease(t *testing
 				if ignoreCancel != errors.Is(err, context.DeadlineExceeded) {
 					t.Fatalf("shutdown error = %v", err)
 				}
-			case <-time.After(time.Second):
+			case <-testwait.Expired(t):
 				t.Fatal("control role shutdown exceeded its budget")
 			}
 			select {
 			case <-owner.stopped:
-			case <-time.After(time.Second):
+			case <-testwait.Expired(t):
 				t.Fatal("control lease renewal continued")
 			}
 			if owner.released.Load() == ignoreCancel {
@@ -97,7 +105,7 @@ func TestControlRoleStopsRenewalAndWaitsForControlWritesBeforeRelease(t *testing
 			}
 			select {
 			case <-control.returned:
-			case <-time.After(time.Second):
+			case <-testwait.Expired(t):
 				t.Fatal("control round leaked after unblocking")
 			}
 			if err := waitPhaseTwoGroup(context.Background(), &bundle.maintenanceWG); err != nil {
@@ -160,7 +168,7 @@ func TestBusinessRoleCombinationsKeepExecutionAndControlOwnershipSeparate(t *tes
 			} else if len(owner.registrationStates()) != 0 || owner.opens != 0 || len(bundle.runners) != 0 {
 				t.Fatal("control-only process entered the Worker population or acquired a QG lease")
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			ctx, cancel := context.WithCancel(testwait.Context(t))
 			defer cancel()
 			if err := bundle.Shutdown(ctx); err != nil {
 				t.Fatal(err)
@@ -198,5 +206,25 @@ func TestExpectedWorkerContractExcludesRoleAndResourceQuotaWhileRetainingLegacyD
 	old.CapabilitiesDigest = want.CapabilitiesDigest
 	if !want.Matches(old) {
 		t.Fatal("compatible legacy registration was refused")
+	}
+}
+
+// The execution contract a worker declares is the one the fleet runs. In a
+// rolling window a Leader places Query Groups only on workers that declare
+// the contract it requires, so a release that changed it would have new and
+// old Leaders take each other's Query Groups as Replaced every round, without
+// waiting for the ready set to settle -- a window the release would have to
+// be designed for. The digest is the one 0.6's second batch, the release this
+// one rolls over, declares; a change to the schema version, the algorithm
+// registry or the runtime state semantics changes it, and is not made by
+// changing this line alone.
+func TestTheExecutionContractIsTheOneTheFleetRuns(t *testing.T) {
+	const released = "d781a1045eed9a6fdf0be80209f3806fc8bc4f7d9fc190a691cf31d47f189222"
+	digest, err := phaseTwoExecutionContractDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest != released {
+		t.Fatalf("execution contract digest = %s, want the released %s", digest, released)
 	}
 }

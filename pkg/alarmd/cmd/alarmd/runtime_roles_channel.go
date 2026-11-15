@@ -19,6 +19,7 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/config"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/controlplane"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/evidenceroute"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/fleet"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/obchannel"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/observability"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/ownership"
@@ -51,6 +52,9 @@ type ChannelBinding struct {
 	// SREReceiptWritten hears whether each receipt write landed; nil hears
 	// none.
 	SREReceiptWritten func(ok bool)
+	// FrontRefused hears each refused front read: its code and the operation
+	// it asked for. Optional.
+	FrontRefused func(code, operation string)
 }
 
 type roleChannelRuntime struct {
@@ -64,6 +68,9 @@ type roleChannelRuntime struct {
 	Ready func(context.Context) error
 	Bind  func(ChannelBinding)
 	Close func() error
+	// FrontRefusals is the front surface's refusals by code; nil without a
+	// channel.
+	FrontRefusals func() map[string]uint64
 }
 
 type channelProviders struct {
@@ -190,15 +197,20 @@ func openProductionRoleChannel(cfg config.Config, binding ChannelBinding) (_ *ro
 		}
 	}
 	queryTransport := &http.Transport{Proxy: http.ProxyFromEnvironment,
-		DialContext:     (&net.Dialer{Timeout: obchannel.RequestTimeout}).DialContext,
-		MaxConnsPerHost: 1, MaxIdleConns: 1, MaxIdleConnsPerHost: 1,
+		DialContext:  (&net.Dialer{Timeout: obchannel.RequestTimeout}).DialContext,
+		MaxIdleConns: 8, MaxIdleConnsPerHost: 8,
 		IdleConnTimeout: 30 * time.Second, TLSHandshakeTimeout: obchannel.RequestTimeout, ResponseHeaderTimeout: obchannel.MaxExecutionTimeout}
 	closeQuery = queryTransport.CloseIdleConnections
 	queryClient, _ := accessuq.NewDiagnosticClient(cfg.PhaseTwo.Access.UQEndpoint, cfg.PhaseTwo.Access.QuerySource,
 		&http.Client{Transport: queryTransport, Timeout: obchannel.MaxExecutionTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }})
 	// The operation schemas stay the same across roles; only their currently
 	// bound providers and the ingress's default routing differ.
-	ops := obchannel.NativeOperations(providers)
+	ops := obchannel.NativeOperationsWith(providers, obchannel.NativeOptions{Rejections: func(queryGroup string) (fleet.KeptRejection, bool) {
+		if rejections := providers.read().Control.Rejections; rejections != nil {
+			return rejections(queryGroup)
+		}
+		return fleet.KeptRejection{}, false
+	}})
 	for i := range ops {
 		ops[i].DefaultControlLeader = true
 		// object.list already has a replica domain filter. Preserve that
@@ -230,7 +242,12 @@ func openProductionRoleChannel(cfg config.Config, binding ChannelBinding) (_ *ro
 		}
 		return cliMaintenanceOperation(current.Control.Maintenance)
 	}))
+	ops = append(ops, dynamicChannelOperation(cliLinkdAlertsOperation(nil, ""), func() obchannel.Operation {
+		control := providers.read().Control
+		return cliLinkdAlertsOperation(linkdSearchOf(control.LinkdSearch), control.LinkdSource)
+	}))
 	ops = append(ops, cliLifecycleOperation(diagnosticRuntime, lifecycleRecordKey(cfg)))
+	ops = append(ops, changesOperation(cfg, binding, diagnosticRuntime))
 	for i := range workload {
 		if workload[i].ID != "k8s.workloads" {
 			workload[i].Targetable = true
@@ -242,7 +259,7 @@ func openProductionRoleChannel(cfg config.Config, binding ChannelBinding) (_ *ro
 			return obchannel.MetricsOperations(providers.read().Control.Metrics)[index]
 		}))
 	}
-	ops = append(ops, obchannel.SlotOperations(obchannel.SlotOptions{Resolve: newCLISlotResolver(cfg, diagnosticRuntime), Evidence: newCLISlotEvidenceReader(cfg, diagnosticRuntime), UQ: queryClient, LatestPublication: cliLatestPublication(catalog)})...)
+	ops = append(ops, obchannel.SlotOperations(obchannel.SlotOptions{Resolve: newCLISlotResolver(cfg, diagnosticRuntime), Evidence: newCLISlotEvidenceReader(cfg, diagnosticRuntime), UQ: queryClient, LatestPublication: cliLatestPublication(catalog), PlanCarries: cliPlanCarries(catalog)})...)
 	if binding.Roles.Has(roles.Channel) {
 		var sreOps []obchannel.Operation
 		sreOps, closeSRE, err = channelSREOperations(cfg, binding, clientFor("sre")(cfg.RuntimeStoreRedis()))
@@ -265,7 +282,7 @@ func openProductionRoleChannel(cfg config.Config, binding ChannelBinding) (_ *ro
 		}
 	}
 	executor, err := obchannel.NewEvidenceExecutor(obchannel.ExecutorOptions{EnvironmentID: binding.EnvironmentID, Replica: binding.InstanceID,
-		Incarnation: binding.Control.Incarnation, Build: version + "/" + commit, Concurrency: 1, Operations: ops, Roles: binding.Roles})
+		Incarnation: binding.Control.Incarnation, Build: version + "/" + commit, Operations: ops, Roles: binding.Roles})
 	if err != nil {
 		return nil, err
 	}
@@ -300,7 +317,7 @@ func openProductionRoleChannel(cfg config.Config, binding ChannelBinding) (_ *ro
 				http.NotFound(w, r)
 			}
 		})
-		publicNative = publicAPI(providers, windows)
+		publicNative = publicAPI(providers, windows, forwardedPeer(func() string { return providers.read().Control.StreamToken }))
 	}
 	// Explicit Worker/Control processes serve business evidence through
 	// authenticated internal RPC regardless of a local HTTP key. Shared
@@ -308,15 +325,26 @@ func openProductionRoleChannel(cfg config.Config, binding ChannelBinding) (_ *ro
 	if !binding.Roles.Has(roles.Channel) {
 		restrictPublic()
 	}
-	runtime.Handler = composeCLI(publicNative, nil, nil)
+	runtime.Handler = composeCLI(publicNative, nil, nil, nil)
 	if !binding.Roles.Has(roles.Channel) || !cfg.CLI.Enabled() {
 		return runtime, nil
 	}
-	manager, authErr := cliauth.New(cliauth.Options{Redis: clientFor("auth")(cfg.RuntimeStoreRedis()), Prefix: cfg.Redis.StatePrefix,
+	authClient := clientFor("auth")(cfg.RuntimeStoreRedis())
+	manager, authErr := cliauth.New(cliauth.Options{Redis: authClient, Prefix: cfg.Redis.StatePrefix,
 		EnvironmentID: cfg.CLI.EnvironmentID, EnvironmentName: cfg.CLI.EnvironmentName, PublicBaseURL: cfg.CLI.PublicBaseURL, AdminKey: cfg.CLI.AdminKey,
 		OnStoreFailure: func(reason, detail string) {
 			if failure := providers.read().Control.RedisFailures; failure != nil {
 				failure("auth", reason, detail)
+			}
+		},
+		OnEvent: func(event string, n uint64) {
+			if count := providers.read().Control.AuthEvents; count != nil {
+				count(event, n)
+			}
+		},
+		OnRosterApplied: func(at time.Time) {
+			if applied := providers.read().Control.RosterApplied; applied != nil {
+				applied(at)
 			}
 		}})
 	if authErr != nil {
@@ -330,6 +358,7 @@ func openProductionRoleChannel(cfg config.Config, binding ChannelBinding) (_ *ro
 	if router != nil {
 		options.Route = router.Invoke
 	}
+	options.OnFrontRefused = binding.FrontRefused
 	channel, err := obchannel.New(options)
 	if err != nil {
 		return nil, err
@@ -337,7 +366,8 @@ func openProductionRoleChannel(cfg config.Config, binding ChannelBinding) (_ *ro
 	if cfg.PublicSurfaceRestrictionRequested() {
 		restrictPublic()
 	}
-	runtime.Handler = composeCLI(publicNative, channel, manager.Handler())
+	runtime.Handler = composeCLI(publicNative, channel, manager.Handler(), frontSurface(channel, manager))
+	runtime.FrontRefusals = channel.FrontRefusals
 	runtime.HTTPConfigured = true
 	runtime.Ready = func(ctx context.Context) error {
 		// ActivePairings uses the auth pool's real Lua/read contract within

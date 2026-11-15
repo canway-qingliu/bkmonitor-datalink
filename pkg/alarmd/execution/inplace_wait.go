@@ -9,6 +9,8 @@
 
 package execution
 
+import "context"
+
 // InPlaceWaitFacts is how long one execution waited, holding its execution
 // slot, for a later query of its Slot to become readable: a Slot whose
 // queries are readable at different times is not deferred as a whole, so its
@@ -40,4 +42,33 @@ type InPlaceWaitFacts struct {
 // many input bytes the execution has retained so far.
 type RetainedInputReporter interface {
 	RetainedInputBytesNow() uint64
+}
+
+// RetainedBytesReserver is a consumer that holds bytes retained outside its
+// series against the same budget its series are: ReserveRetainedBytes
+// reserves them, or refuses them past the share one Query Group's Slot may
+// hold or past what the pool has left, and ReleaseRetainedBytes gives back
+// what was reserved and is no longer held. Whatever is still reserved when
+// the execution ends is released with it. Safe to call from any query of
+// the execution while its series are delivered. A provider's sink that is
+// one is what a query with named outputs reserves its alignment through, and
+// what a query that holds its series until its response is whole (an APM
+// application carried) reserves them through until it hands them on.
+type RetainedBytesReserver interface {
+	ReserveRetainedBytes(ctx context.Context, bytes uint64) error
+	ReleaseRetainedBytes(bytes uint64)
+}
+
+// RetainedBytesBorrower is a cache that holds bytes of the retained pool only
+// while no Slot has reserved them. The pool's owner hands it room once, when
+// it takes the borrower on: what no Slot has reserved, which bounds what the
+// borrower takes in. BorrowedRetainedBytes is what it holds of the pool now,
+// and YieldRetainedBytes gives back at least need bytes, or all it holds,
+// before a reservation that needs them is judged. The pool's owner calls
+// those two under the lock its reservations are judged under, and room takes
+// that lock, so the borrower must not call room while it holds its own lock.
+type RetainedBytesBorrower interface {
+	BorrowRetainedWithin(room func() uint64)
+	BorrowedRetainedBytes() uint64
+	YieldRetainedBytes(need uint64)
 }

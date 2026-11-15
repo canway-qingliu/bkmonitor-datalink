@@ -212,7 +212,7 @@ func TestAMemoryOverTheGroupBoundIsReportedWithoutFailingTheSlotOnARealServer(t 
 			}
 			want := observability.NoDataMemoryRefusalFacts{
 				Reason: contract.ReasonStateBudgetExceeded, Record: string(execution.NoDataRecordGroups),
-				Groups: limit + 1, Limit: limit,
+				Groups: limit + 1, Limit: limit, LimitSource: execution.NoDataLimitPlatform,
 			}
 			if refusals[0].NoDataMemoryRefusal == nil || *refusals[0].NoDataMemoryRefusal != want {
 				t.Fatalf("refusal facts = %+v, want %+v", refusals[0].NoDataMemoryRefusal, want)
@@ -292,9 +292,14 @@ func TestARefusedRenewalIsObservedAndTheRoundGoesOnOnARealServer(t *testing.T) {
 	if err := stream.loadNoDataMemory(ctx); err != nil {
 		t.Fatalf("a refused renewal stopped the Slot's load: %v", err)
 	}
-	if snapshot := stream.noData.Items[0]; snapshot.Status != execution.NoDataMemoryFound ||
-		len(snapshot.Groups) != 1 || snapshot.Groups[0] != absent {
-		t.Fatalf("the round was handed %+v, want the memory the previous round wrote", snapshot)
+	// The load hands the round the header; its groups are what the round's
+	// scan of the record reads.
+	snapshot := stream.noData.Items[0]
+	page, err := reader.ScanNoDataGroups(ctx, execution.NoDataScanRequest{
+		Identity: snapshot.Identity, PresentAsOf: snapshot.PresentAsOf})
+	if err != nil || snapshot.Status != execution.NoDataMemoryFound || page.Next != 0 ||
+		len(page.Groups) != 1 || page.Groups[0] != absent {
+		t.Fatalf("the round was handed %+v and scans %+v (%v), want the memory the previous round wrote", snapshot, page, err)
 	}
 	renewals := stagesOf(observed, observability.StageNoDataMemoryRenewed)
 	if len(renewals) != 1 {

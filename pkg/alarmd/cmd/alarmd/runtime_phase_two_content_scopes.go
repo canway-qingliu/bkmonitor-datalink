@@ -96,7 +96,7 @@ func (runtime *productionPhaseTwoOwnership) PublishContentScopes(
 		observeRuntime(ctx, runtime.dependencies.Observer, observability.Observation{
 			Component: observability.ComponentOwnership, Stage: observability.StageAssignmentAcquired,
 			Result: observability.ResultDegraded, Operation: observability.OperationTransition,
-			Direction: observability.DirectionInternal, ReasonCode: ownershipObservationReason(err), Err: err,
+			ReasonCode: ownershipObservationReason(err), Err: err,
 		})
 	}
 	authority, err := runtime.ensureControlAuthority(ctx, at)
@@ -119,7 +119,7 @@ func (runtime *productionPhaseTwoOwnership) PublishContentScopes(
 		queryGroups = append(queryGroups, queryGroup)
 	}
 	sort.Slice(queryGroups, func(left, right int) bool { return queryGroups[left] < queryGroups[right] })
-	records, _, err := runtime.dependencies.Store.ReadAssignments(ctx, queryGroups)
+	records, _, err := runtime.records.ReadAssignments(ctx, queryGroups)
 	if err != nil {
 		report(fmt.Errorf("phase-two content scopes before cutover: read records: %w", err))
 		return
@@ -130,7 +130,7 @@ func (runtime *productionPhaseTwoOwnership) PublishContentScopes(
 		if !exists || record.PendingContentScope == digest || (record.ContentScope == digest && record.PendingContentScope == "") {
 			continue
 		}
-		if _, err := runtime.dependencies.Store.PublishAssignment(ctx, authority, ownership.AssignmentDecision{
+		if _, err := runtime.records.PublishAssignment(ctx, authority, ownership.AssignmentDecision{
 			QueryGroup: queryGroup, DesiredWorkerID: record.DesiredWorkerID, ExpectedRecordRevision: record.RecordRevision,
 			PlacementReason: record.PlacementReason, DecidedAt: at, ContentScope: digest,
 		}); err != nil {

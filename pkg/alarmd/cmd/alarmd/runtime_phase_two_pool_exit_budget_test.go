@@ -55,12 +55,16 @@ const (
 // request times out, as a backend that did not answer in time does. Every
 // request is kept with the time it had left.
 type poolBackend struct {
+	step    atomic.Int64
 	clock   atomic.Int64 // unix milliseconds
 	latency atomic.Int64 // milliseconds
 	// cut, when set, is the backend's own limit: a query that would take
 	// that long or longer is answered unavailable when it is reached, as a
 	// query service answers when its storage client gives up.
-	cut      atomic.Int64 // milliseconds
+	cut atomic.Int64 // milliseconds
+	// missing, when set, answers every query in its latency with the query
+	// service's refusal of a table that does not route in the space.
+	missing  atomic.Bool
 	mu       sync.Mutex
 	requests []poolRequest
 }
@@ -78,6 +82,15 @@ func (backend *poolBackend) take() []poolRequest {
 	taken := backend.requests
 	backend.requests = nil
 	return taken
+}
+
+// stepSeconds is how far back of a window's end its one point is: a minute,
+// unless the case reads at another step.
+func (backend *poolBackend) stepSeconds() int64 {
+	if step := backend.step.Load(); step > 0 {
+		return step
+	}
+	return 60
 }
 
 func (backend *poolBackend) roundTrip(request *http.Request) (*http.Response, error) {
@@ -100,6 +113,15 @@ func (backend *poolBackend) roundTrip(request *http.Request) (*http.Response, er
 		return &http.Response{StatusCode: http.StatusInternalServerError, Header: http.Header{"Content-Type": []string{"application/json"}},
 			Body: io.NopCloser(bytes.NewBufferString(`{"error":"context deadline exceeded"}`)), Request: request}, nil
 	}
+	if backend.missing.Load() && latency < remaining {
+		backend.mu.Lock()
+		backend.requests = append(backend.requests, poolRequest{remaining: time.Duration(remaining) * time.Millisecond})
+		backend.mu.Unlock()
+		backend.clock.Store(now + latency)
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}},
+			Body:    io.NopCloser(bytes.NewBufferString(`{"series":[],"status":{"code":"SPACE_TABLE_ID_FIELD_IS_NOT_EXISTS"},"is_partial":false}`)),
+			Request: request}, nil
+	}
 	answered := latency < remaining
 	backend.mu.Lock()
 	backend.requests = append(backend.requests, poolRequest{remaining: time.Duration(remaining) * time.Millisecond, answered: answered})
@@ -117,7 +139,7 @@ func (backend *poolBackend) roundTrip(request *http.Request) (*http.Response, er
 	if err := json.NewEncoder(&buf).Encode(map[string]any{"series": []any{map[string]any{
 		"name": "_result0", "columns": []string{"_time", "_value"}, "types": []string{"float", "float"},
 		"group_keys": []string{"host"}, "group_values": []string{"host-a"},
-		"values": []any{[]any{(end - 60) * 1000, 1}}}}, "status": nil, "trace_id": "pool", "is_partial": false}); err != nil {
+		"values": []any{[]any{(end - backend.stepSeconds()) * 1000, 1}}}}, "status": nil, "trace_id": "pool", "is_partial": false}); err != nil {
 		return nil, err
 	}
 	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}},
@@ -235,11 +257,19 @@ func (h *poolProbeHarness) normalBudget() time.Duration {
 	return time.Minute - poolBudgetReserve - readWaitOf(h.cfg, h.bundle.queryGroups[0], 60)
 }
 
+// isANormalRoundsBudget says remaining is what a round that started on a pass has
+// of a normal round's budget: the pass's slack less, and less up to the second the
+// source answers the Slot due by.
+func (h *poolProbeHarness) isANormalRoundsBudget(remaining time.Duration) bool {
+	whole := h.normalBudget() - poolPassSlack
+	return remaining <= whole && remaining > whole-time.Second
+}
+
 // round runs the minute's round half a second after its Slot is ready, and
 // returns the queries it sent and the pool transitions it made.
 func (h *poolProbeHarness) round(minute int64) ([]poolRequest, []observability.QueryCooldownFacts) {
 	h.t.Helper()
-	h.backend.clock.Store((h.base+minute*60)*1000 + h.readWait().Milliseconds() + 500)
+	h.backend.clock.Store(upToTheSecondMillis((h.base+minute*60)*1000 + h.readWait().Milliseconds() + 500))
 	if err := runScheduledOnceSettled(h.ctx, h.bundle); err != nil {
 		h.t.Fatalf("minute %d: %v", minute, err)
 	}
@@ -277,6 +307,8 @@ func (h *poolProbeHarness) pass(at int64) ([]poolRequest, []observability.QueryC
 // passCounting is pass, and how many Slots it completed.
 func (h *poolProbeHarness) passCounting(at int64) ([]poolRequest, []observability.QueryCooldownFacts, int) {
 	h.t.Helper()
+	// The source answers a Slot due by the second its read falls in.
+	at = upToTheSecondMillis(at)
 	h.backend.clock.Store(at)
 	if err := runScheduledOnceSettled(h.ctx, h.bundle); err != nil {
 		h.t.Fatalf("pass at base+%d ms: %v", at-h.base*1000, err)
@@ -421,7 +453,7 @@ func TestThePoolIsLeftOnlyOnAnAnswerItsNormalRoundGets(t *testing.T) {
 			if !anyReplayAnswered(replays) {
 				t.Fatalf("the held Slots' executions %+v, want the held Slot replayed with 55 s and answered", replays)
 			}
-			if decider.remaining != h.normalBudget()-poolPassSlack-late {
+			if !h.isANormalRoundsBudget(decider.remaining + late) {
 				t.Fatalf("the deciding round had %s, want its normal round's %s less %s late", decider.remaining, h.normalBudget(), late)
 			}
 			if event.Event != test.event {
@@ -436,7 +468,7 @@ func TestThePoolIsLeftOnlyOnAnAnswerItsNormalRoundGets(t *testing.T) {
 				t.Fatalf("the transition's probe = %+v, want a normal round's, %s, with budget %d ms", probe, test.outcome, decider.remaining.Milliseconds())
 			}
 			// The record a restart or the next owner reads back says the same.
-			if record := h.poolRecord(); record.LastProbe == nil || *record.LastProbe != *probe {
+			if record := h.poolRecord(); record.LastProbe == nil || !sameQueryCooldownProbe(*record.LastProbe, *probe) {
 				t.Fatalf("the pool record's probe = %+v, want %+v", record.LastProbe, probe)
 			}
 		})
@@ -463,7 +495,7 @@ func TestABackendSlowerThanANormalRoundStaysInThePoolWithoutReentering(t *testin
 			t.Fatalf("cooldown %d: the held Slots' executions %+v, want the held Slot replayed with 55 s and answered in 30", cooldown, replays)
 		}
 		probe := event.LastProbe
-		if decider.answered || decider.remaining != h.normalBudget()-poolPassSlack ||
+		if decider.answered || !h.isANormalRoundsBudget(decider.remaining) ||
 			event.Event != "extended" || event.Reentries != 0 || event.Failures != failures+1 ||
 			probe == nil || probe.Operation != string(execution.OperationNormal) || probe.Outcome != observability.QueryCooldownProbeUnavailable {
 			t.Fatalf("cooldown %d: the deciding round %+v made %+v (probe %+v), want a normal round that timed out and the pool extended on failure %d",
@@ -565,7 +597,7 @@ func TestARoundLateBehindThePoolsOwnReplayDoesNotKeepTheQueryGroupIn(t *testing.
 	}
 	at := h.readyAfter(h.backend.clock.Load()+1) + poolPassSlack.Milliseconds()
 	requests, events = h.pass(at)
-	if len(requests) != 1 || !requests[0].answered || requests[0].remaining != h.normalBudget()-poolPassSlack || len(events) != 1 || events[0].Event != "recovered" {
+	if len(requests) != 1 || !requests[0].answered || !h.isANormalRoundsBudget(requests[0].remaining) || len(events) != 1 || events[0].Event != "recovered" {
 		t.Fatalf("the next round: %+v sent and %+v made, want a normal round's whole budget answered and the Query Group out", requests, events)
 	}
 }
@@ -632,7 +664,7 @@ func TestTheProductionBundleCountsDownstreamDistressByContention(t *testing.T) {
 	}
 	counts := map[string]float64{}
 	for _, family := range families {
-		if family.GetName() != "bkmonitor_alarmd_query_downstream_distress_total" {
+		if family.GetName() != "alarmd_query_downstream_distress_total" {
 			continue
 		}
 		for _, series := range family.GetMetric() {
@@ -681,7 +713,7 @@ func TestTheProductionBundleCountsHowEachGroupWasSeeded(t *testing.T) {
 	}
 	seeds := map[string]float64{}
 	for _, family := range families {
-		if family.GetName() != "bkmonitor_alarmd_read_hold_seeds_total" {
+		if family.GetName() != "alarmd_read_hold_seeds_total" {
 			continue
 		}
 		for _, series := range family.GetMetric() {

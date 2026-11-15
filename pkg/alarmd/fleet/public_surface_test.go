@@ -41,7 +41,7 @@ var publicHealthFields = map[string]bool{
 var redactedHealthFields = map[string]bool{
 	"Impact": true, "StrategyLinkBase": true, "PrunedSkips": true, "RetainedShare": true, "ReadEarly": true, "Workers": true,
 	"PrunedSkipsTotal": true, "RetainedShareTotal": true, "ReadEarlyTotal": true,
-	"Builds": true, "OutputProtocols": true, "Retentions": true, "OutputPath": true, "Cooling": true, "Degradations": true,
+	"Builds": true, "OutputProtocols": true, "Tracings": true, "Retentions": true, "OutputPath": true, "Cooling": true, "Degradations": true,
 	"Activation": true, "NoDataHorizon": true, "Load": true, "ActivationReplica": true, "Rebalance": true,
 	"RebalanceReplica": true, "AssignmentScope": true, "AssignmentScopeReplica": true, "AssignmentSweep": true,
 	"AssignmentSweepReplica": true, "ViewStream": true, "ViewStreamReplica": true, "Source": true,
@@ -67,7 +67,7 @@ func fill(value reflect.Value, depth int) {
 			value.SetString("WORD")
 			return
 		}
-		value.SetString("redis.internal.example:6379")
+		value.SetString("redis.planted.invalid:6379")
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		value.SetInt(7)
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
@@ -147,7 +147,7 @@ func TestThePublicSummaryCarriesOnlyItsFieldsAndNoPlace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "redis.internal.example") {
+	if strings.Contains(string(raw), "redis.planted.invalid") {
 		t.Fatalf("summary names a place: %s", raw)
 	}
 	if !strings.Contains(string(raw), `"restricted":true`) || !strings.Contains(string(raw), `"health":"HEALTHY"`) {
@@ -261,7 +261,7 @@ func TestThePublicWindowRouteBoundsWritesPerMinute(t *testing.T) {
 // failingWindowRedis fails every command with an error naming the store.
 type failingWindowRedis struct{ *fakeWindowRedis }
 
-var errStoreNamed = errors.New("dial tcp redis.internal.example:6379: connect: connection refused")
+var errStoreNamed = errors.New("dial tcp redis.planted.invalid:6379: connect: connection refused")
 
 func (failingWindowRedis) ZRangeByScore(context.Context, string, *redis.ZRangeBy) *redis.StringSliceCmd {
 	return redis.NewStringSliceResult(nil, errStoreNamed)
@@ -280,7 +280,7 @@ func TestThePublicWindowRouteNeverPassesOnAStoreError(t *testing.T) {
 		{http.MethodPost, `{"query_groups":["` + digest("a") + `"],"opened_by":"x","ttl_seconds":60}`},
 	} {
 		got := publicWindowsCall(t, handler, tc.method, "/api/windows", tc.body)
-		if got.Code != http.StatusServiceUnavailable || strings.Contains(got.Body.String(), "redis.internal.example") {
+		if got.Code != http.StatusServiceUnavailable || strings.Contains(got.Body.String(), "redis.planted.invalid") {
 			t.Errorf("%s = %d %s, want 503 in fixed words", tc.method, got.Code, got.Body.String())
 		}
 	}

@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -95,7 +96,7 @@ func TestTheErrorTextNamesTheDependencyTheCodeDoesNot(t *testing.T) {
 		{"the server's LOADING reply", Anomaly{Kind: KindDegradedRun, ReasonCode: "error",
 			LastError: &LastError{Text: "LOADING Redis is loading the dataset in memory", At: at}}, DependencyRedis, dependencyByText},
 		{"the query failure's detail", Anomaly{Kind: KindDegradedRun, CauseReason: "STATE_WRITE_RETRYABLE", ReasonLastAt: at,
-			Failure: &FailureRef{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 10.0.0.1:6379: i/o timeout", At: &at}}, DependencyRedis, dependencyByText},
+			Failure: &FailureRef{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 192.0.2.1:6379: i/o timeout", At: &at}}, DependencyRedis, dependencyByText},
 		{"a timeout whose text names nothing stays unlocated", Anomaly{Kind: KindDegradedRun, CauseReason: "QUERY_TIMEOUT",
 			LastError: &LastError{Text: "context deadline exceeded", At: at}}, DependencyUnlocated, ""},
 		{"the code wins over the text when it names one", Anomaly{Kind: KindDegradedRun, CauseReason: "KAFKA_UNAVAILABLE",
@@ -121,7 +122,7 @@ func TestTheReadingIsTakenFromTheLatestRoundOnly(t *testing.T) {
 	fresh := now.Add(-time.Minute)
 	stale := &LastError{Text: "alarmd progress: commit: redis: connection pool timeout", At: old, Operation: "commit"}
 	row := Anomaly{Kind: KindDegradedRun, Cause: "LEVEL_OUTCOME_UNKNOWN", CauseReason: "QUERY_TIMEOUT", ReasonLastAt: fresh, LastError: stale,
-		Failure: &FailureRef{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 10.0.0.1:6379: i/o timeout", At: &old}}
+		Failure: &FailureRef{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 192.0.2.1:6379: i/o timeout", At: &old}}
 	blocked := blockedOf(row, ScheduleOnTime)
 	if blocked.Dependency != DependencyUnlocated || blocked.DependencyEvidence != "" || blocked.Text != "" || blocked.Operation != "" {
 		t.Fatalf("blocked = %+v, want the old error's words and dependency left out of this round's reading", blocked)
@@ -142,7 +143,7 @@ func TestTheReadingIsTakenFromTheLatestRoundOnly(t *testing.T) {
 	// A failure reference without a time is from a publisher that could not
 	// say when it was: not this round's evidence.
 	undated := Anomaly{Kind: KindDegradedRun, CauseReason: "STATE_WRITE_RETRYABLE", ReasonLastAt: fresh,
-		Failure: &FailureRef{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 10.0.0.1:6379: i/o timeout"}}
+		Failure: &FailureRef{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 192.0.2.1:6379: i/o timeout"}}
 	if blocked := blockedOf(undated, ScheduleOnTime); blocked.Dependency != DependencyUnlocated || blocked.Text != "" {
 		t.Fatalf("blocked = %+v, want an undated failure reference left out", blocked)
 	}
@@ -344,7 +345,7 @@ func TestTrackerStampsTheQueryFailureWithItsTimeAndSlot(t *testing.T) {
 		slot := int64(100 + 60*round)
 		failedAt = at.at
 		tracker.Observe(context.Background(), observability.Observation{
-			QueryFailure: &observability.QueryFailureFacts{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 10.0.0.1:6379: i/o timeout"},
+			QueryFailure: &observability.QueryFailureFacts{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 192.0.2.1:6379: i/o timeout"},
 			Trace:        observability.TraceFields{QueryGroupKey: "qg-1", EvaluationTime: slot},
 		})
 		at.at = at.at.Add(time.Millisecond)
@@ -363,7 +364,7 @@ func TestTrackerStampsTheQueryFailureWithItsTimeAndSlot(t *testing.T) {
 	}
 	Attribute(rows, at.at)
 	blocked := rows[0].Blocked
-	if blocked == nil || blocked.Dependency != DependencyRedis || blocked.DependencyEvidence != dependencyByText || blocked.Text != "dial tcp 10.0.0.1:6379: i/o timeout" {
+	if blocked == nil || blocked.Dependency != DependencyRedis || blocked.DependencyEvidence != dependencyByText || blocked.Text != "dial tcp 192.0.2.1:6379: i/o timeout" {
 		t.Fatalf("blocked = %+v, want Redis named from this round's failure detail, and the detail as the round's words", blocked)
 	}
 	// The round ended -- degraded, but ended -- so it is not being retried,
@@ -498,7 +499,7 @@ func TestKnownAndDifferentSlotsAreTwoRoundsWhateverTheClocksSay(t *testing.T) {
 	later := now.Add(time.Second)
 	inFlight := Anomaly{Kind: KindDegradedRun, ReasonCode: "COMPLETED_WITH_UNAVAILABLE", CauseReason: "HISTORY_GAPPED",
 		ReasonLastAt: now, RoundSlot: 1000,
-		Failure: &FailureRef{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 10.0.0.1:6379: i/o timeout", At: &later, Slot: 1060}}
+		Failure: &FailureRef{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 192.0.2.1:6379: i/o timeout", At: &later, Slot: 1060}}
 	blocked := blockedOf(inFlight, "")
 	if blocked.Dependency == DependencyRedis || blocked.Text != "" {
 		t.Fatalf("blocked = %+v, want the next Slot's failure not read as this round's although stamped later", blocked)
@@ -507,7 +508,7 @@ func TestKnownAndDifferentSlotsAreTwoRoundsWhateverTheClocksSay(t *testing.T) {
 	// as it did before the field existed.
 	unslotted := inFlight
 	unslotted.RoundSlot = 0
-	unslotted.Failure = &FailureRef{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 10.0.0.1:6379: i/o timeout", At: &later}
+	unslotted.Failure = &FailureRef{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 192.0.2.1:6379: i/o timeout", At: &later}
 	if blocked := blockedOf(unslotted, ""); blocked.Dependency != DependencyRedis {
 		t.Fatalf("blocked = %+v, want the clock to decide when no Slot is known", blocked)
 	}
@@ -622,7 +623,7 @@ func TestAFailureOnThePreviousSlotIsNotLentToTheNextRound(t *testing.T) {
 	}
 	// This round: a Redis failure on the way to the completion.
 	tracker.Observe(context.Background(), observability.Observation{
-		QueryFailure: &observability.QueryFailureFacts{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 10.0.0.1:6379: i/o timeout"},
+		QueryFailure: &observability.QueryFailureFacts{Stage: "execute", Category: "other", Code: "STATE_WRITE_RETRYABLE", Detail: "dial tcp 192.0.2.1:6379: i/o timeout"},
 		Trace:        observability.TraceFields{QueryGroupKey: "qg-1", EvaluationTime: 1000},
 	})
 	at.at = at.at.Add(time.Millisecond)
@@ -847,5 +848,98 @@ func TestANotDueAnswerStartsNoRunAndLendsNoStart(t *testing.T) {
 		if row.QueryGroup == "qg-b" {
 			t.Fatalf("an object the pool once exposed became a row on a not-due answer: %+v", row)
 		}
+	}
+}
+
+// A query the provider refused as written is the strategy's: its row reads
+// refused, files under the query refused, and names the refusal's class and
+// the provider's trace id. The words of the provider's answer - which can
+// echo label values - are not in the row, which every reader of the
+// strategy route sees: they stay on this replica, for the session-gated
+// strategy read.
+func TestARejectedQuerysRowNamesTheRefusalButNotItsWords(t *testing.T) {
+	at := &clock{at: now}
+	tracker := newTracker(t, at)
+	excerpt := `{"error":"cannot select more than 10000000 samples for pod=\"payments-7f9c\"; password=<redacted>"}`
+	for round := 0; round < DefaultDegradedRounds; round++ {
+		slot := int64(100 + 60*round)
+		tracker.Observe(context.Background(), observability.Observation{
+			QueryFailure: &observability.QueryFailureFacts{Stage: "provider", Category: "source_backend", Code: "QUERY_REJECTED",
+				Detail: "http_status=400", HTTPStatus: 400,
+				Rejection: &observability.QueryRejection{Class: "VM_SAMPLE_LIMIT", TraceID: "4bf92f3577b34da6a3ce929d0e0e4736", Excerpt: excerpt}},
+			Trace: observability.TraceFields{QueryGroupKey: "qg-1", EvaluationTime: slot},
+		})
+		at.at = at.at.Add(time.Millisecond)
+		tracker.Observe(context.Background(), observability.Observation{
+			ProgressCompletionKind: "COMPLETED_WITH_UNAVAILABLE", ProgressCompletionReason: "QUERY_REJECTED",
+			Trace: observability.TraceFields{QueryGroupKey: "qg-1", EvaluationTime: slot},
+		})
+		at.at = at.at.Add(time.Minute)
+	}
+	rows := tracker.Anomalies()
+	Attribute(rows, at.at)
+	if len(rows) != 1 || rows[0].Failure == nil || rows[0].Failure.Rejection == nil ||
+		*rows[0].Failure.Rejection != (RejectionRef{Class: "VM_SAMPLE_LIMIT", TraceID: "4bf92f3577b34da6a3ce929d0e0e4736"}) {
+		t.Fatalf("rows = %+v, want the failure naming the rejection", rows)
+	}
+	for _, row := range []any{rows[0]} {
+		encoded, _ := json.Marshal(row)
+		for _, word := range []string{"payments-7f9c", "password", "samples for", "excerpt"} {
+			if strings.Contains(string(encoded), word) {
+				t.Fatalf("the row carries %q: %s", word, encoded)
+			}
+		}
+	}
+	if tracked, ok := tracker.TrackedRow("qg-1"); ok {
+		encoded, _ := json.Marshal(tracked)
+		if strings.Contains(string(encoded), "payments-7f9c") {
+			t.Fatalf("the tracked row carries the excerpt: %s", encoded)
+		}
+	}
+	kept, ok := tracker.LocalRejection("qg-1")
+	if !ok || kept.Excerpt != excerpt || kept.HTTPStatus != 400 || kept.Class != "VM_SAMPLE_LIMIT" {
+		t.Fatalf("kept %+v (%v), want the excerpt on this replica", kept, ok)
+	}
+	// The provider classed it as the query's sample limit: the strategy's
+	// query as written (refusalNamesStrategyQuery).
+	if rows[0].Finding.Check != CheckPlanUnevaluable {
+		t.Fatalf("finding %+v, want the strategy's query refused as unevaluable", rows[0].Finding)
+	}
+	if code, known := failureFacets["QUERY_REJECTED"]; !known || code.class != ClassRefused {
+		t.Fatalf("QUERY_REJECTED blocked as %+v (known %v), want refused", code, known)
+	}
+}
+
+// The kept refusals are bounded: a group's latest replaces its earlier one,
+// past the bound the oldest group's is given up, and a group this replica
+// no longer owns keeps none.
+func TestKeptRejectionsAreBoundedReplacedAndForgotten(t *testing.T) {
+	at := &clock{at: now}
+	tracker := newTracker(t, at)
+	reject := func(group, class string) {
+		tracker.Observe(context.Background(), observability.Observation{
+			QueryFailure: &observability.QueryFailureFacts{Stage: "provider", Category: "source_backend", Code: "QUERY_REJECTED",
+				HTTPStatus: 400, Rejection: &observability.QueryRejection{Class: class, Excerpt: "x"}},
+			Trace: observability.TraceFields{QueryGroupKey: group, EvaluationTime: 100},
+		})
+		at.at = at.at.Add(time.Second)
+	}
+	reject("qg-a", "HTTP_400")
+	reject("qg-a", "PROMQL_PARSE")
+	if kept, _ := tracker.LocalRejection("qg-a"); kept.Class != "PROMQL_PARSE" {
+		t.Fatalf("kept %+v, want the latest refusal", kept)
+	}
+	for index := 0; index < MaxKeptRejections; index++ {
+		reject(fmt.Sprintf("qg-%d", index), "HTTP_400")
+	}
+	if _, kept := tracker.LocalRejection("qg-a"); kept {
+		t.Fatal("the oldest group's refusal was kept past the bound")
+	}
+	if len(tracker.rejections) != MaxKeptRejections {
+		t.Fatalf("%d kept, want the bound %d", len(tracker.rejections), MaxKeptRejections)
+	}
+	tracker.Forget(map[string]struct{}{"qg-1": {}})
+	if _, kept := tracker.LocalRejection("qg-2"); kept || len(tracker.rejections) != 1 {
+		t.Fatalf("%d kept after the handover, want only the owned group's", len(tracker.rejections))
 	}
 }

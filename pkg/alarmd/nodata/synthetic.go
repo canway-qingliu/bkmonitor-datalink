@@ -52,6 +52,10 @@ type SyntheticSeries struct {
 	// handover - and so lose it. A close the consumer holds no alert for is
 	// an orphan there and changes nothing.
 	Closing bool
+	// FirstAbsent is when an absent group's absence began, zero for a present
+	// one. It is what decides whether a manual close recorded during this
+	// round covers the event the round is about to send (decision-024).
+	FirstAbsent int64
 }
 
 // IdentityFields returns what the event carries and what its identity is hashed
@@ -107,19 +111,29 @@ type SyntheticInput struct {
 // A verdict whose group cannot be named is an error, and the round with it:
 // see below.
 func SyntheticSeriesFor(input SyntheticInput) ([]SyntheticSeries, error) {
-	keys := make([]string, 0, len(input.Result.Verdicts))
+	verdicts := make([]GroupJudgement, 0, len(input.Result.Verdicts))
 	for key, verdict := range input.Result.Verdicts {
 		if verdict == VerdictUnavailable {
 			continue
 		}
-		keys = append(keys, key)
+		verdicts = append(verdicts, GroupJudgement{
+			Key: key, Verdict: verdict, Closing: input.Result.Closing[key], Memory: input.Memory[key],
+		})
 	}
-	sort.Strings(keys)
+	sort.Slice(verdicts, func(left, right int) bool { return verdicts[left].Key < verdicts[right].Key })
+	return syntheticSeriesOf(input.EvaluationTime, input.PeriodSeconds, verdicts, input.Roster.Groups)
+}
 
-	series := make([]SyntheticSeries, 0, len(keys))
-	sourceTime := input.EvaluationTime - input.PeriodSeconds
-	for _, key := range keys {
-		group, named := input.Roster.Groups[key]
+// syntheticSeriesOf is SyntheticSeriesFor over verdicts already in key order
+// and without UNAVAILABLE, each carrying the memory the round left the group
+// with. roster names the expected groups; any other is named from its key.
+func syntheticSeriesOf(
+	evaluationTime, periodSeconds int64, verdicts []GroupJudgement, roster map[string]Group,
+) ([]SyntheticSeries, error) {
+	series := make([]SyntheticSeries, 0, len(verdicts))
+	sourceTime := evaluationTime - periodSeconds
+	for _, verdict := range verdicts {
+		group, named := roster[verdict.Key]
 		if !named {
 			// Two verdicts are not roster groups: the whole item, and the one
 			// NORMAL that closes an absence on a group the roster has stopped
@@ -137,16 +151,17 @@ func SyntheticSeriesFor(input SyntheticInput) ([]SyntheticSeries, error) {
 			// was closing, and the alert would stay open with nothing left to
 			// close it; failed, the round writes nothing, the memory keeps the
 			// group, and the Plan reports the round by name.
-			parsed, ok := ParseGroupKey(key)
+			parsed, ok := ParseGroupKey(verdict.Key)
 			if !ok {
-				return nil, unparseableGroupKey(key)
+				return nil, unparseableGroupKey(verdict.Key)
 			}
 			group = parsed
 		}
-		entry := SyntheticSeries{Group: group, SourceTime: sourceTime, Value: PresentValue, Closing: input.Result.Closing[key]}
-		if input.Result.Verdicts[key] == VerdictAnomaly {
+		entry := SyntheticSeries{Group: group, SourceTime: sourceTime, Value: PresentValue, Closing: verdict.Closing}
+		if verdict.Verdict == VerdictAnomaly {
 			entry.Value = AbsentValue
-			entry.Periods = absentPeriods(input.Memory[key], input.EvaluationTime, input.PeriodSeconds)
+			entry.Periods = absentPeriods(verdict.Memory, evaluationTime, periodSeconds)
+			entry.FirstAbsent = verdict.Memory.FirstAbsent
 		}
 		series = append(series, entry)
 	}

@@ -15,12 +15,14 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"testing"
 	"time"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/internal/testwait"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/ownership"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/scheduler"
 )
@@ -47,9 +49,12 @@ func runScheduledOnceSettled(ctx context.Context, bundle *phaseTwoWorkerBundle) 
 // controlStreamServers is the control stream listener each bundle under test
 // got, keyed by bundle: a fixture that only Start()s the bundle serves no
 // listener, and the Worker's own view client has nothing to install from
-// until one is served on the address its registration advertises. Kept for
-// the life of the test process rather than closed per case, because the
-// helper has no test to hang a cleanup on. A case about a Worker whose
+// until one is served on the address its registration advertises. The
+// helper has no test to hang a cleanup on, so each listener lives as long
+// as its bundle: it is closed, and its entry let go, once the bundle has
+// shut down (releaseWhenClosed). Kept for the test process instead, every
+// bundle a case ever settled stayed reachable from here, its server and all
+// it held - seven gigabytes of a whole-package run. A case about a Worker whose
 // Leader is unreachable withholds it (withholdControlStreamForTest), and
 // the settling helpers leave it withheld until the case gives it back.
 var controlStreamServers sync.Map
@@ -98,11 +103,35 @@ func serveControlStreamForTest(bundle *phaseTwoWorkerBundle) {
 		http.NotFound(response, request)
 	}), &http2.Server{})
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
-	if _, raced := controlStreamServers.LoadOrStore(bundle, &testControlStream{server: server, listener: listener}); raced {
+	served := &testControlStream{server: server, listener: listener}
+	if _, raced := controlStreamServers.LoadOrStore(bundle, served); raced {
 		_ = listener.Close()
 		return
 	}
 	go func() { _ = server.Serve(listener) }()
+	go releaseWhenClosed(bundle, served)
+}
+
+// releaseWhenClosed closes the bundle's test listener and lets its entry go
+// once the bundle has shut down, unless another has taken its place (a case
+// withheld or restored it). It holds the bundle only until then.
+func releaseWhenClosed(bundle *phaseTwoWorkerBundle, served *testControlStream) {
+	ticker := time.NewTicker(200 * time.Millisecond) // fixed-wait: the poll interval of a condition wait, bounded by the bundle's shutdown
+	defer ticker.Stop()
+	for range ticker.C {
+		if current, ok := controlStreamServers.Load(bundle); !ok || current != any(served) {
+			return
+		}
+		bundle.mu.RLock()
+		closed := bundle.closed
+		bundle.mu.RUnlock()
+		if closed {
+			if controlStreamServers.CompareAndDelete(bundle, served) {
+				served.stop()
+			}
+			return
+		}
+	}
 }
 
 // withholdControlStreamForTest takes the bundle's control stream away --
@@ -127,7 +156,12 @@ func settleExecutableView(ctx context.Context, bundle *phaseTwoWorkerBundle, wai
 	}
 	serveControlStreamForTest(bundle)
 	deadline := time.Now().Add(wait)
-	for {
+	// Best effort by design: a case whose control process is gone or flapping
+	// has a view that cannot settle, and its passes run on unsettled after
+	// this bound (measured: three election cases reach it, twice each, and
+	// pass). A case that needs the settled view waits for it with
+	// requireSettledView, to the test's deadline.
+	for { // fixed-wait: how long a pass tries to settle before it runs unsettled, as the cases without a steady leader must
 		renewLapsedRegistrationForTest(ctx, bundle, ownership)
 		if viewSettled(ctx, bundle, ownership) {
 			return true
@@ -135,8 +169,28 @@ func settleExecutableView(ctx context.Context, bundle *phaseTwoWorkerBundle, wai
 		if time.Now().After(deadline) {
 			return false
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond) // fixed-wait: the poll interval of a best-effort settle; requireSettledView waits on the condition
 	}
+}
+
+// requireSettledView waits, until the test's deadline, for every Query Group
+// of the bundle to be executable from the view with its lease at the
+// record's timeline revision (viewSettled), and fails t if that never comes.
+// A case asserting what a settled round reads needs the settled state, not
+// settleExecutableView's bounded best effort: past that bound the round runs
+// on a lease behind the record, and its stale hint is answered through the
+// activation header.
+func requireSettledView(t *testing.T, ctx context.Context, bundle *phaseTwoWorkerBundle) {
+	t.Helper()
+	production, ok := bundle.dependencies.Ownership.(*productionPhaseTwoOwnership)
+	if bundle.dependencies.ViewClient == nil || !ok {
+		return
+	}
+	serveControlStreamForTest(bundle)
+	testwait.Until(t, "the view settling with every lease at its record's timeline revision", func() bool {
+		renewLapsedRegistrationForTest(ctx, bundle, production)
+		return viewSettled(ctx, bundle, production)
+	})
 }
 
 // renewLapsedRegistrationForTest re-registers the Worker when its own

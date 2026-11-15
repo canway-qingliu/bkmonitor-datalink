@@ -11,6 +11,8 @@ package metric
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -22,35 +24,117 @@ import (
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/absentalerts"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/access"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/activecopy"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/cliauth"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/contract"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/controlplane"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/editclose"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/filterclose"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/fleet"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/newopens"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/nodata"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/obchannel"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/observability"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/openalerts"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/openepisodes"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/ownership"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/platformsettings"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/redisfailure"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/redisscript"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/scopeclose"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/sourceliveness"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/state"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/strategycache"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/targetplan"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/tracing"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/viewstream"
 )
 
-func TestRecorderUsesPrivateRegistries(t *testing.T) {
-	first := NewRecorder(BuildInfo{Version: "v1", Commit: "a", SchemaVersion: "none"})
-	second := NewRecorder(BuildInfo{Version: "v2", Commit: "b", SchemaVersion: "none"})
+// cgroupShapes are the files the memory gauges read, as a host of each kind
+// has them: none outside a container, cgroup v1, cgroup v2. Every shape
+// serves a container_memory_cgroup_info line whose version label says which.
+var cgroupShapes = []struct {
+	name, version string
+	files         map[string]string
+}{
+	{"no cgroup", "unknown", map[string]string{}},
+	{"cgroup v1", "v1", map[string]string{"/proc/self/cgroup": "11:memory:/kubepods/pod1/c1\n", "/sys/fs/cgroup/memory/memory.usage_in_bytes": "1\n"}},
+	{"cgroup v2", "v2", map[string]string{"/proc/self/cgroup": "0::/kubepods/pod1/c1\n", "/sys/fs/cgroup/memory.current": "1\n"}},
+}
 
-	if first.Gatherer() == second.Gatherer() {
-		t.Fatal("recorders unexpectedly share a registry")
+// readingCgroup has the recorder's memory gauges read files instead of the
+// host's.
+func readingCgroup(recorder *Recorder, files map[string]string) {
+	recorder.phaseTwo.processMemory.read = func(name string) ([]byte, error) {
+		if body, ok := files[name]; ok {
+			return []byte(body), nil
+		}
+		return nil, errors.New("not here")
 	}
-	if got := scrape(t, first); !strings.Contains(got, `version="v1"`) || strings.Contains(got, `version="v2"`) {
-		t.Fatalf("first registry contains unexpected build labels:\n%s", got)
+}
+
+func TestRecorderUsesPrivateRegistries(t *testing.T) {
+	for _, shape := range cgroupShapes {
+		t.Run(shape.name, func(t *testing.T) {
+			first := NewRecorder(BuildInfo{Version: "v1", Commit: "a", SchemaVersion: "none"})
+			second := NewRecorder(BuildInfo{Version: "v2", Commit: "b", SchemaVersion: "none"})
+			readingCgroup(first, shape.files)
+			readingCgroup(second, shape.files)
+
+			if first.Gatherer() == second.Gatherer() {
+				t.Fatal("recorders unexpectedly share a registry")
+			}
+			// The fixture: the cgroup's version is served under the same
+			// label name as the build's.
+			if got := seriesLabels(t, second, "alarmd_container_memory_cgroup_info"); len(got) != 1 || got[0]["version"] != shape.version {
+				t.Fatalf("fixture: cgroup info = %v, want one of version %s", got, shape.version)
+			}
+			// Each registry's build_info is its own build and only that; the
+			// other recorder's build is in neither.
+			if got := buildLabels(t, first); len(got) != 1 || got[0] != "v1/a" {
+				t.Fatalf("first registry's build_info = %v, want only v1/a", got)
+			}
+			if got := buildLabels(t, second); len(got) != 1 || got[0] != "v2/b" {
+				t.Fatalf("second registry's build_info = %v, want only v2/b", got)
+			}
+		})
 	}
-	if got := scrape(t, second); !strings.Contains(got, `version="v2"`) || strings.Contains(got, `version="v1"`) {
-		t.Fatalf("second registry contains unexpected build labels:\n%s", got)
+}
+
+// buildLabels is each alarmd_build_info series the recorder serves, as
+// version/commit. It reads that family alone: other families carry a version
+// label too (container_memory_cgroup_info's is the cgroup's).
+func buildLabels(t *testing.T, recorder *Recorder) []string {
+	t.Helper()
+	var builds []string
+	for _, labels := range seriesLabels(t, recorder, "alarmd_build_info") {
+		builds = append(builds, labels["version"]+"/"+labels["commit"])
 	}
+	return builds
+}
+
+// seriesLabels is the labels of each series of one family the recorder
+// serves.
+func seriesLabels(t *testing.T, recorder *Recorder, name string) []map[string]string {
+	t.Helper()
+	families, err := recorder.Gatherer().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var series []map[string]string
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.Metric {
+			labels := map[string]string{}
+			for _, pair := range metric.Label {
+				labels[pair.GetName()] = pair.GetValue()
+			}
+			series = append(series, labels)
+		}
+	}
+	return series
 }
 
 func TestUnknownLabelValuesCollapseToOther(t *testing.T) {
@@ -83,11 +167,10 @@ func TestObservationRejectsANegativeDuration(t *testing.T) {
 		Component: observability.ComponentRuntime,
 		Stage:     observability.StageFleetSnapshotPublish,
 		Result:    observability.ResultSuccess,
-		Direction: observability.DirectionInternal,
 		Duration:  -time.Second,
 	})
 	got := scrape(t, recorder)
-	if strings.Contains(got, "bkmonitor_alarmd_observation_duration_seconds") {
+	if strings.Contains(got, "alarmd_observation_duration_seconds") {
 		t.Fatalf("negative duration created a histogram:\n%s", got)
 	}
 }
@@ -98,7 +181,7 @@ func TestKnownM0ReasonMapsToBoundedMetricValue(t *testing.T) {
 	recorder := NewRecorder(BuildInfo{})
 	recorder.Observe(context.Background(), observability.Observation{
 		Component: observability.ComponentRuntime, Stage: observability.StageFleetSnapshotPublish,
-		Result: observability.ResultTerminal, Direction: observability.DirectionInternal,
+		Result:     observability.ResultTerminal,
 		ReasonCode: observability.ReasonCode(contract.ReasonRecordIdentityConflict),
 	})
 	got := scrape(t, recorder)
@@ -119,14 +202,12 @@ func TestObservationsAreCountedByStageAndResult(t *testing.T) {
 			Component: observability.ComponentRuntime,
 			Stage:     observability.StageFleetSnapshotPublish,
 			Result:    observability.ResultSuccess,
-			Direction: observability.DirectionInternal,
 			Duration:  time.Second,
 		},
 		{
 			Component: observability.ComponentResource,
 			Stage:     observability.StageResourceHard,
 			Result:    observability.ResultPaused,
-			Direction: observability.DirectionInternal,
 		},
 	} {
 		recorder.Observe(context.Background(), observation)
@@ -142,10 +223,10 @@ func TestObservationsAreCountedByStageAndResult(t *testing.T) {
 	}
 	// The same scrape covers the exported base families after Observe.
 	wants := []string{
-		"bkmonitor_alarmd_build_info",
-		"bkmonitor_alarmd_observation_total",
-		"bkmonitor_alarmd_operation_total",
-		"bkmonitor_alarmd_observation_duration_seconds_bucket",
+		"alarmd_build_info",
+		"alarmd_observation_total",
+		"alarmd_operation_total",
+		"alarmd_observation_duration_seconds_bucket",
 	}
 	for _, want := range wants {
 		if !strings.Contains(got, want) {
@@ -192,37 +273,50 @@ func TestCustomMetricFamilySeriesDevelopmentLimits(t *testing.T) {
 	}
 
 	for family, want := range map[string]int{
-		"bkmonitor_alarmd_observation_duration_seconds": 810,
+		// 9 generic stages x 12 results x (6 buckets, +Inf, sum, count):
+		// skipped and recovered are results the code writes, so they are in
+		// the bound; both are written on phase-two stages only, so no
+		// generic cell is created for either.
+		"alarmd_observation_duration_seconds": 972,
 	} {
 		if got := bounds[family]; got != want {
 			t.Errorf("histogram family %s theoretical maximum = %d, want buckets/+Inf/sum/count total %d", family, got, want)
 		}
 	}
 	for family, want := range map[string]int{
-		"bkmonitor_alarmd_worker_query_permits_held":         4,
-		"bkmonitor_alarmd_worker_query_permits_waiting":      2,
-		"bkmonitor_alarmd_worker_query_permit_seconds_total": 4,
-		"bkmonitor_alarmd_worker_query_permit_budget":        2,
-		"bkmonitor_alarmd_worker_query_admission_total":      20,
-		"bkmonitor_alarmd_query_downstream_distress_total":   8,
+		"alarmd_worker_query_permits_held":         5,
+		"alarmd_worker_query_permits_waiting":      2,
+		"alarmd_worker_query_permit_seconds_total": 5,
+		"alarmd_worker_query_permit_budget":        2,
+		"alarmd_worker_query_admission_total":      20,
+		"alarmd_query_downstream_distress_total":   8,
 		// One series per alert level this build has no name for, plus "other"
 		// for anything past the bound. The platform states its levels in
 		// strategy configuration and today has three named ones, so this family
 		// is empty in a healthy build and grows one series when it is not.
-		"bkmonitor_alarmd_unmapped_severity_total": 65,
+		"alarmd_unmapped_severity_total": 65,
 		// Redis command names are the bounded redisCommandNames set plus
 		// "other", each with pipelined true/false, for each named client plus
 		// "other". The client dimension multiplies this family, which is the
 		// price of being able to say which client the load belongs to; both
 		// sets are closed, so the product stays a number rather than a risk.
-		"bkmonitor_alarmd_redis_command_total": (len(redisCommandNames) + 1) * 2 * (len(redisClientNames) + 1),
-		"bkmonitor_alarmd_redis_command_failure_total": (len(redisCommandNames) + 1) * 2 *
+		"alarmd_redis_command_total": (len(redisCommandNames) + 1) * 2 * (len(redisClientNames) + 1),
+		"alarmd_redis_command_failure_total": (len(redisCommandNames) + 1) * 2 *
 			(len(redisClientNames) + 1),
 		// Reasons are a closed word set and the family does not carry the
 		// command, so it stays one client by nine words.
-		"bkmonitor_alarmd_redis_failure_reason_total": (len(redisClientNames) + 1) * len(redisfailure.Reasons),
-		"bkmonitor_alarmd_redis_command_duration_seconds": (len(redisCommandNames) + 1) * 2 *
+		"alarmd_redis_failure_reason_total": (len(redisClientNames) + 1) * len(redisfailure.Reasons),
+		"alarmd_redis_command_duration_seconds": (len(redisCommandNames) + 1) * 2 *
 			(len(redisClientNames) + 1) * (12 + 1 + 2),
+		// The script families are bounded by redisscript.MaxScripts plus
+		// "other"; the caller ones by the closed caller list plus "other" and
+		// "unnamed".
+		"alarmd_redis_script_total":            65 * 3 * 2 * 3,
+		"alarmd_redis_script_duration_seconds": 65 * 2 * (12 + 1 + 2),
+		"alarmd_redis_script_bytes_total":      65 * 2,
+		"alarmd_redis_caller_duration_seconds": (len(redisClientNames) + 1) * 25 * 2 * (12 + 1 + 2),
+		"alarmd_redis_bytes_total":             (len(redisClientNames) + 1) * 25 * (len(redisCommandNames) + 1) * 2,
+		"alarmd_lease_renewal_total":           4 * 14,
 	} {
 		if got := bounds[family]; got != want {
 			t.Errorf("query permit metric family %s theoretical maximum = %d, want %d", family, got, want)
@@ -230,385 +324,31 @@ func TestCustomMetricFamilySeriesDevelopmentLimits(t *testing.T) {
 	}
 }
 
-func TestCustomMetricDescriptorsAreExplicitlyApproved(t *testing.T) {
-	recorder := NewRecorder(BuildInfo{})
-	expected := map[string]string{
-		"bkmonitor_alarmd_build_info":                                   "variableLabels: {version,commit,schema_version}",
-		"bkmonitor_alarmd_observation_total":                            "variableLabels: {component,stage,result,reason_code}",
-		"bkmonitor_alarmd_operation_total":                              "variableLabels: {operation,result,reason_code}",
-		"bkmonitor_alarmd_observation_duration_seconds":                 "variableLabels: {component,stage,result}",
-		"bkmonitor_alarmd_worker_work_total":                            "variableLabels: {work_kind}",
-		"bkmonitor_alarmd_worker_busy_seconds_total":                    "variableLabels: {stage}",
-		"bkmonitor_alarmd_last_progress_timestamp_seconds":              "variableLabels: {kind}",
-		"bkmonitor_alarmd_capacity_transition_total":                    "variableLabels: {budget,result}",
-		"bkmonitor_alarmd_state_retained_share_approaching_slots_total": "variableLabels: {}",
-		"bkmonitor_alarmd_state_write_reuse_total":                      "variableLabels: {class,stored}",
-		"bkmonitor_alarmd_state_already_applied_total":                  "variableLabels: {site,kind}",
-		"bkmonitor_alarmd_state_version_conflict_total":                 "variableLabels: {site,kind}",
-		"bkmonitor_alarmd_worker_owned_query_groups":                    "variableLabels: {worker_role}",
-		"bkmonitor_alarmd_ownership_transition_total":                   "variableLabels: {transition,result,reason_class}",
-		"bkmonitor_alarmd_ownership_refusals_total":                     "variableLabels: {site,refusal}",
-		"bkmonitor_alarmd_source_observation_total":                     "variableLabels: {source_kind,result,reason_class}",
-		"bkmonitor_alarmd_source_refresh_total":                         "variableLabels: {status}",
-		"bkmonitor_alarmd_source_compile_total":                         "variableLabels: {result}",
-		"bkmonitor_alarmd_source_read_total":                            "variableLabels: {mode,reason}",
-		"bkmonitor_alarmd_source_refresh_build_total":                   "variableLabels: {build}",
-		"bkmonitor_alarmd_source_strategies_read_total":                 "variableLabels: {}",
-		"bkmonitor_alarmd_source_change_signal_age_seconds":             "variableLabels: {}",
-		"bkmonitor_alarmd_activation_failure_total":                     "variableLabels: {activation_failure_stage,activation_failure_class}",
-		"bkmonitor_alarmd_worker_query_admission_total":                 "variableLabels: {operation,result}",
-		"bkmonitor_alarmd_query_downstream_distress_total":              "variableLabels: {class,contended}",
-		"bkmonitor_alarmd_control_cache_total":                          "variableLabels: {object,result}",
-		"bkmonitor_alarmd_control_cache_entries":                        "variableLabels: {object}",
-		"bkmonitor_alarmd_control_cache_bytes":                          "variableLabels: {object}",
-		"bkmonitor_alarmd_control_cache_bytes_limit":                    "variableLabels: {object}",
-		"bkmonitor_alarmd_heap_inuse_site_bytes":                        "variableLabels: {site}",
-		"bkmonitor_alarmd_heap_inuse_site_objects":                      "variableLabels: {site}",
-		"bkmonitor_alarmd_heap_inuse_profiled_bytes":                    "variableLabels: {}",
-		"bkmonitor_alarmd_heap_inuse_profile_records":                   "variableLabels: {}",
-		"bkmonitor_alarmd_heap_inuse_live_bytes":                        "variableLabels: {}",
-		"bkmonitor_alarmd_control_cache_audit_total":                    "variableLabels: {object,result}",
-		"bkmonitor_alarmd_legacy_pod_cache_total":                       "variableLabels: {result}",
-		"bkmonitor_alarmd_series_admission_total":                       "variableLabels: {filter,result,reason}",
-		"bkmonitor_alarmd_admission_cmdb_address_differs_total":         "variableLabels: {grouped_by_target_ip,cause}",
-		"bkmonitor_alarmd_admission_cmdb_placed_by_host_id_total":       "variableLabels: {grouped_by_target_ip}",
-		"bkmonitor_alarmd_unmapped_severity_total":                      "variableLabels: {level}",
-		"bkmonitor_alarmd_cmdb_host_index_hosts":                        "variableLabels: {}",
-		"bkmonitor_alarmd_cmdb_service_instance_index_instances":        "variableLabels: {}",
-		"bkmonitor_alarmd_cmdb_index_business_mappings":                 "variableLabels: {mapping,state}",
-		"bkmonitor_alarmd_cmdb_index_records_refused":                   "variableLabels: {record}",
-		"bkmonitor_alarmd_fleet_snapshot_bytes":                         "variableLabels: {}",
-		"bkmonitor_alarmd_fleet_view_snapshot_loads_total":              "variableLabels: {}",
-		"bkmonitor_alarmd_fleet_view_snapshot_bytes_total":              "variableLabels: {}",
-		"bkmonitor_alarmd_fleet_summary_bytes":                          "variableLabels: {}",
-		"bkmonitor_alarmd_fleet_view_summary_loads_total":               "variableLabels: {}",
-		"bkmonitor_alarmd_fleet_view_summary_bytes_total":               "variableLabels: {}",
-		"bkmonitor_alarmd_fleet_view_owned_loads_total":                 "variableLabels: {}",
-		"bkmonitor_alarmd_fleet_view_owned_bytes_total":                 "variableLabels: {}",
-		"bkmonitor_alarmd_retained_peak_census_groups":                  "variableLabels: {}",
-		"bkmonitor_alarmd_retained_peak_census_overflow":                "variableLabels: {}",
-		"bkmonitor_alarmd_host_disable_monitor_states":                  "variableLabels: {}",
-		"bkmonitor_alarmd_cmdb_host_index_age_seconds":                  "variableLabels: {kind}",
-		"bkmonitor_alarmd_cmdb_host_index_degraded":                     "variableLabels: {reason}",
-		"bkmonitor_alarmd_cmdb_host_index_reads_total":                  "variableLabels: {result}",
-		"bkmonitor_alarmd_due_index_entries":                            "variableLabels: {}",
-		"bkmonitor_alarmd_due_index_prediction_total":                   "variableLabels: {prediction,actual}",
-		"bkmonitor_alarmd_due_index_recomputed_total":                   "variableLabels: {trigger}",
-		"bkmonitor_alarmd_due_index_version_check_total":                "variableLabels: {result}",
-		"bkmonitor_alarmd_due_index_horizon_seconds":                    "variableLabels: {}",
-		"bkmonitor_alarmd_dispatch_skipped_total":                       "variableLabels: {reason}",
-		"bkmonitor_alarmd_dispatch_crowded_out_total":                   "variableLabels: {by}",
-		"bkmonitor_alarmd_redis_operation_total":                        "variableLabels: {client}",
-		"bkmonitor_alarmd_redis_pool_size":                              "variableLabels: {client}",
-		"bkmonitor_alarmd_redis_pool_connections":                       "variableLabels: {client,state}",
-		"bkmonitor_alarmd_redis_pool_waits_total":                       "variableLabels: {client,result}",
-		"bkmonitor_alarmd_redis_command_total":                          "variableLabels: {client,command,pipelined}",
-		"bkmonitor_alarmd_redis_command_failure_total":                  "variableLabels: {client,command,pipelined}",
-		"bkmonitor_alarmd_redis_failure_reason_total":                   "variableLabels: {client,reason}",
-		"bkmonitor_alarmd_redis_caller_operation_total":                 "variableLabels: {client,caller}",
-		"bkmonitor_alarmd_redis_caller_failure_reason_total":            "variableLabels: {client,caller,reason}",
-		"bkmonitor_alarmd_redis_command_duration_seconds":               "variableLabels: {client,command,pipelined}",
-		"bkmonitor_alarmd_short_period_slot_completions_total":          "variableLabels: {cohort,operation,completion_kind}",
-		"bkmonitor_alarmd_query_cooldown_events_total":                  "variableLabels: {event}",
-		"bkmonitor_alarmd_access_response_status_total":                 "variableLabels: {code,outcome}",
-		"bkmonitor_alarmd_access_response_codec_total":                  "variableLabels: {codec,negotiation,completion}",
-		"bkmonitor_alarmd_uq_answer_truncated_total":                    "variableLabels: {source_semantics}",
-		"bkmonitor_alarmd_query_unavailable_attribution_total":          "variableLabels: {attribution,http_class}",
-		"bkmonitor_alarmd_slot_readiness_slack_seconds":                 "variableLabels: {}",
-		"bkmonitor_alarmd_slot_readiness_boundary_total":                "variableLabels: {boundary}",
-		"bkmonitor_alarmd_short_period_slot_execution_duration_seconds": "variableLabels: {cohort,completion_kind}",
-		"bkmonitor_alarmd_short_period_slot_completion_lag_seconds":     "variableLabels: {cohort,completion_kind}",
-		"bkmonitor_alarmd_run_one_return_total":                         "variableLabels: {outcome}",
-		"bkmonitor_alarmd_expired_range_total":                          "variableLabels: {result}",
-		"bkmonitor_alarmd_expired_slots_finalized_total":                "variableLabels: {reason}",
-		"bkmonitor_alarmd_execute_return_total":                         "variableLabels: {outcome}",
-		"bkmonitor_alarmd_progress_completed_total":                     "variableLabels: {kind}",
-		"bkmonitor_alarmd_progress_completion_causes_total":             "variableLabels: {completion_kind,cause,reason}",
-		"bkmonitor_alarmd_scheduler_active_executions":                  "variableLabels: {}",
-		"bkmonitor_alarmd_scheduler_ready_runners":                      "variableLabels: {}",
-		"bkmonitor_alarmd_scheduler_delayed_runners":                    "variableLabels: {}",
-		"bkmonitor_alarmd_query_permit_wait_seconds":                    "variableLabels: {queue_kind}",
-		"bkmonitor_alarmd_slot_operation_duration_seconds":              "variableLabels: {stage}",
-		"bkmonitor_alarmd_active_qg_set_query_groups":                   "variableLabels: {}",
-		"bkmonitor_alarmd_active_qg_set_object_bytes":                   "variableLabels: {}",
-		"bkmonitor_alarmd_active_qg_set_redis_duration_seconds":         "variableLabels: {operation,result}",
-		"bkmonitor_alarmd_schedule_cutover_payload_bytes":               "variableLabels: {}",
-		"bkmonitor_alarmd_schedule_timeline_bytes_max":                  "variableLabels: {}",
-		"bkmonitor_alarmd_schedule_timeline_bytes":                      "variableLabels: {}",
-		"bkmonitor_alarmd_schedule_segments_pruned_total":               "variableLabels: {}",
-		"bkmonitor_alarmd_dispatch_rotation_total":                      "variableLabels: {result}",
-		"bkmonitor_alarmd_local_view_object_bytes":                      "variableLabels: {kind}",
-		"bkmonitor_alarmd_local_view_query_groups":                      "variableLabels: {}",
-		"bkmonitor_alarmd_view_stream_leading":                          "variableLabels: {}",
-		"bkmonitor_alarmd_view_revision":                                "variableLabels: {}",
-		"bkmonitor_alarmd_view_stream_sessions":                         "variableLabels: {}",
-		"bkmonitor_alarmd_view_version_receivers":                       "variableLabels: {stage}",
-		"bkmonitor_alarmd_view_receipts_ignored_total":                  "variableLabels: {reason}",
-		"bkmonitor_alarmd_view_publications_total":                      "variableLabels: {result}",
-		"bkmonitor_alarmd_view_messages_sent_total":                     "variableLabels: {kind}",
-		"bkmonitor_alarmd_view_stream_refusals_total":                   "variableLabels: {}",
-		"bkmonitor_alarmd_view_publish_failures_total":                  "variableLabels: {reason}",
-		"bkmonitor_alarmd_view_publish_failing_seconds":                 "variableLabels: {}",
-		"bkmonitor_alarmd_view_stream_no_sessions_seconds":              "variableLabels: {}",
-		"bkmonitor_alarmd_view_deltas_oversized_total":                  "variableLabels: {}",
-		"bkmonitor_alarmd_view_executed_query_groups":                   "variableLabels: {outcome}",
-		"bkmonitor_alarmd_view_gate_lease_renewal_total":                "variableLabels: {result}",
-		"bkmonitor_alarmd_view_client_connected":                        "variableLabels: {}",
-		"bkmonitor_alarmd_view_installed_revision":                      "variableLabels: {}",
-		"bkmonitor_alarmd_view_objects_missing":                         "variableLabels: {}",
-		"bkmonitor_alarmd_view_install_total":                           "variableLabels: {kind}",
-		"bkmonitor_alarmd_view_install_failure_total":                   "variableLabels: {reason}",
-		"bkmonitor_alarmd_view_snapshot_request_total":                  "variableLabels: {}",
-		"bkmonitor_alarmd_view_client_refusal_total":                    "variableLabels: {reason}",
-		"bkmonitor_alarmd_view_client_connection_total":                 "variableLabels: {}",
-		"bkmonitor_alarmd_view_discovery_miss_total":                    "variableLabels: {reason}",
-		"bkmonitor_alarmd_dispatch_walk_total":                          "variableLabels: {result}",
-		"bkmonitor_alarmd_due_index_audit_overshoot_seconds":            "variableLabels: {cooldown}",
-		"bkmonitor_alarmd_schedule_prune_skipped_total":                 "variableLabels: {reason}",
-		"bkmonitor_alarmd_schedule_cutover_query_groups_total":          "variableLabels: {decision}",
-		"bkmonitor_alarmd_schedule_cutover_read_hold_links_total":       "variableLabels: {decision}",
-		"bkmonitor_alarmd_fleet_overdue_episodes_total":                 "variableLabels: {hold}",
-		"bkmonitor_alarmd_schedule_cutover_timelines_read":              "variableLabels: {}",
-		"bkmonitor_alarmd_schedule_cutover_first_duration_seconds":      "variableLabels: {}",
-		"bkmonitor_alarmd_schedule_cutover_first_timelines_read":        "variableLabels: {}",
-		"bkmonitor_alarmd_query_failure_total":                          "variableLabels: {stage,category}",
-		"bkmonitor_alarmd_schedule_cutover_duration_seconds":            "variableLabels: {result}",
-		"bkmonitor_alarmd_object_catalog_objects_total":                 "variableLabels: {operation,outcome}",
-		"bkmonitor_alarmd_object_catalog_written_bytes_total":           "variableLabels: {kind}",
-		"bkmonitor_alarmd_canonical_encoding_calls_total":               "variableLabels: {outcome}",
-		"bkmonitor_alarmd_canonical_encoding_records_shadow_total":      "variableLabels: {outcome}",
-		"bkmonitor_alarmd_object_catalog_redis_duration_seconds":        "variableLabels: {operation,result}",
-		"bkmonitor_alarmd_object_catalog_manifest_bytes":                "variableLabels: {}",
-		"bkmonitor_alarmd_object_read_total":                            "variableLabels: {kind,result}",
-		"bkmonitor_alarmd_state_generation_skew_total":                  "variableLabels: {kind}",
-		"bkmonitor_alarmd_state_generation_carry_total":                 "variableLabels: {scope,result}",
-		"bkmonitor_alarmd_undrained_draining_query_groups":              "variableLabels: {}",
-		"bkmonitor_alarmd_draining_cursor_pruned_query_groups":          "variableLabels: {}",
-		"bkmonitor_alarmd_rebalance_planned_moves":                      "variableLabels: {}",
-		"bkmonitor_alarmd_level_outcome_total":                          "variableLabels: {outcome,reason}",
-		"bkmonitor_alarmd_shard_unaware_ready_replicas":                 "variableLabels: {}",
-		"bkmonitor_alarmd_rebalance_gap":                                "variableLabels: {}",
-		"bkmonitor_alarmd_dispatch_queue_turnaways_total":               "variableLabels: {outcome,cohort}",
-		"bkmonitor_alarmd_handover_drains_total":                        "variableLabels: {outcome}",
-		"bkmonitor_alarmd_handover_drain_seconds":                       "variableLabels: {}",
-		"bkmonitor_alarmd_output_unapplied_total":                       "variableLabels: {refusal}",
-		"bkmonitor_alarmd_executions_hung_total":                        "variableLabels: {outcome}",
-		"bkmonitor_alarmd_assignment_moves_total":                       "variableLabels: {reason}",
-		"bkmonitor_alarmd_rebalance_paused_total":                       "variableLabels: {reason}",
-		"bkmonitor_alarmd_control_read_round_trips_total":               "variableLabels: {read}",
-		"bkmonitor_alarmd_control_read_keys_total":                      "variableLabels: {read}",
-		"bkmonitor_alarmd_control_read_duration_seconds":                "variableLabels: {read}",
-		"bkmonitor_alarmd_assignment_index_stale_rounds":                "variableLabels: {}",
-		"bkmonitor_alarmd_assignment_index_write_total":                 "variableLabels: {result}",
-		"bkmonitor_alarmd_control_facts_read_total":                     "variableLabels: {fact}",
-		"bkmonitor_alarmd_control_facts_unavailable_total":              "variableLabels: {fact,reason}",
-		"bkmonitor_alarmd_control_facts_rebuilt_total":                  "variableLabels: {fact}",
-		"bkmonitor_alarmd_control_health_facts_total":                   "variableLabels: {status}",
-		"bkmonitor_alarmd_control_health_invalid_total":                 "variableLabels: {field}",
-		"bkmonitor_alarmd_control_leader_transitions_total":             "variableLabels: {to_class,reason}",
-		"bkmonitor_alarmd_startup_dependency_wait_total":                "variableLabels: {dependency}",
-		"bkmonitor_alarmd_activation_blocked_query_groups":              "variableLabels: {reason}",
-		"bkmonitor_alarmd_activation_blocked_set_total":                 "variableLabels: {accounting}",
-		"bkmonitor_alarmd_activation_timeline_reopened_total":           "variableLabels: {}",
-		"bkmonitor_alarmd_activation_body_bytes":                        "variableLabels: {}",
-		"bkmonitor_alarmd_fleet_round_memory_objects":                   "variableLabels: {rounds}",
-		"bkmonitor_alarmd_fleet_round_memory_rounds":                    "variableLabels: {}",
-		"bkmonitor_alarmd_fleet_round_memory_bytes":                     "variableLabels: {}",
-		"bkmonitor_alarmd_fleet_round_memory_max_rounds":                "variableLabels: {}",
-		"bkmonitor_alarmd_fleet_round_memory_window_sized_objects":      "variableLabels: {}",
-		"bkmonitor_alarmd_fleet_round_memory_line_held_objects":         "variableLabels: {}",
-		"bkmonitor_alarmd_target_group_groups":                          "variableLabels: {state}",
-		"bkmonitor_alarmd_target_group_refresh_failed":                  "variableLabels: {}",
-		"bkmonitor_alarmd_loop_turn_age_seconds":                        "variableLabels: {loop}",
-		"bkmonitor_alarmd_loop_turn_duration_seconds":                   "variableLabels: {loop}",
-		"bkmonitor_alarmd_executions_past_deadline":                     "variableLabels: {}",
-		"bkmonitor_alarmd_assignment_index_read_total":                  "variableLabels: {result}",
-		"bkmonitor_alarmd_assignment_index_confirm_total":               "variableLabels: {result}",
-		"bkmonitor_alarmd_assignment_record_read_total":                 "variableLabels: {path}",
-		"bkmonitor_alarmd_schedule_cursor_advance_total":                "variableLabels: {result,refusal}",
-		"bkmonitor_alarmd_activation_held_query_groups":                 "variableLabels: {}",
-		"bkmonitor_alarmd_activation_held_age_seconds_max":              "variableLabels: {}",
-	}
-	expected["bkmonitor_alarmd_algorithm_evaluation_total"] = "variableLabels: {algorithm_family,result}"
-	expected["bkmonitor_alarmd_algorithm_input_total"] = "variableLabels: {algorithm_family,input_name,dependency_point,result}"
-	expected["bkmonitor_alarmd_trigger_recovery_beside_level_total"] = "variableLabels: {beside}"
-	expected["bkmonitor_alarmd_trigger_open_alert_gate_total"] = "variableLabels: {outcome}"
-	expected["bkmonitor_alarmd_open_alert_set_authoritative_age_seconds"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_open_alert_set_unavailable_total"] = "variableLabels: {reason}"
-	expected["bkmonitor_alarmd_open_alert_set_refresh_total"] = "variableLabels: {result}"
-	expected["bkmonitor_alarmd_open_alert_set_lookup_total"] = "variableLabels: {answer}"
-	expected["bkmonitor_alarmd_effective_close_total"] = "variableLabels: {outcome}"
-	expected["bkmonitor_alarmd_log_lines_total"] = "variableLabels: {stage,admission}"
-	expected["bkmonitor_alarmd_observer_panics_total"] = "variableLabels: {observer}"
-	expected["bkmonitor_alarmd_absent_strategy_close_total"] = "variableLabels: {outcome}"
-	expected["bkmonitor_alarmd_target_scope_close_total"] = "variableLabels: {outcome}"
-	expected["bkmonitor_alarmd_absent_strategy_difference"] = "variableLabels: {side}"
-	expected["bkmonitor_alarmd_absent_strategy_round_total"] = "variableLabels: {disposition}"
-	expected["bkmonitor_alarmd_open_alert_set_entries"] = "variableLabels: {kind}"
-	expected["bkmonitor_alarmd_open_alert_set_tracked_strategies"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_open_alert_set_evictions_total"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_open_alert_set_notices_refused_total"] = "variableLabels: {reason}"
-	expected["bkmonitor_alarmd_linkd_calibration_coverage"] = "variableLabels: {state}"
-	expected["bkmonitor_alarmd_fleet_tracker_dropped_total"] = "variableLabels: {what}"
-	expected["bkmonitor_alarmd_effective_time_refresh_total"] = "variableLabels: {result}"
-	expected["bkmonitor_alarmd_activation_rebuild_total"] = "variableLabels: {outcome}"
-	expected["bkmonitor_alarmd_timeline_repairs_total"] = "variableLabels: {outcome}"
-	expected["bkmonitor_alarmd_activation_timelines_skipped_total"] = "variableLabels: {reason}"
-	expected["bkmonitor_alarmd_timeline_unreadable_reports_total"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_activation_header_rebuild_total"] = "variableLabels: {outcome}"
-	expected["bkmonitor_alarmd_activation_renewal_conflict_total"] = "variableLabels: {reason}"
-	expected["bkmonitor_alarmd_control_source_refresh_total"] = "variableLabels: {outcome,exit}"
-	expected["bkmonitor_alarmd_catalog_strategy_returned_after_removal_total"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_leader_forward_duration_seconds"] = "variableLabels: {route,result}"
-	expected["bkmonitor_alarmd_control_source_mode"] = "variableLabels: {role,mode}"
-	expected["bkmonitor_alarmd_control_source_last_success_age_seconds"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_leader_rounds_total"] = "variableLabels: {result}"
-	expected["bkmonitor_alarmd_query_cooldown_saves_total"] = "variableLabels: {result}"
-	expected["bkmonitor_alarmd_fleet_control_facts_writes_total"] = "variableLabels: {result}"
-	expected["bkmonitor_alarmd_query_cooldown_loads_total"] = "variableLabels: {result}"
-	expected["bkmonitor_alarmd_event_business_attribution_total"] = "variableLabels: {source}"
-	expected["bkmonitor_alarmd_diagnostic_redis_failures_total"] = "variableLabels: {client,reason}"
-	expected["bkmonitor_alarmd_diagnostic_redis_dial_retries_total"] = "variableLabels: {client,reason}"
-	expected["bkmonitor_alarmd_leader_round_stage_seconds_total"] = "variableLabels: {stage}"
-	expected["bkmonitor_alarmd_lookback_first_reads_total"] = "variableLabels: {source}"
-	expected["bkmonitor_alarmd_lookback_rechecks_total"] = "variableLabels: {source,outcome}"
-	expected["bkmonitor_alarmd_lookback_changed_windows_total"] = "variableLabels: {source}"
-	expected["bkmonitor_alarmd_lookback_changes_total"] = "variableLabels: {source,class}"
-	expected["bkmonitor_alarmd_lookback_sample_classes_total"] = "variableLabels: {source,class}"
-	expected["bkmonitor_alarmd_lookback_read_early_groups"] = "variableLabels: {source}"
-	expected["bkmonitor_alarmd_lookback_series_late_groups"] = "variableLabels: {source}"
-	expected["bkmonitor_alarmd_lookback_supplement_windows_total"] = "variableLabels: {source,outcome}"
-	expected["bkmonitor_alarmd_lookback_supplement_unobserved_total"] = "variableLabels: {source,reason}"
-	expected["bkmonitor_alarmd_lookback_supplement_series_total"] = "variableLabels: {source,outcome}"
-	expected["bkmonitor_alarmd_lookback_supplement_points_total"] = "variableLabels: {source}"
-	expected["bkmonitor_alarmd_lookback_directed_read_bytes_total"] = "variableLabels: {source}"
-	expected["bkmonitor_alarmd_lookback_supplement_hold_total"] = "variableLabels: {source,bucket}"
-	expected["bkmonitor_alarmd_lookback_supplement_hold_max_seconds"] = "variableLabels: {source}"
-	expected["bkmonitor_alarmd_lookback_directed_early_total"] = "variableLabels: {source,group}"
-	expected["bkmonitor_alarmd_lookback_directed_early_undecided_total"] = "variableLabels: {source}"
-	expected["bkmonitor_alarmd_lookback_directed_early_read_bytes_total"] = "variableLabels: {source}"
-	expected["bkmonitor_alarmd_lookback_earlier_read_bytes_total"] = "variableLabels: {source}"
-	expected["bkmonitor_alarmd_lookback_read_hold_ignored_total"] = "variableLabels: {source,reason}"
-	expected["bkmonitor_alarmd_read_hold_transition_total"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_read_hold_transition_overtaken_total"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_read_hold_predecessor_total"] = "variableLabels: {reason}"
-	expected["bkmonitor_alarmd_read_hold_seeds_total"] = "variableLabels: {origin}"
-	expected["bkmonitor_alarmd_read_hold_transition_clamped_total"] = "variableLabels: {source}"
-	expected["bkmonitor_alarmd_read_hold_record_corrupt_total"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_read_hold_retire_close_failed_total"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_read_hold_close_previous_skipped_total"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_read_hold_degraded_total"] = "variableLabels: {reason}"
-	expected["bkmonitor_alarmd_read_hold_groups"] = "variableLabels: {source,kind}"
-	expected["bkmonitor_alarmd_read_hold_max_seconds"] = "variableLabels: {source}"
-	expected["bkmonitor_alarmd_lookback_first_read_bytes_total"] = "variableLabels: {source}"
-	expected["bkmonitor_alarmd_lookback_recheck_bytes_total"] = "variableLabels: {source}"
-	expected["bkmonitor_alarmd_lookback_unknown_lookback_total"] = "variableLabels: {source}"
-	expected["bkmonitor_alarmd_lookback_coverage"] = "variableLabels: {what}"
-	expected["bkmonitor_alarmd_lookback_pending"] = "variableLabels: {what}"
-	expected["bkmonitor_alarmd_lookback_preemptions_total"] = "variableLabels: {source}"
-	expected["bkmonitor_alarmd_lookback_permit_refusals_total"] = "variableLabels: {reason}"
-	expected["bkmonitor_alarmd_lookback_faults_total"] = "variableLabels: {reason}"
-	expected["bkmonitor_alarmd_linkd_console_state"] = "variableLabels: {state}"
-	expected["bkmonitor_alarmd_linkd_console_calls_total"] = "variableLabels: {op,result}"
-	expected["bkmonitor_alarmd_sre_actions_total"] = "variableLabels: {op,result}"
-	expected["bkmonitor_alarmd_sre_rollouts_total"] = "variableLabels: {state}"
-	expected["bkmonitor_alarmd_sre_rollouts_watched"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_sre_receipts_write_total"] = "variableLabels: {result}"
-	expected["bkmonitor_alarmd_linkd_console_failures_total"] = "variableLabels: {op,class}"
-	expected["bkmonitor_alarmd_control_source_retained_stale_revisions_total"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_control_source_last_good_identity_changed_total"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_catalog_query_groups"] = "variableLabels: {source_semantics}"
-	expected["bkmonitor_alarmd_catalog_plans"] = "variableLabels: {source_semantics}"
-	expected["bkmonitor_alarmd_catalog_objects"] = "variableLabels: {disposition}"
-	expected["bkmonitor_alarmd_catalog_withheld_objects"] = "variableLabels: {disposition,reason}"
-	expected["bkmonitor_alarmd_catalog_no_data_plans"] = "variableLabels: {source}"
-	expected["bkmonitor_alarmd_catalog_plans_by_wire_format"] = "variableLabels: {format}"
-	expected["bkmonitor_alarmd_output_events_by_wire_format_total"] = "variableLabels: {format}"
-	expected["bkmonitor_alarmd_output_events_without_message_total"] = "variableLabels: {format,event_kind}"
-	expected["bkmonitor_alarmd_output_events_by_kind_total"] = "variableLabels: {format,event_kind}"
-	expected["bkmonitor_alarmd_output_events_rejected_total"] = "variableLabels: {rule,strategy}"
-	expected["bkmonitor_alarmd_output_events_rejected_strategies_overflow_total"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_history_coverage_rejected_total"] = "variableLabels: {rule}"
-	expected["bkmonitor_alarmd_history_coverage_unsummarised_total"] = "variableLabels: {cause}"
-	expected["bkmonitor_alarmd_worker_no_data_slot_plans_total"] = "variableLabels: {outcome}"
-	expected["bkmonitor_alarmd_worker_no_data_absences_total"] = "variableLabels: {outcome}"
-	expected["bkmonitor_alarmd_target_plan_resolution_total"] = "variableLabels: {state}"
-	expected["bkmonitor_alarmd_target_selector_resolutions_total"] = "variableLabels: {kind,state,reason}"
-	expected["bkmonitor_alarmd_target_excluded_absent_members_total"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_worker_no_data_persistent_skips_total"] = "variableLabels: {outcome}"
-	expected["bkmonitor_alarmd_worker_no_data_memory_refusals_total"] = "variableLabels: {reason,record}"
-	expected["bkmonitor_alarmd_worker_no_data_memory_writes_total"] = "variableLabels: {outcome}"
-	expected["bkmonitor_alarmd_query_free_completion_total"] = "variableLabels: {kind,evidence}"
-	expected["bkmonitor_alarmd_execution_evidence_written_total"] = "variableLabels: {result}"
-	expected["bkmonitor_alarmd_worker_no_data_memory_reads_total"] = "variableLabels: {representation}"
-	expected["bkmonitor_alarmd_worker_no_data_memory_renewals_total"] = "variableLabels: {result,reason}"
-	expected["bkmonitor_alarmd_worker_frozen_state_renewals_total"] = "variableLabels: {result}"
-	expected["bkmonitor_alarmd_worker_frozen_state_census_total"] = "variableLabels: {stage}"
-	expected["bkmonitor_alarmd_worker_gap_guard_scope_rounds_total"] = "variableLabels: {status,reason,progress}"
-	expected["bkmonitor_alarmd_worker_no_data_plans_seen_total"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_no_data_plans_by_hop_total"] = "variableLabels: {hop}"
-	expected["bkmonitor_alarmd_segment_content_freshness_total"] = "variableLabels: {state}"
-	expected["bkmonitor_alarmd_access_inplace_readiness_waits_total"] = "variableLabels: {wait}"
-	expected["bkmonitor_alarmd_access_inplace_held_input_bytes"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_schedule_cutover_total"] = "variableLabels: {result,reason}"
-	expected["bkmonitor_alarmd_replay_expired_total"] = "variableLabels: {reason}"
-	expected["bkmonitor_alarmd_replay_takeover_slots_total"] = "variableLabels: {outcome}"
-	expected["bkmonitor_alarmd_range_gate_total"] = "variableLabels: {outcome}"
-	expected["bkmonitor_alarmd_state_preflight_total"] = "variableLabels: {result,reason}"
-	expected["bkmonitor_alarmd_state_admission_total"] = "variableLabels: {result,reason}"
-	expected["bkmonitor_alarmd_slot_wait_duration_seconds"] = "variableLabels: {wait}"
-	expected["bkmonitor_alarmd_control_source_withheld_lines_total"] = "variableLabels: {result}"
-	expected["bkmonitor_alarmd_state_renewal_gate_resets_total"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_catalog_inert_plans"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_catalog_required_history_points"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_catalog_retained_history_points"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_catalog_levels_with_retention_slack"] = "variableLabels: {dominant}"
-	expected["bkmonitor_alarmd_catalog_global_strategies"] = "variableLabels: {outcome}"
-	expected["bkmonitor_alarmd_catalog_global_strategies_unsupported"] = "variableLabels: {reason,source_semantics}"
-	expected["bkmonitor_alarmd_level_abnormal_total"] = "variableLabels: {window}"
-	expected["bkmonitor_alarmd_platform_settings_mode"] = "variableLabels: {mode}"
-	expected["bkmonitor_alarmd_platform_settings_authoritative_age_seconds"] = "variableLabels: {}"
-	expected["bkmonitor_alarmd_platform_settings_refresh_total"] = "variableLabels: {result}"
-	expected["bkmonitor_alarmd_platform_settings_unavailable_total"] = "variableLabels: {reason}"
-	expected["bkmonitor_alarmd_platform_settings_change_total"] = "variableLabels: {field}"
-	expected["bkmonitor_alarmd_platform_settings_read_retry_total"] = "variableLabels: {}"
-
-	descriptions := make(chan string)
-	go func() {
-		descriptors := make(chan *prometheus.Desc)
-		go func() {
-			recorder.registry.Describe(descriptors)
-			close(descriptors)
-		}()
-		for descriptor := range descriptors {
-			descriptions <- descriptor.String()
-		}
-		close(descriptions)
-	}()
-
-	seen := make(map[string]bool, len(expected))
-	for description := range descriptions {
+// Which families there are, with which labels, is METRICS.md's
+// (TestTheMetricsReferenceIsTheRegistry). What the reference does not show is
+// a constant label or a family outside alarmd's namespace, so none may exist.
+func TestEveryFamilyIsAlarmdsAndCarriesNoConstantLabel(t *testing.T) {
+	recorder := describedRecorder(t)
+	descs := make(chan *prometheus.Desc, 64)
+	go func() { recorder.registry.Describe(descs); close(descs) }()
+	families := 0
+	for desc := range descs {
+		description := desc.String()
 		name := metricNameFromDescriptor(description)
 		if strings.HasPrefix(name, "go_") || strings.HasPrefix(name, "process_") {
 			continue
 		}
-		labels, approved := expected[name]
-		if !approved {
-			t.Errorf("unapproved metric descriptor: %s", description)
+		if !strings.HasPrefix(name, metricSubsystem+"_") {
+			t.Errorf("a family outside alarmd's namespace: %s", description)
 			continue
 		}
-		seen[name] = true
+		families++
 		if !strings.Contains(description, "constLabels: {}") {
-			t.Errorf("metric %s descriptor contains unapproved constant labels: %s", name, description)
-		}
-		if !strings.Contains(description, labels) {
-			t.Errorf("metric %s descriptor = %q, want %q", name, description, labels)
+			t.Errorf("%s carries a constant label: %s", name, description)
 		}
 	}
-	for name := range expected {
-		if !seen[name] {
-			t.Errorf("approved custom metric %s is not registered", name)
-		}
+	if families == 0 {
+		t.Fatal("the recorder described no alarmd family; the check read nothing")
 	}
 }
 
@@ -668,7 +408,50 @@ func equalFloats(left, right []float64) bool {
 	return true
 }
 
+func populateRedisScriptLabelCombinations(recorder *Recorder) {
+	metrics := recorder.phaseTwo.redisCalls
+	scripts := []string{redisscript.Other}
+	for index := 0; index < redisscript.MaxScripts; index++ {
+		scripts = append(scripts, fmt.Sprintf("script_%d", index))
+	}
+	for _, script := range scripts {
+		for _, pipelined := range []string{"true", "false"} {
+			metrics.scriptDuration.WithLabelValues(script, pipelined).Observe(0)
+			for _, command := range []string{redisscript.CommandEval, redisscript.CommandEvalSHA, redisscript.CommandLoad} {
+				for _, outcome := range []string{redisScriptOutcomeOK, redisScriptOutcomeNoScript, redisScriptOutcomeError} {
+					metrics.scriptCalls.WithLabelValues(script, command, pipelined, outcome).Inc()
+				}
+			}
+		}
+		for _, direction := range []string{redisBytesSent, redisBytesReceived} {
+			metrics.scriptBytes.WithLabelValues(script, direction).Inc()
+		}
+	}
+	clients := []string{"other"}
+	for client := range redisClientNames {
+		clients = append(clients, client)
+	}
+	commands := []string{"other"}
+	for command := range redisCommandNames {
+		commands = append(commands, command)
+	}
+	callers := append([]string{"other", redisCallerUnnamed}, redisfailure.Callers...)
+	for _, client := range clients {
+		for _, caller := range callers {
+			for _, pipelined := range []string{"true", "false"} {
+				metrics.callerDuration.WithLabelValues(client, caller, pipelined).Observe(0)
+			}
+			for _, command := range commands {
+				for _, direction := range []string{redisBytesSent, redisBytesReceived} {
+					metrics.bytes.WithLabelValues(client, caller, command, direction).Inc()
+				}
+			}
+		}
+	}
+}
+
 func populateAllCustomLabelCombinations(recorder *Recorder) {
+	populateRedisScriptLabelCombinations(recorder)
 	for level := uint32(1); level <= 65; level++ {
 		recorder.RecordUnmappedSeverity(level)
 	}
@@ -689,7 +472,6 @@ func populateAllCustomLabelCombinations(recorder *Recorder) {
 					Component:  pair.Component,
 					Stage:      pair.Stage,
 					Result:     result,
-					Direction:  observability.DirectionOther,
 					ReasonCode: metricInputReason(reason),
 					Duration:   time.Second,
 				})
@@ -701,7 +483,7 @@ func populateAllCustomLabelCombinations(recorder *Recorder) {
 			for _, reason := range observability.AllMetricReasons() {
 				recorder.Observe(context.Background(), observability.Observation{
 					Component: observability.ComponentResource, Stage: observability.StageResourceHard,
-					Result: result, Operation: operation, Direction: observability.DirectionOther,
+					Result: result, Operation: operation,
 					ReasonCode: metricInputReason(reason),
 				})
 			}
@@ -724,7 +506,7 @@ func metricInputReason(metricReason observability.ReasonCode) observability.Reas
 
 func customMetricFamilySeriesUpperBounds() map[string]int {
 	fqName := func(name string) string {
-		return prometheus.BuildFQName(metricNamespace, metricSubsystem, name)
+		return prometheus.BuildFQName("", metricSubsystem, name)
 	}
 	histogramSeries := func(labelCombinations, explicitBuckets int) int {
 		return labelCombinations * (explicitBuckets + 1 + 2) // explicit buckets, +Inf, sum and count
@@ -757,7 +539,8 @@ func customMetricFamilySeriesUpperBounds() map[string]int {
 	}
 
 	bounds := map[string]int{
-		fqName("build_info"): 1,
+		fqName("build_info"):          1,
+		fqName("config_unknown_keys"): 1,
 
 		fqName("observation_total"): observationTotal,
 		fqName("operation_total"): len(observability.AllMetricOperations()) *
@@ -772,6 +555,15 @@ func customMetricFamilySeriesUpperBounds() map[string]int {
 		fqName("last_progress_timestamp_seconds"):              len(phaseTwoProgressKinds),
 		fqName("capacity_transition_total"):                    len(phaseTwoBudgets) * len(phaseTwoCapacityResults),
 		fqName("state_retained_share_approaching_slots_total"): 1,
+		fqName("worker_input_slices_total"):                    2,
+		fqName("worker_sliced_slots_total"):                    1,
+		fqName("worker_first_seen_unseen_total"):               2,
+		fqName("worker_slice_read_ahead_total"):                len(observability.SliceReadAheadOutcomes),
+		fqName("worker_input_slice_timeouts_total"):            len(observability.InputSliceTimeoutOutcomes),
+		fqName("worker_input_slice_shapes_total"):              len(observability.InputSliceShapeOutcomes),
+		fqName("worker_no_data_stage_ahead_total"):             len(observability.NoDataStageAheadOutcomes),
+		fqName("worker_no_data_groups_staged_ahead_total"):     1,
+		fqName("worker_no_data_stage_ahead_differs_total"):     len(nodata.StagedDiffersReasons),
 		fqName("state_write_reuse_total"):                      len(observability.AllStateWriteReuseClasses()) * len(observability.AllStateWriteReuseStored()),
 		fqName("state_already_applied_total"):                  len(observability.AllStateAlreadyAppliedSites()) * len(observability.AllStateAlreadyAppliedKinds()),
 		fqName("state_version_conflict_total"):                 len(observability.AllStateAlreadyAppliedSites()) * len(observability.AllStateVersionConflictKinds()),
@@ -792,8 +584,8 @@ func customMetricFamilySeriesUpperBounds() map[string]int {
 		fqName("container_cpu_cores"):                          len(capacitySources) + 1,
 		fqName("container_memory_used_bytes"):                  1,
 		fqName("container_cpu_throttled_seconds_total"):        1,
-		fqName("worker_query_permits_held"):                    len(phaseTwoQueryInflightKinds),
-		fqName("worker_query_permit_seconds_total"):            len(phaseTwoQueryInflightKinds),
+		fqName("worker_query_permits_held"):                    len(phaseTwoQueryPermitKinds),
+		fqName("worker_query_permit_seconds_total"):            len(phaseTwoQueryPermitKinds),
 		fqName("worker_query_permits_waiting"):                 len(phaseTwoReadyQueueKinds),
 		fqName("worker_query_permit_budget"):                   len(phaseTwoReadyQueueKinds),
 		fqName("worker_query_admission_total"):                 len(phaseTwoQueryInflightKinds) * len(phaseTwoQueryAdmissionResults),
@@ -811,6 +603,7 @@ func customMetricFamilySeriesUpperBounds() map[string]int {
 		fqName("heap_inuse_profiled_bytes"):  1,
 		fqName("heap_inuse_profile_records"): 1,
 		fqName("heap_inuse_live_bytes"):      1,
+		fqName("heap_inuse_reserved_bytes"):  2,
 		fqName("control_cache_audit_total"):  4,
 		fqName("legacy_pod_cache_total"):     3,
 		// Filters and reasons are closed vocabularies in the recorder.
@@ -837,6 +630,7 @@ func customMetricFamilySeriesUpperBounds() map[string]int {
 		fqName("retained_peak_census_overflow"):         1,
 		fqName("host_disable_monitor_states"):           1,
 		fqName("cmdb_host_index_age_seconds"):           3,
+		fqName("cmdb_host_index_publish_seconds"):       2,
 		fqName("cmdb_host_index_degraded"):              len(cmdbIndexReasons),
 		fqName("cmdb_host_index_reads_total"):           3,
 		// Every combination is created at construction, so these are exact rather
@@ -848,24 +642,47 @@ func customMetricFamilySeriesUpperBounds() map[string]int {
 		fqName("due_index_version_check_total"): len(dueIndexVersionResults),
 		fqName("due_index_horizon_seconds"):     histogramSeries(1, len(dueIndexHorizonBuckets)),
 		fqName("dispatch_skipped_total"):        len(dispatchSkipReasons),
+		fqName("schedule_objects"):              len(ScheduleObjectClasses),
 		fqName("dispatch_crowded_out_total"):    len(dispatchCrowdedOutHolders),
 		// Two clients at most: the control plane connection and, when it resolves
 		// to a different endpoint, the runtime connection.
 		// One unlabelled series; connection acquisitions minus it is the retries.
-		fqName("redis_operation_total"):               len(redisClientNames) + 1,
-		fqName("redis_pool_size"):                     2,
-		fqName("redis_pool_connections"):              6,
-		fqName("redis_pool_waits_total"):              6,
-		fqName("redis_command_total"):                 redisCommandSeries,
-		fqName("redis_command_failure_total"):         redisCommandSeries,
-		fqName("redis_failure_reason_total"):          (len(redisClientNames) + 1) * len(redisfailure.Reasons),
-		fqName("redis_caller_operation_total"):        (len(redisClientNames) + 1) * (len(redisfailure.Callers) + 1),
-		fqName("redis_caller_failure_reason_total"):   (len(redisClientNames) + 1) * (len(redisfailure.Callers) + 1) * len(redisfailure.Reasons),
-		fqName("redis_command_duration_seconds"):      histogramSeries(redisCommandSeries, 12),
+		fqName("redis_operation_total"):             len(redisClientNames) + 1,
+		fqName("redis_pool_size"):                   2,
+		fqName("redis_pool_connections"):            6,
+		fqName("redis_pool_waits_total"):            6,
+		fqName("redis_command_total"):               redisCommandSeries,
+		fqName("redis_command_failure_total"):       redisCommandSeries,
+		fqName("redis_failure_reason_total"):        (len(redisClientNames) + 1) * len(redisfailure.Reasons),
+		fqName("redis_caller_operation_total"):      (len(redisClientNames) + 1) * (len(redisfailure.Callers) + 1),
+		fqName("redis_caller_failure_reason_total"): (len(redisClientNames) + 1) * (len(redisfailure.Callers) + 1) * len(redisfailure.Reasons),
+		fqName("redis_command_duration_seconds"):    histogramSeries(redisCommandSeries, 12),
+		// Every registered script plus "other". The table is capped at
+		// MaxScripts whatever a binary links, so these are numbers too. The
+		// callers are the closed list plus "other" and "unnamed".
+		fqName("redis_script_total"):            (redisscript.MaxScripts + 1) * 3 * 2 * 3,
+		fqName("redis_script_duration_seconds"): histogramSeries((redisscript.MaxScripts+1)*2, 12),
+		fqName("redis_script_bytes_total"):      (redisscript.MaxScripts + 1) * 2,
+		fqName("redis_caller_duration_seconds"): histogramSeries((len(redisClientNames)+1)*(len(redisfailure.Callers)+2)*2, 12),
+		fqName("redis_bytes_total"):             (len(redisClientNames) + 1) * (len(redisfailure.Callers) + 2) * (len(redisCommandNames) + 1) * 2,
+		// Three leases, each with renewed, the refusal words and the failure
+		// reasons: the cells a registration cannot reach are not created.
+		fqName("lease_renewal_total"):                 4 * (1 + len(ownership.RefusalReasons) + len(redisfailure.Reasons)),
 		fqName("short_period_slot_completions_total"): 56,
 		// 11 codes UQ declares plus OTHER, times allowed/unavailable/other.
 		fqName("access_response_status_total"): 36,
-		fqName("access_response_codec_total"):  3 * 3 * 4,
+		// the flow: two label-free histograms (bounds, +Inf, sum, count; the
+		// query duration has 10 bounds, the decision lag 15), six failure
+		// reasons, one label-free counter
+		fqName("access_query_duration_seconds"):    13,
+		fqName("access_query_answer_bytes"):        histogramSeries(len(observability.PhysicalQueryOutcomes), 12),
+		fqName("access_query_answer_series"):       histogramSeries(len(observability.PhysicalQueryOutcomes), 11),
+		fqName("access_query_answer_records"):      histogramSeries(len(observability.PhysicalQueryOutcomes), 14),
+		fqName("access_query_answer_seconds"):      histogramSeries(len(observability.PhysicalQueryOutcomes), len(QueryAnswerBuckets)),
+		fqName("slot_decision_lag_seconds"):        18,
+		fqName("access_query_failure_total"):       7,
+		fqName("output_events_rejected_all_total"): 1,
+		fqName("access_response_codec_total"):      3 * 3 * 4,
 		// One per source answered through Elasticsearch terms.
 		fqName("uq_answer_truncated_total"): 4,
 		// attempt, no_attempt_reason, no_attempts, other.
@@ -881,9 +698,11 @@ func customMetricFamilySeriesUpperBounds() map[string]int {
 		fqName("run_one_return_total"):                         13,
 		fqName("expired_range_total"):                          4,
 		fqName("expired_slots_finalized_total"):                2,
+		fqName("unfinished_slots_abandoned_total"):             1,
+		fqName("share_refusal_gaps_total"):                     1,
 		fqName("execute_return_total"):                         6,
 		fqName("progress_completed_total"):                     7,
-		fqName("progress_completion_causes_total"):             2 * (len(observability.ProgressCompletionCauses) + 2) * observability.NormalizedReasonCount(),
+		fqName("progress_completion_causes_total"):             2 * (len(observability.ProgressCompletionCauses) + 2) * observability.NormalizedReasonCount() * 2,
 		fqName("scheduler_active_executions"):                  1,
 		fqName("scheduler_ready_runners"):                      1,
 		fqName("scheduler_delayed_runners"):                    1,
@@ -943,6 +762,7 @@ func customMetricFamilySeriesUpperBounds() map[string]int {
 		fqName("schedule_cutover_query_groups_total"):     len(observability.ScheduleCutoverDecisions),
 		fqName("schedule_cutover_read_hold_links_total"):  len(observability.ScheduleCutoverReadHoldLinks),
 		fqName("fleet_overdue_episodes_total"):            len(fleet.OverdueHoldClasses),
+		fqName("fleet_restore_unread_total"):              len(FleetRestoreUnreadReasons),
 		fqName("schedule_cutover_timelines_read"):         1,
 		fqName("schedule_cutover_first_duration_seconds"): 1,
 		fqName("schedule_cutover_first_timelines_read"):   1,
@@ -951,24 +771,29 @@ func customMetricFamilySeriesUpperBounds() map[string]int {
 		// Two operations (write, renew) by three outcomes (written, present,
 		// missing); two operations by two results for the duration.
 		fqName("object_catalog_objects_total"): 2 * 3,
+		fqName("catalog_renewals_total"):       4,
 		// object, manifest.
 		fqName("object_catalog_written_bytes_total"): 2,
 		// One series per rollout position, all four always emitted so the
 		// graph survives a cutover instead of a series vanishing at it.
 		fqName("canonical_encoding_calls_total"):          2,
 		fqName("canonical_encoding_records_shadow_total"): 2,
-		fqName("object_catalog_redis_duration_seconds"):   histogramSeries(2*2, len(activeQGSetDurationBuckets)),
-		fqName("object_catalog_manifest_bytes"):           1,
+		// Unlabelled: one count each.
+		fqName("dataset_record_ids_kept_runs_total"):              1,
+		fqName("dataset_record_ids_derived_outside_window_total"): 1,
+		fqName("object_catalog_redis_duration_seconds"):           histogramSeries(2*2, len(activeQGSetDurationBuckets)),
+		fqName("object_catalog_manifest_bytes"):                   1,
 		// Kinds and results are closed vocabularies plus "other" for each.
 		fqName("object_read_total"):           (len(observability.ObjectReadKinds) + 1) * (len(observability.ObjectReadResults) + 1),
 		fqName("state_generation_skew_total"): len(observability.StateGenerationSkewKinds) + 1,
 		// Every (scope, result) pair of the closed vocabulary, plus the one
 		// the normalizer folds anything else into.
-		fqName("state_generation_carry_total"):        len(observability.StateCarryResults["plan"]) + len(observability.StateCarryResults["series"]) + 1,
+		fqName("state_generation_carry_total"): len(observability.StateCarryResults["plan"]) + len(observability.StateCarryResults["series"]) +
+			len(observability.StateCarryResults["no_data_plan"]) + len(observability.StateCarryResults["no_data_load"]) + 1,
 		fqName("undrained_draining_query_groups"):     1,
 		fqName("draining_cursor_pruned_query_groups"): 1,
 		fqName("rebalance_planned_moves"):             1,
-		fqName("level_outcome_total"):                 3 + 2*len(observability.LevelOutcomeReasons()),
+		fqName("level_outcome_total"):                 3 + 3*len(observability.LevelOutcomeReasons()) + len(observability.RecoveryWithheldReasons),
 		fqName("shard_unaware_ready_replicas"):        1,
 		fqName("rebalance_gap"):                       1,
 		fqName("dispatch_queue_turnaways_total"):      len(dispatchTurnawayOutcomes) * len(dispatchTurnawayCohorts),
@@ -976,10 +801,20 @@ func customMetricFamilySeriesUpperBounds() map[string]int {
 		fqName("handover_drain_seconds"):              histogramSeries(1, len(handoverDrainBuckets)),
 		fqName("output_unapplied_total"):              len(ownership.RefusalReasons),
 		fqName("executions_hung_total"):               len(observability.ExecutionHungOutcomes),
-		fqName("assignment_moves_total"):              1,
+		fqName("control_tier_paused_total"):           len(ControlTierFunctions),
+		fqName("assignment_moves_total"):              8,
+		fqName("state_superseded_total"):              len(observability.AllStateSupersededSites()) * len(observability.StateSupersededOperations),
+		fqName("rebalance_byte_overloaded_workers"):   1,
+		fqName("rebalance_byte_most_loaded_share"):    1,
+		fqName("rebalance_byte_unread_groups"):        1,
+		fqName("placement_unfit_total"):               1,
+		fqName("state_series_held"):                   1,
 		fqName("rebalance_paused_total"):              1,
 		fqName("control_read_round_trips_total"):      len(ControlReadKinds),
 		fqName("control_read_keys_total"):             len(ControlReadKinds),
+		fqName("control_record_reads_total"):          len(observability.RecordReadReasons),
+		fqName("control_record_cache_mismatch_total"): len(observability.RecordFields),
+		fqName("control_record_conflicts_total"):      2,
 		fqName("control_read_duration_seconds"):       histogramSeries(len(ControlReadKinds), len(controlReadDurationBuckets)),
 		fqName("assignment_index_stale_rounds"):       1,
 		fqName("assignment_index_write_total"):        2,
@@ -991,11 +826,16 @@ func customMetricFamilySeriesUpperBounds() map[string]int {
 		fqName("control_health_facts_total"):              len(controlHealthStatuses),
 		fqName("control_health_invalid_total"):            len(controlHealthInvalidFields),
 		fqName("control_leader_transitions_total"):        len(controlLeaderTransitions),
+		fqName("control_handback_watch_resets_total"):     len(ControlHandbackWatchResetReasons),
+		fqName("trace_export"):                            len(fleet.TracingStates),
+		fqName("trace_slots_total"):                       len(tracing.Decisions),
+		fqName("trace_spans_dropped_total"):               len(tracing.DropReasons),
 		fqName("startup_dependency_wait_total"):           len(StartupDependencies),
 		fqName("activation_blocked_query_groups"):         len(ActivationBlockedReasons),
 		fqName("activation_blocked_set_total"):            len(controlplane.BlockedSetAccountings),
 		fqName("activation_timeline_reopened_total"):      1,
 		fqName("activation_body_bytes"):                   1,
+		fqName("live_query_reserve_seconds"):              1,
 		fqName("fleet_round_memory_objects"):              len(fleet.RoundMemoryBuckets),
 		fqName("fleet_round_memory_rounds"):               1,
 		fqName("fleet_round_memory_bytes"):                1,
@@ -1011,36 +851,72 @@ func customMetricFamilySeriesUpperBounds() map[string]int {
 		fqName("assignment_index_confirm_total"):          4,
 		fqName("assignment_record_read_total"):            2,
 		// Four outcomes without a refusal, plus a conflict for each refusal
-		// OTHER included, all created at construction.
-		fqName("schedule_cursor_advance_total"):   len(observability.CursorAdvanceStatuses) - 1 + len(observability.CursorRefusals),
+		// OTHER included, each under every skip reason, and an applied skip
+		// that threw away a Slot in flight under every reason: all created at
+		// construction.
+		fqName("schedule_cursor_advance_total"): (len(observability.CursorAdvanceStatuses) - 1 + len(observability.CursorRefusals) + 1) * len(execution.ForwardSkipReasons),
+		// Every word of the contract catalogue, none, reason_not_reported and
+		// _other, created at construction.
+		// The standing cells, and every word of the contract catalogue a Slot
+		// may end with.
+		fqName("slot_completed_reasons_total"):    len(slotReasonWords) + len(contract.ReasonCatalogV2()),
 		fqName("activation_held_query_groups"):    1,
 		fqName("activation_held_age_seconds_max"): 1,
 	}
 	bounds[fqName("algorithm_evaluation_total")] = 25
 	bounds[fqName("algorithm_input_total")] = 160
 	bounds[fqName("trigger_recovery_beside_level_total")] = 3
+	bounds[fqName("trigger_recovery_withheld_total")] = len(observability.RecoveryWithheldReasons)
+	bounds[fqName("no_data_end_total")] = len(observability.NoDataEndOutcomes)
+	bounds[fqName("source_liveness_checks_total")] = len(sourceliveness.Kinds) *
+		(1 + len(sourceliveness.UnknownReasons) + len(sourceliveness.UnsupportedReasons))
+	bounds[fqName("source_liveness_probe_deferred_total")] = 1
+	bounds[fqName("source_liveness_answers_evicted_total")] = 1
+	bounds[fqName("source_liveness_held_evicted_total")] = 1
+	bounds[fqName("source_liveness_check_seconds")] = histogramSeries(len(sourceliveness.Kinds), len(sourceLivenessBuckets))
 	bounds[fqName("trigger_open_alert_gate_total")] = len(observability.OpenAlertGateOutcomes)
-	bounds[fqName("open_alert_set_authoritative_age_seconds")] = 1
-	bounds[fqName("open_alert_set_unavailable_total")] = len(openalerts.UnavailableReasons)
-	bounds[fqName("open_alert_set_refresh_total")] = 3
-	bounds[fqName("open_alert_set_lookup_total")] = len(openalerts.Answers)
 	bounds[fqName("effective_close_total")] = len(observability.EffectiveCloseOutcomes)
+	bounds[fqName("active_copy_lookup_total")] = len(activecopy.Answers)
+	bounds[fqName("active_copy_pass_total")] = len(activecopy.Outcomes)
+	bounds[fqName("active_copy_entries")] = 2
+	bounds[fqName("active_copy_link_unsupported")] = 1
 	// Every stage of the closed list, _other among them, written and limited.
 	bounds[fqName("log_lines_total")] = 2 * len(observability.AllStages())
 	bounds[fqName("observer_panics_total")] = len(observability.ObserverNames)
 	bounds[fqName("absent_strategy_close_total")] = len(absentalerts.Outcomes)
+	bounds[fqName("strategy_edit_close_total")] = len(editclose.Outcomes)
+	bounds[fqName("state_cache_lookups_total")] = len(state.StateCacheLookupResults)
+	bounds[fqName("state_cache_departures_total")] = len(state.StateCacheDepartureReasons)
+	bounds[fqName("state_cache_restored_total")] = len(state.StateCacheRestoreCauses)
+	bounds[fqName("state_cache_restore_declined_total")] = len(state.StateCacheDeclineReasons)
+	bounds[fqName("state_cache_bytes")] = 1
+	bounds[fqName("state_cache_budget_bytes")] = 1
+	bounds[fqName("state_cache_query_groups")] = 1
+	bounds[fqName("state_witness_items")] = 1
+	bounds[fqName("state_witness_bytes")] = 1
+	bounds[fqName("container_memory_cgroup_info")] = 1
+	bounds[fqName("container_memory_v1_bytes")] = 5
+	// cmd/alarmd noDataCloseOutcomes: eight words.
+	bounds[fqName("no_data_close_requests_total")] = 8
+	bounds[fqName("linkd_filter_close_total")] = len(filterclose.Outcomes)
+	bounds[fqName("open_episode_record_total")] = len(openepisodes.Outcomes)
+	bounds[fqName("new_opens_total")] = len(newopens.Outcomes)
+	bounds[fqName("front_refused_total")] = len(obchannel.FrontRefusalCodes)
+	bounds[fqName("process_resident_bytes")] = 1
+	bounds[fqName("go_heap_idle_bytes")] = 1
+	bounds[fqName("go_heap_released_bytes")] = 1
+	bounds[fqName("container_memory_stat_bytes")] = len(cgroupMemoryKinds)
+	// statm and memory_stat.
+	bounds[fqName("process_memory_read_failed_total")] = 2
+	bounds[fqName("strategy_scope_close_total")] = 11
 	bounds[fqName("target_scope_close_total")] = len(scopeclose.Outcomes)
 	bounds[fqName("absent_strategy_round_total")] = len(absentalerts.Refusals)
 	bounds[fqName("absent_strategy_difference")] = len(differenceSides)
-	bounds[fqName("open_alert_set_entries")] = 3
-	bounds[fqName("open_alert_set_tracked_strategies")] = 1
-	bounds[fqName("open_alert_set_evictions_total")] = 1
-	bounds[fqName("open_alert_set_notices_refused_total")] = len(openalerts.NoticeRefusals)
 	// covered and short.
-	bounds[fqName("linkd_calibration_coverage")] = 2
 	bounds[fqName("fleet_tracker_dropped_total")] = len(fleet.TrackerDroppedKinds)
 	bounds[fqName("effective_time_refresh_total")] = len(strategycache.EffectiveTimeRefreshResults)
 	bounds[fqName("activation_rebuild_total")] = len(controlplane.ActivationRebuildOutcomes)
+	bounds[fqName("activation_rebuild_unread_query_groups_total")] = len(controlplane.SkippedTimelineReasons)
 	bounds[fqName("timeline_repairs_total")] = len(controlplane.TimelineRepairOutcomes)
 	bounds[fqName("activation_timelines_skipped_total")] = len(controlplane.SkippedTimelineReasons)
 	bounds[fqName("timeline_unreadable_reports_total")] = 1
@@ -1049,13 +925,19 @@ func customMetricFamilySeriesUpperBounds() map[string]int {
 	bounds[fqName("control_source_refresh_total")] = len(controlplane.SourceRefreshExits)
 	bounds[fqName("catalog_strategy_returned_after_removal_total")] = 1
 	bounds[fqName("leader_forward_duration_seconds")] = histogramSeries(len(LeaderForwardRoutes)*len(LeaderForwardResults), len(leaderForwardBuckets))
-	bounds[fqName("control_source_mode")] = len(observability.ControlSourceRoles) * len(observability.ControlSourceModes)
+	bounds[fqName("apm_app_carried_responses_total")] = len(APMCarriedTables) * len(APMCarriedOutcomes)
+	bounds[fqName("apm_app_carried_response_bytes")] = histogramSeries(len(APMCarriedTables), 10)
+	bounds[fqName("control_source_mode")] = len(observability.ControlSourceRoles)*len(observability.ControlSourceModes) + 1
 	bounds[fqName("control_source_last_success_age_seconds")] = 1
 	bounds[fqName("leader_rounds_total")] = 2
 	bounds[fqName("query_cooldown_saves_total")] = len(QueryCooldownSaveResults)
 	bounds[fqName("fleet_control_facts_writes_total")] = len(ControlFactsWriteResults)
+	bounds[fqName("fleet_plan_carries_reads_total")] = len(PlanCarriesReadResults)
+	bounds[fqName("linkd_filter_close_request_seconds")] = histogramSeries(2*len(filterclose.RequestResults), len(linkdFilterCloseRequestBuckets))
 	bounds[fqName("query_cooldown_loads_total")] = len(QueryCooldownLoadResults)
 	bounds[fqName("event_business_attribution_total")] = len(contract.BusinessAttributionSources)
+	bounds[fqName("event_detection_snapshots_total")] = len(DetectionSnapshotResults)
+	bounds[fqName("event_detection_snapshot_ref_states_total")] = len(DetectionSnapshotStates)
 	bounds[fqName("diagnostic_redis_failures_total")] = len(DiagnosticRedisClients) * len(redisfailure.Reasons)
 	bounds[fqName("diagnostic_redis_dial_retries_total")] = len(DiagnosticRedisClients) * len(redisfailure.Reasons)
 	bounds[fqName("leader_round_stage_seconds_total")] = len(fleet.LeaderRoundStages) + 1
@@ -1063,16 +945,16 @@ func customMetricFamilySeriesUpperBounds() map[string]int {
 		bounds[fqName(name)] = n
 	}
 	// Five states; three operations by two results.
-	bounds[fqName("linkd_console_state")] = 5
-	bounds[fqName("linkd_console_calls_total")] = 6
 	// Eight SRE execution, management, Secret- and ConfigMap-read and image-change operations by six results.
 	bounds[fqName("sre_actions_total")] = 48
 	// Seven final states of an image change; one gauge.
 	bounds[fqName("sre_rollouts_total")] = 7
 	bounds[fqName("sre_rollouts_watched")] = 1
 	bounds[fqName("sre_receipts_write_total")] = 2
+	// cliauth.Counts, bound at wiring.
+	bounds[fqName("cli_auth_total")] = len(cliauth.Counts)
+	bounds[fqName("cli_roster_applied_timestamp_seconds")] = 1
 	// Every Console operation by every failure class.
-	bounds[fqName("linkd_console_failures_total")] = len(openalerts.ConsoleOps) * len(openalerts.ConsoleFailureClasses)
 	bounds[fqName("control_source_retained_stale_revisions_total")] = 1
 	bounds[fqName("control_source_last_good_identity_changed_total")] = 1
 	// The supported data sources, plus other for one the compiler started
@@ -1112,6 +994,8 @@ func customMetricFamilySeriesUpperBounds() map[string]int {
 	// can be told from a label nothing ever wrote.
 	bounds[fqName("worker_no_data_slot_plans_total")] = len(nodata.SlotOutcomes)
 	bounds[fqName("worker_no_data_absences_total")] = len(observability.NoDataAbsenceOutcomes)
+	bounds[fqName("worker_no_data_manual_close_dropped_total")] = 1
+	bounds[fqName("worker_no_data_manual_close_read_failures_total")] = len(noDataManualCloseReadSites)
 	bounds[fqName("target_plan_resolution_total")] = len(targetplan.ResolutionStates)
 	// Four kinds by four states by the closed reasons; cells are created on
 	// observation because most triples cannot happen.
@@ -1149,6 +1033,8 @@ func customMetricFamilySeriesUpperBounds() map[string]int {
 	// all read identically otherwise, which is the reading this family was
 	// added to end.
 	bounds[fqName("worker_frozen_state_census_total")] = 3
+	// One per reason a Slot lets an answered series go, created at startup.
+	bounds[fqName("input_series_discarded_total")] = 1
 	// Every held status against every reason this build can put on a scope
 	// plus the catch-all, against every place the count can stand. All three
 	// come from published lists, so a value added to any of them moves this
@@ -1174,6 +1060,7 @@ func customMetricFamilySeriesUpperBounds() map[string]int {
 	// typed constants are held to that list by a test of its own.
 	bounds[fqName("replay_expired_total")] = len(observability.ReplayExpiryReasons)
 	bounds[fqName("replay_takeover_slots_total")] = len(observability.ReplayTakeoverOutcomes)
+	bounds[fqName("slot_diversions_total")] = len(observability.SlotDiversionReasons)
 	// One per word the range gate can put on a round, applied included, and
 	// no more: the label is written from the facts after normalization, which
 	// folds any other word to unexplained.
@@ -1207,7 +1094,7 @@ func customMetricFamilySeriesUpperBounds() map[string]int {
 	bounds[fqName("catalog_global_strategies_unsupported")] = len(controlplane.GlobalBusinessRefusalWords) *
 		(len(controlplane.SupportedSourceSemantics) + 3)
 	bounds[fqName("level_abnormal_total")] = 2
-	bounds[fqName("platform_settings_mode")] = len(platformsettings.Modes)
+	bounds[fqName("platform_settings_mode")] = len(platformsettings.Modes) + 1
 	bounds[fqName("platform_settings_authoritative_age_seconds")] = 1
 	bounds[fqName("platform_settings_refresh_total")] = 2
 	bounds[fqName("platform_settings_unavailable_total")] = len(platformsettings.UnavailableReasons)
@@ -1226,7 +1113,7 @@ func customMetricDescriptorNames(t *testing.T, recorder *Recorder) map[string]bo
 	names := make(map[string]bool)
 	for descriptor := range descriptors {
 		name := metricNameFromDescriptor(descriptor.String())
-		if strings.HasPrefix(name, "bkmonitor_alarmd_") {
+		if strings.HasPrefix(name, "alarmd_") {
 			names[name] = true
 		}
 	}
@@ -1243,7 +1130,7 @@ func countCustomSeriesByFamily(t *testing.T, recorder *Recorder) map[string]int 
 	counts := make(map[string]int)
 	for _, family := range families {
 		name := family.GetName()
-		if !strings.HasPrefix(name, "bkmonitor_alarmd_") {
+		if !strings.HasPrefix(name, "alarmd_") {
 			continue
 		}
 		switch family.GetType() {
@@ -1278,7 +1165,7 @@ func TestLeaderForwardSeriesExistFromTheStartAndTakeOnlyTheClosedWords(t *testin
 		}
 		out := map[string]uint64{}
 		for _, family := range families {
-			if family.GetName() != "bkmonitor_alarmd_leader_forward_duration_seconds" {
+			if family.GetName() != "alarmd_leader_forward_duration_seconds" {
 				continue
 			}
 			for _, m := range family.GetMetric() {
@@ -1311,12 +1198,51 @@ func TestLeaderForwardSeriesExistFromTheStartAndTakeOnlyTheClosedWords(t *testin
 	}
 }
 
+// A carried APM response is counted by table kind and outcome, its bytes
+// observed; the series exist from the start, and an unknown kind is dropped.
+func TestAPMCarriedResponsesAreCountedByKindAndOutcome(t *testing.T) {
+	r := NewRecorder(BuildInfo{})
+	read := func() (map[string]float64, uint64) {
+		families, err := r.Gatherer().Gather()
+		if err != nil {
+			t.Fatal(err)
+		}
+		counts, samples := map[string]float64{}, uint64(0)
+		for _, family := range families {
+			for _, m := range family.GetMetric() {
+				key := ""
+				for _, label := range m.GetLabel() {
+					key += label.GetName() + "=" + label.GetValue() + ","
+				}
+				switch family.GetName() {
+				case "alarmd_apm_app_carried_responses_total":
+					counts[key] = m.GetCounter().GetValue()
+				case "alarmd_apm_app_carried_response_bytes":
+					samples += m.GetHistogram().GetSampleCount()
+				}
+			}
+		}
+		return counts, samples
+	}
+	start, _ := read()
+	if len(start) != len(APMCarriedTables)*len(APMCarriedOutcomes) {
+		t.Fatalf("series at construction %v", start)
+	}
+	r.ObserveAPMCarriedResponse("metric", false, 4096)
+	r.ObserveAPMCarriedResponse("metric", true, 8192)
+	r.ObserveAPMCarriedResponse("logs", false, 1)
+	after, samples := read()
+	if after["outcome=unique,table=metric,"] != 1 || after["outcome=not_unique,table=metric,"] != 1 || samples != 2 || len(after) != len(start) {
+		t.Fatalf("after %v samples %d", after, samples)
+	}
+}
+
 // The pool record writes are pre-created: every result reads 0 before any
 // write, so a zero is a count and not a series nobody registered.
 func TestQueryCooldownSaveResultsArePreCreated(t *testing.T) {
 	r := NewRecorder(BuildInfo{})
 	seen := map[string]bool{}
-	for _, m := range gatherFamily(t, r, "bkmonitor_alarmd_query_cooldown_saves_total") {
+	for _, m := range gatherFamily(t, r, "alarmd_query_cooldown_saves_total") {
 		seen[m.GetLabel()[0].GetValue()] = true
 	}
 	for _, result := range QueryCooldownSaveResults {
@@ -1333,11 +1259,26 @@ func TestControlFactsWriteResultsArePreCreated(t *testing.T) {
 	r.ObserveControlFactsWrite("oversized")
 	r.ObserveControlFactsWrite("guessed")
 	counts := map[string]float64{}
-	for _, m := range gatherFamily(t, r, "bkmonitor_alarmd_fleet_control_facts_writes_total") {
+	for _, m := range gatherFamily(t, r, "alarmd_fleet_control_facts_writes_total") {
 		counts[m.GetLabel()[0].GetValue()] = m.GetCounter().GetValue()
 	}
 	if len(counts) != len(ControlFactsWriteResults) || counts["oversized"] != 1 || counts["written"] != 0 {
 		t.Fatalf("writes = %v, want every result present, oversized at 1, nothing else", counts)
+	}
+}
+
+// The plan carries reads are pre-created, and a result outside the closed list
+// creates no series.
+func TestPlanCarriesReadResultsArePreCreated(t *testing.T) {
+	r := NewRecorder(BuildInfo{})
+	r.ObservePlanCarriesRead("failed")
+	r.ObservePlanCarriesRead("guessed")
+	counts := map[string]float64{}
+	for _, m := range gatherFamily(t, r, "alarmd_fleet_plan_carries_reads_total") {
+		counts[m.GetLabel()[0].GetValue()] = m.GetCounter().GetValue()
+	}
+	if len(counts) != len(PlanCarriesReadResults) || counts["failed"] != 1 || counts["read"] != 0 || counts["no_open_segment"] != 0 {
+		t.Fatalf("reads = %v, want every result present, failed at 1, nothing else", counts)
 	}
 }
 
@@ -1348,7 +1289,7 @@ func TestQueryCooldownLoadResultsArePreCreated(t *testing.T) {
 	r.ObserveQueryCooldownLoad("failed")
 	r.ObserveQueryCooldownLoad("guessed")
 	counts := map[string]float64{}
-	for _, m := range gatherFamily(t, r, "bkmonitor_alarmd_query_cooldown_loads_total") {
+	for _, m := range gatherFamily(t, r, "alarmd_query_cooldown_loads_total") {
 		counts[m.GetLabel()[0].GetValue()] = m.GetCounter().GetValue()
 	}
 	if len(counts) != len(QueryCooldownLoadResults) || counts["failed"] != 1 || counts["found"] != 0 {
@@ -1356,13 +1297,49 @@ func TestQueryCooldownLoadResultsArePreCreated(t *testing.T) {
 	}
 }
 
-// close_acked is what the broker took, not what the consumer did with it:
-// whether an alert closed is the consumer's to say, so the help does not say
-// that none is left open.
-func TestTheEffectiveCloseHelpCountsSendsNotClosedAlerts(t *testing.T) {
+// Every close goes through the link's filtered close, so no close help
+// counts a broker's acknowledgement: the target scope close's close_sent is
+// a close the link settled, nothing active found among them; the edit
+// close counts its rounds and strategies and leaves what its closes did to
+// linkd_filter_close_total; the absent close's send is a close answered
+// item by item, which does not say the link closed anything. None says
+// none is left open.
+func TestTheCloseHelpsSayWhatTheFilteredCloseCounts(t *testing.T) {
+	target := newTargetScopeCloseCollector().outcomeIs.String()
+	edit := newEditCloseCollector().outcomeIs.String()
+	for family, help := range map[string]string{"target_scope_close_total": target, "strategy_edit_close_total": edit,
+		"absent_strategy_close_total": newAbsentCloseCollector().outcomeIs.String()} {
+		if strings.Contains(help, "left open") || strings.Contains(help, "broker") || strings.Contains(help, "acknowledg") {
+			t.Fatalf("%s help = %s, want no broker acknowledgement and nothing said to be left open", family, help)
+		}
+	}
+	if !strings.Contains(target, "closes the link's filtered close settled") || !strings.Contains(target, "found nothing active of it") {
+		t.Fatalf("target_scope_close_total help = %s, want close_sent a close the link settled, nothing active found among them", target)
+	}
+	if !strings.Contains(edit, "linkd_filter_close_total") || !strings.Contains(edit, "they stay zero") {
+		t.Fatalf("strategy_edit_close_total help = %s, want what the closes did read on linkd_filter_close_total", edit)
+	}
+	absent := newAbsentCloseCollector().outcomeIs.String()
+	if strings.Contains(absent, "left open") || !strings.Contains(absent, "whose items the link answered") ||
+		!strings.Contains(absent, "neither says the link closed anything") || strings.Contains(absent, "reconcile still lists") {
+		t.Fatalf("absent_strategy_close_total help = %s, want a send counted as a close the link answered item by item, not as one it closed", absent)
+	}
+}
+
+// The effective-time maintenance closes through the link's filter close,
+// not the broker, so its help describes every outcome it counts and none of
+// the broker-era words it no longer has.
+func TestTheEffectiveCloseHelpNamesItsOutcomes(t *testing.T) {
 	help := newEffectiveCloseCollector().outcomes.String()
-	if strings.Contains(help, "left open") || !strings.Contains(help, "consumer") {
-		t.Fatalf("help = %s, want the sends counted and the closing left to the consumer", help)
+	for _, outcome := range observability.EffectiveCloseOutcomes {
+		if !strings.Contains(help, string(outcome)) {
+			t.Fatalf("effective_close_total help does not name %q: %s", outcome, help)
+		}
+	}
+	for _, gone := range []string{"close_acked", "index_set", "evidence_unavailable", "close_send_failed", "calibration", "Console"} {
+		if strings.Contains(help, gone) {
+			t.Fatalf("effective_close_total help still says %q: %s", gone, help)
+		}
 	}
 }
 
@@ -1373,7 +1350,7 @@ func TestEventBusinessAttributionSourcesArePreCreated(t *testing.T) {
 	r.ObserveEventBusinessAttribution(contract.BusinessAttributionTarget)
 	r.ObserveEventBusinessAttribution("guessed")
 	counts := map[string]float64{}
-	for _, m := range gatherFamily(t, r, "bkmonitor_alarmd_event_business_attribution_total") {
+	for _, m := range gatherFamily(t, r, "alarmd_event_business_attribution_total") {
 		counts[m.GetLabel()[0].GetValue()] = m.GetCounter().GetValue()
 	}
 	if len(counts) != len(contract.BusinessAttributionSources) || counts["target"] != 1 || counts["dimension"] != 0 || counts["global"] != 0 {
@@ -1386,14 +1363,14 @@ func TestEventBusinessAttributionSourcesArePreCreated(t *testing.T) {
 // it is not counted.
 func TestDiagnosticRedisFailuresAreCountedByReason(t *testing.T) {
 	r := NewRecorder(BuildInfo{})
-	if cells := gatherFamily(t, r, "bkmonitor_alarmd_diagnostic_redis_failures_total"); len(cells) != len(DiagnosticRedisClients)*len(redisfailure.Reasons) {
+	if cells := gatherFamily(t, r, "alarmd_diagnostic_redis_failures_total"); len(cells) != len(DiagnosticRedisClients)*len(redisfailure.Reasons) {
 		t.Fatalf("%d cells before any failure, want every client and reason", len(cells))
 	}
 	r.ObserveDiagnosticRedisFailure("auth", redisfailure.ConnectionClosed)
 	r.ObserveDiagnosticRedisFailure("auth", "not_a_reason")
 	r.ObserveDiagnosticRedisFailure("nobody", redisfailure.Timeout)
 	counts := map[string]float64{}
-	for _, m := range gatherFamily(t, r, "bkmonitor_alarmd_diagnostic_redis_failures_total") {
+	for _, m := range gatherFamily(t, r, "alarmd_diagnostic_redis_failures_total") {
 		labels := map[string]string{}
 		for _, label := range m.GetLabel() {
 			labels[label.GetName()] = label.GetValue()
@@ -1409,7 +1386,7 @@ func TestDiagnosticRedisFailuresAreCountedByReason(t *testing.T) {
 // startup; a client outside the closed set is not counted at all.
 func TestDiagnosticRedisDialRetriesAreCountedByReason(t *testing.T) {
 	r := NewRecorder(BuildInfo{})
-	name := "bkmonitor_alarmd_diagnostic_redis_dial_retries_total"
+	name := "alarmd_diagnostic_redis_dial_retries_total"
 	if cells := gatherFamily(t, r, name); len(cells) != len(DiagnosticRedisClients)*len(redisfailure.Reasons) {
 		t.Fatalf("%d cells before any retry, want every client and reason", len(cells))
 	}
@@ -1442,7 +1419,7 @@ func TestTheRefusedRecordsGaugeHasEveryKindFromStartup(t *testing.T) {
 	r.SetCMDBRecordsRefused("topo_node", 3)
 	r.SetCMDBRecordsRefused("guessed", 9)
 	values := map[string]float64{}
-	for _, m := range gatherFamily(t, r, "bkmonitor_alarmd_cmdb_index_records_refused") {
+	for _, m := range gatherFamily(t, r, "alarmd_cmdb_index_records_refused") {
 		for _, label := range m.GetLabel() {
 			values[label.GetValue()] = m.GetGauge().GetValue()
 		}
@@ -1466,7 +1443,7 @@ func TestTheBusinessMappingGaugeHasEveryCellFromStartup(t *testing.T) {
 	r.SetCMDBBusinessMapping("bcs_namespace", 5, 0, 2, false, true)
 	r.SetCMDBBusinessMapping("guessed", 9, 9, 9, true, true)
 	values := map[string]float64{}
-	for _, m := range gatherFamily(t, r, "bkmonitor_alarmd_cmdb_index_business_mappings") {
+	for _, m := range gatherFamily(t, r, "alarmd_cmdb_index_business_mappings") {
 		labels := map[string]string{}
 		for _, label := range m.GetLabel() {
 			labels[label.GetName()] = label.GetValue()
@@ -1501,7 +1478,7 @@ func TestObserverPanicsAreExportedForEveryObserver(t *testing.T) {
 		}
 		values := map[string]float64{}
 		for _, family := range families {
-			if family.GetName() != "bkmonitor_alarmd_observer_panics_total" {
+			if family.GetName() != "alarmd_observer_panics_total" {
 				continue
 			}
 			for _, m := range family.GetMetric() {
@@ -1526,12 +1503,44 @@ func TestObserverPanicsAreExportedForEveryObserver(t *testing.T) {
 func TestInPlaceWaitBucketsArePreCreated(t *testing.T) {
 	r := NewRecorder(BuildInfo{})
 	seen := map[string]bool{}
-	for _, m := range gatherFamily(t, r, "bkmonitor_alarmd_access_inplace_readiness_waits_total") {
+	for _, m := range gatherFamily(t, r, "alarmd_access_inplace_readiness_waits_total") {
 		seen[m.GetLabel()[0].GetValue()] = true
 	}
 	for _, bucket := range observability.InPlaceWaitBuckets {
 		if !seen[bucket] {
 			t.Fatalf("bucket %q not pre-created: %v", bucket, seen)
 		}
+	}
+}
+
+// A detection snapshot counts once by its result, and each named output of
+// one an event carries by its state; a state this build does not name folds
+// to _other, and a dropped snapshot - the event sent without it - counts no
+// state. Every result and state exists before any snapshot.
+func TestDetectionSnapshotsAreCountedByResultAndState(t *testing.T) {
+	r := NewRecorder(BuildInfo{})
+	if cells := gatherFamily(t, r, "alarmd_event_detection_snapshot_ref_states_total"); len(cells) != len(DetectionSnapshotStates) {
+		t.Fatalf("%d state cells before any snapshot, want every state", len(cells))
+	}
+	if cells := gatherFamily(t, r, "alarmd_event_detection_snapshots_total"); len(cells) != len(DetectionSnapshotResults) {
+		t.Fatalf("%d result cells before any snapshot, want every result", len(cells))
+	}
+	r.ObserveDetectionSnapshot([]string{"MISSING", "SUCCESS", "SUCCESS", "STALE"}, "whole")
+	r.ObserveDetectionSnapshot(nil, "whole")
+	r.ObserveDetectionSnapshot(nil, "truncated")
+	r.ObserveDetectionSnapshot([]string{"ERROR"}, "dropped")
+	r.ObserveDetectionSnapshot([]string{"ERROR"}, "guessed")
+	results, states := map[string]float64{}, map[string]float64{}
+	for _, m := range gatherFamily(t, r, "alarmd_event_detection_snapshots_total") {
+		results[m.GetLabel()[0].GetValue()] = m.GetCounter().GetValue()
+	}
+	for _, m := range gatherFamily(t, r, "alarmd_event_detection_snapshot_ref_states_total") {
+		states[m.GetLabel()[0].GetValue()] = m.GetCounter().GetValue()
+	}
+	if results["whole"] != 2 || results["truncated"] != 1 || results["dropped"] != 1 || len(results) != 3 {
+		t.Fatalf("results %v, want two whole, one truncated and one dropped", results)
+	}
+	if states["SUCCESS"] != 2 || states["MISSING"] != 1 || states["_other"] != 1 || states["ERROR"] != 0 || len(states) != len(DetectionSnapshotStates) {
+		t.Fatalf("states %v", states)
 	}
 }

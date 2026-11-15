@@ -103,7 +103,7 @@ func TestChannelOnlyRequiresPublicRuntimeDependencies(t *testing.T) {
 	cfg.PlatformCache.Strategy = &RedisConnectionConfig{}
 	cfg.PlatformCache.CMDB = &RedisConnectionConfig{}
 	cfg.PlatformCache.TargetGroup = &RedisConnectionConfig{}
-	cfg.PhaseTwo.Linkd.ConsoleURL = "invalid"
+	cfg.PhaseTwo.Linkd.ControlPlane.URL = "invalid"
 	cfg.PhaseTwo.Scheduler = PhaseTwoSchedulerConfig{}
 	cfg.Limits = LimitsConfig{}
 	if err := cfg.Validate(); err != nil {
@@ -136,6 +136,11 @@ func TestRoleSpecificBusinessDependenciesAndLeaseBudgets(t *testing.T) {
 	if err := control.Validate(); err != nil {
 		t.Fatalf("Control required Worker-only dependencies: %v", err)
 	}
+	withTrends := control
+	withTrends.PhaseTwo.Access.UQEndpoint = "http://uq.example.invalid:10205"
+	if err := withTrends.Validate(); err != nil {
+		t.Fatalf("Control with valid UQ coordinates for trends: %v", err)
+	}
 	worker := validGoAccessConfigObject()
 	worker.Roles = roles.Set{roles.Worker}
 	worker.PhaseTwo.Control.StrategyCachePrefix = ""
@@ -154,7 +159,13 @@ func TestRoleSpecificBusinessDependenciesAndLeaseBudgets(t *testing.T) {
 		{"Control strategy Redis", control, func(c *Config) { c.PlatformCache.Strategy = &RedisConnectionConfig{} }, "platform_cache.strategy"},
 		{"Control compiler", control, func(c *Config) { c.Limits.Compiler.MaxPlanBytes = 0 }, "limits.compiler"},
 		{"Control global-close Kafka", control, func(c *Config) { c.Kafka.Brokers = nil }, "broker"},
-		{"Control global-close Linkd", control, func(c *Config) { c.PhaseTwo.Linkd.ConsoleURL = "invalid" }, "linkd"},
+		{"Control global-close Linkd", control, func(c *Config) { c.PhaseTwo.Linkd.ControlPlane.URL = "invalid" }, "linkd"},
+		// A control process reads trends through the UQ endpoint when one is
+		// set, so the coordinates are checked here, not at startup.
+		{"Control trends query source", control, func(c *Config) {
+			c.PhaseTwo.Access.UQEndpoint = "http://uq.example.invalid:10205"
+			c.PhaseTwo.Access.QuerySource = ""
+		}, "trends"},
 		{"Control leader lease", control, func(c *Config) {
 			c.PhaseTwo.Ownership.ControlLeaderRenewInterval = c.PhaseTwo.Ownership.ControlLeaderTTL
 		}, "ownership TTL"},
@@ -176,7 +187,6 @@ func TestRoleSpecificBusinessDependenciesAndLeaseBudgets(t *testing.T) {
 }
 
 func TestUnusedRoleCredentialsDoNotBlockLoad(t *testing.T) {
-	t.Setenv(LinkdConsoleUsernameEnvironment, "")
 	t.Setenv(CLIAdminKeyEnvironment, "from-environment")
 	contents := validGoAccessRuntimeConfigYAML("instance") + `cli:
   admin_key: from-file
@@ -191,10 +201,10 @@ phase_two:
   worker:
     id: channel
   linkd:
-    username: from-file
+    control_plane:
+      jwt_secret_file: /absent/secret
 `
 	t.Setenv(CLIAdminKeyEnvironment, "")
-	t.Setenv(LinkdConsoleUsernameEnvironment, "from-environment")
 	if _, err := LoadWithRoles(writeConfig(t, channel), nil); err != nil {
 		t.Fatalf("unused Linkd credentials blocked channel: %v", err)
 	}
@@ -233,4 +243,10 @@ func TestChannelAuthenticationAndPublicSurface(t *testing.T) {
 	if cfg.PublicSurfaceRestrictionRequested() {
 		t.Fatal("Worker-only public surface was restricted by an unused CLI key")
 	}
+}
+
+// LoadWithRoles is LoadWithCredentials reading the credential references the
+// selected roles use, as the process does.
+func LoadWithRoles(path string, override roles.Set) (Config, error) {
+	return LoadWithCredentials(path, override, CredentialsForRoles)
 }

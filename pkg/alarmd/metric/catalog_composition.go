@@ -47,7 +47,7 @@ type catalogCompositionCollector struct {
 
 func newCatalogCompositionCollector() *catalogCompositionCollector {
 	descriptor := func(name, help string, labels ...string) *prometheus.Desc {
-		return prometheus.NewDesc(prometheus.BuildFQName(metricNamespace, metricSubsystem, name), help, labels, nil)
+		return prometheus.NewDesc(prometheus.BuildFQName("", metricSubsystem, name), help, labels, nil)
 	}
 	const partition = "Every Query Group falls under exactly one source_semantics, so this family adds up to " +
 		"the Catalog's total. A Query Group whose query reads more than one data source is counted once, " +
@@ -154,7 +154,7 @@ func newCatalogCompositionCollector() *catalogCompositionCollector {
 				"on. Reported by the leader only.", "outcome"),
 		globalUnsupported: descriptor("catalog_global_strategies_unsupported",
 			"The global_unsupported strategies of catalog_global_strategies by the word they were refused for "+
-				"(query_kind, query_table, legacy_target, output_protocol) and the source their query reads "+
+				"(query_kind, query_table, legacy_target, output_protocol, condition_ignored, business_dimension) and the source their query reads "+
 				"(the catalog_plans source_semantics label, or promql); the pairs add up to that outcome. "+
 				"This is what decides which query source alarmd learns to run globally next. Both labels are "+
 				"closed sets, and only the pairs a round produced are published. Reported by the leader only.",

@@ -87,3 +87,77 @@ func TestTheSummaryOfAnEmptyRoundKeepsWhatItSaidAndUnderWhichContent(t *testing.
 		})
 	}
 }
+
+// A round emptied by identity continues the count of the round before it
+// when that round was the same kind of empty under the same content, and
+// starts it at one otherwise; any other round carries no count, so a restart
+// resumes exactly where the rounds left off.
+func TestAnIdentityEmptyRoundCountsTheRunItContinues(t *testing.T) {
+	identity := &execution.PrimaryInputFact{Completeness: execution.CompletenessFull, DataState: execution.DataStateEmpty,
+		Identity: &execution.IdentityEvidence{Withheld: 1, KeyMissing: 1}}
+	outside := &execution.PrimaryInputFact{Completeness: execution.CompletenessFull, DataState: execution.DataStateEmpty, EmptiedByTarget: true}
+	for _, tc := range []struct {
+		name     string
+		primary  *execution.PrimaryInputFact
+		previous *execution.EmptyRoundSummary
+		want     uint32
+	}{
+		{"first", identity, nil, 1},
+		{"continues", identity, &execution.EmptyRoundSummary{ContentScope: "c", IdentityRounds: 2}, 3},
+		{"other content", identity, &execution.EmptyRoundSummary{ContentScope: "other", IdentityRounds: 2}, 1},
+		{"after another empty", identity, &execution.EmptyRoundSummary{ContentScope: "c", EmptiedByTarget: true}, 1},
+		{"another empty after a run", outside, &execution.EmptyRoundSummary{ContentScope: "c", IdentityRounds: 5}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			summary := emptyRoundOf(tc.primary, "c", tc.previous)
+			if summary == nil || summary.IdentityRounds != tc.want {
+				t.Fatalf("summary %+v, want identity rounds %d", summary, tc.want)
+			}
+		})
+	}
+	if summary := emptyRoundOf(&execution.PrimaryInputFact{Completeness: execution.CompletenessFull, DataState: execution.DataStateData,
+		Identity: identity.Identity}, "c", nil); summary != nil {
+		t.Fatalf("a round with records wrote %+v", summary)
+	}
+}
+
+// A filtered round keeps its word, and every round with an unfiltered witness
+// counts the run's rounds the witness answered with data and without,
+// continuing the previous round's under the same content and starting again
+// under other content; a round with no witness writes no count, and one with
+// records no summary - the run ends.
+func TestAWitnessedEmptyRoundCountsTheRunItContinues(t *testing.T) {
+	round := func(filtered bool, witness execution.WitnessData) *execution.PrimaryInputFact {
+		return &execution.PrimaryInputFact{Completeness: execution.CompletenessFull, DataState: execution.DataStateEmpty,
+			FilteredWhenEmpty: filtered, WitnessData: witness}
+	}
+	for _, tc := range []struct {
+		name          string
+		primary       *execution.PrimaryInputFact
+		previous      *execution.EmptyRoundSummary
+		filtered      bool
+		data, missing uint32
+	}{
+		{"first with data", round(true, execution.WitnessDataFull), nil, true, 1, 0},
+		{"first without", round(false, execution.WitnessEmpty), nil, false, 0, 1},
+		{"continues", round(false, execution.WitnessNotFull), &execution.EmptyRoundSummary{ContentScope: "c", WitnessDataRounds: 3, WitnessMissingRounds: 2}, false, 3, 3},
+		{"unbound counts as without", round(false, execution.WitnessUnbound), &execution.EmptyRoundSummary{ContentScope: "c", WitnessDataRounds: 3}, false, 3, 1},
+		{"other content", round(true, execution.WitnessDataFull), &execution.EmptyRoundSummary{ContentScope: "other", WitnessDataRounds: 3}, true, 1, 0},
+		{"saturates", round(true, execution.WitnessDataFull), &execution.EmptyRoundSummary{ContentScope: "c", WitnessDataRounds: ^uint32(0)}, true, ^uint32(0), 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			summary := emptyRoundOf(tc.primary, "c", tc.previous)
+			if summary == nil || summary.Filtered != tc.filtered || summary.WitnessDataRounds != tc.data || summary.WitnessMissingRounds != tc.missing {
+				t.Fatalf("summary %+v, want filtered %t, %d with data and %d without", summary, tc.filtered, tc.data, tc.missing)
+			}
+		})
+	}
+	if summary := emptyRoundOf(round(false, execution.WitnessNone), "c", &execution.EmptyRoundSummary{ContentScope: "c", WitnessDataRounds: 3}); summary != nil {
+		t.Fatalf("a round with no witness and nothing else to say wrote %+v", summary)
+	}
+	withRecords := round(true, execution.WitnessDataFull)
+	withRecords.DataState = execution.DataStateData
+	if summary := emptyRoundOf(withRecords, "c", nil); summary != nil {
+		t.Fatalf("a round with records wrote %+v", summary)
+	}
+}

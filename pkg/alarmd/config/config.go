@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -71,6 +72,9 @@ type CLIConfig struct {
 	EnvironmentName string `yaml:"environment_name"`
 	PublicBaseURL   string `yaml:"public_base_url"`
 	AdminKey        string `yaml:"admin_key" json:"-"`
+	// AdminKeyFile names a file holding AdminKey (resolveCredentials),
+	// cleared once read.
+	AdminKeyFile string `yaml:"admin_key_file" json:"-"`
 	// AdminKeySecret says where the deployment keeps AdminKey, so that the
 	// login page can show the one command that reads it. It is never read
 	// from the file; see resolveAdminKeySecret.
@@ -110,20 +114,25 @@ const (
 // at a file of their own.
 var serviceAccountNamespacePath = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 
+// ProcessNamespace is the namespace this process's Pod runs in: its
+// ServiceAccount's namespace file, or POD_NAMESPACE when the file is not
+// there; empty out of a cluster.
+func ProcessNamespace() string {
+	if raw, err := os.ReadFile(serviceAccountNamespacePath); err == nil {
+		if namespace := strings.TrimSpace(string(raw)); namespace != "" {
+			return namespace
+		}
+	}
+	return strings.TrimSpace(os.Getenv(PodNamespaceEnvironment))
+}
+
 // resolveAdminKeySecret fills AdminKeySecret: the namespace from the Pod's
 // own namespace file, or POD_NAMESPACE when the file is not there, and the
 // Secret's name and key from the environment. Nothing here can fail
 // startup; a name that cannot be read stays empty.
 func (c *CLIConfig) resolveAdminKeySecret() {
-	namespace := ""
-	if raw, err := os.ReadFile(serviceAccountNamespacePath); err == nil {
-		namespace = strings.TrimSpace(string(raw))
-	}
-	if namespace == "" {
-		namespace = strings.TrimSpace(os.Getenv(PodNamespaceEnvironment))
-	}
 	c.AdminKeySecret = CLIAdminKeySecret{
-		Namespace: namespace,
+		Namespace: ProcessNamespace(),
 		Name:      strings.TrimSpace(os.Getenv(CLIAdminKeySecretNameEnvironment)),
 		Key:       strings.TrimSpace(os.Getenv(CLIAdminKeySecretKeyEnvironment)),
 	}
@@ -321,6 +330,10 @@ func (c Config) DynamicGroupKeyPrefix() (string, bool) {
 }
 
 type Config struct {
+	// UnknownKeys names, with their lines, the keys the file carries that no
+	// field reads: retired keys and misspellings. They are ignored and named
+	// at startup and on /metrics, never a reason to refuse to start.
+	UnknownKeys []string `yaml:"-"`
 	// Roles is omitted for the default shared process. An explicit selection
 	// is validated before dependencies are checked.
 	Roles         roles.Set             `yaml:"roles,omitempty"`
@@ -484,10 +497,11 @@ func (c Config) DeploymentProfile() string {
 // AdmittedQueryConcurrency is the number of queries the scheduler may have in
 // flight at once. It bounds the query stage only; it is not the bound on Redis
 // concurrency, because the Slot source reads the control plane before a Slot
-// becomes eligible to query and holds no permit while doing so.
+// becomes eligible to query and holds no permit while doing so. It is the
+// process permits alone: the recovery permits are a share of them, and a
+// recovery query holds a process permit as well as its own.
 func (c Config) AdmittedQueryConcurrency() int {
-	s := c.PhaseTwo.Scheduler
-	return s.ProcessQueryPermits + s.RecoveryQueryPermits
+	return c.PhaseTwo.Scheduler.ProcessQueryPermits
 }
 
 // redisPoolCapacityInputs is the container the pool derives from: the one this
@@ -575,6 +589,15 @@ func (c Config) NoDataTrackingHorizonSeconds() (int64, bool) {
 		return 0, false
 	}
 	return *c.PhaseTwo.NoData.TrackingHorizonSeconds, true
+}
+
+// NoDataMaxGroups is the deployment's no-data group bound, zero when the
+// values state none and the store's default applies.
+func (c Config) NoDataMaxGroups() int {
+	if c.PhaseTwo.NoData.MaxGroups == nil {
+		return 0
+	}
+	return *c.PhaseTwo.NoData.MaxGroups
 }
 
 // PlatformSettingsLayer is the deployment's layer of the platform settings:
@@ -715,9 +738,87 @@ func (c *Config) resolveCompatibilityServiceTimeouts() {
 	}
 }
 
-// LoadWithRoles applies a CLI selection before validating dependencies. A nil
-// override keeps the file's selection; a non-nil empty override is refused.
-func LoadWithRoles(path string, override roles.Set) (Config, error) {
+// decodeDocument decodes one YAML document onto cfg strictly: quoted
+// integers are refused, a value of the wrong type is refused, and a key no
+// field reads is ignored and recorded in cfg.UnknownKeys.
+func decodeDocument(raw []byte, cfg *Config) error {
+	var document yaml.Node
+	if err := yaml.Unmarshal(raw, &document); err != nil {
+		return fmt.Errorf("decode config: %w", err)
+	}
+	rewritten, err := strictIntegers(&document, reflect.TypeOf(*cfg), "")
+	if err != nil {
+		return fmt.Errorf("decode config: %w", err)
+	}
+	// Only a document with a quoted integer is re-encoded, so every other
+	// one is decoded from the bytes as written and its errors keep their
+	// lines.
+	if rewritten {
+		if raw, err = yaml.Marshal(&document); err != nil {
+			return fmt.Errorf("decode config: %w", err)
+		}
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(raw))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(cfg); err != nil {
+		unknown, rest := splitUnknownKeys(err)
+		if rest != nil {
+			return fmt.Errorf("decode config: %w", rest)
+		}
+		cfg.UnknownKeys = unknown
+	}
+	// yaml.v3 decodes an explicit null as nil, just like omission. Preserve
+	// the declaration so roles: null cannot silently enable every role.
+	if cfg.Roles == nil && yamlRolesDeclared(&document) {
+		cfg.Roles = roles.Set{}
+	}
+	// The same for the link: an empty or null phase_two.linkd decodes like
+	// none, and the block's presence is what states the link as the
+	// deployment's destination (LinkdConfig.Present).
+	if yamlPathDeclared(&document, "phase_two", "linkd") {
+		cfg.PhaseTwo.Linkd.Declared = true
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("decode config: multiple YAML documents are not allowed")
+		}
+		return fmt.Errorf("decode config: %w", err)
+	}
+	return nil
+}
+
+var unknownKeyError = regexp.MustCompile(`^line \d+: field \S+ not found in type \S+$`)
+
+// splitUnknownKeys separates, in a decode error, the keys no field reads from
+// everything else. yaml.v3 goes on decoding past an unknown key, so the
+// configuration is whole when they are the only errors; any other error,
+// a value of the wrong type above all, is returned and refuses the load.
+func splitUnknownKeys(err error) ([]string, error) {
+	var typeErr *yaml.TypeError
+	if !errors.As(err, &typeErr) {
+		return nil, err
+	}
+	var unknown, rest []string
+	for _, message := range typeErr.Errors {
+		if unknownKeyError.MatchString(message) {
+			unknown = append(unknown, message)
+		} else {
+			rest = append(rest, message)
+		}
+	}
+	if len(rest) > 0 {
+		return nil, &yaml.TypeError{Errors: rest}
+	}
+	return unknown, nil
+}
+
+// LoadWithCredentials applies a CLI selection before validating
+// dependencies. A nil override keeps the file's selection; a non-nil empty
+// override is refused. credentials states how the credential references are
+// treated: see CredentialMode (CredentialsForRoles reads the ones the
+// selected roles use).
+func LoadWithCredentials(path string, override roles.Set, credentials CredentialMode) (Config, error) {
 	cfg := Default().WithContainerCapacity()
 	if path == "" {
 		if override != nil {
@@ -747,38 +848,8 @@ func LoadWithRoles(path string, override roles.Set) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("read config: %w", err)
 	}
-	var document yaml.Node
-	if err := yaml.Unmarshal(raw, &document); err != nil {
-		return Config{}, fmt.Errorf("decode config: %w", err)
-	}
-	rewritten, err := strictIntegers(&document, reflect.TypeOf(cfg), "")
-	if err != nil {
-		return Config{}, fmt.Errorf("decode config: %w", err)
-	}
-	// Only a document with a quoted integer is re-encoded, so every other
-	// one is decoded from the bytes as written and its errors keep their
-	// lines.
-	if rewritten {
-		if raw, err = yaml.Marshal(&document); err != nil {
-			return Config{}, fmt.Errorf("decode config: %w", err)
-		}
-	}
-	decoder := yaml.NewDecoder(bytes.NewReader(raw))
-	decoder.KnownFields(true)
-	if err := decoder.Decode(&cfg); err != nil {
-		return Config{}, fmt.Errorf("decode config: %w", err)
-	}
-	// yaml.v3 decodes an explicit null as nil, just like omission. Preserve
-	// the declaration so roles: null cannot silently enable every role.
-	if cfg.Roles == nil && yamlRolesDeclared(&document) {
-		cfg.Roles = roles.Set{}
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return Config{}, errors.New("decode config: multiple YAML documents are not allowed")
-		}
-		return Config{}, fmt.Errorf("decode config: %w", err)
+	if err := decodeDocument(raw, &cfg); err != nil {
+		return Config{}, err
 	}
 
 	if override != nil {
@@ -789,6 +860,10 @@ func LoadWithRoles(path string, override roles.Set) (Config, error) {
 		return Config{}, err
 	}
 	cfg.Roles = selected
+	// Before anything copies a connection: see resolveCredentials.
+	if err := cfg.resolveCredentials(credentials); err != nil {
+		return Config{}, err
+	}
 	cfg.resolvePlatformCacheRedis()
 	cfg.resolveCompatibilityServiceTimeouts()
 	cfg.resolveCompatibilityPodCache()
@@ -796,15 +871,9 @@ func LoadWithRoles(path string, override roles.Set) (Config, error) {
 		return Config{}, err
 	}
 	cfg.resolvePhaseTwoWorkerIDFromEnvironment()
-	if cfg.HasRole(roles.Control) || cfg.HasRole(roles.Worker) {
-		if err := cfg.PhaseTwo.Linkd.resolveCredentialsFromEnvironment(); err != nil {
-			return Config{}, err
-		}
-	}
 	if cfg.HasRole(roles.Channel) {
-		if err := cfg.CLI.resolveAdminKeyFromEnvironment(); err != nil {
-			return Config{}, err
-		}
+		// Where the key is kept, for the login page; a pointer beside the
+		// key's one source, not a source of its own.
 		cfg.CLI.resolveAdminKeySecret()
 	}
 	if err := cfg.Validate(); err != nil {
@@ -837,6 +906,43 @@ func yamlRolesDeclared(node *yaml.Node) bool {
 					if yamlRolesDeclared(entry) {
 						return true
 					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// yamlPathDeclared reports whether the document has the key path, through
+// aliases and merge keys, whatever the value under it, null included.
+func yamlPathDeclared(node *yaml.Node, path ...string) bool {
+	if len(path) == 0 {
+		return true
+	}
+	if node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
+		return yamlPathDeclared(node.Content[0], path...)
+	}
+	if node.Kind == yaml.AliasNode {
+		return yamlPathDeclared(node.Alias, path...)
+	}
+	if node.Kind != yaml.MappingNode {
+		return false
+	}
+	for index := 0; index+1 < len(node.Content); index += 2 {
+		key, value := node.Content[index], node.Content[index+1]
+		if key.Value == path[0] && yamlPathDeclared(value, path[1:]...) {
+			return true
+		}
+		if key.Value != "<<" {
+			continue
+		}
+		if yamlPathDeclared(value, path...) {
+			return true
+		}
+		if value.Kind == yaml.SequenceNode {
+			for _, entry := range value.Content {
+				if yamlPathDeclared(entry, path...) {
+					return true
 				}
 			}
 		}
@@ -990,6 +1096,11 @@ func (c Config) validateGoAccessRuntime() error {
 	}
 	if err := c.PhaseTwo.validateRoles(selected); err != nil {
 		return err
+	}
+	if business {
+		if err := c.PhaseTwo.Linkd.validateDestination(); err != nil {
+			return err
+		}
 	}
 	if !business {
 		return c.CLI.validateEnabled()

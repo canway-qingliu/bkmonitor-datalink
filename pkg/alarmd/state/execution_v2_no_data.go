@@ -117,20 +117,54 @@ func (store *ExecutionStore) loadOneNoDataHash(
 		return execution.NoDataMemorySnapshot{Identity: item.Identity, Status: execution.NoDataMemoryTerminal,
 			ReasonCode: execution.ReasonCode(contract.ReasonStateCorrupt)}, nil, true
 	}
-	fields, readErr := backend.ReadHash(ctx, key)
+	fields, closes, closesUnread, readErr := store.readNoDataHashAndCloses(ctx, backend, key, item)
 	if readErr != nil {
 		return execution.NoDataMemorySnapshot{Identity: item.Identity, Status: execution.NoDataMemoryUnavailable,
 			ReasonCode: execution.ReasonCode(contract.ReasonRedisUnavailable)}, nil, true
 	}
 	if len(fields) == 0 {
+		// No memory, so nothing is open for a close to stop.
 		return execution.NoDataMemorySnapshot{Identity: item.Identity, Status: execution.NoDataMemoryMissing}, nil, true
 	}
 	// Renewed before the record is decoded, and for a record this build cannot
 	// read just as much as for one it can: a paused Plan's memory must not
 	// expire while the rollback it is waiting out is still going on.
 	renewal := store.renewNoDataHash(ctx, target, item, key)
-	return store.validatedNoData(request, item,
-		named(decodeNoDataHash(fields, item.Identity), execution.NoDataRepresentationPerGroup)), renewal, true
+	snapshot := store.validatedNoData(request, item,
+		named(decodeNoDataHash(fields, item.Identity), execution.NoDataRepresentationPerGroup))
+	if snapshot.Status == execution.NoDataMemoryFound {
+		snapshot.ManualCloses, snapshot.ManualClosesUnread = closes, closesUnread
+	}
+	return snapshot, renewal, true
+}
+
+// readNoDataHashAndCloses reads a Plan's memory and its strategy's manual
+// closes in one round trip when the backend can; a backend that holds no
+// closes reads the memory alone.
+//
+// Closes that cannot be read cost only themselves: the memory is returned
+// with no closes and closesUnread set, and the round goes on as though nobody
+// had closed anything. A close is a user's request to stop one alert, and
+// failing the whole Plan's no-data detection over it would stop every other
+// one; the output check and the next round still honour the close.
+func (store *ExecutionStore) readNoDataHashAndCloses(
+	ctx context.Context, backend NoDataHashBackend, key string, item execution.PlanNoDataLoadItem,
+) (fields map[string][]byte, closes map[string]int64, closesUnread bool, err error) {
+	pair, ok := backend.(NoDataManualCloseBackend)
+	closeKey, keyErr := NoDataManualCloseKey(store.options.Prefix, item.Identity.Plan.TenantID, item.Identity.Plan.StrategyID)
+	if !ok || keyErr != nil {
+		// A key that cannot be built is one no close was ever recorded under.
+		fields, err = backend.ReadHash(ctx, key)
+		return fields, nil, false, err
+	}
+	fields, closeFields, closeErr, err := pair.ReadHashPair(ctx, key, closeKey)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if closeErr != nil {
+		return fields, nil, true, nil
+	}
+	return fields, parseNoDataManualCloses(closeFields), false, nil
 }
 
 // renewNoDataHash keeps a record that was read alive through the renewal gate.
@@ -192,7 +226,9 @@ func (store *ExecutionStore) validatedNoData(
 	return snapshot
 }
 
-// ApplyNoData replaces one Plan's whole no-data memory per request item.
+// ApplyNoData writes one Plan's no-data memory per request item: a delta
+// against the record it was derived from, or a whole memory staged and put in
+// place.
 func (store *ExecutionStore) ApplyNoData(
 	ctx context.Context, request execution.NoDataApplyRequest,
 ) (execution.NoDataApplyResult, error) {
@@ -215,13 +251,14 @@ func (store *ExecutionStore) ApplyNoData(
 		if err := ctx.Err(); err != nil {
 			return execution.NoDataApplyResult{}, err
 		}
-		result.Items[index] = store.applyOneNoData(ctx, mutation, lifetimes[index])
+		result.Items[index] = store.applyOneNoData(ctx, mutation, lifetimes[index], request.Attempt)
 	}
 	return result, nil
 }
 
 func (store *ExecutionStore) applyOneNoData(
 	ctx context.Context, mutation execution.PlanNoDataMutation, lifetime time.Duration,
+	attempt execution.NoDataWriteAttempt,
 ) execution.NoDataApplyItemResult {
 	item := execution.NoDataApplyItemResult{Identity: mutation.Identity}
 	reject := func(reason string) execution.NoDataApplyItemResult {
@@ -251,7 +288,11 @@ func (store *ExecutionStore) applyOneNoData(
 	if err := mutation.ValidateDigest(); err != nil {
 		return reject(contract.ReasonStateCorrupt)
 	}
-	if int(mutation.GroupCount) > store.options.MaxNoDataGroups {
+	limit, source := store.options.MaxNoDataGroups, execution.NoDataLimitPlatform
+	if mutation.GroupLimit > 0 {
+		limit, source = int(mutation.GroupLimit), execution.NoDataLimitStrategy
+	}
+	if int(mutation.GroupCount) > limit {
 		// The one bound left on a memory, and it is a guard rather than a
 		// working limit: the representation has no size ceiling any more, so
 		// this only catches an expected set that has run away. It is refused
@@ -259,7 +300,7 @@ func (store *ExecutionStore) applyOneNoData(
 		// because a Plan whose memory is refused goes on evaluating and only
 		// stops remembering.
 		return tooLarge(execution.NoDataRecordGroups, execution.NoDataRecordSize{
-			Groups: int(mutation.GroupCount), Limit: store.options.MaxNoDataGroups,
+			Groups: int(mutation.GroupCount), Limit: limit, LimitSource: source,
 		})
 	}
 	key, err := PlanNoDataHashKeyV2(store.options.Prefix, mutation.Identity)
@@ -349,31 +390,59 @@ func (store *ExecutionStore) applyOneNoData(
 	if encodeErr != nil {
 		return reject(contract.ReasonStateCorrupt)
 	}
-	set, deleted, deltaErr := encodeNoDataDelta(mutation)
-	if deltaErr != nil {
-		return reject(contract.ReasonStateCorrupt)
+	var outcome HashDeltaOutcome
+	var applyErr error
+	if mutation.ReplacesWholeRecord() {
+		// A statement derived from no record carries the whole memory, and
+		// at the Plans this representation exists for that is hundreds of
+		// thousands of groups - one script for them blocked the server for
+		// seconds. It is staged a segment at a time under this attempt's own
+		// key and renamed into place, so the record a reader finds is still
+		// only ever one writer's whole memory: nothing a writer put in the
+		// formal key since the read survives the rename, and nothing of
+		// another attempt's staging is in it.
+		stageKey, stageKeyErr := PlanNoDataStageKeyV1(store.options.Prefix, mutation.Identity, attempt)
+		if stageKeyErr != nil {
+			return reject(contract.ReasonStateCorrupt)
+		}
+		// The Plan's own lifetime, the one the load renews it to, for the
+		// same reason a gap marker takes it: written at the floor, the memory
+		// of a Plan whose interval is past a day was gone before its next
+		// round.
+		outcome, applyErr = store.replaceNoDataRecord(ctx, backend, key, stageKey, mutation, header, expectedHeader,
+			lifetime, attempt)
+		if errors.Is(applyErr, errNoDataGroupEncoding) || errors.Is(applyErr, errNoDataGroupCount) ||
+			errors.Is(applyErr, errNoDataStagedMemory) {
+			return reject(contract.ReasonStateCorrupt)
+		}
+	} else {
+		set, deleted, deltaErr := encodeNoDataDelta(mutation)
+		if deltaErr != nil {
+			return reject(contract.ReasonStateCorrupt)
+		}
+		write := HashDeltaWrite{
+			Key: key, HeaderField: noDataHeaderField,
+			ExpectedMissing: expectedHeader == nil, Header: header,
+			Set: set, Del: deleted,
+			// The Plan's own lifetime, as for a whole memory above.
+			TTL: lifetime,
+		}
+		if expectedHeader != nil {
+			write.ExpectedDigest = HeaderDigest(expectedHeader)
+		}
+		outcome, applyErr = backend.ApplyHashDelta(ctx, write)
 	}
-	write := HashDeltaWrite{
-		Key: key, HeaderField: noDataHeaderField,
-		ExpectedMissing: expectedHeader == nil, Header: header,
-		Set: set, Del: deleted,
-		// A statement derived from no record carries the whole memory, so what
-		// this one holds goes first. Leaving it would keep every group a writer
-		// put there since the read, and no reader could tell the mixture from a
-		// memory somebody wrote.
-		Replace: mutation.ReplacesWholeRecord(),
-		// The Plan's own lifetime, the one the load renews it to, for the same
-		// reason a gap marker takes it: written at the floor, the memory of a
-		// Plan whose interval is past a day was gone before its next round.
-		TTL: lifetime,
-	}
-	if expectedHeader != nil {
-		write.ExpectedDigest = HeaderDigest(expectedHeader)
-	}
-	outcome, applyErr := backend.ApplyHashDelta(ctx, write)
 	switch {
 	case applyErr != nil:
 		return retry()
+	case outcome.Status == HashStageLost || outcome.Status == HashStageShort:
+		// The staging key expired between two segments, was started over by
+		// another write under its name, or does not hold the memory's groups.
+		// Nothing was renamed and the formal key is as the read found it, so
+		// this is a write to try again - named as the write's and not as the
+		// server being down, because the server answered.
+		item.Status, item.ReasonCode = execution.NoDataRetryable, execution.ReasonCode(contract.ReasonStateWriteRetryable)
+		return item
 	case outcome.Status == HashDeltaConflict:
 		// Something wrote between the read above and this call. The header it
 		// left is classified exactly as a fresh read would classify it, so the

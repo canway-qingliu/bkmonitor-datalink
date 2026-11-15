@@ -182,7 +182,7 @@ func TestSlotFreezeFailureScheduleDueLineCarriesClassStageAndCause(t *testing.T)
 	observability.NewLoggingObserver(observability.New("alarmd", &output), policy).Observe(context.Background(), observability.Observation{
 		Component: observability.ComponentScheduler, Stage: observability.StageScheduleDue,
 		Result: observability.ResultRetrying, ReasonCode: observability.ReasonCode(contract.ReasonBlockedExactSetUnavailable),
-		Direction: observability.DirectionInternal, Trace: observability.TraceFields{QueryGroupKey: "query-group-1"}, Err: blocked.Err,
+		Trace: observability.TraceFields{QueryGroupKey: "query-group-1"}, Err: blocked.Err,
 	})
 	var event map[string]any
 	if err := json.Unmarshal(output.Bytes(), &event); err != nil {
@@ -620,16 +620,25 @@ func TestProductionSlotSourceRestartFreezesSameContract(t *testing.T) {
 	}
 }
 
-func TestProductionSlotSourceRechecksOwnershipAfterFreeze(t *testing.T) {
+// The source dispatches a Slot under the ownership it opened with, and reads
+// it once: a reading that moved after the freeze is the Slot's first write's to
+// refuse, by the same fence in its own script.
+func TestProductionSlotSourceDispatchesUnderItsOpeningOwnership(t *testing.T) {
 	schedule := schedulerSchedule(t, 60, 60, nil, "snapshot-1", 1)
 	catalog := &fakeSlotCatalog{t: t, schedules: []execution.FrozenQueryGroupSchedule{schedule}}
-	source := mustProductionSlotSource(t, &sequenceOwnerSession{
+	session := &sequenceOwnerSession{
 		fences:  []execution.OwnerFence{testFence(7)},
 		records: []ownership.AssignmentRecord{testAssignment("worker-1", 3), testAssignment("worker-1", 4)},
-	}, catalog, &fakeProgressReader{result: missingProgress(), catalog: catalog}, time.Unix(200, 0))
+	}
+	source := mustProductionSlotSource(t, session, catalog, &fakeProgressReader{result: missingProgress(), catalog: catalog}, time.Unix(200, 0))
 
-	if _, _, _, err := source.Next(context.Background(), "query-group-1"); !errors.Is(err, ErrSlotOwnershipChanged) {
-		t.Fatalf("Next() error = %v, want ErrSlotOwnershipChanged", err)
+	slot, due, _, err := source.Next(context.Background(), "query-group-1")
+	if err != nil || !due {
+		t.Fatalf("Next() due=%t error=%v, want the Slot", due, err)
+	}
+	if slot.Dispatch.AssignmentGeneration != 3 || slot.Dispatch.OwnerFence != testFence(7) || session.reads != 1 {
+		t.Fatalf("dispatched under generation %d fence %+v after %d readings, want generation 3, the opening fence, one reading",
+			slot.Dispatch.AssignmentGeneration, slot.Dispatch.OwnerFence, session.reads)
 	}
 }
 

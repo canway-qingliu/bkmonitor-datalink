@@ -37,6 +37,34 @@ type ControlFacts struct {
 	// in: preferred, or fallback while a Worker leads because no control
 	// process is there. Empty in records written before candidacy existed.
 	CandidacyClass string `json:"candidacy_class,omitempty"`
+	// Handback is the handback watch of a fallback Leader; nil from a
+	// preferred one, which has nothing to hand back.
+	Handback *HandbackFacts `json:"handback,omitempty"`
+}
+
+// MaxHandbackCandidates bounds the candidates a record names: a deployment
+// runs one or two control processes, and a record that grew with whatever
+// registered would cost every reader.
+const MaxHandbackCandidates = 8
+
+// HandbackFacts is a fallback Leader's handback watch, so one read says why
+// the lease has not been given back yet: no preferred candidate is ready
+// (Ready empty), or which one is and when it is due, when the watch last read
+// the candidates, and how often it started over since this process began.
+type HandbackFacts struct {
+	WindowSeconds int64               `json:"window_seconds"`
+	LastReadingAt *time.Time          `json:"last_reading_at,omitempty"`
+	Ready         []HandbackCandidate `json:"ready"`
+	Resets        map[string]uint64   `json:"resets"`
+}
+
+// HandbackCandidate is one preferred candidate the watch is counting: ready
+// without a break since ReadySince, handed the lease at DueAt.
+type HandbackCandidate struct {
+	Instance    string    `json:"instance"`
+	Incarnation string    `json:"incarnation"`
+	ReadySince  time.Time `json:"ready_since"`
+	DueAt       time.Time `json:"due_at"`
 }
 
 func (facts ControlFacts) Validate() error {
@@ -261,6 +289,9 @@ type ControlFactsStanding struct {
 	// leads because no control process is there. Empty when the record
 	// does not say.
 	LeaderClass string `json:"leader_class,omitempty"`
+	// Handback is the record's handback watch while a fallback Leader wrote
+	// it: why the lease has not been given back yet.
+	Handback *HandbackFacts `json:"handback,omitempty"`
 }
 
 type controlRead struct {
@@ -354,6 +385,25 @@ func mergeControlFacts(view *View, snapshot ControlFacts) {
 		view.Activation, view.ActivationReplica = snapshot.Activation, replica
 		if snapshot.Activation.BehindBeyondBound {
 			view.Degradations = append(view.Degradations, Degradation{Kind: DegradationActivationBehind, Replica: replica})
+		} else if activation := snapshot.Activation; activation.FailingBeyondBound {
+			// Behind past the bound already says the round fails; this is
+			// the same failure with nothing newer waiting.
+			degradation := Degradation{Kind: DegradationActivationFailing, Replica: replica, Stage: activation.FailureStage,
+				Text: fmt.Sprintf("%d rounds failed (%s): %s", activation.ConsecutiveFailures, activation.Reason(), activation.LastFailure)}
+			if activation.FailingSecondsThisProcess != nil {
+				age := *activation.FailingSecondsThisProcess
+				degradation.AgeSeconds = &age
+			}
+			view.Degradations = append(view.Degradations, degradation)
+		}
+		if activation := snapshot.Activation; activation.UnrepairedBeyondBound > 0 {
+			degradation := Degradation{Kind: DegradationActivationTimelineUnrepaired, Replica: replica,
+				Text: fmt.Sprintf("%d timelines unread past the bound, repair failing: %s", activation.UnrepairedBeyondBound, activation.UnrepairedNamed)}
+			if activation.UnrepairedSeconds != nil {
+				age := *activation.UnrepairedSeconds
+				degradation.AgeSeconds = &age
+			}
+			view.Degradations = append(view.Degradations, degradation)
 		}
 		if snapshot.Activation.BlockedQueryGroups > 0 {
 			view.Degradations = append(view.Degradations, Degradation{Kind: DegradationActivationBlocked, Replica: replica,

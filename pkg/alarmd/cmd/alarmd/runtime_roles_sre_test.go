@@ -32,7 +32,7 @@ func TestSREProvidersAreRegisteredOnlyByTheChannelRole(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer runtime.Close()
-			for _, operation := range []string{"pod.targets", "pod.get", "pod.logs", "pod.exec", "pod.delete", "workload.restart", "workload.scale", "secret.get", "configmap.get", "uq.egresses", "uq.query", "uq.trace"} {
+			for _, operation := range []string{"node.exec", "node.execution.get", "node.execution.cancel", "pod.targets", "pod.get", "pod.logs", "pod.exec", "pod.delete", "workload.restart", "workload.scale", "secret.get", "configmap.get", "uq.egresses", "uq.query", "uq.trace", "log.count", "log.search"} {
 				present := runtime.Executor.OperationContractRevision(operation) != ""
 				if present != cfg.HasRole(roles.Channel) {
 					t.Fatalf("%s registered in roles %v: %v", operation, selected, present)
@@ -75,8 +75,8 @@ func TestSREQueryReusesCurrentUQEndpointAndSource(t *testing.T) {
 }
 
 // The audit sink writes one sre_action line per call, Info when it was done
-// and Warn otherwise, with who, what and where, and counts it under its
-// operation and result; every cell of the count exists once it is wired.
+// and Warn otherwise, with who, what and where -- an execution's command
+// line too -- and counts it under its operation and result; every cell of the count exists once it is wired.
 func TestTheSREAuditSinkWritesALineAndCountsTheCall(t *testing.T) {
 	var out bytes.Buffer
 	recorder := metric.NewRecorder(metric.BuildInfo{})
@@ -88,13 +88,21 @@ func TestTheSREAuditSinkWritesALineAndCountsTheCall(t *testing.T) {
 			t.Fatalf("line lacks %s: %s", part, line)
 		}
 	}
+	if strings.Contains(line, `"argv"`) {
+		t.Fatalf("a call without a command line writes argv: %s", line)
+	}
+	out.Reset()
+	sink(obchannel.SREAction{Op: "pod.exec", Namespace: "fixture", Kind: "Pod", Name: "web-0/web", Result: obchannel.SREResultDone, Argv: "/bin/sh -s"})
+	if line := out.String(); !strings.Contains(line, `"argv":"/bin/sh -s"`) {
+		t.Fatalf("an execution's line lacks its command line: %s", line)
+	}
 	families, err := recorder.Gatherer().Gather()
 	if err != nil {
 		t.Fatal(err)
 	}
 	cells, counted := 0, 0.0
 	for _, family := range families {
-		if family.GetName() != "bkmonitor_alarmd_sre_actions_total" {
+		if family.GetName() != "alarmd_sre_actions_total" {
 			continue
 		}
 		for _, series := range family.Metric {
@@ -134,7 +142,7 @@ func TestTheRolloutSinkWritesALineAndCountsTheEnd(t *testing.T) {
 	}
 	cells, counted := 0, 0.0
 	for _, family := range families {
-		if family.GetName() != "bkmonitor_alarmd_sre_rollouts_total" {
+		if family.GetName() != "alarmd_sre_rollouts_total" {
 			continue
 		}
 		for _, series := range family.Metric {
@@ -150,14 +158,14 @@ func TestTheRolloutSinkWritesALineAndCountsTheEnd(t *testing.T) {
 }
 
 // The credentials the deployment holds are the redaction's literal secrets:
-// the CLI administrator key, the link Console password, and every Redis
+// the CLI administrator key, the link control plane JWT secret, and every Redis
 // connection's password and Sentinel password - the runtime store, each
 // platform cache on a Redis of its own (strategy, CMDB, dynamic config,
 // target groups) and the compatibility service Redis.
 func TestTheRedactionKnowsEveryCredentialTheDeploymentHolds(t *testing.T) {
 	cfg := config.Default()
 	cfg.CLI.AdminKey = "fixture-admin-key"
-	cfg.PhaseTwo.Linkd.Password = "fixture-linkd-password"
+	cfg.PhaseTwo.Linkd.ControlPlane.JWTSecret = "fixture-linkd-secret"
 	cfg.Redis.Password = "fixture-redis-password"
 	cfg.Redis.SentinelPassword = "fixture-sentinel-password"
 	// Every platform cache on a Redis of its own, and the compatibility
@@ -175,7 +183,7 @@ func TestTheRedactionKnowsEveryCredentialTheDeploymentHolds(t *testing.T) {
 	for _, value := range sreDeploymentSecrets(cfg) {
 		known[value] = true
 	}
-	want := []string{"fixture-admin-key", "fixture-linkd-password", "fixture-redis-password", "fixture-sentinel-password"}
+	want := []string{"fixture-admin-key", "fixture-linkd-secret", "fixture-redis-password", "fixture-sentinel-password"}
 	for _, name := range []string{"strategy", "cmdb", "dynamic", "group", "service", "pods"} {
 		want = append(want, "fixture-"+name+"-password", "fixture-"+name+"-sentinel")
 	}

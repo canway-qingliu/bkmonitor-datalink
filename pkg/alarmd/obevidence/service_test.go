@@ -54,7 +54,7 @@ func (log *commandLog) assertBounded(t *testing.T) {
 	}
 	for _, cmd := range log.commands {
 		switch cmd {
-		case "type", "pttl", "getrange", "strlen", "hlen", "hget":
+		case "type", "pttl", "getrange", "strlen", "hlen", "hget", "hscan":
 		default:
 			t.Fatalf("unbounded/unexpected command %s", cmd)
 		}
@@ -147,7 +147,7 @@ func TestRedisTypesAbsenceLimitsAndFailure(t *testing.T) {
 	log.assertBounded(t)
 	cases := []struct{ name, value, status string }{
 		{"missing", "", "missing"}, {"empty", "", "empty"}, {"corrupt", "{", "invalid_document"},
-		{"large", strings.Repeat("x", MaxDocumentBytes+1000), "budget_exceeded"},
+		{"large", strings.Repeat("x", MaxDocumentBytes+1000), "document_too_large"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

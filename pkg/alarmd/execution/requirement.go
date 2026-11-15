@@ -207,9 +207,48 @@ type DataRequirement struct {
 	// event count's group comes back from the provider only while it holds
 	// an event inside the range asked, with zeros for the empty steps, so a
 	// range of the trigger and recovery windows keeps a group that went
-	// quiet in the answer until it can recover. Zero for every other
+	// quiet in the answer while those windows are walked. Its zeros end no
+	// alert (ZeroIsNoObservation): a quiet group recovers only on a count
+	// above zero, or ends by -nodata. Zero for every other
 	// requirement; a whole number of steps.
 	ProviderLeadSeconds int64 `json:",omitempty"`
+	// UnfilledCounts says the primary answers counts its provider does not
+	// zero-fill: a log count, or a log time series counted, read from an
+	// Elasticsearch date histogram, where a group with no document in the
+	// range is absent from the answer rather than zero. Its empty answer
+	// cannot tell a quiet group from a missing one. False for every other
+	// requirement; on a primary only.
+	//
+	// Observation only, like SlotExecutionRequest.ShortPeriodCohort: it
+	// labels an empty answer and changes nothing the Slot computes, so it is
+	// never part of the requirement's identity or the due Plan set digest.
+	// The controlplane derives it from the query each time it builds the
+	// primary requirement; nothing persists it.
+	UnfilledCounts bool `json:"-"`
+	// ZeroIsNoObservation says a count of zero from the primary is no
+	// observation: an event count (custom/event), whose zero is no event, or
+	// a log count that groups by nothing, whose zero is no matching document
+	// or no document at all. It does not end an alert
+	// (contract.RecoveryWithheldZeroCount) though the trigger reads it. Read
+	// off the Plan's query - its source and its group-by - not off a record,
+	// so a grouped Plan's record without dimensions is still grouped.
+	// Derived from the query each time, like UnfilledCounts, and never part
+	// of the requirement's identity.
+	ZeroIsNoObservation bool `json:"-"`
+	// ValueFiltered says the primary's expression compares its values - a
+	// filter such as OsRestart's "a <= 3600" - so a FULL, EMPTY answer may be
+	// every series filtered out, not data missing. On a primary only.
+	// Observation only, like UnfilledCounts: derived from the query each
+	// time, never part of the requirement's identity.
+	ValueFiltered bool `json:"-"`
+	// UnfilteredWitness says this algorithm dependency reads the same source
+	// as the primary of every Level it serves, through another query that
+	// filters nothing: when the primary comes back filtered empty and this
+	// one has data, the data is there and nothing passed the filter
+	// (PrimaryInputFact.FilteredWhenEmpty). On a dependency only; derived
+	// where the requirement is bound, never part of its identity or its
+	// frozen template.
+	UnfilteredWitness bool `json:"-"`
 }
 
 func (requirement DataRequirement) Validate(plans map[PlanIdentity]DuePlan) error {
@@ -226,8 +265,13 @@ func (requirement DataRequirement) Validate(plans map[PlanIdentity]DuePlan) erro
 		return errors.New("alarmd execution: invalid DataRequirement result window contract")
 	}
 	if requirement.ProviderLeadSeconds < 0 || requirement.ProviderLeadSeconds*1000%requirement.StepMillis != 0 ||
-		requirement.ProviderLeadSeconds > 0 && requirement.Role != InputRolePrimary {
+		requirement.ProviderLeadSeconds > 0 && requirement.Role != InputRolePrimary ||
+		(requirement.UnfilledCounts || requirement.ZeroIsNoObservation) && requirement.Role != InputRolePrimary {
 		return errors.New("alarmd execution: a provider lead is a whole number of steps, on a primary requirement")
+	}
+	if requirement.ValueFiltered && requirement.Role != InputRolePrimary ||
+		requirement.UnfilteredWitness && requirement.Role != InputRoleAlgorithmDependency {
+		return errors.New("alarmd execution: a value filter is a primary's word, an unfiltered witness a dependency's")
 	}
 	if requirement.ReadinessClass != ReadinessEager && requirement.ReadinessClass != ReadinessFinalizedRequired {
 		return errors.New("alarmd execution: invalid DataRequirement readiness class")

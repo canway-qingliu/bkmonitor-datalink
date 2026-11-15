@@ -31,26 +31,29 @@ import (
 // A Slot of more than one physical query is not read: its late series would
 // be found in one query and needed from all of them, which one read of each
 // in any order cannot keep. It is counted unobserved, multi_query, and a
-// supplement of it is not attempted.
+// supplement of it is not attempted. Nor is a Slot of a query with named
+// outputs read: unobserved, named_outputs.
 
 // Directed window outcomes, closed: what became of each Slot of a directed
 // Query Group. supplemented is a Slot read whose supplement ran, whatever
 // each of its series came to; nothing_late one read that had no series its
 // first read did not. flight_busy, contract_expired and failed are Slots
-// read whose supplement did not run, by why; unobserved one not read, by
-// the reason in DirectedUnobservedReasons.
+// read whose supplement did not run, by why - kept_read_absent one whose
+// queries, planned again, were not the query the read kept; unobserved one
+// not read, by the reason in DirectedUnobservedReasons.
 const (
 	DirectedSupplemented    = "supplemented"
 	DirectedNothingLate     = "nothing_late"
 	DirectedFlightBusy      = "flight_busy"
 	DirectedContractExpired = "contract_expired"
+	DirectedKeptReadAbsent  = "kept_read_absent"
 	DirectedFailed          = "failed"
 	DirectedUnobserved      = "unobserved"
 )
 
 // DirectedOutcomes is every directed window outcome.
 var DirectedOutcomes = []string{DirectedSupplemented, DirectedNothingLate, DirectedFlightBusy, DirectedContractExpired,
-	DirectedFailed, DirectedUnobserved}
+	DirectedKeptReadAbsent, DirectedFailed, DirectedUnobserved}
 
 // Why a directed Slot was not read, closed.
 const (
@@ -68,11 +71,16 @@ const (
 	// UnobservedMemoryRefused is a Slot whose series set or kept series the
 	// process's memory line refused.
 	UnobservedMemoryRefused = "memory_refused"
+	// UnobservedNamedOutputs is a Slot of a query with named outputs. It is
+	// one physical query, so multi_query does not take it; a supplement of
+	// it would evaluate a read of its legacy output alone, and its alerts
+	// would carry none of the outputs the Slot's own read aligned.
+	UnobservedNamedOutputs = "named_outputs"
 )
 
 // DirectedUnobservedReasons is every reason.
 var DirectedUnobservedReasons = []string{UnobservedYielded, UnobservedReadFailed, UnobservedFirstReadIncomplete,
-	UnobservedMultiQuery, UnobservedMemoryRefused}
+	UnobservedMultiQuery, UnobservedMemoryRefused, UnobservedNamedOutputs}
 
 // Series outcomes of the supplements that ran, closed: the names
 // execution.SupplementFacts counts, and the points the admitted ones were
@@ -162,10 +170,23 @@ type KeptRead struct {
 	completion execution.ProviderCompletion
 }
 
+// Digest is the physical query the read kept.
+func (read *KeptRead) Digest() execution.PhysicalQueryDigest {
+	if read == nil {
+		return ""
+	}
+	return read.digest
+}
+
+// Keeps says whether the read is of the physical query of digest.
+func (read *KeptRead) Keeps(digest execution.PhysicalQueryDigest) bool {
+	return read != nil && digest == read.digest
+}
+
 // Replay delivers the kept series in the order they were read and returns
 // the completion restated for them.
 func (read *KeptRead) Replay(ctx context.Context, spec execution.PhysicalQuerySpec, sink execution.ProviderSeriesSink) (execution.ProviderCompletion, error) {
-	if read == nil || spec.Digest != read.digest {
+	if !read.Keeps(spec.Digest) {
 		return execution.ProviderCompletion{}, ErrNotKept
 	}
 	for _, batch := range read.batches {
@@ -215,6 +236,7 @@ func (series *seriesSet) add(key uint64) {
 // the series its first read had, and whether that read was whole.
 type directedQuery struct {
 	spec     execution.PhysicalQuerySpec
+	slice    execution.InputSlice
 	first    *seriesSet
 	complete bool
 	finished bool
@@ -259,6 +281,10 @@ type directedSlot struct {
 	facts        execution.SupplementFacts
 	supplemented bool
 	filed        bool
+	// sliceTook is its slices' first reads' times summed, and tookCounted
+	// whether that reading was counted among its Query Group's.
+	sliceTook   time.Duration
+	tookCounted bool
 }
 
 // supplementTally is what a directed Query Group's Slots came to since it
@@ -294,13 +320,41 @@ func (engine *Engine) captureDirectedLocked(state *group, query Query, source st
 			readHold: query.Contract.ReadHoldMillis}
 		state.directed[query.Contract.Slot.EvaluationTime] = slot
 	}
-	captured := &directedQuery{spec: query.Spec, first: newSeriesSet(engine.options.Memory), slot: slot, begunAt: now}
+	captured := &directedQuery{spec: query.Spec, slice: query.Slice, first: newSeriesSet(engine.options.Memory), slot: slot, begunAt: now}
 	slot.queries = append(slot.queries, captured)
-	if len(slot.queries) > 1 && slot.early != nil && !slot.early.running {
+	if slot.physicalQueries() > 1 && slot.early != nil && !slot.early.running {
 		// A second physical query: its late series could not be read whole.
 		engine.fileEarlyLocked(state, slot, EarlyMultiQuery)
 	}
 	return captured
+}
+
+// removeDirectedLocked takes one captured first read off its Slot, and the
+// Slot off its Query Group once it has none and is not being read.
+func (engine *Engine) removeDirectedLocked(captured *directedQuery) {
+	slot := captured.slot
+	for index, query := range slot.queries {
+		if query == captured {
+			slot.queries = append(slot.queries[:index], slot.queries[index+1:]...)
+			break
+		}
+	}
+	if len(slot.queries) == 0 && !slot.running {
+		if state := engine.groups[slot.queryGroup]; state != nil && state.directed[slot.evaluation] == slot {
+			delete(state.directed, slot.evaluation)
+		}
+	}
+}
+
+// physicalQueries is how many physical queries a directed Slot's captured
+// reads are of: the slices of one query are one, and a supplement replays
+// one kept read per physical query.
+func (slot *directedSlot) physicalQueries() int {
+	digests := map[execution.PhysicalQueryDigest]struct{}{}
+	for _, query := range slot.queries {
+		digests[query.spec.Digest] = struct{}{}
+	}
+	return len(digests)
 }
 
 // completeDirectedLocked takes the end of a directed first read: how long
@@ -314,7 +368,14 @@ func (engine *Engine) completeDirectedLocked(captured *directedQuery, completion
 		return
 	}
 	if captured.complete {
-		state.took.add(now.Sub(captured.begunAt))
+		if captured.slice.IsZero() {
+			state.took.add(now.Sub(captured.begunAt))
+		} else {
+			// A slice's time is a part of its Slot's: the slices' times
+			// summed are counted once, as one reading, when the Slot is
+			// read again (rereadSlices).
+			captured.slot.sliceTook += now.Sub(captured.begunAt)
+		}
 	}
 	engine.planEarlyLocked(state, captured.slot, now)
 }
@@ -346,12 +407,23 @@ func (engine *Engine) dueDirectedLocked(state *group, now time.Time) []*directed
 		switch {
 		case now.After(at.Add(rungWindow(slot.rung, slot.step))):
 			reason = UnobservedYielded
-		case len(slot.queries) != 1:
-			reason = UnobservedMultiQuery
-		case !slot.queries[0].finished || !slot.queries[0].complete:
+		case len(slot.queries) == 0:
 			reason = UnobservedFirstReadIncomplete
-			if slot.queries[0].first.refused {
-				reason = UnobservedMemoryRefused
+		case slot.physicalQueries() != 1:
+			reason = UnobservedMultiQuery
+		case slot.queries[0].spec.PlanFacts.NamedOutputs != nil:
+			reason = UnobservedNamedOutputs
+		default:
+			// Every slice's first read whole: a slice short of it has no
+			// first read to say which of its series are late.
+			for _, query := range slot.queries {
+				if !query.finished || !query.complete {
+					reason = UnobservedFirstReadIncomplete
+					if query.first.refused {
+						reason = UnobservedMemoryRefused
+					}
+					break
+				}
 			}
 		}
 		if reason != "" {
@@ -432,10 +504,11 @@ func (sink *keptSink) ConsumeProviderSeries(_ context.Context, batch execution.P
 	if _, had := sink.first[hashString(identity)]; had {
 		return nil
 	}
-	// What a kept series holds is the delivery's own byte count; the line is
+	// What a kept series holds is its Dataset's RetainedBytes; the line is
 	// asked for room as it doubles, as a series table's is.
-	if sink.keptBytes+batch.Delivery.Bytes > sink.grantBytes {
-		step := max(sink.grantBytes, sink.keptBytes+batch.Delivery.Bytes)
+	kept := batch.Dataset.RetainedBytes()
+	if sink.keptBytes+kept > sink.grantBytes {
+		step := max(sink.grantBytes, sink.keptBytes+kept)
 		if sink.admit != nil && !sink.admit(step) {
 			sink.refused, sink.batches, sink.series = true, nil, nil
 			return nil
@@ -447,7 +520,7 @@ func (sink *keptSink) ConsumeProviderSeries(_ context.Context, batch execution.P
 		sink.invalid = err
 		return nil
 	}
-	sink.delivery, sink.keptBytes = delivery, sink.keptBytes+batch.Delivery.Bytes
+	sink.delivery, sink.keptBytes = delivery, sink.keptBytes+kept
 	sink.batches = append(sink.batches, batch)
 	sink.stats.Series++
 	sink.stats.Records += batch.Delivery.Records
@@ -477,12 +550,102 @@ func (sink *keptSink) kept(spec execution.PhysicalQuerySpec, completion executio
 	return &KeptRead{digest: spec.Digest, batches: sink.batches, completion: restated}, series
 }
 
+// slotRereadTimeout bounds a Slot's reread: one read's bound
+// (rereadTimeout, its Query Group's longest first read, which a slice's is
+// of one slice) for each slice it rereads one after another.
+func (engine *Engine) slotRereadTimeout(slot *directedSlot) time.Duration {
+	engine.mu.Lock()
+	slices := max(len(slot.queries), 1)
+	engine.mu.Unlock()
+	return engine.rereadTimeout(slot.queryGroup) * time.Duration(slices)
+}
+
+// rereadSlices reads every captured first read of a Slot's one physical
+// query again - one, or one a slice of a Slot read in slices - each as
+// itself, the slice's against the slice's own first read, one after
+// another, each bounded by the share as a first read is. The slices are
+// disjoint, so what each finds new is its own; their kept batches make one
+// kept read of the physical query (mergeKeptSinks). It stops at the first
+// read that fails, whose completion and error it returns; refused counts
+// the slices whose reread the share refused.
+func (engine *Engine) rereadSlices(readCtx context.Context, slot *directedSlot) (
+	queries []*directedQuery, sinks []*keptSink, completion execution.ProviderCompletion, err error, refused int,
+) {
+	engine.mu.Lock()
+	queries = append([]*directedQuery(nil), slot.queries...)
+	firsts := make([]map[uint64]struct{}, len(queries))
+	for index, query := range queries {
+		firsts[index] = query.first.set
+	}
+	// A slice's first read time is its Slot's once its slices are all read:
+	// counted here, once, as the Slot's (completeDirectedLocked).
+	if state := engine.groups[slot.queryGroup]; state != nil && slot.sliceTook > 0 && !slot.tookCounted {
+		state.took.add(slot.sliceTook)
+		slot.tookCounted = true
+	}
+	engine.mu.Unlock()
+	for index, query := range queries {
+		sink := &keptSink{first: firsts[index], admit: engine.options.Memory}
+		var read execution.ProviderCompletion
+		read, err = engine.options.Recheck(execution.WithInputSlice(readCtx, query.slice), query.spec, sink)
+		if index == 0 || err == nil && read.Completeness != execution.CompletenessFull {
+			completion = read
+		}
+		sinks = append(sinks, sink)
+		if sink.refused {
+			// This slice's reread past the share: its late series are this
+			// round's data next round, as an unobserved Slot's are; the
+			// other slices' are supplemented.
+			refused++
+		}
+		if err != nil || read.Completeness != execution.CompletenessFull || sink.invalid != nil {
+			break
+		}
+	}
+	return queries, sinks, completion, err, refused
+}
+
+// mergeKeptSinks is the kept reads of one physical query's slices as one:
+// their kept batches in the order the slices were read, deliveries chained,
+// counts and bytes summed; a slice whose reread the share refused keeps
+// nothing. The slices are disjoint, so no series is in two.
+func mergeKeptSinks(sinks []*keptSink) *keptSink {
+	merged := &keptSink{}
+	for _, sink := range sinks {
+		merged.bytes += sink.bytes
+		if merged.invalid == nil && sink.invalid != nil {
+			merged.invalid = sink.invalid
+		}
+		if sink.refused {
+			continue
+		}
+		for _, batch := range sink.batches {
+			delivery, err := execution.AccumulateSeriesDelivery(merged.delivery, batch.Delivery)
+			if err != nil {
+				merged.invalid = err
+				return merged
+			}
+			merged.delivery = delivery
+		}
+		merged.batches = append(merged.batches, sink.batches...)
+		merged.stats.Series += sink.stats.Series
+		merged.stats.Records += sink.stats.Records
+		for identity := range sink.series {
+			if merged.series == nil {
+				merged.series = map[execution.SeriesIdentityDigest]struct{}{}
+			}
+			merged.series[identity] = struct{}{}
+		}
+	}
+	return merged
+}
+
 // directedRead reads a directed Slot's query again and hands its late
 // series to the supplement. The permit is given back before the supplement
 // runs: a supplement reads nothing, and it waits for nothing but its own
 // Query Group's flight.
 func (engine *Engine) directedRead(ctx context.Context, slot *directedSlot, release func(), yield <-chan struct{}) {
-	readCtx, cancel := context.WithTimeout(ctx, engine.rereadTimeout(slot.queryGroup))
+	readCtx, cancel := context.WithTimeout(ctx, engine.slotRereadTimeout(slot))
 	back := make(chan struct{})
 	if yield != nil {
 		go func() {
@@ -493,17 +656,13 @@ func (engine *Engine) directedRead(ctx context.Context, slot *directedSlot, rele
 			}
 		}()
 	}
-	captured := slot.queries[0]
-	engine.mu.Lock()
-	first := captured.first.set
-	engine.mu.Unlock()
-	sink := &keptSink{first: first, admit: engine.options.Memory}
-	completion, err := engine.options.Recheck(readCtx, captured.spec, sink)
+	queries, sinks, completion, err, refused := engine.rereadSlices(readCtx, slot)
 	close(back)
 	release()
 	cancel()
+	merged := mergeKeptSinks(sinks)
 	engine.mu.Lock()
-	engine.counts.directedBytes[slot.source] += sink.bytes
+	engine.counts.directedBytes[slot.source] += merged.bytes
 	state := engine.groups[slot.queryGroup]
 	if slot.dropped || state == nil {
 		engine.mu.Unlock()
@@ -517,10 +676,15 @@ func (engine *Engine) directedRead(ctx context.Context, slot *directedSlot, rele
 	}
 	reason := ""
 	switch {
-	case err != nil || completion.Completeness != execution.CompletenessFull || sink.invalid != nil:
+	case err != nil || completion.Completeness != execution.CompletenessFull || merged.invalid != nil:
 		reason = UnobservedReadFailed
-	case sink.refused:
+	case refused == len(sinks):
 		reason = UnobservedMemoryRefused
+	case refused > 0:
+		// Some slices' rereads past the share, the others' supplemented: the
+		// Slot comes to its one outcome of the slices read, and is counted
+		// apart as partly refused, not as unobserved by any reason.
+		engine.counts.directedPartlyRefused[slot.source]++
 	}
 	if reason != "" {
 		engine.fileWindowLocked(state, slot, DirectedUnobserved, reason, rungRead{})
@@ -528,7 +692,8 @@ func (engine *Engine) directedRead(ctx context.Context, slot *directedSlot, rele
 		engine.mu.Unlock()
 		return
 	}
-	read, series := sink.kept(captured.spec, completion)
+	read, series := merged.kept(queries[0].spec, completion)
+	sink := merged
 	if len(series) == 0 {
 		engine.fileWindowLocked(state, slot, DirectedNothingLate, "", rungRead{})
 		delete(state.directed, slot.evaluation)
@@ -555,7 +720,8 @@ func (engine *Engine) directedRead(ctx context.Context, slot *directedSlot, rele
 	case outcome.Ran:
 		rung.facts = &outcome.Facts
 		engine.fileWindowLocked(state, slot, DirectedSupplemented, "", rung)
-	case outcome.Refused == DirectedFlightBusy || outcome.Refused == DirectedContractExpired:
+	case outcome.Refused == DirectedFlightBusy || outcome.Refused == DirectedContractExpired ||
+		outcome.Refused == DirectedKeptReadAbsent:
 		engine.fileWindowLocked(state, slot, outcome.Refused, "", rung)
 	default:
 		engine.fileWindowLocked(state, slot, DirectedFailed, "", rung)
@@ -571,6 +737,8 @@ func earlyRefusalWindow(early string) (outcome string, ok bool) {
 		return DirectedFlightBusy, true
 	case EarlyContractExpired, EarlyOvertaken:
 		return DirectedContractExpired, true
+	case EarlyKeptReadAbsent:
+		return DirectedKeptReadAbsent, true
 	case EarlyFailed:
 		return DirectedFailed, true
 	}
@@ -704,7 +872,7 @@ func (engine *Engine) supplementReadingLocked(queryGroup execution.QueryGroupIde
 	if tally == nil {
 		return SupplementReading{}, false
 	}
-	lead := engine.leadLocked(state)
+	lead := engine.leadLocked(state, nil)
 	hold := lead - state.took.longest()
 	reading := SupplementReading{QueryGroup: queryGroup, Source: state.source, Since: tally.since,
 		Windows: map[string]uint64{}, Unobserved: map[string]uint64{}, Series: tally.facts, Pending: len(state.directed),

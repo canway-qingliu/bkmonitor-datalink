@@ -11,12 +11,16 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/contract"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/internal/testwait"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/observability"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/ownership"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/scheduler"
 )
 
@@ -133,20 +137,33 @@ func TestTheRunningDispatcherRunsATurnedAwayRoundWhenTheHoldEnds(t *testing.T) {
 	done := make(chan error, 1)
 	dispatcher := newPhaseTwoRunnerDispatcher(bundle, false)
 	dispatcher.start(ctx)
+	defer dispatcher.stop()
 	go func() { done <- dispatcher.run(ctx, wake, nil) }()
 	wake <- struct{}{}
-	for deadline := time.Now().Add(2 * time.Second); runs.Load() == 0 && time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+	for deadline := testwait.Deadline(t); runs.Load() == 0 && time.Now().Before(deadline); time.Sleep(time.Millisecond) { // fixed-wait: the poll interval of a condition wait bounded by the test deadline
 	}
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond) // fixed-wait: the round must not run again while the hold lasts; 200 ms is many wakes of the dispatcher
 	if got := runs.Load(); got != 1 {
 		t.Fatalf("the round ran %d times while the hold lasted, want once", got)
 	}
 	bundle.noticeFlightReleased("query-group-1")
 	select {
 	case <-ranAgain:
-	case <-time.After(2 * time.Second):
+	case <-testwait.Expired(t):
 		t.Fatal("the round was not run when the hold ended")
 	}
 	cancel()
 	<-done
+}
+
+// A round that did not run because ownership refused it is named by the
+// refusal's word on its schedule_due line, not left unknown.
+func TestAnUnattemptedRoundRefusedByOwnershipNamesTheRefusal(t *testing.T) {
+	dispatcher, observed, entry := yieldRig(t)
+	dispatcher.handleResult(context.Background(), phaseTwoScheduledResult{scheduled: entry.scheduled, ran: true,
+		err: fmt.Errorf("acquire: %w", ownership.ErrLeaseBusy)}, true)
+	last := (*observed)[len(*observed)-1]
+	if last.Stage != observability.StageScheduleDue || last.ReasonCode != observability.ReasonCode(contract.ReasonOwnershipLeaseBusy) {
+		t.Fatalf("observed %s %s %s, want the round named %s", last.Stage, last.Result, last.ReasonCode, contract.ReasonOwnershipLeaseBusy)
+	}
 }

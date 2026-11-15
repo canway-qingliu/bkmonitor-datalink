@@ -39,15 +39,31 @@ const memorySourceFallback = "fallback_default"
 // What they do not yet carry is measured scaling to other container shapes;
 // that calibration changes the formulas below and no interface.
 const (
-	retainedMemoryDivisor = 4
-	bytesPerSeries        = 4 << 10
-	bytesPerMutation      = 32 << 10
+	// The retained pool is what the Slots may hold of the live heap: half the
+	// soft memory limit, less what the process holds whatever runs
+	// (retainedPoolBytes, sizing.md, the pool). Half, so the collector keeps
+	// at least as much room above the live heap as the default GOGC of 100
+	// gives it - where the replicas holding the largest Query Group, at a live
+	// heap of 774-1,074 MiB, spent 4.6-4.7% of their busy CPU on compulsory
+	// collection (11-10, 5-minute windows). A sixteenth of the container -
+	// 256 MiB on 4 GiB - for the rest, where the most live heap a
+	// production replica held with no Slot reserving was 235 MiB, State cache
+	// included.
+	gcHeadroomDivisor   = 2
+	residentHeapDivisor = 16
+	bytesPerMutation    = 32 << 10
 
 	// The Go runtime's own budgets are derived from the same container limit.
-	// The soft memory limit takes half of it; the collector target crosses over
-	// to that limit once the live heap reaches an eighth of it.
-	goMemoryLimitDivisor = 2
-	goGCLiveHeapDivisor  = 8
+	// The soft memory limit takes five eighths of it (DeriveGoRuntime); the
+	// collector target is a fixed ratio, set on its own.
+	goMemoryLimitNumerator   = 5
+	goMemoryLimitDenominator = 8
+	goGCPercent              = 300
+	// executionRuntimeDivisor is the share of the container the parked
+	// executions are sized under (activeExecutionCeiling): half, as it was
+	// before the soft limit moved, so raising the collector's room admits no
+	// more concurrent Slots than before.
+	executionRuntimeDivisor = 2
 
 	controlTimelineCacheMemoryDivisor = 16
 	// The smallest Schedule timeline that can exist - one Segment carrying one
@@ -55,6 +71,19 @@ const (
 	controlTimelineCacheMinEntryBytes = 1 << 10
 
 	compileCacheMemoryDivisor = 32
+
+	// stateCacheMemoryDivisor bounds the write-through State cache: at most
+	// the container's thirty-second, 128 MiB on 4 GiB (about 82,000 series),
+	// borrowed from the retained-bytes pool (fourth-batch design §4.5). The
+	// pool, not the container, gives it: the cache is resident heap, so the
+	// cache and the Slots' reservations together stay within the pool. It is
+	// borrowed, not taken out: the cache holds only what no Slot has
+	// reserved and gives it back when a Slot needs it, so the share one
+	// Query Group may hold is the same with the cache on or off. Taking it
+	// out of the pool once cut the share on 4 GiB by 96 MiB and refused a
+	// Query Group of about 700 MiB that had run beside no cache. Query permits keep
+	// their own line (DeriveExecution), which does not move.
+	stateCacheMemoryDivisor = 32
 	// Every compile cache entry is charged a 64-byte header before anything
 	// it holds (strategy.estimateCompileResultBytes), so none is smaller.
 	compileCacheMinEntryBytes = 64
@@ -160,17 +189,9 @@ const (
 // in-place wait's retention reading against the heap at peak.
 const bytesPerParkedExecution = 3 << 20
 
-// Until the first demand is measured, a query is taken to hold its permit for
-// half a second - three times the 0.153 s a production fleet measured - and an
-// execution to run for a second.
-const (
-	coldStartHold      = 500 * time.Millisecond
-	coldStartExecution = time.Second
-)
-
-// DeriveScheduler is the shape a container starts with: every bound at the
-// ceiling its memory sets, until the work it owns is known and
-// DeriveSchedulerShape sizes the bounds from it.
+// DeriveScheduler is the shape a container runs with: every bound at the
+// ceiling its memory sets. Only the queues are sized again once the work it
+// owns is known (DeriveSchedulerShape).
 //
 // CPU sizes none of them. The permits once came from CPU times four, the
 // executions from four per permit and the queues from thirty-two per permit,
@@ -180,12 +201,21 @@ const (
 // trip. A query permit is held while the query service answers and an
 // execution slot while Redis and the query service answer; neither is CPU
 // work. What a held slot costs this process is memory, so memory sets the
-// ceiling, and what it costs the query service is concurrency, so the work's
-// own rate sets the value under it.
+// ceiling, and the query permits are a share of it.
+//
+// The permits were once sized from the work's own rate - peak queries a
+// second times the hold, twice over - and that sized nothing real: on a small
+// deployment it sat at its floor of two while almost no query ever waited,
+// and on a large one it rose with the demand, so it never stood between the
+// query service and a load it could not take. A share of what this process
+// can hold in memory is the bound this process actually has. What the query
+// service can take is the service's own capacity, read from its metrics and
+// from query_downstream_distress_total, not guessed from alarmd's demand.
 //
 // The ceiling is the memory the runtime may use beyond the retained pool -
-// the soft memory limit less the retained bytes - over what one parked
-// execution holds.
+// half the container less the retained bytes (executionRuntimeDivisor), not
+// the soft memory limit, which has room above it for the live heap's
+// overshoot - over what one parked execution holds.
 func DeriveScheduler(inputs CapacityInputs) DerivedScheduler {
 	ceiling := activeExecutionCeiling(inputs)
 	queries := max(ceiling/startQueryShareOfCeiling, 3)
@@ -203,8 +233,8 @@ func DeriveScheduler(inputs CapacityInputs) DerivedScheduler {
 }
 
 func activeExecutionCeiling(inputs CapacityInputs) int {
-	runtimeBytes := inputs.MemoryLimitBytes / goMemoryLimitDivisor
-	retained := inputs.MemoryLimitBytes / retainedMemoryDivisor
+	runtimeBytes := inputs.MemoryLimitBytes / executionRuntimeDivisor
+	retained := retainedPoolBytes(inputs.MemoryLimitBytes)
 	if runtimeBytes <= retained {
 		return minimumActiveExecutions
 	}
@@ -215,19 +245,19 @@ func activeExecutionCeiling(inputs CapacityInputs) int {
 // above it, an execution for each and one more.
 const minimumActiveExecutions = 4
 
-// Until the first derivation half the execution slots may hold a query - a
-// profile of full slots found about a third in one - a quarter of those are
-// recovery permits, and each permit gets thirty-two queue places. All three
-// are start values only: the derivation replaces them with the measured
-// demand.
+// Half the execution slots may hold a query - a profile of full slots found
+// about a third in one - and a quarter of those are recovery permits. Each
+// permit gets thirty-two queue places until the work is known; the queues are
+// then sized from the owned Query Groups.
 const (
 	startQueryShareOfCeiling = 2
 	recoveryShareOfQueries   = 4
 	queueDepthPerQueryPermit = 32
 )
 
-// SchedulerDemand is the work a process owns and how fast it is served, the
-// inputs DeriveSchedulerShape sizes the bounds from.
+// SchedulerDemand is the work a process owns and how fast it is served. Only
+// the owned Query Groups size anything (the queues); the rest is reported
+// beside the bounds, so a reader sees how far the work is from them.
 type SchedulerDemand struct {
 	// PeakQueriesPerSecond is the most normal queries this process's owned
 	// Query Groups make ready in one second.
@@ -250,64 +280,31 @@ type SchedulerDemand struct {
 	MaxQueuedItemsPerQG int
 }
 
-// demandHeadroom is how far above the demand's own concurrency a bound sits.
-// At the demand's rate times its hold a bound is fully used and the queue
-// behind it is unbounded; at twice that it is half used, and a multi-server
-// queue at half load waits less than one service time.
-const demandHeadroom = 2
-
-// DeriveSchedulerShape sizes the bounds from the work, given the shape in
-// force (previous) and the permits held now (held).
+// DeriveSchedulerShape sizes the queues from the work and keeps every other
+// bound at the ceiling the container's memory sets.
 //
-//   - Execution slots stay at the container's ceiling. They bound how many
-//     executions are parked in memory at once, which is what the ceiling
-//     measures; an execution slot is a goroutine waiting on Redis or the query
-//     service. Sized from demand they hid the demand: fewer slots ran fewer
-//     Slots, which asked for fewer permits, which read as less demand - a
-//     bound whose input its own output gated, stuck at its floor on a
+//   - Execution slots stay at the ceiling. They bound how many executions are
+//     parked in memory at once, which is what the ceiling measures. Sized from
+//     demand they hid the demand: fewer slots ran fewer Slots, which asked for
+//     fewer permits, which read as less demand - stuck at the floor on a
 //     production deployment within a minute of starting.
-//   - Process permits: peak queries a second times the hold, twice over. The
-//     queries are counted where they ask for a permit, before the permit
-//     budget gates them, and with the slots at the ceiling nothing upstream
-//     gates them either.
-//   - Recovery permits: replay queries a second times the hold, at least one.
-//   - Neither comes down by more than half in one derivation, nor below what
-//     is held now: a minute that measured little does not take a full budget
-//     to its floor, and lowering never takes back what is running.
+//   - Process and recovery permits stay at their share of the ceiling. They
+//     do not move with the demand: a bound that follows the demand at twice
+//     its size is never the constraint, and on a small deployment its floor
+//     read as one.
 //   - Queues: every owned Query Group queued as deep as one may be.
-//
-// The hold is the lowest hourly median, not the latest: a hold that followed
-// the query service as it slowed would raise the budget and put more queries
-// at once on a service that is already slow.
-func DeriveSchedulerShape(ceiling DerivedScheduler, demand SchedulerDemand, previous DerivedScheduler, held int) DerivedScheduler {
-	hold := demand.Hold
-	if hold <= 0 {
-		hold = coldStartHold
-	}
+func DeriveSchedulerShape(ceiling DerivedScheduler, demand SchedulerDemand) DerivedScheduler {
 	top := max(ceiling.ActiveExecutionCeiling, minimumActiveExecutions)
-	gradual := func(derived, before int) int { return max(derived, before/2, held) }
-	// Normal rounds first: recovery permits stay below the process permits,
-	// as the coordinator requires, and the two together under the slots.
-	permits := min(max(gradual(concurrency(demand.PeakQueriesPerSecond, hold), previous.ProcessQueryPermits), 2), top-2)
-	recovery := min(max(concurrency(demand.ReplayQueriesPerSecond, hold), previous.RecoveryQueryPermits/2, 1), permits-1, top-1-permits)
 	queued := max(demand.MaxQueuedItemsPerQG, 1)
 	queue := max(demand.OwnedQueryGroups, 1)*queued + 1
 	return DerivedScheduler{
 		ActiveExecutions:       top,
-		ProcessQueryPermits:    permits,
-		RecoveryQueryPermits:   recovery,
+		ProcessQueryPermits:    ceiling.ProcessQueryPermits,
+		RecoveryQueryPermits:   ceiling.RecoveryQueryPermits,
 		ReadyQueueCapacity:     queue,
 		RecoveryQueueCapacity:  queue,
 		ActiveExecutionCeiling: top,
 	}
-}
-
-// concurrency is a rate times a hold, times the headroom, rounded up.
-func concurrency(perSecond float64, hold time.Duration) int {
-	if perSecond <= 0 {
-		return 0
-	}
-	return int(math.Min(math.Ceil(perSecond*hold.Seconds()*demandHeadroom), math.MaxInt32))
 }
 
 // DerivedGoRuntime is the collector's budget for one container.
@@ -337,40 +334,39 @@ type DerivedGoRuntime struct {
 // target alone has no absolute ceiling. So the limit is the byte budget and
 // derives from the container; the target is a ratio and therefore does not.
 //
-// Half the container is what the limit can be without becoming the next
-// problem. It has to clear the largest ceiling the process already derives
-// from the same number - retained bytes take a quarter - and it has to leave
-// enough underneath that the runtime's own collector CPU limiter can overshoot
-// into the remainder rather than the kernel reclaiming the process. Half
-// leaves both: twice the retained ceiling above, and half the container below.
-// It also keeps the steady heap under the memory request a deployment of this
-// shape asks for, which turning the collector off entirely would not - and a
-// process permanently above its request is the first one evicted when its node
-// comes under pressure.
+// The limit is five eighths of the container, derived from measured usage
+// (decision-019 §5.2). The live heap rises at most about 1.5 bytes per
+// retained byte charged; with one Query Group at its share of the retained
+// pool beside its measured co-tenants, the live heap is near 1.4 GiB on a
+// 4 GiB container. Five eighths gives the collector about 1.8 times that
+// before it runs continuously - the room it had at half the container
+// before the share grew - and the container, counting the measured non-heap
+// memory and a sampling allowance, stays within about 3.3 GiB.
 //
-// The target crosses over to that limit once the live heap reaches an eighth
-// of the container. Below that the ratio governs and the heap tracks what the
-// process actually holds; above it the byte budget governs. Both crossover
-// terms are fractions of the same limit, so the ratio between them - 300 - is
-// the same on every container, which is correct for a ratio.
+// The collector target is a fixed 300 percent, set apart from the limit: at
+// 2 to 4 percent collector CPU in bursts a higher target buys nothing and
+// only raises the peak. The limit also bounds the observation memory line,
+// which reads it live (memoryline), so its consumers gain the same room;
+// they still refuse at the line.
 func DeriveGoRuntime(inputs CapacityInputs) DerivedGoRuntime {
 	if inputs.MemorySource == "" || inputs.MemorySource == memorySourceFallback {
 		return DerivedGoRuntime{}
 	}
-	limit := inputs.MemoryLimitBytes / goMemoryLimitDivisor
+	limit := inputs.MemoryLimitBytes / goMemoryLimitDenominator * goMemoryLimitNumerator
 	if limit > uint64(math.MaxInt64) {
 		limit = uint64(math.MaxInt64)
 	}
 	return DerivedGoRuntime{
 		MemoryLimitBytes: int64(max(limit, 1)),
-		GCPercent:        (goGCLiveHeapDivisor/goMemoryLimitDivisor - 1) * 100,
+		GCPercent:        goGCPercent,
 		Applied:          true,
 	}
 }
 
-// AdmittedConcurrency is how many queries this container may have in flight.
+// AdmittedConcurrency is how many queries this container may have in flight:
+// the process permits, which the recovery permits are a share of.
 func (d DerivedScheduler) AdmittedConcurrency() int {
-	return d.ProcessQueryPermits + d.RecoveryQueryPermits
+	return d.ProcessQueryPermits
 }
 
 // DerivedControlTimelineCache bounds the control plane's Schedule timeline
@@ -497,8 +493,12 @@ func DeriveCompileCache(inputs CapacityInputs, maxCompiledPlanBytes int) Derived
 // The bytes govern. What is left of the count is a runaway guardrail at the
 // smallest size a series can have, so it binds only where the byte accounting
 // itself has gone wrong.
+//
+// The State cache takes nothing out of the pool: it borrows what no Slot has
+// reserved of it and gives that back when a Slot needs it, so the share one
+// Query Group may hold is the same with the cache on or off.
 func DeriveCoordinator(inputs CapacityInputs, storeItemsPerBatch, chunkedApplyBudget uint64) PhaseTwoCoordinatorConfig {
-	retained := max(inputs.MemoryLimitBytes/retainedMemoryDivisor, uint64(bytesPerMutation))
+	retained := max(retainedPoolBytes(inputs.MemoryLimitBytes), uint64(bytesPerMutation))
 	guardrail := max(chunkedApplyBudget, storeItemsPerBatch, 1)
 	return PhaseTwoCoordinatorConfig{
 		MaxRetainedBytes:  retained,
@@ -511,4 +511,20 @@ func DeriveCoordinator(inputs CapacityInputs, storeItemsPerBatch, chunkedApplyBu
 		// what an int holds is not a guardrail on this platform.
 		MaxSequencerReservations: int(min(guardrail, uint64(math.MaxInt))),
 	}
+}
+
+// retainedPoolBytes is the retained pool of a container of limit bytes: half
+// its soft memory limit less its sixteenth, which is the container's quarter
+// (1,024 MiB on 4 GiB) - the number the pool was, now read against the live
+// heap the Slots hold rather than the bytes their input came in.
+func retainedPoolBytes(limit uint64) uint64 {
+	goLimit := limit / goMemoryLimitDenominator * goMemoryLimitNumerator
+	return goLimit/gcHeadroomDivisor - limit/residentHeapDivisor
+}
+
+// DeriveStateCacheBytes is the most the write-through State cache may hold:
+// the container's thirty-second, borrowed from the retained-bytes pool while
+// no Slot has reserved it, never taken out of it.
+func DeriveStateCacheBytes(inputs CapacityInputs) uint64 {
+	return inputs.MemoryLimitBytes / stateCacheMemoryDivisor
 }

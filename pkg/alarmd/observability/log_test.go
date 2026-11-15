@@ -16,6 +16,7 @@ import (
 	"errors"
 	"log/slog"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -403,8 +404,8 @@ func TestTheViewSessionLineCarriesTheStreamsWordAsItsReasonCode(t *testing.T) {
 		{"NO_LEADER", ResultDegraded, "NO_LEADER"},
 		{"DELTA_DIGEST_MISMATCH", ResultDegraded, "DELTA_DIGEST_MISMATCH"},
 		{"NOT_LEADER", ResultDegraded, "NOT_LEADER"},
-		{"10.0.0.1:9000", ResultDegraded, string(ReasonNotReported)},
-		{"10.0.0.1:9000", ResultSuccess, string(ReasonNone)},
+		{"192.0.2.1:9000", ResultDegraded, string(ReasonNotReported)},
+		{"192.0.2.1:9000", ResultSuccess, string(ReasonNone)},
 	} {
 		var output bytes.Buffer
 		limiter, err := NewScopedLogLimiter(ScopedLogLimiterConfig{Window: time.Hour, MaxEvents: 10, MaxScopes: 1024})
@@ -605,5 +606,31 @@ func TestLoggingObserverWritesReplayTakeoverFacts(t *testing.T) {
 	if facts["outcome"] != "age_exceeded" || facts["age_seconds"] != 601.5 || facts["takeover_offset_seconds"] != float64(42) ||
 		event["query_group_key"] != "qg-taken-over" {
 		t.Fatalf("replay takeover line = %#v, want the outcome, age and offset beside the Query Group", event)
+	}
+}
+
+// A selector's named dropped members are on its target_selector line.
+func TestTheTargetSelectorLineNamesItsDroppedMembers(t *testing.T) {
+	t.Parallel()
+
+	var output bytes.Buffer
+	limiter, err := NewScopedLogLimiter(ScopedLogLimiterConfig{Window: time.Hour, MaxEvents: 1, MaxScopes: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := NewScopedBoundedLogPolicy(limiter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	NewLoggingObserver(New("alarmd", &output), policy).Observe(context.Background(), Observation{
+		Component: ComponentAccess, Stage: StageTargetResolved, Result: ResultDegraded,
+		TargetResolution: &TargetResolutionFacts{StrategyID: "10", State: "Incomplete", Selectors: []TargetSelectorFacts{{
+			Kind: "dynamic_group", ID: "1", State: "Incomplete", Reason: "members_dropped", Kept: 175, Dropped: 19,
+			DroppedMembers: []string{"506:host_unindexed", "504:address_shared"},
+		}}},
+	})
+	want := "dynamic_group 1 Incomplete members_dropped kept=175 dropped=19 dropped_members=506:host_unindexed,504:address_shared"
+	if !strings.Contains(output.String(), want) {
+		t.Fatalf("log = %s, want the selector line %q", output.String(), want)
 	}
 }

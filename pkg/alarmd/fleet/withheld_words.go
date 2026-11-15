@@ -81,6 +81,20 @@ var withheldReasonWords = map[string]WithheldReasonWords{
 	// The one reason under CONFIG_NOTED: not withheld at all. The
 	// words say what was read instead of what was written, and that the
 	// strategy detects more than it asked for until the range is fixed.
+	// Under CONFIG_NOTED: the level runs, comparing values and thresholds
+	// raw because the unit or the prefix it was written with cannot be read.
+	"DATA_UNIT_UNKNOWN_COMPARED_RAW": {Kind: WithheldStrategyDefinition,
+		What:   "这一级别的数据单位不在 alarmd 的单位表里，无法换算，按原始数值比较：值和阈值都按写的数字比，阈值前缀不起作用。策略在检测，不是被扣住",
+		Next:   "策略负责人把指标或表达式的单位改成平台支持的单位；改好后下一轮刷新按单位换算，这一行消失",
+		Action: ActionStrategyEdit},
+	"UNIT_PREFIX_OUTSIDE_STEPS_READ_AS_SMALLEST": {Kind: WithheldStrategyDefinition,
+		What:   "这一级别的阈值单位不在数据单位的阶梯里（例如数据是时间、阈值选了字节），按没选单位处理：阈值按数据单位的最小阶读，例如数据是 ms 时阈值按 ns，与平台原有检测的结果一致。策略在检测，不是被扣住",
+		Next:   "策略负责人把阈值单位改成和数据单位同一类的单位；改好后下一轮刷新按单位换算，这一行消失",
+		Action: ActionStrategyEdit},
+	"UNIT_PREFIX_IGNORED_NO_UNIT": {Kind: WithheldStrategyDefinition,
+		What:   "这一级别的阈值带了单位，但数据没有单位（多指标计算的结果、表达式声明了无单位，或指标本身没有单位），阈值单位不起作用，按原始数值比较。策略在检测，不是被扣住",
+		Next:   "阈值按原始数值写即可；要按单位比较时，给表达式声明结果单位。改好后下一轮刷新这一行消失",
+		Action: ActionStrategyEdit},
 	"EFFECTIVE_TIME_RANGE_INVALID": {Kind: WithheldStrategyDefinition,
 		What:   "生效时间段的开始或结束时间格式不合法，已按平台自己的读法读：开始坏读作 00:00、结束坏读作 23:59——策略在检测，但检测的时段比配置写的宽，不是被扣住",
 		Next:   "策略负责人把该时间段改成 HH:MM；改好后下一轮刷新按写的时段检测，这一行消失",
@@ -104,6 +118,21 @@ var withheldReasonWords = map[string]WithheldReasonWords{
 		What:   "策略的查询配置没有写聚合周期，或写的是 0，已按平台的读法按 60 秒作为检测周期——策略在检测，不是被扣住",
 		Next:   "策略负责人在查询配置里写上聚合周期；改好后下一轮刷新按写的周期检测，这一行消失",
 		Action: ActionStrategyEdit},
+	// Under CONFIG_NOTED too: the strategy runs, aggregating by the sum the
+	// platform's metric source puts in place of the method written, one
+	// word for each of its fallbacks.
+	"AGG_METHOD_VARIABLE_DEFAULTED": {Kind: WithheldStrategyDefinition,
+		What:   "策略查询配置的聚合方法是没有填值的变量（含 $），已按平台指标数据源的读法按 SUM 聚合（带 _without_time 后缀的按 SUM(PromQL)）——策略在检测，不是被扣住",
+		Next:   "策略负责人把聚合方法改成具体的方法；改好后下一轮刷新按写的方法检测，这一行消失",
+		Action: ActionStrategyEdit},
+	"AGG_METHOD_UNDEFINED_DEFAULTED": {Kind: WithheldStrategyDefinition,
+		What:   "策略查询配置的聚合方法以 undefined 开头（没有取到值的变量），已按平台指标数据源的读法按 SUM 聚合（带 _without_time 后缀的按 SUM(PromQL)）——策略在检测，不是被扣住",
+		Next:   "策略负责人把聚合方法改成具体的方法；改好后下一轮刷新按写的方法检测，这一行消失",
+		Action: ActionStrategyEdit},
+	"AGG_METHOD_WITHOUT_TIME_DEFAULTED": {Kind: WithheldStrategyDefinition,
+		What:   "策略查询配置的聚合方法带 _without_time 后缀，但不是平台登记的五种（sum、avg、count、min、max），已按平台指标数据源的读法按 SUM 聚合——策略在检测，不是被扣住",
+		Next:   "策略负责人把聚合方法改成平台支持的方法；改好后下一轮刷新按写的方法检测，这一行消失",
+		Action: ActionStrategyEdit},
 	// Under CONFIG_NOTED too: the level recovers, on the window the platform
 	// reads when it cannot read the one written.
 	"RECOVERY_CONFIG_DEFAULTED": {Kind: WithheldStrategyDefinition,
@@ -118,6 +147,27 @@ var withheldReasonWords = map[string]WithheldReasonWords{
 		What:   "无数据告警要连续缺席的时长达到或超过追踪期限：第 N 个连续缺席点出现在首次缺席后（连续周期数−1）×周期 秒，而追踪在缺席满追踪期限的那一轮停止且不出裁决，所以这条无数据永远发不出告警（详情里写明连续周期数、周期、最早可告警时刻、追踪期限及其来源）——策略在检测，阈值检测和无数据的追踪、停止、恢复都照常，不是被扣住",
 		Next:   "策略负责人把连续周期数调小，或调大追踪期限（来源是 STRATEGY 时改策略的无数据配置，是 PLATFORM 时改平台配置）；改好后下一轮刷新这一行消失",
 		Action: ActionStrategyEdit},
+	// Under CONFIG_NOTED too: the level recovers as the platform reads what
+	// was written, and the ending it was written with is said.
+	"RECOVERY_STATUS_SETTER_DEFAULTED": {Kind: WithheldStrategyDefinition,
+		What:   "这一级别恢复配置的 status_setter 不是 recovery、close、recovery-nodata、close-nodata 之一，已按平台的读法读：\"-\" 前是 close 就按关闭结束，否则按恢复结束（详情里写明原值与读法）——策略在检测，不是被扣住",
+		Next:   "策略负责人把 status_setter 改成四个取值之一；改好后下一轮刷新这一行消失",
+		Action: ActionStrategyEdit},
+	// Under CONFIG_NOTED too: the level runs as written, with automatic
+	// recovery off as its owner chose. Nobody is asked to act; an owner who
+	// did not mean it reads Next.
+	"RECOVERY_DISABLED_BY_CONFIG": {Kind: WithheldStrategyDefinition,
+		What:   "这一级别的恢复配置关闭了自动恢复（disable_recovery），alarmd 按写的执行：告警不按恢复周期恢复，也不因无数据结束；这一项的无数据告警在数据重新上报后也不自动恢复。告警只在人工关闭，或策略删除或停用、监控目标移除、能力不支持、生效时间外这些关闭时结束——策略在检测，不是被扣住",
+		Next:   "这是策略负责人有意关闭的就不需要处理；要自动恢复时在策略的检测配置里打开自动恢复，下一轮刷新按恢复周期恢复，这一行消失",
+		Action: ActionNone},
+	// Under CONFIG_NOTED too: the Plan runs with the bound its owner raised,
+	// and the words state the one-off cost that was chosen with it. Nobody is
+	// asked to act: the cost was the owner's choice, and an owner who did not
+	// mean it reads Next.
+	"NO_DATA_GROUP_BOUND_ABOVE_DEFAULT": {Kind: WithheldStrategyDefinition,
+		What:   "策略的无数据配置把分组上限设在默认值之上。这条策略的无数据记忆在每个状态代次的首次写入是整份写，会让 Redis 阻塞一次：测得 10 万组约 120–180 ms、20 万组约 610 ms、100 万组约 2.9 s（详情里写明设的上限、默认值与这组测量值）；之后每轮只写变化的分组，不受影响——策略在检测，不是被扣住",
+		Next:   "这是策略负责人有意设的就不需要处理；不需要这么多分组时把 max_groups 调到默认值以下或删掉，下一轮刷新这一行消失",
+		Action: ActionNone},
 	// The detect_interval readings, under CONFIG_NOTED: the Plan runs,
 	// at the step written or at the aggregation interval, and the words say
 	// which and what follows from it.
@@ -140,6 +190,10 @@ var withheldReasonWords = map[string]WithheldReasonWords{
 	"ALGORITHM_NOT_SLIDING": {Kind: WithheldStrategyDefinition,
 		What:   "策略有级别用的算法不能按这个检测周期检测（详情里写明是哪个算法），已按聚合周期检测：高级环比（AdvancedRingRatio）要按检测周期取多个历史点，按聚合周期分的桶落不到这些点上；系统重启（OsRestart）要和 10 分钟、25 分钟前的点比，检测周期达到 10 分钟及以上时比较点会乱序——策略在检测，检测周期没有生效",
 		Next:   "要按检测周期检测，策略负责人把该级别换成其它算法（例如简易环比），系统重启则把检测周期改到 10 分钟以下，或去掉检测周期；改好后下一轮刷新这一行消失",
+		Action: ActionStrategyEdit},
+	"HISTORY_OFF_GRID": {Kind: WithheldStrategyDefinition,
+		What:   "策略有级别用的算法要比较的历史点落不到按这个检测周期分的桶上（详情里写明是哪个算法），已按聚合周期检测：系统重启（OsRestart）的运行时长历史从 25 分钟前起按检测周期分桶，前一点、10 分钟和 25 分钟前的点离起点都要是检测周期的整数倍，否则读不到——策略在检测，检测周期没有生效",
+		Next:   "要按检测周期检测，策略负责人把检测周期改成能整除这几个间隔的值（聚合周期 60 秒时，60 秒以下要能整除 180，例如 15、30、45 秒；60 秒以上要是 60 的整数倍且小于 600，例如 120 秒），或去掉检测周期；改好后下一轮刷新这一行消失",
 		Action: ActionStrategyEdit},
 	"DETECT_INTERVAL_INVALID": {Kind: WithheldStrategyDefinition,
 		What: "检测周期不是正整数（秒），无法执行，策略被扣住",
@@ -174,8 +228,8 @@ var withheldReasonWords = map[string]WithheldReasonWords{
 	// A global business strategy written in a form this build cannot run
 	// across businesses; the detail's reason= names which one.
 	"GLOBAL_STRATEGY_UNSUPPORTED": {Kind: WithheldBuildCapability,
-		What: "全局业务策略的这种写法本构建还不能按全局运行：详情里的 reason 说明是哪一条（旧写法的目标、非结构化时序查询、查询没写表或数据标签、输出兼容事件）",
-		Next: "一般要等支持该写法的构建。两种例外：reason 为 query_table 时，策略负责人给查询补上表或数据标签即可；reason 为 output_protocol 时，部署输出协议（phase_two.output.protocol）是 legacy 的改为 auto 或 native 即可（策略须带快照 revision），是 auto 的要等写方给策略补上快照 revision"},
+		What: "全局业务策略的这种写法本构建还不能按全局运行：详情里的 reason 说明是哪一条（旧写法的目标、既不是结构化时序也不是自定义事件的查询、查询没写表或数据标签、输出兼容事件、PromQL 查询带了不生效的 agg_condition、自定义事件查询既没有目标也不按 bk_biz_id 分组）",
+		Next: "一般要等支持该写法的构建。四种例外：reason 为 business_dimension 时，写方给策略加上 bk_biz_id 分组即可，否则同一主机在各业务的事件会合成一条告警、归到全局业务下；reason 为 query_table 时，策略负责人给查询补上表或数据标签即可；reason 为 output_protocol 时，部署输出协议（phase_two.output.protocol）是 legacy 的改为 auto 或 native 即可（策略须带快照 revision），是 auto 的要等写方给策略补上快照 revision；reason 为 condition_ignored 时，PromQL 不读 agg_condition，按全局运行会读到租户下全部业务，要由写方（策略发布方）把 keys 列出的条件（多业务策略的 bk_biz_id 业务条件）写进 PromQL 本身"},
 	"UNSUPPORTED_MULTI_ITEM_STRATEGY": {Kind: WithheldBuildCapability,
 		What: "多 item 的策略本构建不支持",
 		Next: "等支持多 item 的构建；改部署参数没有用"},
@@ -184,9 +238,20 @@ var withheldReasonWords = map[string]WithheldReasonWords{
 	"QUERY_FTA_UNSUPPORTED": {Kind: WithheldStrategyDefinition,
 		What: "FTA 告警事件类数据源不支持：这类查询要用查询服务没有的字段，不带这些字段就会把整张表的告警都算进来，所以一律不编译",
 		Next: "不会在这里检测，也没有开关可开；需要检测的话，策略负责人改用其它数据源"},
+	// Retired by the platform, not still to come: no build carries them, and
+	// the strategy owner rewrites the strategy into the form that replaced it.
+	"QUERY_SOURCE_RETIRED": {Kind: WithheldStrategyDefinition,
+		What: "GSE 系统事件（bk_monitor 事件、system.event）这条旧链路平台已退役，由自定义事件链路取代",
+		Next: "策略改写为自定义事件策略（custom/event，如 AgentLost、DiskReadonly、DiskFull、CoreFile、OOM）后即在这里检测；不会有构建再支持旧链路"},
+	"QUERY_PROMQL_FORM_RETIRED": {Kind: WithheldStrategyDefinition,
+		What: "未标记 expression_mode 的多条 PromQL 写法已停用：各查询独立出数、表达式不生效，不迁移也不自动转换",
+		Next: "策略负责人改写为三者之一：一条合并后的 PromQL（同一规则下的多组序列）；带 expression_mode 的多 PromQL 表达式（跨查询计算）；拆成多条策略（各自独立告警与恢复）"},
 	"QUERY_SOURCE_NOT_MIGRATED": {Kind: WithheldBuildCapability,
 		What: "该数据源的查询还没迁到 Go 侧",
 		Next: "等带该数据源的构建；改部署参数没有用"},
+	"QUERY_OUTPUT_CONFIG_NOT_MIGRATED": {Kind: WithheldBuildCapability,
+		What: "命名输出的某个输入在本构建里对不上唯一一个查询引用",
+		Next: "等支持它的构建；改部署参数没有用"},
 	"QUERY_MIXED_PROMQL_NOT_MIGRATED": {Kind: WithheldBuildCapability,
 		What: "混合 PromQL 的查询还没迁到 Go 侧",
 		Next: "等带它的构建；改部署参数没有用"},

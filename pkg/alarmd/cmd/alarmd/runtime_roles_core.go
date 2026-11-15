@@ -5,9 +5,11 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/config"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/contract"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/controlplane"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/memoryline"
@@ -41,6 +43,41 @@ type phaseTwoCoreResources struct {
 	StorageRouter   *state.FixedRouter
 	ExecutionStore  *state.ExecutionStore
 	StrategySource  controlplane.StrategySource
+	// NoDataCloses is where the control role records manual closes of no-data
+	// alerts (decision-024): the runtime-state store workers read them from.
+	// Nil for a process without the control role.
+	NoDataCloses *state.ExecutionStore
+}
+
+// executionStoreOptions is what a deployment's configuration gives an
+// execution store over router: its key prefix, the value and batch bounds,
+// the TTL bounds the store derives each write's lifetime within (exactly as
+// for the phase-one store built in config.StoreOptions), and the
+// deployment's no-data group bound, zero for the default - an item's own
+// max_groups travels on its mutations. Production and the cases that build
+// a store the way production does take it from here, so a bound read from
+// the configuration cannot be dropped at one of them alone.
+func executionStoreOptions(cfg config.Config, router state.StorageRouter) state.ExecutionStoreOptions {
+	return state.ExecutionStoreOptions{
+		Prefix: cfg.Redis.StatePrefix, Router: router, MaxValueBytes: cfg.Limits.Codec.MaxEncodedBytes,
+		MaxItemsPerCall: cfg.Limits.Store.MaxKeysPerBatch,
+		MinTTL:          cfg.Redis.MinTTL.Duration(), MaxTTL: cfg.Redis.MaxTTL.Duration(),
+		RestartMargin:   cfg.Redis.RestartMargin.Duration(),
+		MaxNoDataGroups: cfg.NoDataMaxGroups(),
+	}
+}
+
+// logNoDataGroupBound writes one line at startup when the deployment's no-data
+// group bound is above the default: the operator raised it, and the line names
+// the one-off Redis cost that buys (contract.NoDataGroupFirstWriteCost). An
+// item's own bound above the default is noted on that strategy instead.
+func logNoDataGroupBound(logger *observability.Logger, cfg config.Config) {
+	if cfg.NoDataMaxGroups() <= contract.DefaultMaxNoDataGroups {
+		return
+	}
+	logger.WarnEvent("no_data_group_bound_above_default", "noted", 0,
+		slog.Int("max_groups", cfg.NoDataMaxGroups()), slog.Int("default", contract.DefaultMaxNoDataGroups),
+		slog.String("first_write_cost", contract.NoDataGroupFirstWriteCost))
 }
 
 func openPhaseTwoCoreResources(ctx context.Context, cfg config.Config, recorder *metric.Recorder, observer observability.Observer,
@@ -144,6 +181,7 @@ func openPhaseTwoCoreResources(ctx context.Context, cfg config.Config, recorder 
 		stats := repository.ControlReadCacheStats()
 		occupancy := stats.TimelineOccupancy
 		objects := repository.ObjectCacheStats()
+		compiled := compiler.CacheStats()
 		counts := []metric.ControlCacheCounts{
 			{Object: "version", Hits: stats.Version.Hits, Misses: stats.Version.Misses, Refreshes: stats.Version.Refreshes},
 			{Object: "activation", Hits: stats.Activation.Hits, Misses: stats.Activation.Misses, Refreshes: stats.Activation.Refreshes},
@@ -174,9 +212,19 @@ func openPhaseTwoCoreResources(ctx context.Context, cfg config.Config, recorder 
 			// stored bytes it is bounded by; the observation memory line
 			// charges them decoded (observation_memory_budget_*_bytes).
 			{Object: "catalog_object", Hits: objects.Hits, Misses: objects.Misses, Evictions: objects.Evictions,
+				Clears: objects.Clears,
 				Occupancy: &metric.ControlCacheOccupancy{
 					Entries: float64(objects.Occupancy.Entries), Bytes: float64(objects.Occupancy.Bytes),
 					BytesLimit: float64(objects.Occupancy.MaxBytes),
+				}},
+			// Compiled Plans, shared by the control rounds and the Worker's
+			// Slot freezing. A clear is a term ending (ForgetCached): a former
+			// Leader drops what it compiled for every Query Group and refills
+			// its own, so the occupancy after one is a Worker's again.
+			{Object: "plan_compile", Hits: compiled.Hits, Misses: compiled.Misses, Evictions: compiled.Evictions,
+				Clears: compiled.Clears,
+				Occupancy: &metric.ControlCacheOccupancy{
+					Entries: float64(compiled.Entries), Bytes: float64(compiled.Bytes), BytesLimit: float64(compiled.MaxBytes),
 				}},
 		}
 		// The key segment memos are caches too, and they report through the same
@@ -251,6 +299,9 @@ func openPhaseTwoCoreResources(ctx context.Context, cfg config.Config, recorder 
 
 	var storageRouter *state.FixedRouter
 	var executionStore *state.ExecutionStore
+	// progressReader is the Progress store once opened, read by the State
+	// cache before it writes a value back over a rolled-back key.
+	var progressReader *progress.Store
 	if cfg.HasRole(roles.Worker) {
 		stateBackend, err := state.NewRedisBackendWithClient(productionRedisAddress(cfg.RuntimeStoreRedis()), redisForCaller(runtimeClient, redisfailure.CallerRuntimeState))
 		if err != nil {
@@ -263,19 +314,31 @@ func openPhaseTwoCoreResources(ctx context.Context, cfg config.Config, recorder 
 		if err != nil {
 			return nil, err
 		}
-		executionStore, err = state.NewExecutionStore(state.ExecutionStoreOptions{
-			Prefix: cfg.Redis.StatePrefix, Router: storageRouter, MaxValueBytes: cfg.Limits.Codec.MaxEncodedBytes,
-			MaxItemsPerCall: cfg.Limits.Store.MaxKeysPerBatch,
-			// The store derives each write TTL from the Plan retention the request
-			// carries; these only bound it, exactly as they do for the phase-one
-			// store built in config.StoreOptions.
-			MinTTL: cfg.Redis.MinTTL.Duration(), MaxTTL: cfg.Redis.MaxTTL.Duration(),
-			RestartMargin: cfg.Redis.RestartMargin.Duration(),
-			ReadHoldBound: recoveryLimits.MaxReplayAge,
-			// Runtime State writes verify the owner lease inside Redis; without the
-			// resolver the store would fall back to unfenced batched writes.
-			FenceKeys: ownershipStore,
-		})
+		options := executionStoreOptions(cfg, storageRouter)
+		options.ReadHoldBound = recoveryLimits.MaxReplayAge
+		// Runtime State writes verify the owner lease inside Redis; without the
+		// resolver the store would fall back to unfenced batched writes.
+		options.FenceKeys = ownershipStore
+		// The write-through State cache (fourth-batch design §4), its budget
+		// borrowed from the retained-bytes pool (the coordinator lends it its
+		// room). A value is written back over a
+		// rolled-back key only while the Query Group's Progress still has the
+		// Slot begun; the Progress store is opened below, before any Slot runs.
+		if !cfg.PhaseTwo.StateCache.Disabled {
+			options.StateCacheBudgetBytes = int64(config.DeriveStateCacheBytes(config.DetectCapacityInputs()))
+		}
+		options.StateCacheReplayAge = recoveryLimits.MaxReplayAge
+		options.RestoreProgressCheck = func(ctx context.Context, group execution.QueryGroupIdentity, slot execution.EvaluationTime) (bool, error) {
+			if progressReader == nil {
+				return false, nil
+			}
+			loaded, err := progressReader.LoadProgress(ctx, execution.ProgressIdentity{QueryGroup: group})
+			if err != nil || loaded.Progress == nil || loaded.Progress.UnfinishedSlot == nil {
+				return false, err
+			}
+			return loaded.Progress.UnfinishedSlot.Contract.Slot.EvaluationTime == slot, nil
+		}
+		executionStore, err = state.NewExecutionStore(options)
 		if err != nil {
 			return nil, err
 		}
@@ -283,6 +346,29 @@ func openPhaseTwoCoreResources(ctx context.Context, cfg config.Config, recorder 
 		// renewal round trip per Plan per Slot, and nothing else in the process
 		// says so: the Slots keep passing and the keys keep being renewed.
 		recorder.SetRenewalGateSource(executionStore.RenewalGateResets)
+		recorder.SetStateCacheSource(executionStore.StateCacheStats)
+		recorder.SetStateWitnessSource(executionStore.RuntimeWitnessStats)
+	}
+	// The control role records manual closes in the runtime-state store the
+	// owning worker reads them from. A process that is also a worker reuses
+	// its store; a control-only one opens the store for this alone.
+	var noDataCloses *state.ExecutionStore
+	if cfg.HasRole(roles.Control) {
+		noDataCloses = executionStore
+		if noDataCloses == nil {
+			closeBackend, err := state.NewRedisBackendWithClient(productionRedisAddress(cfg.RuntimeStoreRedis()), redisForCaller(runtimeClient, redisfailure.CallerRuntimeState))
+			if err != nil {
+				return nil, err
+			}
+			closeRouter, err := state.NewFixedRouter("phase-two-primary", closeBackend)
+			if err != nil {
+				return nil, err
+			}
+			noDataCloses, err = state.NewExecutionStore(executionStoreOptions(cfg, closeRouter))
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 	progressStore, err := progress.NewStore(progress.StoreOptions{
 		Prefix: productionPhaseTwoPrefix(cfg.Redis.StatePrefix, "schedule"), Control: ownershipStore,
@@ -291,6 +377,7 @@ func openPhaseTwoCoreResources(ctx context.Context, cfg config.Config, recorder 
 	if err != nil {
 		return nil, err
 	}
+	progressReader = progressStore
 	activator, err := controlplane.NewScheduleActivationReconcilerWithProgress(
 		repository, compiler, strategySemantics, progressStore, now,
 	)
@@ -330,5 +417,6 @@ func openPhaseTwoCoreResources(ctx context.Context, cfg config.Config, recorder 
 		StorageRouter:   storageRouter,
 		ExecutionStore:  executionStore,
 		StrategySource:  strategySource,
+		NoDataCloses:    noDataCloses,
 	}, nil
 }

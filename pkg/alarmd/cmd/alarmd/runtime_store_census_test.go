@@ -61,15 +61,15 @@ func TestTheLeaderReportsWhatEachStoreHoldsByFamily(t *testing.T) {
 	}
 
 	census.measure(ctx, false)
-	if readings := gather(); readings["bkmonitor_alarmd_store_census_keys/source"] != 0 {
+	if readings := gather(); readings["alarmd_store_census_keys/source"] != 0 {
 		t.Fatalf("a replica that does not lead reported %v", readings)
 	}
 	census.measure(ctx, true)
 	readings := gather()
-	if readings["bkmonitor_alarmd_store_census_keys/source"] != 40 || readings["bkmonitor_alarmd_store_census_exact/source"] != 1 ||
-		readings["bkmonitor_alarmd_store_census_family_keys/source/alarmd:state:*"] != 40 ||
-		readings["bkmonitor_alarmd_store_census_family_samples/source/alarmd:state:*"] != 40 ||
-		readings["bkmonitor_alarmd_store_census_family_bytes/source/alarmd:state:*"] <= 0 {
+	if readings["alarmd_store_census_keys/source"] != 40 || readings["alarmd_store_census_exact/source"] != 1 ||
+		readings["alarmd_store_census_family_keys/source/alarmd:state:*"] != 40 ||
+		readings["alarmd_store_census_family_samples/source/alarmd:state:*"] != 40 ||
+		readings["alarmd_store_census_family_bytes/source/alarmd:state:*"] <= 0 {
 		t.Fatalf("the Leader's census = %v, want the store's 40 keys in one family, weighed", readings)
 	}
 	operations, _ := callerCounts(t, recorder)
@@ -77,7 +77,7 @@ func TestTheLeaderReportsWhatEachStoreHoldsByFamily(t *testing.T) {
 		t.Fatalf("operations %v, want the census counted under store_census", operations)
 	}
 	census.measure(ctx, false)
-	if readings := gather(); readings["bkmonitor_alarmd_store_census_keys/source"] != 0 {
+	if readings := gather(); readings["alarmd_store_census_keys/source"] != 0 {
 		t.Fatalf("a replica that stopped leading still reports %v", readings)
 	}
 }
@@ -137,7 +137,6 @@ func TestTheCensusKnowsTheDeploymentsPrefixes(t *testing.T) {
 		"platform key":      func(cfg *config.Config, prefix string) { cfg.Kafka.LegacyAdapter.SnapshotPrefix = prefix },
 		"platform settings": func(cfg *config.Config, prefix string) { cfg.PhaseTwo.PlatformSettings.RedisKeyPrefix = prefix },
 		"dynamic groups":    func(cfg *config.Config, prefix string) { cfg.PlatformCache.DynamicGroupKeyPrefix = &prefix },
-		"linkd":             func(cfg *config.Config, prefix string) { cfg.PhaseTwo.Linkd.KeyPrefix = prefix },
 		"pod cache": func(cfg *config.Config, prefix string) {
 			cfg.Kafka.LegacyAdapter.PodCache = &config.LegacyPodCacheConfig{KeyPrefix: prefix}
 		},

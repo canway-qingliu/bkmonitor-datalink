@@ -21,9 +21,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/controlplane"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/filterclose"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/fleet"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/observability"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/openalerts"
 )
 
 // removedFamilies are families taken out because nothing read them: their
@@ -33,7 +33,9 @@ var removedFamilies = []string{
 	"lookback_samples_total", "lookback_completion_total", "lookback_completion_max_seconds", "lookback_probes_total",
 	"lookback_empty_first_reads_total", "lookback_empty_first_read_completion_total", "lookback_groups",
 	"lookback_rest_seconds", "lookback_yield_releases_total", "lookback_yield_release_seconds_total",
-	"lookback_yield_release_max_seconds", "lookback_earlier_reads_total",
+	"lookback_yield_release_max_seconds",
+	// lookback_earlier_reads_total is back with a reader: the read-hold
+	// acceptance, on deployments whose lookback route is not public.
 	"active_qg_set_encode_duration_seconds", "run_one_attempted_total", "schedule_cutover_last_duration_seconds",
 	"schedule_cutover_payload_size_bytes", "state_write_change_reason_total",
 	"platform_setting_enabled", "platform_setting_entries", "platform_setting_source",
@@ -66,9 +68,9 @@ var removedFamilies = []string{
 	// How long a source change had waited for a second identical read. A
 	// change is published by the round that reads it, so nothing waits.
 	"source_pending_confirmation_age_seconds",
-	// Per-group failure detail of the target group store: a refresh reads
-	// every group or none, and the replica's dependencies say since when and
-	// why the refreshes fail.
+	// Per-group failure detail of the target group store: target_group_groups
+	// counts the groups held past a failed read (failing), and the replica's
+	// dependencies say since when and why the refreshes fail.
 	"target_group_unanswered_reads_total", "target_group_oldest_failing_seconds",
 	// The inference that the sets were keyed another way, from none of this
 	// process's alerts being found in them: one alert the link closed on its
@@ -80,6 +82,15 @@ var removedFamilies = []string{
 	// and counted when sent again. A duplicate RECOVERY is an orphan there,
 	// which changes nothing, so the copy no longer hides one or counts it.
 	"open_alert_set_recovery_resent_total",
+	// The copy of the link's index sets, read through its Console, the
+	// Console itself and the record of reopens: the recovery gate and the
+	// no-data end read alarmd's own copy, refreshed by fingerprint through
+	// the link's search (active_copy_*), and every close is by the link's
+	// filter, by alert id (2026-10-27).
+	"open_alert_set_authoritative_age_seconds", "open_alert_set_unavailable_total", "open_alert_set_refresh_total",
+	"open_alert_set_lookup_total", "open_alert_set_entries", "open_alert_set_tracked_strategies",
+	"open_alert_set_evictions_total", "open_alert_set_notices_refused_total", "linkd_calibration_coverage",
+	"linkd_console_state", "linkd_console_calls_total", "linkd_console_failures_total", "recovery_record_total",
 }
 
 // removedLabelValues are label values taken out of families that stay.
@@ -105,11 +116,25 @@ var removedLabelValues = []struct {
 	// The close counts said closed where they counted decisions and sends:
 	// a deployment read 354 alert_closed while the link still listed nearly every
 	// one of those alerts active. They now say close_decided and close_sent,
-	// and whether the link closed anything is read per strategy, from what
-	// its reconcile still lists active after an earlier send.
+	// and whether the link closed anything is read per alert on the link.
 	{"absent_strategy_close_total", "outcome", "alert_closed", false},
 	{"absent_strategy_close_total", "outcome", "closed", true},
 	{"target_scope_close_total", "outcome", "closed", true},
+	// The per-series close of alerts whose target left the strategy's scope
+	// never sent: it judged only on the copy's existing word, and the copy is
+	// not refreshed for a rejection. The control leader's close per strategy,
+	// on a change of the scope, closes them (strategy_scope_close_total); the
+	// family keeps the superseded-identity close and its words.
+	{"target_scope_close_total", "outcome", "not_known_open", false},
+	{"target_scope_close_total", "outcome", "set_unavailable", false},
+	{"target_scope_close_total", "outcome", "not_member", false},
+	{"target_scope_close_total", "outcome", "cache_unavailable", true},
+	{"target_scope_close_total", "outcome", "indefinite", true},
+	{"target_scope_close_total", "outcome", "fingerprint_unsupported", true},
+	{"target_scope_close_total", "outcome", "target_close_sent", false},
+	// The per-series target-scope close was the one job whose expectation was
+	// its removed targets times their series.
+	{"linkd_filter_close_total", "outcome", "expect_removed_targets", false},
 	// An item accepted with a note on its configuration was CONFIG_NORMALIZED,
 	// which says its configuration was read otherwise than written. A no-data
 	// trigger the tracking horizon stops first is noted with nothing read
@@ -146,11 +171,6 @@ var removedLabelValues = []struct {
 	// Every Plan a series is admitted for has its scope indexed: a consumer
 	// of a Plan that is not due is refused before the query is prepared.
 	{"series_admission_total", "reason", "plan_not_indexed", false},
-	// The disjoint inference went with its families: the Console's facts
-	// replace it, as location_unconfirmed and keying_unconfirmed.
-	{"open_alert_set_unavailable_total", "reason", "members_disjoint", false},
-	// The ledger's entries went with the ledger.
-	{"open_alert_set_entries", "kind", "sent_closed", false},
 	// The absent close refused a round whose strategy list had lost more than
 	// a fifth of the round before's, unless the writer stated it holds the
 	// last good document. The list's writer is what decides a strategy is
@@ -158,6 +178,11 @@ var removedLabelValues = []struct {
 	// waived.
 	{"absent_strategy_round_total", "disposition", "snapshot_shrunk", false},
 	{"absent_strategy_difference", "side", "writer_holds_last_good", false},
+	// A level written to end its alert closed, or to end it when no data
+	// arrives through the recovery window, was noted as not run and published
+	// at zero regardless. Both now run, and nothing is noted.
+	{"catalog_withheld_objects", "reason", "RECOVERY_CLOSE_UNSUPPORTED", false},
+	{"catalog_withheld_objects", "reason", "RECOVERY_NODATA_UNSUPPORTED", false},
 }
 
 // A removed label value is emitted by no family, whatever its source
@@ -180,6 +205,8 @@ func TestARemovedLabelValueIsNotEmitted(t *testing.T) {
 		return sides
 	})
 	r.SetTargetScopeCloseSource(everything)
+	// The filter close's words are the list it is bound with: this build's.
+	r.SetLinkdFilterCloseSource(filterclose.Outcomes, everything)
 	for _, removed := range removedLabelValues {
 		if removed.family == "cmdb_index_business_mappings" {
 			r.SetCMDBBusinessMapping("bcs_cluster", 1, 0, 0, false, true)
@@ -206,13 +233,6 @@ func TestARemovedLabelValueIsNotEmitted(t *testing.T) {
 	r.Observe(context.Background(), observability.Observation{
 		Component: observability.ComponentAccess, Stage: observability.StageTargetResolved,
 		TargetResolution: &observability.TargetResolutionFacts{StrategyID: "1", State: "Unavailable", Selectors: selectors},
-	})
-	r.SetOpenAlertSetSource(func() openalerts.Stats {
-		counts := map[openalerts.UnavailableReason]uint64{}
-		for _, removed := range removedLabelValues {
-			counts[openalerts.UnavailableReason(removed.value)] = 1
-		}
-		return openalerts.Stats{Unavailable: counts}
 	})
 	// The catalog's and the fleet's families are filled by their producers'
 	// closed lists, so the guard drives those: an object recorded under a
@@ -270,7 +290,7 @@ func TestARemovedLabelValueIsNotEmitted(t *testing.T) {
 		}
 	}
 	for _, removed := range removedLabelValues {
-		name := "bkmonitor_alarmd_" + removed.family
+		name := "alarmd_" + removed.family
 		if len(emittedOf(emitted, name)) == 0 {
 			t.Fatalf("%s emitted nothing: the guard is not reading it", name)
 		}
@@ -346,8 +366,8 @@ func TestARemovedFamilyIsNotRegistered(t *testing.T) {
 		}
 	}
 	for _, name := range removedFamilies {
-		if registered["bkmonitor_alarmd_"+name] {
-			t.Errorf("%s is registered again", "bkmonitor_alarmd_"+name)
+		if registered["alarmd_"+name] {
+			t.Errorf("%s is registered again", "alarmd_"+name)
 		}
 	}
 }
@@ -415,10 +435,10 @@ func removedFamilyPattern(removed []string, labels map[string]bool) *regexp.Rege
 	}
 	var names []string
 	if len(bare) > 0 {
-		names = append(names, `(?:bkmonitor_alarmd_)?(`+strings.Join(bare, "|")+`)`)
+		names = append(names, `(?:alarmd_)?(`+strings.Join(bare, "|")+`)`)
 	}
 	if len(prefixed) > 0 {
-		names = append(names, `bkmonitor_alarmd_(`+strings.Join(prefixed, "|")+`)`)
+		names = append(names, `alarmd_(`+strings.Join(prefixed, "|")+`)`)
 	}
 	return regexp.MustCompile(`(?:^|[^A-Za-z0-9_])(?:` + strings.Join(names, "|") + `)(?:_bucket|_sum|_count)?(?:[^A-Za-z0-9_]|$)`)
 }
@@ -426,15 +446,46 @@ func removedFamilyPattern(removed []string, labels map[string]bool) *regexp.Rege
 func TestARemovedNameIsFoundBareUnlessItIsALabel(t *testing.T) {
 	pattern := removedFamilyPattern([]string{"gone_total", "kind"}, map[string]bool{"kind": true})
 	for text, found := range map[string]bool{
-		"rate(gone_total[5m])":                  true,
-		"bkmonitor_alarmd_gone_total_bucket":    true,
-		"sum by (kind) (bkmonitor_alarmd_kind)": true,
-		`[]string{"kind"}`:                      false,
-		"still_gone_total":                      false,
-		"gone_totals":                           false,
+		"rate(gone_total[5m])":        true,
+		"alarmd_gone_total_bucket":    true,
+		"sum by (kind) (alarmd_kind)": true,
+		`[]string{"kind"}`:            false,
+		"still_gone_total":            false,
+		"gone_totals":                 false,
 	} {
 		if got := pattern.MatchString(text); got != found {
 			t.Errorf("%q: found %v, want %v", text, got, found)
+		}
+	}
+}
+
+// The families lost the bkmonitor_ namespace in one switch, so any name
+// still carrying it is wrong whether or not its family was removed: a reader
+// asking for it reads nothing and takes it for zero. A word that merely ends
+// in it (a topic such as 0bkmonitor_...) is not a metric name.
+func TestNoSourceNamesAFamilyWithTheOldNamespace(t *testing.T) {
+	pattern := regexp.MustCompile(`(?:^|[^0-9A-Za-z])` + "bkmonitor" + `_alarmd_[a-z0-9_]*`)
+	for _, root := range []string{"..", filepath.Join("..", "..", "alarmd-cli")} {
+		err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil || entry.IsDir() {
+				return err
+			}
+			switch filepath.Ext(path) {
+			case ".go", ".html", ".js", ".md", ".yaml", ".json":
+			default:
+				return nil
+			}
+			body, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			if match := pattern.Find(body); match != nil {
+				t.Errorf("%s names %s, a family under the old namespace", path, strings.TrimLeft(string(match), "\"'`([{ |^:\t\n"))
+			}
+			return nil
+		})
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
 		}
 	}
 }

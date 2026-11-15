@@ -32,6 +32,27 @@ var (
 	ErrContentScopeMoved = errors.New("alarmd ownership: content scope has moved")
 )
 
+// LeaseBusyError is ErrLeaseBusy as the store answered it: the lease in the
+// way, by its holder's id, owner epoch and session epoch (zero for a lease
+// not held under a worker session), and its deadline on the store's clock
+// (zero for one held under a session, which has none of its own). A refused
+// takeover names what refused it with these, where the bare word could not
+// tell one holder from the next.
+type LeaseBusyError struct {
+	OwnerID           string
+	OwnerEpoch        uint64
+	SessionEpoch      uint64
+	DeadlineUnixMilli int64
+}
+
+func (err *LeaseBusyError) Error() string { return ErrLeaseBusy.Error() }
+
+func (err *LeaseBusyError) Unwrap() error { return ErrLeaseBusy }
+
+// ErrNoWorkerSession is ErrLeaseBusy decided before the store was asked: this
+// worker holds no session yet to take a lease under (OpenSessionUnder).
+var ErrNoWorkerSession = fmt.Errorf("%w: no worker session is held yet", ErrLeaseBusy)
+
 // IsLeaseDecision reports whether err is an authoritative answer from the
 // lease store about the fence (stale, not desired, held by another owner)
 // rather than a failure to reach the store. Renewal loops retry only the
@@ -135,13 +156,8 @@ func (worker WorkerRegistration) Declines(queryGroup execution.QueryGroupIdentit
 }
 
 // MaxReportedUnreadableTimelines bounds the names a registration carries. A
-// fleet-wide decode failure - a rollout whose new timelines the old build
-// cannot read - would otherwise put every owned Query Group on every
-// heartbeat; the total still says how many.
-//
-// Retire when: the upstream snapshot after the one that adds this field is
-// merged, the rollout case above is gone; the bound stays for a decode
-// failure that spans a fleet for any other reason.
+// decode failure that spans a fleet would otherwise put every owned Query
+// Group on every heartbeat; the total still says how many.
 const MaxReportedUnreadableTimelines = 64
 
 // AppliedControlFacts says which version of each versioned control fact the
@@ -158,12 +174,12 @@ type AppliedControlFacts struct {
 // capacity its fleet snapshot already reports; it adds no measurement. It is
 // written for a scheduler that will weigh it later, and read by nothing yet.
 //
-// Placement must not read PermitBudget, or anything else here that the
-// worker re-derives while it runs: the query budget is sized from the work
-// the worker owns once a minute (config.DeriveSchedulerShape), so placing by
-// it would move work every time the budget followed the work, and the next
-// derivation would move it back. Only RetainedPoolBytes, which is fixed by
-// the container, is read (the cost ledger's byte constraint).
+// Placement reads only RetainedPoolBytes, which is fixed by the container
+// (the cost ledger's byte constraint). The query budget is the memory's share
+// and fixed too, but it says how much the worker may run at once, not how much
+// work it should be given; anything here the worker re-derives from the work
+// it owns (the queues, config.DeriveSchedulerShape) would move work every time
+// it followed the work, and the next derivation would move it back.
 type WorkerLoad struct {
 	OwnedQueryGroups int     `json:"owned_query_groups"`
 	PermitsHeld      int     `json:"permits_held"`
@@ -399,6 +415,9 @@ type AssignmentRecord struct {
 	// on a record no leader has written it to yet: a reader treats zero as
 	// "not said", never as revision zero, which no timeline has.
 	TimelineRecordRevision uint64
+	// ObservedAt is the server instant a fence check read the record at, on
+	// the clock EffectiveAt is on; zero for a record read any other way.
+	ObservedAt time.Time
 }
 
 // ContentChangePending reports whether the record carries a content change
@@ -410,8 +429,13 @@ func (record AssignmentRecord) ContentChangePending() bool {
 // AssignmentDecision is a Control Leader decision based on one observed
 // Assignment revision. ExpectedRecordRevision is zero only for first publish.
 type AssignmentDecision struct {
-	QueryGroup             execution.QueryGroupIdentity
-	DesiredWorkerID        string
+	QueryGroup      execution.QueryGroupIdentity
+	DesiredWorkerID string
+	// HolderWorkerID is the worker the Leader expects holds the lease now --
+	// the record's current desired worker -- whose session the publication
+	// reads to tell a holder that is gone from one that is draining. Empty
+	// is the decision's own desired worker.
+	HolderWorkerID         string
 	ExpectedRecordRevision uint64
 	PlacementReason        PlacementReason
 	DecidedAt              time.Time
@@ -485,6 +509,11 @@ type Lease struct {
 	// the Query Group is on, as of this renewal; zero when the record does
 	// not say. See AssignmentRecord.TimelineRecordRevision.
 	TimelineRecordRevision uint64
+	// SessionEpoch is the worker session the lease was taken under (A2), and
+	// TTL how long a confirmation lets its holder act; both zero for a lease
+	// its holder renews itself.
+	SessionEpoch uint64
+	TTL          time.Duration
 }
 
 // ContentChangePending reports whether the lease was renewed under a content

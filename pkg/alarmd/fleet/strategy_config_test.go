@@ -284,8 +284,8 @@ func TestIncludeConfigReadsOncePerPlanAndOnlyWhenAsked(t *testing.T) {
 }
 
 // What a Plan carries when its configuration cannot be read: the reason, in
-// place of content, so a reader tells "not configured" from "not read". The
-// loader is asked at most MaxStrategyConfigReads times per request.
+// place of content, so a reader tells "not configured" from "not read". Every
+// Plan is read, each object once.
 func TestIncludeConfigNamesWhyAPlanHasNoConfig(t *testing.T) {
 	t.Run("loader not wired", func(t *testing.T) {
 		handler := configHandler(t, map[string]StrategyLookupFacts{"4101": {Available: true, Found: true, Plans: plans(planA)}}, nil)
@@ -333,28 +333,118 @@ func TestIncludeConfigNamesWhyAPlanHasNoConfig(t *testing.T) {
 			t.Fatalf("loader calls = %d, want one: a Plan without a digest is not read", loader.calls)
 		}
 	})
-	t.Run("read bound", func(t *testing.T) {
+	t.Run("every Plan is read, an object once", func(t *testing.T) {
 		loader := &configLoader{objects: map[string]controlplane.QueryGroupObject{}}
 		var refs []StrategyPlanRef
-		for index := 0; index < MaxStrategyConfigReads+3; index++ {
+		for index := 0; index < 20; index++ {
 			ref := planA
-			ref.QueryGroup, ref.ObjectDigest = fmt.Sprintf("qg-4101-%d", index), fmt.Sprintf("d-%d", index)
+			// Twenty Plans in ten objects, two to an object.
+			ref.QueryGroup, ref.ObjectDigest = fmt.Sprintf("qg-4101-%d", index), fmt.Sprintf("d-%d", index/2)
 			loader.objects[ref.ObjectDigest] = configObject()
 			refs = append(refs, ref)
 		}
 		handler := configHandler(t, map[string]StrategyLookupFacts{"4101": {Available: true, Found: true, Plans: refs}}, loader.load)
 		_, body := get(t, handler, "/api/strategies/4101?include=config")
-		plansOut := body["plans"].([]any)
-		if loader.calls != MaxStrategyConfigReads {
-			t.Fatalf("loader calls = %d, want the bound %d", loader.calls, MaxStrategyConfigReads)
+		if loader.calls != 10 {
+			t.Fatalf("loader calls = %d, want each of the ten objects once", loader.calls)
 		}
-		if config := plansOut[MaxStrategyConfigReads-1].(map[string]any)["config"].(map[string]any); config["refusal"] != nil {
-			t.Fatalf("the last Plan within the bound = %v, want content", config)
-		}
-		for _, past := range plansOut[MaxStrategyConfigReads:] {
-			if config := past.(map[string]any)["config"].(map[string]any); config["refusal"] != ConfigReadBoundExceeded {
-				t.Fatalf("a Plan past the bound = %v, want %s", config, ConfigReadBoundExceeded)
+		for index, plan := range body["plans"].([]any) {
+			if config := plan.(map[string]any)["config"].(map[string]any); config["refusal"] != nil || config["items"] == nil {
+				t.Fatalf("Plan %d = %v, want content", index, config)
 			}
 		}
 	})
+}
+
+// A plan with calendar rules says so and carries none of them; an empty or
+// null snapshot is a plan without rules.
+func TestStrategyConfigSaysWhetherAnEffectiveTimeIsConfigured(t *testing.T) {
+	const rules = `{"calendars":["holiday-secret"],"time_ranges":["09:00--18:00"]}`
+	for snapshot, want := range map[string]bool{rules: true, "": false, "null": false} {
+		object := configObject()
+		object.Plans[0].EffectiveTimeSnapshot = json.RawMessage(snapshot)
+		configs := StrategyPlanConfigsOf(object, "4101", "2")
+		if got := configs.Items[0].EffectiveTimeConfigured; got != want {
+			t.Errorf("snapshot %q: configured %v, want %v", snapshot, got, want)
+		}
+		if wire, _ := json.Marshal(configs); strings.Contains(string(wire), "holiday-secret") || strings.Contains(string(wire), "09:00") {
+			t.Errorf("the rules reached the wire: %s", wire)
+		}
+	}
+}
+
+// How a Plan's values are compared comes from the publication's frozen
+// Plan, through the lookup, not from the object a Worker runs: a Plan whose
+// lookup names an expression unit and a Level compared raw is read so under
+// include=config; one whose lookup names nothing reads as comparing in its
+// one query's unit.
+func TestIncludeConfigReadsTheUnitFactsFromTheLookup(t *testing.T) {
+	facts := &controlplane.DataUnitFacts{Basis: controlplane.DataUnitBasisExpressionUnit,
+		RawLevels: []controlplane.DataUnitRawLevel{{LevelID: 2, Reason: controlplane.ReasonDataUnitUnknownComparedRaw, Unit: "furlongs"}}}
+	for _, test := range []struct {
+		name      string
+		facts     *controlplane.DataUnitFacts
+		wantBasis string
+		wantRaw   int
+	}{
+		{name: "the lookup names facts", facts: facts, wantBasis: controlplane.DataUnitBasisExpressionUnit, wantRaw: 1},
+		{name: "the lookup names none", wantBasis: controlplane.DataUnitBasisQueryUnit},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			loader := &configLoader{objects: map[string]controlplane.QueryGroupObject{"d-a": configObject()}}
+			plan := planA
+			plan.DataUnitFacts = test.facts
+			handler := configHandler(t, map[string]StrategyLookupFacts{"4101": {Available: true, Found: true, Plans: plans(plan)}}, loader.load)
+			_, body := get(t, handler, "/api/strategies/4101?include=config")
+			items, _ := body["plans"].([]any)[0].(map[string]any)["config"].(map[string]any)["items"].([]any)
+			if len(items) == 0 {
+				t.Fatalf("no items: %v", body)
+			}
+			for _, raw := range items {
+				item := raw.(map[string]any)
+				levels, _ := item["raw_unit_levels"].([]any)
+				if item["data_unit_basis"] != test.wantBasis || len(levels) != test.wantRaw {
+					t.Fatalf("item basis %v raw levels %v, want %s and %d", item["data_unit_basis"], levels, test.wantBasis, test.wantRaw)
+				}
+			}
+		})
+	}
+}
+
+// Whether a Level's zero count is no observation is read off the query its
+// primary reads, by the rule the evaluator holds it to: an event count or a
+// log count grouped by nothing says so, a metric does not, and a
+// template-bound primary reads the Plan's own query, for its own Level only.
+func TestALevelSaysWhetherItsZeroCountIsNoObservation(t *testing.T) {
+	event := model.QueryPlanFacts{SourceSemantics: []string{"custom/event"}, StepMillis: 60000,
+		QueryList: []model.QueryClause{{TimeAggregation: model.QueryFunction{Method: "count_over_time"}, Dimensions: []string{"bk_target_ip"}}}}
+	zeroOf := func(object controlplane.QueryGroupObject) map[uint32]bool {
+		words := map[uint32]bool{}
+		for _, level := range StrategyPlanConfigsOf(object, "4101", "2").Items[0].Levels {
+			words[level.LevelID] = level.ZeroCountIsNoObservation
+		}
+		return words
+	}
+	metric := configObject()
+	if got := zeroOf(metric); got[1] {
+		t.Errorf("a metric's zero is no observation: %v", got)
+	}
+	counted := configObject()
+	counted.QueryPlan = event
+	if got := zeroOf(counted); !got[1] {
+		t.Errorf("an event count's zero is an observation: %v", got)
+	}
+	// A template-bound primary of Level 1 reading an event count beside a
+	// metric object: Level 1 reads it, Level 2 reads the object's query.
+	bound := configObject()
+	plan := &bound.Plans[0]
+	plan.QueryPlans = map[model.LogicalQueryRef]model.QueryPlanFacts{"a": plan.QueryPlans["a"], "events": event}
+	plan.RequirementTemplates = append(plan.RequirementTemplates, model.DataRequirementTemplate{
+		DatasetName: "primary:events", Role: model.InputRolePrimary, ConsumerLevelID: 1, LogicalQueryRef: "events"})
+	second := plan.StrategyIR.Levels[0]
+	second.Definition.LevelID = 2
+	plan.StrategyIR.Levels = append(plan.StrategyIR.Levels, second)
+	if got := zeroOf(bound); !got[1] || got[2] {
+		t.Errorf("a template-bound event count: %v, want Level 1 only", got)
+	}
 }

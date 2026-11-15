@@ -191,6 +191,8 @@ func (source *ProductionSlotSource) buildExpiredRange(ctx context.Context, first
 	if distance != nil {
 		distance.steps, distance.count = steps, proof.Count
 		source.observeRangeDistanceExpiry(ctx, *distance)
+		facts := distance.facts()
+		first.Recovery.RangeDistance = &facts
 	}
 	return first, rangeBuildRefusal{}, nil
 }
@@ -231,20 +233,26 @@ func (source *ProductionSlotSource) observeRangeDistanceExpiry(ctx context.Conte
 	}
 	// Observability is a fail-open side channel, as everywhere else here.
 	defer func() { _ = recover() }()
+	facts := report.facts()
 	source.observer.Observe(ctx, observability.Observation{
 		Component: observability.ComponentScheduler, Stage: observability.StageRangeDistanceExpired,
-		Result: observability.ResultDegraded, Direction: observability.DirectionInternal,
+		Result:     observability.ResultDegraded,
 		ReasonCode: observability.ReasonCode(contract.ReasonGapSkipped),
 		Trace: observability.TraceFields{
 			QueryGroupKey: string(source.queryGroup), EvaluationTime: int64(report.firstEvaluationTime),
 		},
-		RangeDistance: &observability.RangeDistanceFacts{
-			HeadSteps: report.headSteps, DeadlineSteps: report.deadlineSteps, Steps: report.steps,
-			SlotCount: report.count, FirstEvaluationTime: int64(report.firstEvaluationTime),
-			IntervalSeconds: report.intervalSeconds, MaxReplaySlots: report.maxReplaySlots,
-			BoundBy: report.boundBy(),
-		},
+		RangeDistance: &facts,
 	})
+}
+
+// facts is the report as the lines carry it.
+func (report rangeDistanceReport) facts() observability.RangeDistanceFacts {
+	return observability.RangeDistanceFacts{
+		HeadSteps: report.headSteps, DeadlineSteps: report.deadlineSteps, Steps: report.steps,
+		SlotCount: report.count, FirstEvaluationTime: int64(report.firstEvaluationTime),
+		IntervalSeconds: report.intervalSeconds, MaxReplaySlots: report.maxReplaySlots,
+		BoundBy: report.boundBy(),
+	}
 }
 
 // boundBy names which of the two candidate bounds produced the range.
@@ -290,13 +298,9 @@ func (source *ProductionSlotSource) resumeExpiredRange(ctx context.Context, p ex
 	if next != p.Next {
 		return FrozenSlot{}, false, &SourceBlockedError{Err: ErrProgressOffSchedule}
 	}
-	assignment, current, err := source.currentOwnership(ctx, source.now())
-	if err != nil {
-		return FrozenSlot{}, false, err
-	}
-	if !sameAssignment(initial, assignment) || current != fence {
-		return FrozenSlot{}, false, ErrSlotOwnershipChanged
-	}
+	// Dispatched under the ownership the round opened with; BeginRange runs the
+	// full fence in its own script (A1.2).
+	assignment, current := initial, fence
 	copy := p.Clone()
 	slot := FrozenSlot{ExpiredRange: &copy, Contract: p.Last.Contract, DuePlanTargets: p.Last.DuePlanTargets.Clone(),
 		EarliestQueryDeadlineUnixMilli: p.Last.EarliestQueryDeadlineUnixMilli,
@@ -395,7 +399,6 @@ func (source *ProductionSlotSource) observeRangeGate(
 	source.observer.Observe(ctx, observability.Observation{
 		Component: observability.ComponentScheduler, Stage: observability.StageRangeGateDecided,
 		Result: rangeGateResult(outcome.word), ReasonCode: observability.ReasonCode(outcome.word),
-		Direction: observability.DirectionInternal,
 		Trace: observability.TraceFields{
 			QueryGroupKey: string(source.queryGroup), EvaluationTime: int64(evaluationTime),
 		},

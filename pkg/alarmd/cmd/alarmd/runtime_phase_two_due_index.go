@@ -14,6 +14,7 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/fleet"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/metric"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/readhold"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/scheduler"
 )
 
@@ -157,6 +158,9 @@ type phaseTwoDueEntry struct {
 	// first round (fleet.AwaitingFirstRound).
 	nextSlotUnix  int64
 	readinessHold bool
+	// awaiting is a bound that is the next Slot waiting on a predecessor's
+	// read hold record, for a reader to see the wait (fleet.PredecessorWait).
+	awaiting *readhold.AwaitingPredecessorError
 	// heldBack marks that the dispatcher pushed this object back at least once
 	// since its last round returned: no room in the ready queue, or not urgent
 	// enough for the recovery queue. Cleared when the next round returns, and
@@ -365,13 +369,14 @@ func (index *phaseTwoDueIndex) Record(
 		existing.deferred = bound.Deferred
 		existing.queryCooldown = bound.QueryCooldown
 		existing.nextSlotUnix, existing.readinessHold = bound.NextSlotUnix, bound.ReadinessHold
+		existing.awaiting = bound.AwaitingPredecessor
 		existing.heldBack = false
 		heap.Fix(&index.pending, existing.position)
 	} else {
 		entry := &phaseTwoDueEntry{
 			queryGroup: queryGroup, lifecycle: lifecycle, dueAtUnix: dueAt,
 			intervalSeconds: interval, deferred: bound.Deferred, queryCooldown: bound.QueryCooldown,
-			nextSlotUnix: bound.NextSlotUnix, readinessHold: bound.ReadinessHold,
+			nextSlotUnix: bound.NextSlotUnix, readinessHold: bound.ReadinessHold, awaiting: bound.AwaitingPredecessor,
 		}
 		index.entries[queryGroup] = entry
 		heap.Push(&index.pending, entry)
@@ -607,9 +612,42 @@ func dueBucketSlot(minute int64) int64 {
 // the same rule OverdueWakes applies, stated once more here because the census
 // is over every entry and that call is over the overdue ones only.
 func (index *phaseTwoDueIndex) Census(now time.Time, owned int) fleet.ScheduleCensus {
+	census, _ := index.census(now, owned, nil)
+	return census
+}
+
+// CensusWithDueClasses is the census of the objects the replica owns and the
+// ones it counts as late, overdue and never evaluated, from one pass under one
+// lock: a page listing the objects and a page counting them read the same
+// instant, and every list is exactly as long as its count. owned is the
+// replica's owned objects (empty, not nil, when it owns none); an entry the
+// index still holds for an object no longer owned -- until the next owned-set
+// change drops it -- is in no count and no list, and the never list is the
+// owned objects with no entry.
+func (index *phaseTwoDueIndex) CensusWithDueClasses(now time.Time, owned []string) (fleet.ScheduleCensus, fleet.DueClasses) {
+	classes := fleet.DueClasses{}
+	census, named := index.census(now, len(owned), owned)
+	if named != nil {
+		classes = *named
+	}
+	return census, classes
+}
+
+// census is Census over the entries, naming the late and overdue objects when
+// ownedIDs is given (and the owned objects with no entry as never).
+func (index *phaseTwoDueIndex) census(now time.Time, owned int, ownedIDs []string) (fleet.ScheduleCensus, *fleet.DueClasses) {
 	census := fleet.ScheduleCensus{}
 	if index == nil {
-		return census
+		return census, nil
+	}
+	var classes *fleet.DueClasses
+	var ownedSet map[execution.QueryGroupIdentity]bool
+	if ownedIDs != nil {
+		classes = &fleet.DueClasses{}
+		ownedSet = make(map[execution.QueryGroupIdentity]bool, len(ownedIDs))
+		for _, id := range ownedIDs {
+			ownedSet[execution.QueryGroupIdentity(id)] = true
+		}
 	}
 	index.mu.Lock()
 	defer index.mu.Unlock()
@@ -630,6 +668,9 @@ func (index *phaseTwoDueIndex) Census(now time.Time, owned int) fleet.ScheduleCe
 		return cohort
 	}
 	for _, entry := range index.pending {
+		if ownedSet != nil && !ownedSet[entry.queryGroup] {
+			continue
+		}
 		cohort := cohortOf(entry.intervalSeconds)
 		cohort.Objects++
 		switch {
@@ -645,11 +686,20 @@ func (index *phaseTwoDueIndex) Census(now time.Time, owned int) fleet.ScheduleCe
 			case entry.intervalSeconds <= 0:
 				census.Late++
 				census.MissingPeriod++
+				if classes != nil {
+					classes.Late = append(classes.Late, string(entry.queryGroup))
+				}
 			case late <= entry.intervalSeconds:
 				census.Late++
+				if classes != nil {
+					classes.Late = append(classes.Late, string(entry.queryGroup))
+				}
 			default:
 				census.Overdue++
 				cohort.Overdue++
+				if classes != nil {
+					classes.Overdue = append(classes.Overdue, string(entry.queryGroup))
+				}
 			}
 			if float64(late) > census.OldestLateSeconds {
 				census.OldestLateSeconds = float64(late)
@@ -662,6 +712,17 @@ func (index *phaseTwoDueIndex) Census(now time.Time, owned int) fleet.ScheduleCe
 	sort.Slice(census.Cohorts, func(i, j int) bool { return census.Cohorts[i].IntervalSeconds < census.Cohorts[j].IntervalSeconds })
 	if owned > len(index.entries) {
 		census.Never = owned - len(index.entries)
+	}
+	if classes != nil {
+		for _, id := range ownedIDs {
+			if _, entered := index.entries[execution.QueryGroupIdentity(id)]; !entered {
+				classes.Never = append(classes.Never, id)
+			}
+		}
+		sort.Strings(classes.Late)
+		sort.Strings(classes.Overdue)
+		sort.Strings(classes.Never)
+		census.Never = len(classes.Never)
 	}
 	minute := nowUnix / 60
 	for offset := int64(0); offset < dueCompletionBuckets; offset++ {
@@ -693,7 +754,7 @@ func (index *phaseTwoDueIndex) Census(now time.Time, owned int) fleet.ScheduleCe
 		break
 	}
 	index.overdue[(minute%dueOverdueSamples+dueOverdueSamples)%dueOverdueSamples] = dueOverdueSample{minute: minute, overdue: census.Overdue}
-	return census
+	return census, classes
 }
 
 // WakeOf reports what the index holds for one object. Known is false when it
@@ -714,6 +775,10 @@ func (index *phaseTwoDueIndex) WakeOf(queryGroup string) fleet.WakeFacts {
 		ReadinessHold: entry.readinessHold}
 	if entry.nextSlotUnix > 0 {
 		wake.NextSlot = time.Unix(entry.nextSlotUnix, 0)
+	}
+	if awaiting := entry.awaiting; awaiting != nil {
+		wake.AwaitingPredecessor = &fleet.PredecessorWait{QueryGroup: string(awaiting.Predecessor), Reason: awaiting.Reason,
+			Since: time.UnixMilli(awaiting.SinceUnixMilli), Until: time.UnixMilli(awaiting.UntilUnixMilli)}
 	}
 	return wake
 }

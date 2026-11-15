@@ -23,6 +23,10 @@ const (
 	RenewInterval          = 24 * time.Hour
 	SingleEventQuiet       = time.Hour
 	EarlierMatchesRequired = 3
+	// FloorDifferentsRequired is the different trials in a row at one
+	// candidate that move the search floor up to it: one late round alone
+	// does not, as one early round alone does not lower the hold.
+	FloorDifferentsRequired = 2
 )
 
 var (
@@ -68,6 +72,16 @@ const (
 // ClampSources is the closed list of them.
 var ClampSources = []string{ClampKnown, ClampFallback}
 
+// Where a retired Query Group's read hold was closed: by its own round that
+// reached the retirement, or by its owner releasing it once it had drained,
+// before the round ever came back to it. RetireCloseSites is the closed list.
+const (
+	RetireCloseNext    = "next"
+	RetireCloseRelease = "release"
+)
+
+var RetireCloseSites = []string{RetireCloseNext, RetireCloseRelease}
+
 // A Slot whose group's hold could not be prepared or written is frozen with
 // the hold the group last read, by what failed: the group's route and delay
 // (spec_unreadable), its previous Segment's schedule (previous_unreadable),
@@ -95,14 +109,61 @@ var DegradedReasons = []string{DegradedSpecUnreadable, DegradedPreviousUnreadabl
 // Stats are the controller's counts since it started.
 type Stats struct {
 	Predecessors map[string]uint64
-	Clamped      map[string]uint64
+	// TransitionWaits is the waits on a predecessor, by outcome
+	// (TransitionWaitOutcomes); WaitingGroups the groups waiting now.
+	TransitionWaits map[string]uint64
+	WaitingGroups   int
+	Clamped         map[string]uint64
 	// OwnCorrupt is the groups whose own record did not decode: read as
 	// missing, and replaced at the group's next write.
 	OwnCorrupt uint64
 	// Seeds is the groups that started from a seeded arrival age, by where
 	// it came from (SeedOrigins).
 	Seeds map[string]uint64
+	// QueryDurationWrites is the records written for the query duration they
+	// keep, by why (QueryDurationWriteReasons).
+	QueryDurationWrites map[string]uint64
+	// EarlierSkipped is the earlier-read trials not run, by why
+	// (EarlierSkipReasons).
+	EarlierSkipped map[string]uint64
+	// FloorProbes is the shadow probes whose end this controller took, by
+	// what it made of them (FloorProbeOutcomes), every kind together, and
+	// FloorProbesByKind by kind (FloorProbeKinds) and outcome.
+	FloorProbes       map[string]uint64
+	FloorProbesByKind map[string]map[string]uint64
+	// ProbationFindings is the probation findings this controller took, by
+	// what it made of them (ProbationFindingOutcomes).
+	ProbationFindings map[string]uint64
+	// ProbeProgress is the probe progress writes, by what came of them
+	// (ProbeProgressOutcomes).
+	ProbeProgress map[string]uint64
 }
+
+// What a probation's finding made of the group's record, closed: undone, a
+// lowering put back to the hold it came from; quiet, nothing to undo - the
+// group not lowered - and its quiet started over.
+const (
+	ProbationFindingUndone = "undone"
+	ProbationFindingQuiet  = "quiet"
+)
+
+// ProbationFindingOutcomes is every way a probation's finding is taken.
+var ProbationFindingOutcomes = []string{ProbationFindingUndone, ProbationFindingQuiet}
+
+// Why an earlier-read trial was not run, closed. at_limit: the group is held
+// at its limit (Record.HeldAtLimit) and has not been quiet for its bar since
+// (atLimitHeld), so its data arrives past the longest hold and a trial below
+// it can show nothing about the hold. search_done: the search below the hold
+// has run out, the gap between its floor and the hold no wider than a step
+// (execution.CandidateReadHold); its record says when the floor was learned
+// (Record.EarlierFloorAtMillis).
+const (
+	EarlierSkipAtLimit    = "at_limit"
+	EarlierSkipSearchDone = "search_done"
+)
+
+// EarlierSkipReasons is every reason a trial is not run.
+var EarlierSkipReasons = []string{EarlierSkipAtLimit, EarlierSkipSearchDone}
 
 // Control uses the existing ownership store. A value and its Plan
 // evidence are one fenced CAS in the owning Query Group's Redis hash slot.
@@ -122,6 +183,23 @@ type Options struct {
 	MaxHold time.Duration
 	Now     func() time.Time
 	Owner   func(execution.QueryGroupIdentity) (Owner, error)
+	// OnLimitCut, when set, is told of each Slot frozen more than a step
+	// below the Slot before it because the limit was configured under the
+	// hold. Called with the group's lock held, after the Slot is frozen.
+	OnLimitCut func(LimitCut)
+}
+
+// LimitCut is a Slot frozen at a limit configured under the hold, more than
+// a step below the Slot before it: a cut the stepping does not soften, so
+// the Slot may be ready before the one before it is read and fall behind by
+// more Slots than a replay covers. Period is the shortest interval the
+// group's Plans are detected at.
+type LimitCut struct {
+	QueryGroup execution.QueryGroupIdentity
+	Slot       execution.EvaluationTime
+	From       time.Duration
+	To         time.Duration
+	Period     time.Duration
 }
 
 type PlanRef struct {
@@ -206,6 +284,9 @@ type Evidence struct {
 	Rung       string
 	Buckets    []int64
 	Noise      bool
+	// Probation is a probation reread's finding: the group's lowering was
+	// wrong, and is undone whatever ArrivalAge says (Observe).
+	Probation bool
 }
 
 type EarlierEvidence struct {
@@ -224,9 +305,19 @@ type entry struct {
 	// corrupt is a stored record that did not decode: raw is its bytes, so
 	// the next write replaces it, and record starts empty.
 	corrupt bool
+	// readFailed is a read of the record that did not answer: unloaded for
+	// that reason, as against one not read since the group was forgotten or
+	// a write conflict dropped what was read.
+	readFailed bool
 	// validated is the Segment whose schedule SlotReadHold last checked: a
 	// frozen schedule is checked once per Segment, not once per Slot.
 	validated execution.ScheduleSegmentFact
+	// measuredQueryDuration is the group's query duration as this process
+	// last measured it (MeasureQueryDuration), for its record to keep.
+	measuredQueryDuration time.Duration
+	// waits is the predecessors the group waits on before its seed freezes,
+	// by link (predecessor_wait.go); empty once it is seeded.
+	waits map[string]predecessorWait
 }
 
 type Controller struct {
@@ -236,9 +327,26 @@ type Controller struct {
 
 	statsMu      sync.Mutex
 	predecessors map[string]uint64
-	clamped      map[string]uint64
-	seeds        map[string]uint64
-	ownCorrupt   uint64
+	// transitionWaits is the waits on a predecessor, by how they began or
+	// ended (TransitionWaitOutcomes).
+	transitionWaits map[string]uint64
+	clamped         map[string]uint64
+	seeds           map[string]uint64
+	ownCorrupt      uint64
+	// earlierSkipped is the earlier-read trials not run, by why
+	// (EarlierSkipReasons).
+	earlierSkipped map[string]uint64
+	// floorProbes is the shadow probes taken, by kind|outcome
+	// (floorProbeKey), and probationFindings the probation findings
+	// (ProbationFindingOutcomes).
+	floorProbes       map[string]uint64
+	probationFindings map[string]uint64
+	// probeProgress is the probe progress writes, by what came of them
+	// (ProbeProgressOutcomes).
+	probeProgress map[string]uint64
+	// durationWrites is the records written for a query duration, by why
+	// (QueryDurationWriteReasons).
+	durationWrites map[string]uint64
 }
 
 func NewController(options Options) (*Controller, error) {
@@ -250,11 +358,16 @@ func NewController(options Options) (*Controller, error) {
 		options.Now = time.Now
 	}
 	return &Controller{options: options, groups: make(map[execution.QueryGroupIdentity]*entry),
-		predecessors: make(map[string]uint64), clamped: make(map[string]uint64), seeds: make(map[string]uint64)}, nil
+		predecessors: make(map[string]uint64), transitionWaits: make(map[string]uint64), clamped: make(map[string]uint64), seeds: make(map[string]uint64),
+		durationWrites: make(map[string]uint64), earlierSkipped: make(map[string]uint64), floorProbes: make(map[string]uint64),
+		probationFindings: make(map[string]uint64), probeProgress: make(map[string]uint64)}, nil
 }
 
 // Stats copies the counts.
 func (controller *Controller) Stats() Stats {
+	// Read before the counts' lock: a group's lock is taken before it
+	// whenever a seed counts, so it must never be taken under it.
+	waiting := controller.waitingGroups()
 	controller.statsMu.Lock()
 	defer controller.statsMu.Unlock()
 	stats := Stats{Predecessors: make(map[string]uint64, len(controller.predecessors)),
@@ -262,6 +375,11 @@ func (controller *Controller) Stats() Stats {
 	for reason, count := range controller.predecessors {
 		stats.Predecessors[reason] = count
 	}
+	stats.TransitionWaits = make(map[string]uint64, len(TransitionWaitOutcomes))
+	for _, outcome := range TransitionWaitOutcomes {
+		stats.TransitionWaits[outcome] = controller.transitionWaits[outcome]
+	}
+	stats.WaitingGroups = waiting
 	for source, count := range controller.clamped {
 		stats.Clamped[source] = count
 	}
@@ -270,6 +388,32 @@ func (controller *Controller) Stats() Stats {
 		for origin, count := range controller.seeds {
 			stats.Seeds[origin] = count
 		}
+	}
+	stats.EarlierSkipped = make(map[string]uint64, len(EarlierSkipReasons))
+	for _, reason := range EarlierSkipReasons {
+		stats.EarlierSkipped[reason] = controller.earlierSkipped[reason]
+	}
+	stats.FloorProbes = make(map[string]uint64, len(FloorProbeOutcomes))
+	stats.FloorProbesByKind = make(map[string]map[string]uint64, len(FloorProbeKinds))
+	for _, kind := range FloorProbeKinds {
+		stats.FloorProbesByKind[kind] = make(map[string]uint64, len(FloorProbeOutcomes))
+		for _, outcome := range FloorProbeOutcomes {
+			count := controller.floorProbes[floorProbeKey(kind, outcome)]
+			stats.FloorProbesByKind[kind][outcome] = count
+			stats.FloorProbes[outcome] += count
+		}
+	}
+	stats.ProbeProgress = make(map[string]uint64, len(ProbeProgressOutcomes))
+	for _, outcome := range ProbeProgressOutcomes {
+		stats.ProbeProgress[outcome] = controller.probeProgress[outcome]
+	}
+	stats.ProbationFindings = make(map[string]uint64, len(ProbationFindingOutcomes))
+	for _, outcome := range ProbationFindingOutcomes {
+		stats.ProbationFindings[outcome] = controller.probationFindings[outcome]
+	}
+	stats.QueryDurationWrites = make(map[string]uint64, len(QueryDurationWriteReasons))
+	for _, reason := range QueryDurationWriteReasons {
+		stats.QueryDurationWrites[reason] = controller.durationWrites[reason]
 	}
 	return stats
 }
@@ -322,6 +466,7 @@ func (controller *Controller) Configure(spec GroupSpec) error {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.spec, state.configured, state.seeded = spec, true, false
+	keepWaits(state, spec)
 	return nil
 }
 
@@ -331,7 +476,8 @@ func (controller *Controller) RestoreBatch(ctx context.Context, groups []executi
 	for _, qg := range groups {
 		state := controller.group(qg)
 		state.mu.Lock()
-		state.loaded = false
+		// Failed until it answers: a batch that fails answers none of them.
+		state.loaded, state.readFailed = false, true
 		state.mu.Unlock()
 	}
 	reads, err := controller.options.Control.ReadControlBatch(ctx, groups, controller.options.Prefix+":"+Namespace)
@@ -367,6 +513,7 @@ func (controller *Controller) RestoreBatch(ctx context.Context, groups []executi
 		state := controller.group(groups[index])
 		state.mu.Lock()
 		state.record, state.raw, state.loaded, state.seeded, state.corrupt = record, append([]byte(nil), read.Raw...), true, false, corrupt
+		state.readFailed = false
 		state.mu.Unlock()
 	}
 	return first
@@ -394,11 +541,122 @@ func (controller *Controller) ReadHold(qg execution.QueryGroupIdentity) time.Dur
 	return time.Duration(current(state.record)) * time.Millisecond
 }
 
+// nextCandidate is the hold the next earlier-read trial of record tries
+// (execution.CandidateReadHold), in milliseconds, and false when none is,
+// at now.
+func nextCandidate(qg execution.QueryGroupIdentity, record Record, step time.Duration, now int64) (int64, bool) {
+	// A group held at its limit has data arriving past the longest hold it
+	// may have: the earlier read and the formal read both come before the
+	// data, so their agreeing says the two are equally incomplete, not that
+	// the data was there. No trial, and no evidence taken from one.
+	if atLimitHeld(qg, record, now) {
+		return 0, false
+	}
+	// A candidate the trials chose is read by a probe before the hold moves,
+	// and no trial runs meanwhile: one trial would only choose it again.
+	if _, ok := verifying(qg, record, now); ok {
+		return 0, false
+	}
+	floor, floored := time.Duration(0), record.EarlierFloorMillis != nil
+	if floored {
+		floor = time.Duration(*record.EarlierFloorMillis) * time.Millisecond
+	}
+	hold, ok := execution.CandidateReadHold(time.Duration(current(record))*time.Millisecond, floor, floored, step)
+	return hold.Milliseconds(), ok
+}
+
+// atLimitHeld says record is held at its limit with its data still past it:
+// read early within the quiet bar (quietBar). Only a read-early arrival
+// moves a group at its limit, and a group whose data has come back in time
+// has none to give, so once it has been quiet for the bar its trials run
+// again, and the lowering they lead to waits for the same quiet. A source
+// still landing past the limit is read early again within the bar, which
+// starts its quiet over: it is never tried while it does.
+func atLimitHeld(qg execution.QueryGroupIdentity, record Record, now int64) bool {
+	return record.AtLimitHeld(qg, now)
+}
+
+// AtLimitHeld says the record is held at its limit with its data still
+// landing past it at now, Unix milliseconds: held at the limit
+// (HeldAtLimit) and read early within its quiet bar since. A group held at
+// its limit whose data has been quiet for its bar is being tried lower and
+// is not one; every reading of "its data lands past the limit" - the trial
+// gate, a round read at the limit, the strategy page - asks this.
+func (record Record) AtLimitHeld(qg execution.QueryGroupIdentity, now int64) bool {
+	if !record.HeldAtLimit() {
+		return false
+	}
+	return record.QuietSinceMillis <= 0 || now-record.QuietSinceMillis < quietBar(qg, record, now)
+}
+
+// clearFloor forgets the search below the hold: the hold moved up or was
+// set anew, so what was too early under the old one says nothing now, nor
+// do the probes of it that failed.
+func clearFloor(record *Record) {
+	record.EarlierFloorMillis, record.EarlierFloorAtMillis, record.EarlierDifferents = nil, 0, 0
+	record.EarlierFloorRetests, record.EarlierFloorProbed = 0, false
+}
+
+// setFloor makes floor the search's floor, learned at now, and starts the
+// different trials in a row over: they count at the candidate above it. A
+// floor that takes another value starts its probes' standing over too, and
+// no probe has failed at it yet.
+func setFloor(record *Record, floor, now int64) {
+	if record.EarlierFloorMillis == nil || *record.EarlierFloorMillis != floor {
+		record.EarlierFloorRetests, record.EarlierFloorProbed = 0, false
+	}
+	record.EarlierFloorMillis, record.EarlierFloorAtMillis, record.EarlierDifferents = &floor, now, 0
+}
+
+// EarlierCandidate is the hold the group's next earlier-read trial tries,
+// and false when there is none: the one candidate both the lookback that
+// reserves the trial and EarlierRead that takes its evidence use.
+func (controller *Controller) EarlierCandidate(qg execution.QueryGroupIdentity) (time.Duration, bool) {
+	state := controller.group(qg)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	hold, ok := nextCandidate(qg, state.record, state.spec.Step, controller.options.Now().UnixMilli())
+	return time.Duration(hold) * time.Millisecond, ok
+}
+
+// EarlierRefused hears that the lookback would have reserved a trial for one
+// of the group's Slots and EarlierCandidate gave it none: a trial not run,
+// counted by why, so a group never lowered for it says so
+// (EarlierSkipReasons).
+func (controller *Controller) EarlierRefused(qg execution.QueryGroupIdentity) {
+	state := controller.group(qg)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	switch now := controller.options.Now().UnixMilli(); {
+	case atLimitHeld(qg, state.record, now):
+		controller.counted(controller.earlierSkipped, EarlierSkipAtLimit)
+	case current(state.record) > 0:
+		// Held, and not at the limit: no candidate is left above the floor.
+		controller.counted(controller.earlierSkipped, EarlierSkipSearchDone)
+	}
+}
+
 func (controller *Controller) ReadHoldAt(qg execution.QueryGroupIdentity, at execution.EvaluationTime) time.Duration {
 	state := controller.group(qg)
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	return time.Duration(holdAt(state.record, at, state.spec.SettlingWait)) * time.Millisecond
+}
+
+// LastLowering is the Slot the group's frozen hold last changed at, while
+// that change was a lowering - each step of a lowering a step per Slot among
+// them, a lowering a shadow probe verified too - and false when it was not,
+// or the record is not loaded. A process
+// that takes the group over reads it from the record the old owner left, so
+// the probation after a lowering outlives the process it began in.
+func (controller *Controller) LastLowering(qg execution.QueryGroupIdentity) (execution.EvaluationTime, bool) {
+	state := controller.group(qg)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !state.loaded || state.record.SinceSlot <= 0 || state.record.PreviousHoldMillis <= state.record.HoldMillis {
+		return 0, false
+	}
+	return state.record.SinceSlot, true
 }
 
 func (controller *Controller) Reading(qg execution.QueryGroupIdentity) (Record, bool) {
@@ -415,6 +673,10 @@ type Inspection struct {
 	Seeded  bool
 	// Corrupt is a stored record that did not decode; Record is then empty.
 	Corrupt bool
+	// ReadFailed is a group not loaded because its last read did not answer.
+	// Not loaded without it, the group has not been read since it was
+	// forgotten, or since a write conflict dropped what was read.
+	ReadFailed bool
 }
 
 // Hold is the read hold the record states - the pending one while a change
@@ -449,7 +711,7 @@ func (controller *Controller) Inspect(qg execution.QueryGroupIdentity) Inspectio
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	return Inspection{Record: clone(state.record), Loaded: state.loaded, Missing: state.loaded && len(state.raw) == 0, Seeded: state.seeded,
-		Corrupt: state.corrupt}
+		Corrupt: state.corrupt, ReadFailed: !state.loaded && state.readFailed}
 }
 
 // Arrival is the group's arrival age and where it came from (empty for a
@@ -486,7 +748,24 @@ func clone(record Record) Record {
 		hold := *record.PendingHoldMillis
 		record.PendingHoldMillis = &hold
 	}
+	if record.EarlierFloorMillis != nil {
+		floor := *record.EarlierFloorMillis
+		record.EarlierFloorMillis = &floor
+	}
+	if record.VerifyCandidateMillis != nil {
+		candidate := *record.VerifyCandidateMillis
+		record.VerifyCandidateMillis = &candidate
+	}
+	if record.Probe != nil {
+		probe := *record.Probe
+		if probe.FloorMillis != nil {
+			floor := *probe.FloorMillis
+			probe.FloorMillis = &floor
+		}
+		record.Probe = &probe
+	}
 	record.Buckets = append([]int64(nil), record.Buckets...)
+	record.EarlyGaps = append([]EarlyGap(nil), record.EarlyGaps...)
 	record.Plans = append([]PlanRecord(nil), record.Plans...)
 	record.Transitions = append([]Transition(nil), record.Transitions...)
 	return record
@@ -516,6 +795,9 @@ func (controller *Controller) persist(ctx context.Context, qg execution.QueryGro
 		return errors.New("alarmd readhold: owner differs from Query Group")
 	}
 	prunePlans(&next, state.spec.Plans, controller.options.Now().Unix()-int64(RecordTTL/time.Second))
+	// A probe's progress kept only while it is of the probe the record has
+	// now: a write that moves what the probe reads clears it (ProbeProgress).
+	settleProgress(qg, &next, state.spec.Step, controller.options.Now().UnixMilli())
 	next.RenewedAtMillis = controller.options.Now().UnixMilli()
 	raw, err := json.Marshal(next)
 	if err != nil {
@@ -524,6 +806,14 @@ func (controller *Controller) persist(ctx context.Context, qg execution.QueryGro
 	if _, err := Decode(raw); err != nil {
 		return err
 	}
+	// Counted against what the store keeps, whatever writes it: a reading
+	// noted while the record was kept only here is first written by whichever
+	// change first stores the record.
+	var durable *Record
+	if len(state.raw) > 0 && !state.corrupt {
+		durable = &state.record
+	}
+	durationWrite := queryDurationWrite(next, durable)
 	status, err := controller.options.Control.FencedCompareAndSet(ctx, ownership.FencedCASRequest{
 		Fence: owner.Fence, ContentScope: owner.ContentScope, Namespace: controller.options.Prefix + ":" + Namespace,
 		ExpectedMissing: len(state.raw) == 0, Expected: state.raw, Value: raw, TTL: RecordTTL,
@@ -534,6 +824,9 @@ func (controller *Controller) persist(ctx context.Context, qg execution.QueryGro
 	switch status {
 	case ownership.FencedCASApplied:
 		state.record, state.raw, state.corrupt = next, raw, false
+		if durationWrite != "" {
+			controller.counted(controller.durationWrites, durationWrite)
+		}
 		return nil
 	case ownership.FencedCASConflict:
 		state.loaded = false
@@ -572,6 +865,9 @@ type previousFact struct {
 	hold   int64
 	reason string
 	bound  bool
+	// closedAtMillis is when a predecessor the successor waited on was read
+	// closed: the transition's deadline is no earlier (awaitPredecessor).
+	closedAtMillis int64
 }
 
 // previousHold reads one moved Plan's previousFact from the old group's
@@ -622,32 +918,53 @@ func (controller *Controller) previousHold(old Inspection, predecessor Previous,
 }
 
 func (controller *Controller) seed(state *entry, predecessors map[execution.QueryGroupIdentity]Inspection) (Record, error) {
+	next, _, err := controller.seedWaiting(state, predecessors, 0)
+	return next, err
+}
+
+// seedWaiting is seed for a Slot at waitAt that may wait on its
+// predecessors: a link read open or unreadable answers awaiting, nothing
+// counted and nothing written, until the wait's end (awaitPredecessor). A
+// zero waitAt waits on nothing and answers the bound, as seed always did.
+func (controller *Controller) seedWaiting(state *entry, predecessors map[execution.QueryGroupIdentity]Inspection,
+	waitAt execution.EvaluationTime) (Record, *AwaitingPredecessorError, error) {
 	next := clone(state.record)
 	if state.seeded {
-		return next, nil
-	}
-	if state.corrupt {
-		// The stored record did not decode: read as missing, the group
-		// relearns its hold, and its next write replaces the bytes. A
-		// deadline the record kept is lost with it, a risk overtaken counts.
-		controller.statsMu.Lock()
-		controller.ownCorrupt++
-		controller.statsMu.Unlock()
+		return next, nil, nil
 	}
 	previous := state.spec.Previous
 	if inherited(next, state.spec) {
 		previous = nil
 	}
+	var awaiting *AwaitingPredecessorError
+	var reasons []string
 	for _, predecessor := range previous {
 		old := predecessors[predecessor.QueryGroup]
 		for _, link := range predecessor.Links {
 			fact := controller.previousHold(old, predecessor, link)
+			if waitAt > 0 && fact.slot > 0 {
+				// What this round read, for the wait to be read as it stands.
+				unread, reason := !old.Loaded && !old.ReadFailed, fact.reason
+				if unread {
+					reason = AwaitingUnread
+				}
+				if waiting, retryAt := controller.awaitPredecessor(state, waitAt, predecessor, link, &fact, unread); waiting {
+					wait := state.waits[waitKey(predecessor, link)]
+					if awaiting == nil || retryAt < awaiting.RetryAt.UnixMilli() {
+						awaiting = &AwaitingPredecessorError{QueryGroup: state.spec.QueryGroup, Predecessor: predecessor.QueryGroup,
+							Reason: reason, SinceUnixMilli: wait.sinceMillis, UntilUnixMilli: wait.endMillis,
+							RetryAt: time.UnixMilli(retryAt)}
+					}
+					continue
+				}
+			}
 			if fact.slot == 0 {
 				// The Segment it left held no Slot of it: no deadline to
 				// keep, so its hold decides nothing and is not counted.
 				fact.hold, fact.bound = 0, false
 			} else {
-				controller.counted(controller.predecessors, fact.reason)
+				// Counted once the seed freezes, not on each round it waits.
+				reasons = append(reasons, fact.reason)
 			}
 			// The old group's arrival age does not carry over: the new group
 			// learns its own, a few windows read early at most.
@@ -656,10 +973,25 @@ func (controller *Controller) seed(state *entry, predecessors map[execution.Quer
 				PreviousHoldUnknown: fact.bound, PreviousHoldMillis: fact.hold, PreviousSlot: fact.slot,
 				CompletionOffsetMillis: fact.offset})
 			if fact.slot > 0 {
+				deadline := max(int64(fact.slot)*1000+fact.hold+fact.offset, fact.closedAtMillis)
 				next.Transitions = append(next.Transitions, Transition{Key: link.Key,
-					DeadlineMillis: int64(fact.slot)*1000 + fact.hold + fact.offset, Fallback: fact.bound})
+					DeadlineMillis: deadline, Fallback: fact.bound})
 			}
 		}
+	}
+	if awaiting != nil {
+		return Record{}, awaiting, nil
+	}
+	for _, reason := range reasons {
+		controller.counted(controller.predecessors, reason)
+	}
+	if state.corrupt {
+		// The stored record did not decode: read as missing, the group
+		// relearns its hold, and its next write replaces the bytes. A
+		// deadline the record kept is lost with it, a risk overtaken counts.
+		controller.statsMu.Lock()
+		controller.ownCorrupt++
+		controller.statsMu.Unlock()
 	}
 	// A group with no record of its own starts where its data has been seen
 	// to land, not at the settling wait alone: with the wait at its floor, a
@@ -680,9 +1012,19 @@ func (controller *Controller) seed(state *entry, predecessors map[execution.Quer
 		if hold != current(next) {
 			next.PendingHoldMillis = &hold
 			next.EarlierMatches, next.QuietSinceMillis = 0, controller.options.Now().UnixMilli()
+			clearFloor(&next)
+			next.VerifyCandidateMillis = nil
+		}
+		// A record holding something with no quiet on it starts its quiet
+		// here. A lowering waits for a quiet that has started, and a group
+		// at its limit is not tried until one has run its bar (atLimitHeld):
+		// with nothing to start one, a group whose data came back in time
+		// would keep its hold for good.
+		if current(next) > 0 && next.QuietSinceMillis <= 0 {
+			next.QuietSinceMillis = controller.options.Now().UnixMilli()
 		}
 	}
-	return next, nil
+	return next, nil, nil
 }
 
 // carries is a record holding anything a successor or a restart needs: a
@@ -770,7 +1112,7 @@ func (controller *Controller) SlotReadHold(ctx context.Context, schedule executi
 		return 0, err
 	}
 	owner.Fence = fence
-	frozen, err := controller.slotHoldOf(state, predecessors, schedule, at)
+	frozen, err := controller.slotHoldOf(state, predecessors, schedule, at, true)
 	if err != nil {
 		return 0, err
 	}
@@ -778,13 +1120,16 @@ func (controller *Controller) SlotReadHold(ctx context.Context, schedule executi
 		controller.counted(controller.clamped, frozen.clamp)
 	}
 	next, hold := frozen.next, frozen.hold
+	controller.noteQueryDurationLocked(state, &next)
 	if !reflect.DeepEqual(next, state.record) {
 		// A first zero hold has no durable value to protect. Remember the
 		// segment locally without creating a record for the full population
 		// -- nor for a group that closed a Segment at zero: a missing record
-		// is what tells its successor its hold was zero.
+		// is what tells its successor its hold was zero. A query duration
+		// alone does not make one either (query_duration.go).
 		if len(state.raw) == 0 && !carries(next) {
 			state.record, state.seeded = next, true
+			controller.endWaits(state)
 			return 0, nil
 		}
 		if err := controller.persist(ctx, qg, state, next, &owner); err != nil {
@@ -792,6 +1137,17 @@ func (controller *Controller) SlotReadHold(ctx context.Context, schedule executi
 		}
 	}
 	state.seeded = true
+	controller.endWaits(state)
+	if frozen.cutFrom > 0 && controller.options.OnLimitCut != nil {
+		period := int64(0)
+		for _, plan := range schedule.Plans {
+			if interval := plan.Spec.EvaluationIntervalSeconds; interval > 0 && (period == 0 || interval < period) {
+				period = interval
+			}
+		}
+		controller.options.OnLimitCut(LimitCut{QueryGroup: qg, Slot: at, From: time.Duration(frozen.cutFrom) * time.Millisecond,
+			To: time.Duration(hold) * time.Millisecond, Period: time.Duration(period) * time.Second})
+	}
 	return time.Duration(hold) * time.Millisecond, nil
 }
 
@@ -816,7 +1172,7 @@ func (controller *Controller) PeekSlotReadHold(schedule execution.FrozenQueryGro
 	if !state.seeded {
 		return 0, ErrNotSeeded
 	}
-	frozen, err := controller.slotHoldOf(state, predecessors, schedule, at)
+	frozen, err := controller.slotHoldOf(state, predecessors, schedule, at, false)
 	if err != nil {
 		return 0, err
 	}
@@ -853,6 +1209,9 @@ type frozenHold struct {
 	hold  int64
 	next  Record
 	clamp string
+	// cutFrom is the hold of the Slot before when the limit cut this one
+	// more than a step below it, and 0 otherwise.
+	cutFrom int64
 }
 
 // slotHoldOf computes, on a working copy of the group's record, the hold
@@ -862,10 +1221,17 @@ type frozenHold struct {
 // asking only a seeded group. The one computation both SlotReadHold and
 // PeekSlotReadHold run. Called with the group's lock held.
 func (controller *Controller) slotHoldOf(state *entry, predecessors map[execution.QueryGroupIdentity]Inspection,
-	schedule execution.FrozenQueryGroupSchedule, at execution.EvaluationTime) (frozenHold, error) {
-	next, err := controller.seed(state, predecessors)
+	schedule execution.FrozenQueryGroupSchedule, at execution.EvaluationTime, wait bool) (frozenHold, error) {
+	waitAt := execution.EvaluationTime(0)
+	if wait {
+		waitAt = at
+	}
+	next, awaiting, err := controller.seedWaiting(state, predecessors, waitAt)
 	if err != nil {
 		return frozenHold{}, err
+	}
+	if awaiting != nil {
+		return frozenHold{}, awaiting
 	}
 	if schedule.Segment.Start < next.SegmentStart {
 		return frozenHold{}, ErrSegmentStale
@@ -878,7 +1244,23 @@ func (controller *Controller) slotHoldOf(state *entry, predecessors map[executio
 	}
 	pruneTransitions(&next, int64(at)*1000+state.spec.SettlingWait.Milliseconds())
 	hold := holdAt(next, at, state.spec.SettlingWait)
-	clamp := ""
+	// A lower hold takes effect a step at a time. The Query Group's Slots
+	// run one after another, so a Slot frozen with less hold than the one
+	// before it is ready before that one is read, and is first attempted
+	// only when it is: a hold come down by more than a few steps at once
+	// leaves that Slot already past its deadline and behind by more Slots
+	// than a replay may cover, and it is skipped unevaluated - as a hold
+	// halved at the limit was. Frozen no more than a step below the Slot
+	// before, each Slot is ready when the one before it is, and the hold
+	// reaches the lower one Slot by Slot while the lower one stays pending.
+	// The limit below still wins: a limit configured under the hold is a
+	// bound no Slot is frozen past, and it takes effect at once.
+	step := state.spec.Step.Milliseconds()
+	stepped := step > 0 && next.SinceSlot > 0 && at > next.SinceSlot
+	if stepped && hold < next.HoldMillis-step {
+		hold = next.HoldMillis - step
+	}
+	clamp, cutFrom := "", int64(0)
 	if limit := min(state.spec.HoldLimit, controller.options.MaxHold).Milliseconds(); hold > limit {
 		// Refusing the Slot refused it on every retry, and the group stopped
 		// on it. Frozen at the limit, the old group's last Slot may overtake
@@ -895,6 +1277,9 @@ func (controller *Controller) slotHoldOf(state *entry, predecessors map[executio
 			clamp = ClampKnown
 		}
 		hold = limit
+		if stepped && limit < next.HoldMillis-step {
+			cutFrom = next.HoldMillis
+		}
 	}
 	if next.HoldMillis != hold || next.PendingHoldMillis != nil {
 		next.PreviousHoldMillis, next.PreviousSinceSlot = next.HoldMillis, next.SinceSlot
@@ -911,7 +1296,7 @@ func (controller *Controller) slotHoldOf(state *entry, predecessors map[executio
 			next.PendingHoldMillis = nil
 		}
 	}
-	return frozenHold{hold: hold, next: next, clamp: clamp}, nil
+	return frozenHold{hold: hold, next: next, clamp: clamp, cutFrom: cutFrom}, nil
 }
 
 // CloseSchedule fixes the old hold and each Plan's last legal Slot before a
@@ -1064,12 +1449,21 @@ func (controller *Controller) Observe(ctx context.Context, evidence Evidence) er
 	if next.SegmentStart == 0 {
 		next.SegmentStart = evidence.Contract.ScheduleSegmentStart
 	}
+	finding := ""
+	if evidence.Probation {
+		finding = ProbationFindingQuiet
+	}
 	if evidence.Noise {
+		// A series that went after its first read: no age to raise to, but
+		// the round was decided on data that changed after it, so no lowering
+		// until the group is quiet again.
 		next.Noise++
+		next.QuietSinceMillis, next.EarlierMatches = controller.options.Now().UnixMilli(), 0
 	} else {
 		now := controller.options.Now().UnixMilli()
-		if next.LastEarlyMillis > 0 {
-			next.MaxEarlyIntervalMillis = max(next.MaxEarlyIntervalMillis, now-next.LastEarlyMillis)
+		if next.LastEarlyMillis > 0 && now > next.LastEarlyMillis {
+			next.EarlyGaps = withEarlyGap(earlyGapsOf(next), now, now-next.LastEarlyMillis)
+			next.MaxEarlyIntervalMillis = longestGap(next.EarlyGaps)
 		}
 		next.LastEarlyMillis, next.QuietSinceMillis, next.EarlierMatches = now, now, 0
 		// The group's own arrival replaces a seed outright: the seed was
@@ -1096,18 +1490,63 @@ func (controller *Controller) Observe(ctx context.Context, evidence Evidence) er
 		// hold, so the arrival age alone decides it.
 		target := max(0, evidence.ArrivalAge.Milliseconds()-state.spec.Delay.Milliseconds()-state.spec.SettlingWait.Milliseconds())
 		next.AtLimit, next.LimitMillis = target > limit, limit
-		if !next.Closed && min(target, limit) > current(next) {
+		// A probation's finding undoes the lowering it watches whatever the
+		// round's arrival age: the hold goes back at least to where it came
+		// from (below), even when the reread saw the change before the
+		// lowered hold - a series that went, or one seen early in its rung.
+		undo := evidence.Probation && next.Lowered && next.LoweredFromMillis > current(next)
+		if !next.Closed && (min(target, limit) > current(next) || undo) {
 			hold := min(target, limit)
+			// A raise right after a lowering shows the lowered hold too early:
+			// a whole window read there was still arriving. The lowering is
+			// undone - the hold goes back at least to where it came from, not
+			// only to the one round's arrival, which under an arrival that
+			// moves round to round leaves it inside the spread and reads its
+			// later rounds early one after another - and the lowered hold is
+			// the search's floor, so the next lowering lands above it. Any
+			// other raise starts the search afresh.
+			raisedFrom := current(next)
+			clearFloor(&next)
+			// The data came later than the hold: a candidate below it the
+			// trials chose is not one to lower to.
+			next.VerifyCandidateMillis = nil
+			if next.Lowered {
+				hold = min(max(hold, next.LoweredFromMillis), limit)
+				if raisedFrom < hold {
+					setFloor(&next, raisedFrom, now)
+					// A verified lowering read early after it: its probe passed
+					// by chance, near a line the data is seen on both sides of.
+					next.EarlierFloorProbed = next.LoweredVerified
+				}
+			}
 			next.PendingHoldMillis = &hold
 			if next.Lowered {
 				next.RaisedAfterLowering++
-				next.Lowered = false
+				next.Lowered, next.LoweredVerified = false, false
+				if evidence.Probation {
+					finding = ProbationFindingUndone
+				}
 			}
 		}
 	}
-	return controller.persist(ctx, qg, state, next, nil)
+	if err := controller.persist(ctx, qg, state, next, nil); err != nil {
+		return err
+	}
+	if finding != "" {
+		controller.counted(controller.probationFindings, finding)
+	}
+	return nil
 }
 
+// EarlierRead takes an earlier-read trial's evidence: one round of the group
+// read at the candidate below its hold and compared with the formal read.
+// FloorDifferentsRequired different trials in a row move the search's floor
+// up to the candidate; EarlierMatchesRequired matching ones in a row, once
+// the group has been quiet for its bar, choose the candidate, which a shadow
+// probe then reads round by round before the hold moves (Record.
+// VerifyCandidateMillis, FloorProbe): a trial reads one round a rest, and a
+// candidate inside the spread the data moves over passes three of them by
+// chance.
 func (controller *Controller) EarlierRead(ctx context.Context, evidence EarlierEvidence) error {
 	if evidence.Contract.Validate() != nil || evidence.CandidateHold < 0 {
 		return errors.New("alarmd readhold: invalid earlier-read evidence")
@@ -1122,29 +1561,43 @@ func (controller *Controller) EarlierRead(ctx context.Context, evidence EarlierE
 		return nil
 	}
 	hold := current(state.record)
-	candidate := execution.LoweredReadHold(time.Duration(hold)*time.Millisecond, state.spec.Step).Milliseconds()
-	if !evidence.Observed || hold == 0 || evidence.CandidateHold.Milliseconds() != candidate || evidence.Contract.Slot.EvaluationTime <= state.record.LastEarlierSlot {
+	now := controller.options.Now().UnixMilli()
+	candidate, tries := nextCandidate(evidence.Contract.Slot.QueryGroup, state.record, state.spec.Step, now)
+	if !evidence.Observed || hold == 0 || !tries || evidence.CandidateHold.Milliseconds() != candidate || evidence.Contract.Slot.EvaluationTime <= state.record.LastEarlierSlot {
 		return nil
 	}
 	next := clone(state.record)
 	next.LastEarlierSlot = evidence.Contract.Slot.EvaluationTime
-	now := controller.options.Now().UnixMilli()
 	if !evidence.Equal {
 		next.EarlierMatches, next.QuietSinceMillis = 0, now
-	} else {
-		next.EarlierMatches = min(next.EarlierMatches+1, EarlierMatchesRequired)
-		quiet := next.MaxEarlyIntervalMillis
-		if quiet == 0 {
-			quiet = SingleEventQuiet.Milliseconds()
+		// Data still changing at the candidate, in rounds enough in a row:
+		// the search moves up to it, and the next candidate is halfway
+		// between it and the hold.
+		next.EarlierDifferents++
+		if next.EarlierDifferents >= FloorDifferentsRequired {
+			setFloor(&next, candidate, now)
 		}
+	} else {
+		next.EarlierDifferents = 0
+		next.EarlierMatches = min(next.EarlierMatches+1, EarlierMatchesRequired)
+		quiet := quietBar(evidence.Contract.Slot.QueryGroup, next, now)
 		if next.QuietSinceMillis > 0 && now-next.QuietSinceMillis >= quiet && next.EarlierMatches >= EarlierMatchesRequired {
-			next.PendingHoldMillis = &candidate
-			next.Lowered, next.EarlierMatches, next.QuietSinceMillis = true, 0, now
-			next.ArrivalAgeMillis = state.spec.Delay.Milliseconds() + state.spec.SettlingWait.Milliseconds() + candidate
-			next.ArrivalAgeSeed = ""
+			// The trials chose the candidate; the hold moves only once a shadow
+			// probe has read it clean round by round (FloorProbe, kind verify).
+			// A trial reads one round a rest, and a candidate inside the data's
+			// spread passes three of them by chance; the probe reads every round.
+			next.VerifyCandidateMillis = &candidate
+			next.EarlierMatches = 0
 		}
 	}
-	return controller.persist(ctx, evidence.Contract.Slot.QueryGroup, state, next, nil)
+	moot := settleVerify(evidence.Contract.Slot.QueryGroup, &next, now)
+	if err := controller.persist(ctx, evidence.Contract.Slot.QueryGroup, state, next, nil); err != nil {
+		return err
+	}
+	if moot {
+		controller.counted(controller.floorProbes, floorProbeKey(FloorProbeKindVerify, FloorProbeMoot))
+	}
+	return nil
 }
 
 // RenewDue reuses CAS with the same value once a day; untouched records expire
@@ -1160,7 +1613,11 @@ func (controller *Controller) RenewDue(ctx context.Context) error {
 	for qg, state := range groups {
 		state.mu.Lock()
 		if state.loaded && state.configured && !state.record.Closed && len(state.raw) > 0 && current(state.record) > 0 && controller.options.Now().UnixMilli()-state.record.RenewedAtMillis >= RenewInterval.Milliseconds() {
-			if err := controller.persist(ctx, qg, state, clone(state.record), nil); err != nil && first == nil {
+			// A floor learned a day ago may not hold now that the data comes
+			// in sooner: the search starts again from half the hold.
+			next := clone(state.record)
+			clearFloor(&next)
+			if err := controller.persist(ctx, qg, state, next, nil); err != nil && first == nil {
 				first = err
 			}
 		}

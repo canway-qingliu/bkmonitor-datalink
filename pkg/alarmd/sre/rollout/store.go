@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
+
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/redisscript"
 )
 
 // The states of a receipt. The first three are in progress; the rest are
@@ -61,8 +63,11 @@ type Record struct {
 	Warnings  []string `json:"warnings,omitempty"`
 	SessionID string   `json:"session_id,omitempty"`
 	RequestID string   `json:"request_id,omitempty"`
-	StartedAt int64    `json:"started_at_ms"`
-	EndedAt   int64    `json:"ended_at_ms,omitempty"`
+	// Operator and IssuedVia are who asked, as the SRE receipt names them.
+	Operator  string `json:"operator,omitempty"`
+	IssuedVia string `json:"issued_via,omitempty"`
+	StartedAt int64  `json:"started_at_ms"`
+	EndedAt   int64  `json:"ended_at_ms,omitempty"`
 	// Generation is the Deployment generation the change (or, once
 	// reverting, the revert) was written at; the rollout is judged at it.
 	Generation int64 `json:"generation,omitempty"`
@@ -148,7 +153,7 @@ local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 
 // create: KEYS record, active, index; ARGV doc, owner, lease ms, ttl ms,
 // receipt id, index keep. Refuses an existing receipt.
-var createScript = redis.NewScript(clock + `
+var createScript = redisscript.New("rollout_create", clock+`
 if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
 redis.call('HSET', KEYS[1], 'doc', ARGV[1], 'owner', ARGV[2], 'lease', now + tonumber(ARGV[3]))
 redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[4]))
@@ -163,7 +168,7 @@ return 1
 // put: KEYS record, active; ARGV doc (empty to renew only), owner, lease
 // ms, final ("1" ends the receipt), receipt id. Writes only for the holder
 // of a live lease.
-var putScript = redis.NewScript(clock + `
+var putScript = redisscript.New("rollout_put", clock+`
 local owner = redis.call('HGET', KEYS[1], 'owner')
 local lease = tonumber(redis.call('HGET', KEYS[1], 'lease') or '0')
 if owner ~= ARGV[2] or lease <= now then return 0 end
@@ -180,7 +185,7 @@ return 1
 // take: KEYS record, active; ARGV owner, lease ms, receipt id. Takes a
 // receipt whose lease has run out; one that no longer exists leaves the
 // in-progress set.
-var takeScript = redis.NewScript(clock + `
+var takeScript = redisscript.New("rollout_take", clock+`
 if redis.call('EXISTS', KEYS[1]) == 0 then
   redis.call('SREM', KEYS[2], ARGV[3])
   return false
@@ -200,14 +205,14 @@ return doc
 
 // release: KEYS record; ARGV owner. Ends the holder's lease so a successor
 // need not wait it out.
-var releaseScript = redis.NewScript(clock + `
+var releaseScript = redisscript.New("rollout_release", clock+`
 if redis.call('HGET', KEYS[1], 'owner') ~= ARGV[1] then return 0 end
 redis.call('HSET', KEYS[1], 'lease', 0)
 return 1
 `)
 
 // read: KEYS record; returns doc, owner, lease, now.
-var readScript = redis.NewScript(clock + `
+var readScript = redisscript.New("rollout_read", clock+`
 local fields = redis.call('HMGET', KEYS[1], 'doc', 'owner', 'lease')
 if not fields[1] then return false end
 return {fields[1], fields[2] or '', fields[3] or '0', tostring(now)}

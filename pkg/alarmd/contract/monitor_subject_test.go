@@ -33,14 +33,14 @@ func TestTheSubjectChainPlacesEachObjectTheWayThePlatformDoes(t *testing.T) {
 		wantID     string
 	}{
 		"host id wins over the address it came with": {
-			dimensions: map[string]string{"bk_host_id": `101`, "bk_target_ip": `"10.0.0.1"`, "bk_target_cloud_id": `0`},
+			dimensions: map[string]string{"bk_host_id": `101`, "bk_target_ip": `"192.0.2.1"`, "bk_target_cloud_id": `0`},
 			identity:   []string{"bk_host_id", "bk_target_ip", "bk_target_cloud_id"},
 			wantType:   MonitorSubjectHost, wantID: "101",
 		},
 		"an address carries its cloud": {
-			dimensions: map[string]string{"bk_target_ip": `"10.0.0.1"`, "bk_target_cloud_id": `0`},
+			dimensions: map[string]string{"bk_target_ip": `"192.0.2.1"`, "bk_target_cloud_id": `0`},
 			identity:   []string{"bk_target_ip", "bk_target_cloud_id"},
-			wantType:   MonitorSubjectHost, wantID: "10.0.0.1|0",
+			wantType:   MonitorSubjectHost, wantID: "192.0.2.1|0",
 		},
 		"a service instance": {
 			dimensions: map[string]string{"bk_target_service_instance_id": `"55"`},
@@ -78,13 +78,19 @@ func TestTheSubjectChainPlacesEachObjectTheWayThePlatformDoes(t *testing.T) {
 			facts:      &MonitorSubjectFacts{Labels: []string{"team", "APM-APP(shop)", "APM-SERVICE(cart)"}},
 			wantType:   MonitorSubjectAPMService, wantID: "shop:cart",
 		},
-		"an APM app read out of the result table when only the service is labelled": {
+		// Python reads the app out of the result table; its name is the app's
+		// normalised form and cannot be read back, so alarmd does not.
+		"no APM app from the result table when only the service is labelled": {
 			dimensions: map[string]string{"bk_instance_id": `"i-1"`},
 			identity:   []string{"bk_instance_id"},
 			facts: &MonitorSubjectFacts{
-				Labels: []string{"APM-SERVICE(cart)"}, ResultTableID: "2_bkapm_metric_shop.__default__",
+				Labels: []string{"APM-SERVICE(cart)"}, ResultTableID: "2_bkapm_metric_cross_bank_trade.__default__",
 			},
-			wantType: MonitorSubjectAPMService, wantID: "shop:cart",
+		},
+		"no APM app from the result table when the record carries only the service": {
+			dimensions: map[string]string{"service_name": `"transfer"`},
+			identity:   []string{"service_name"},
+			facts:      &MonitorSubjectFacts{ResultTableID: "2_bkapm_metric_cross_bank_trade.__default__"},
 		},
 		"a record with no object at all": {
 			dimensions: map[string]string{"device": `"sda"`},

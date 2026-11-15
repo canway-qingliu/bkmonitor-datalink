@@ -1,6 +1,8 @@
 package worker
 
 import (
+	"slices"
+
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/contract"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
 )
@@ -23,6 +25,16 @@ type queryAvailabilityEvidence struct {
 	// unproven.
 	primaryEmptiedOutside    bool
 	primaryWithheldOtherwise bool
+	// primaryEmptiedIdentity says a primary query came back empty because
+	// every series it returned was withheld as one the target's identity
+	// could not read (target_key_missing); primaryWithheldNotIdentity that a
+	// primary query withheld a series for any other reason, which leaves
+	// the claim unproven. withheld, withheldOutside and withheldKeyMissing
+	// add up the primary queries' counts, and identitySamples keeps a few.
+	primaryEmptiedIdentity                        bool
+	primaryWithheldNotIdentity                    bool
+	withheld, withheldOutside, withheldKeyMissing uint64
+	identitySamples                               []execution.IdentitySample
 	// clock is the slowest primary query's budget and elapsed time.
 	clock *execution.PhysicalQueryClock
 	// sentLateTimeout says a primary query timed out after being sent late
@@ -55,6 +67,19 @@ func (e *queryAvailabilityEvidence) observe(binding execution.NamedInputBinding,
 	} else if physical.Withheld > 0 && physical.DataState == execution.DataStateEmpty {
 		e.primaryEmptiedOutside = true
 	}
+	if physical.Withheld > physical.WithheldKeyMissing {
+		e.primaryWithheldNotIdentity = true
+	} else if physical.Withheld > 0 && physical.DataState == execution.DataStateEmpty {
+		e.primaryEmptiedIdentity = true
+	}
+	e.withheld += physical.Withheld
+	e.withheldOutside += physical.WithheldOutsideTarget
+	e.withheldKeyMissing += physical.WithheldKeyMissing
+	for _, sample := range physical.IdentitySamples {
+		if len(e.identitySamples) < execution.IdentitySamplesPerQuery {
+			e.identitySamples = append(e.identitySamples, sample)
+		}
+	}
 	if physical.Completeness == execution.CompletenessUnavailable && e.reason == "" {
 		e.reason = execution.AttributedReason(binding.ReasonCode, binding.UnavailableAttribution)
 	}
@@ -82,6 +107,24 @@ func (e queryAvailabilityEvidence) emptiedByTarget(primary execution.PrimaryInpu
 		e.primaryEmptiedOutside && !e.primaryWithheldOtherwise
 }
 
+// emptiedByIdentity says a FULL, EMPTY primary was empty because every series
+// its queries returned was one the target's identity could not read: data
+// arrived and none of it built the target's key or passed its model gate.
+func (e queryAvailabilityEvidence) emptiedByIdentity(primary execution.PrimaryInputFact) bool {
+	return primary.Completeness == execution.CompletenessFull && primary.DataState == execution.DataStateEmpty &&
+		e.primaryEmptiedIdentity && !e.primaryWithheldNotIdentity
+}
+
+// identityEvidence is what a round emptied by identity carries: the withheld
+// counts by reason and the samples; nil for any other round.
+func (e queryAvailabilityEvidence) identityEvidence(primary execution.PrimaryInputFact) *execution.IdentityEvidence {
+	if !e.emptiedByIdentity(primary) {
+		return nil
+	}
+	return &execution.IdentityEvidence{Withheld: e.withheld, OutsideTarget: e.withheldOutside, KeyMissing: e.withheldKeyMissing,
+		Samples: append([]execution.IdentitySample(nil), e.identitySamples...)}
+}
+
 // quietWhenEmpty says a FULL, EMPTY primary is an event count of groups that
 // came back with no group at all: none had an event in the range asked, the
 // state an event stream spends most of its time in - quiet, not absent. An
@@ -97,6 +140,121 @@ func (e queryAvailabilityEvidence) quietWhenEmpty(primary execution.PrimaryInput
 	}
 	for _, requirement := range requirements {
 		if requirement.Role == execution.InputRolePrimary && requirement.ProviderLeadSeconds > 0 && len(requirement.RequiredColumns) > 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// labelFiltered gives the round's primary what its filter and its unfiltered
+// witness say: whether it filters, what the witness answered, and whether
+// its empty answer was filtered empty.
+func (e queryAvailabilityEvidence) labelFiltered(primary *execution.PrimaryInputFact, requirements []execution.DataRequirement,
+	bindings []execution.NamedInputBinding) {
+	primary.WitnessData = witnessData(requirements, bindings)
+	primary.ValueFiltered = valueFiltered(requirements)
+	primary.FilteredWhenEmpty = e.filteredWhenEmpty(*primary, requirements)
+}
+
+// filteredWhenEmpty says a FULL, EMPTY primary whose expression filters its
+// values (DataRequirement.ValueFiltered) was filtered empty: the round's
+// unfiltered witness answered FULL with data (witnessData), so the data is
+// there and no series passed the filter. A witness that answered anything
+// else leaves the empty answer as it was - data that may be missing.
+// Withholding rules as for quiet.
+func (e queryAvailabilityEvidence) filteredWhenEmpty(primary execution.PrimaryInputFact, requirements []execution.DataRequirement) bool {
+	if primary.Completeness != execution.CompletenessFull || primary.DataState != execution.DataStateEmpty ||
+		e.primaryEmptiedOutside || e.primaryWithheldOtherwise || primary.WitnessData != execution.WitnessDataFull {
+		return false
+	}
+	for _, requirement := range requirements {
+		if requirement.Role == execution.InputRolePrimary && requirement.ValueFiltered {
+			return true
+		}
+	}
+	return false
+}
+
+// valueFiltered is whether the round's primary filters its values.
+func valueFiltered(requirements []execution.DataRequirement) bool {
+	for _, requirement := range requirements {
+		if requirement.Role == execution.InputRolePrimary && requirement.ValueFiltered {
+			return true
+		}
+	}
+	return false
+}
+
+// witnessData is what the round's unfiltered witnesses answered
+// (DataRequirement.UnfilteredWitness), matched to their bindings by
+// requirement, the worst of several witnesses, WitnessNone when the round has
+// none. One witness's bindings are its streamed series, FULL with data, and
+// the completion's share, which never carries records - EMPTY for a FULL
+// query that delivered its series streamed, UNKNOWN for one that failed
+// (access completionBindings) - so a series streamed is DATA unless the
+// query failed, and EMPTY is a FULL query that streamed none. A requirement
+// marked a witness that reads a primary's own query is no witness - it
+// carries the primary's filter - whatever marked it.
+func witnessData(requirements []execution.DataRequirement, bindings []execution.NamedInputBinding) execution.WitnessData {
+	primaryRefs := make(map[execution.LogicalQueryRef]struct{})
+	for _, requirement := range requirements {
+		if requirement.Role == execution.InputRolePrimary {
+			primaryRefs[requirement.LogicalQueryRef] = struct{}{}
+		}
+	}
+	rank := func(word execution.WitnessData) int { return slices.Index(execution.WitnessDataWords, word) }
+	worst := execution.WitnessNone
+	for _, requirement := range requirements {
+		if _, own := primaryRefs[requirement.LogicalQueryRef]; !requirement.UnfilteredWitness ||
+			requirement.Role != execution.InputRoleAlgorithmDependency || own {
+			continue
+		}
+		bound, data, notFull := false, false, false
+		for _, binding := range bindings {
+			if binding.RequirementID != requirement.RequirementID {
+				continue
+			}
+			bound = true
+			switch {
+			case binding.Completeness != execution.CompletenessFull:
+				notFull = true
+			case binding.DataState == execution.DataStateData:
+				data = true
+			}
+		}
+		word := execution.WitnessUnbound
+		switch {
+		case !bound:
+		case notFull:
+			word = execution.WitnessNotFull
+		case data:
+			word = execution.WitnessDataFull
+		default:
+			word = execution.WitnessEmpty
+		}
+		if worst == execution.WitnessNone || rank(word) < rank(worst) {
+			worst = word
+		}
+	}
+	return worst
+}
+
+// unfilledWhenEmpty says a FULL, EMPTY primary is a count its provider does
+// not zero-fill (DataRequirement.UnfilledCounts): a log count whose groups
+// are absent, not zero, while they have no document, so the empty answer
+// cannot say whether a group was quiet or its data missing. Grouped or not:
+// most ungrouped log counts come back with explicit zeros when quiet, which
+// are points and never empty, but some come back with no series at all for
+// a range with no document, and that empty is as ambiguous as a group's.
+// Withholding rules as for quiet: a group the target turned away is the
+// target's empty, and any other withholding leaves the answer unproven.
+func (e queryAvailabilityEvidence) unfilledWhenEmpty(primary execution.PrimaryInputFact, requirements []execution.DataRequirement) bool {
+	if primary.Completeness != execution.CompletenessFull || primary.DataState != execution.DataStateEmpty ||
+		e.primaryEmptiedOutside || e.primaryWithheldOtherwise {
+		return false
+	}
+	for _, requirement := range requirements {
+		if requirement.Role == execution.InputRolePrimary && requirement.UnfilledCounts {
 			return true
 		}
 	}

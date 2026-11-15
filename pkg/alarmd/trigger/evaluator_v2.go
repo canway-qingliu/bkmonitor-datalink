@@ -11,10 +11,12 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/contract"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/strategy"
 )
 
@@ -32,13 +34,13 @@ func EvaluateV2(request EvaluationRequestV2) (EvaluationResultV2, error) {
 	levelResults := make([]contract.LevelResultV1, 0, levels.Len())
 	for index, level := range levels.All() {
 		eligibility, err := EvaluateStateEligibilityV2(
-			request.EvaluationTime, level, request.Record.LevelFacts[index], request.EffectiveTimeFacts[index].Fact,
+			request.DecisionTime, level, request.Record.LevelFacts[index], request.EffectiveTimeFacts[index].Fact,
 		)
 		if err != nil {
 			return EvaluationResultV2{}, err
 		}
 		outcome, successful, err := evaluateLevelV2(
-			request, level, request.Record.LevelFacts[index], request.Histories[index].View,
+			request, level, request.Record.LevelFacts[index], request.Histories[index],
 			request.EffectiveTimeFacts[index].Fact, eligibility,
 		)
 		if err != nil {
@@ -119,6 +121,17 @@ func EvaluateV2(request EvaluationRequestV2) (EvaluationResultV2, error) {
 			if result.RecoveryGate.Held {
 				return result, nil
 			}
+			if result.RecoveryGate.OpenAlertGate == OpenAlertGatePassed {
+				var held bool
+				var omitted []uint32
+				levelResults, omitted, held = openLevelResultsV2(request, ref.StrategyID, dedupeMD5, levelResults)
+				if held {
+					result.RecoveryGate.Held, result.RecoveryGate.Cause = true, RecoveryHeldLevelNotOpen
+					result.RecoveryGate.OpenAlertGate = OpenAlertGateHeldLevelNotOpen
+					return result, nil
+				}
+				result.OmittedRecoveryLevels = omitted
+			}
 		}
 		// An event the Plan's protocol has no message for is decided and not
 		// built: under the compatibility protocol that is every RECOVERY, one
@@ -151,6 +164,20 @@ func EvaluateV2(request EvaluationRequestV2) (EvaluationResultV2, error) {
 			return EvaluationResultV2{}, invariantV2("build TriggerEvent", 0, err)
 		}
 		result.TriggerEvent = event
+		// A Plan with named outputs carries what its detection decided on;
+		// every other Plan's event carries nothing more than it did.
+		if request.NamedOutputs != nil {
+			// An optional field never stops detection: a snapshot that cannot
+			// be held to its bounds is left off, and the event goes without it.
+			snapshot := detectionSnapshot(request, event)
+			encoded, truncated, snapshotErr := encodeDetectionSnapshot(snapshot)
+			if snapshotErr != nil {
+				result.Snapshot = &DetectionSnapshotFacts{Result: contract.DetectionSnapshotDropped}
+			} else {
+				event.DetectionSnapshot = encoded
+				result.Snapshot = snapshotFacts(snapshot, truncated)
+			}
+		}
 		// The compatibility context is attached whenever the Plan publishes that
 		// protocol. Before the format was stated, the only Plans that did were
 		// the ones with no frozen revision, so the two conditions were the same
@@ -193,6 +220,10 @@ func EvaluateV2(request EvaluationRequestV2) (EvaluationResultV2, error) {
 		}
 		event.WireFormat = request.Plan.WireFormat()
 		event.SignalType = request.Plan.SignalType()
+		event.StrategyFacts = request.Plan.StrategyFacts()
+		if target := request.Plan.TargetPlan(); target != nil {
+			event.TargetDimensions = target.Identity.Dimensions
+		}
 		if identity := request.Plan.OutputIdentity(); identity != nil {
 			subject, remaining, subjectErr := contract.ProjectMonitorSubject(
 				request.RecordRef.Dimensions, *identity, request.Plan.SubjectFacts(),
@@ -258,7 +289,9 @@ func EvaluateStateEligibilityV2(
 
 func validateRequestV2(request EvaluationRequestV2) (strategy.LevelList, error) {
 	if request.Plan == nil || !request.Limits.valid() || request.TenantID == "" || request.BusinessID == "" ||
-		request.Record.RecordID == "" || request.Record.SourceTime < 0 || request.EvaluationTime < 0 || request.ExecutionID == "" ||
+		request.Record.RecordID == "" || request.Record.SourceTime < 0 || request.EvaluationTime < 0 || request.DecisionTime <= 0 || request.ExecutionID == "" ||
+		request.ReadHoldMillis < 0 || request.ReadHoldMillis > execution.MaxReadHoldMillis ||
+		request.ReadEnd < 0 || request.ReadEnd > request.EvaluationTime ||
 		request.RecordRef.RecordID != request.Record.RecordID || request.RecordRef.SourceTime != request.Record.SourceTime ||
 		request.RecordRef.Dimensions == nil || request.Observed.Values == nil {
 		return strategy.LevelList{}, invariantV2("validate request", 0, errors.New("missing identity, value, time, or budget"))
@@ -302,11 +335,12 @@ func evaluateLevelV2(
 	request EvaluationRequestV2,
 	level strategy.CompiledLevel,
 	fact DetectionFact,
-	history HistoryView,
+	levelHistory LevelHistory,
 	effective strategy.EffectiveTimeFact,
 	eligibility StateEligibilityV2,
 ) (LevelOutcomeV2, contract.LevelResultV1, error) {
 	definition := level.Definition()
+	history := levelHistory.View
 	// RecoveryEnabled is set here, before any return, so that every outcome
 	// carries it: the suppressed and unavailable paths leave before the
 	// recovery plan is otherwise consulted.
@@ -324,6 +358,8 @@ func evaluateLevelV2(
 	if err != nil {
 		return LevelOutcomeV2{}, contract.LevelResultV1{}, invariantV2("build Detect evidence", definition.LevelID, err)
 	}
+	inferredZero := request.ZeroCountIsNoObservation && zeroCountV2(detectEvidence.NormalizedValue)
+	outcome.RealPoint = !inferredZero
 	switch effective.Status() {
 	case strategy.EffectiveTimeInactive:
 		outcome.SuppressedReason = contract.ReasonEffectiveTimeInactive
@@ -364,7 +400,35 @@ func evaluateLevelV2(
 	// decision-022: recovery reads observed positions, NORMAL is unchanged and
 	// still requires FULL.
 	observedMisses, skippedWindows := uint32(0), uint32(0)
+	// settledHoleMisses counts the misses read off settled holes, the ones
+	// the settled range guard below is for.
+	settledHoleMisses := uint32(0)
 	oldestWindowStart := triggerStart
+	// settledThrough is the newest source time the walk counts as settled.
+	// A position counts once a read made under the group's hold has covered
+	// it, meaning the current Slot's own read, up to E - delay: the Slot was
+	// read its hold later than its schedule, so what that read covered had
+	// landed, and every earlier position was covered by an earlier Slot's
+	// read under the same rule. ReadEnd is that read's end, exclusive.
+	//
+	// A hold set too low reads data before it has all landed; that is the
+	// read hold's own probation to catch and raise (lookback/probation.go),
+	// not this boundary's to guess at.
+	//
+	// No read end means no read is known to have covered anything, so
+	// nothing is settled and every window keeps the skip rule: a missing
+	// requirement can delay a recovery, never bring one early.
+	settledThrough := int64(math.MinInt64)
+	if request.ReadEnd > 0 {
+		settledThrough = request.ReadEnd - 1
+	}
+	// A round of the Plan not read whole is not settled data either: its
+	// hole is a round nobody read. Until the gap marker clears, which takes
+	// as many whole rounds as this history needs, that round may be in any
+	// window the walk reads, so none of them is settled.
+	if levelHistory.ReadGapOpen {
+		settledThrough = math.MinInt64
+	}
 	if recoveryPlan.Enabled && result == "" {
 		// How far back an observed position may still count: the retained
 		// window and no further, because nothing older than that exists to be
@@ -410,11 +474,11 @@ func evaluateLevelV2(
 				break
 			}
 			oldestWindowStart = windowStart
-			// A window nobody observed is evidence of neither recovery nor its
-			// opposite. Counting it as a miss, which is what happened before,
-			// built recoveries on absence; breaking on it would make a single
-			// hole cost the whole run. It is stepped over, and said so on the
-			// evidence.
+			// Unsettled, a window nobody observed is evidence of neither
+			// recovery nor its opposite: its holes may still fill.
+			// Counting it as a miss would build a recovery on points that
+			// have not arrived; breaking on it would make a single hole cost
+			// the whole run. It is stepped over, and said so on the evidence.
 			//
 			// Which of the three it is has to be decided with the holes in
 			// hand. CountAnomalies returns the same small number for a quiet
@@ -432,16 +496,122 @@ func evaluateLevelV2(
 			if observed < triggerPlan.WindowSize {
 				holes = triggerPlan.WindowSize - observed
 			}
-			if anomalies+holes >= triggerPlan.RequiredAnomalies {
-				skippedWindows++
+			if anomalies+holes < triggerPlan.RequiredAnomalies {
+				observedMisses++
 				continue
 			}
-			observedMisses++
+			// A settled window answers with what it holds. Every point that
+			// will reach it has arrived, so a hole there is a minute with no
+			// point rather than a point still on its way, and a minute with
+			// no point is not an anomaly. That is Python's rule:
+			// check_result_cache in recover.py (:467-506) counts only the
+			// anomaly timestamps in each window, so a missing minute is a
+			// non-anomalous one, and a window with no point at all passes
+			// like any other window under the threshold. Without it a series
+			// whose points come further apart than its window never fills a
+			// window and never recovers, while Python recovers it.
+			//
+			// Settled and also inside the series' observed life: the series
+			// had state before this round, or the history holds a position
+			// before the window starts. Before a new series' first position,
+			// a hole is not a minute the series was quiet, it is a minute
+			// before anything was known of it - the same warming the skip
+			// below exists for. Python never asks there: it checks recovery
+			// only for an open alert, and every window such a check can count
+			// starts after the series' first point, because a window reaching
+			// back over it would hold the anomalies that opened the alert and
+			// stop the walk. A series with state is past its first point even
+			// where retention has dropped every position older than the
+			// window, which a sparse series' retention does: it keeps the
+			// window's positions and the lateness tolerance, and a point every
+			// five minutes need leave none of them before the oldest window.
+			//
+			// A window that is not settled keeps the skip: a window no read has
+			// covered yet, or one an unread round may still be in. A point may
+			// still arrive there, and it may be the anomaly that fires the
+			// window; counting its hole as normal would close the alert before
+			// that point could say otherwise.
+			if windowEnd <= settledThrough && (request.SeriesSeenBefore || windowStart > 0 && history.CountObserved(0, windowStart-1) > 0) {
+				observedMisses++
+				settledHoleMisses++
+				continue
+			}
+			skippedWindows++
 		}
 	}
-	if result == "" && recoveryPlan.Enabled && observedMisses >= recoveryPlan.ConsecutiveWindows {
-		result = contract.LevelResultRecovery
-	} else if result == "" {
+	// Python gives up on a time series only when its whole range holds no
+	// check result at all (recover.py:429-431); that range reaches one step
+	// further back than its oldest window (min_check_timestamp, :424). The
+	// same guard applies here, on the same range: a run of misses read from
+	// nothing is not a recovery. The record's own point is applied before it
+	// is evaluated, so on the production path the range always holds that one.
+	//
+	// The same range, read at the settled boundary, when a settled hole was
+	// counted: a quiet minute is a fact only beside a point that was read
+	// whole, and a range whose only points are past the settled boundary
+	// has none. No RECOVERY then; the alert stays as it is. Python's no-data
+	// end (recover.py:191-197) is a Level written to end on no data, decided
+	// below and, for an absent series, by the worker's no-data end index.
+	rangeObserved := true
+	if observedMisses >= recoveryPlan.ConsecutiveWindows {
+		from := pythonRecoveryRangeStartV2(request.Record.SourceTime, triggerPlan, recoveryPlan)
+		rangeObserved = history.CountObserved(from, request.Record.SourceTime) > 0
+		if rangeObserved && settledHoleMisses > 0 {
+			rangeObserved = settledThrough >= from && history.CountObserved(from, min(settledThrough, request.Record.SourceTime)) > 0
+		}
+	}
+	// A recovery withheld on a zero is decided as any round that did not
+	// recover: NORMAL on a whole window, saying it was withheld, and on an
+	// incomplete one the history reason, since only a RECOVERY may be
+	// decided on a window that is not FULL (decision-022).
+	withheld, end, endedBy := "", "", ""
+	if result == "" && recoveryPlan.Enabled && observedMisses >= recoveryPlan.ConsecutiveWindows && rangeObserved {
+		if inferredZero {
+			withheld = contract.RecoveryWithheldZeroCount
+		} else {
+			result, end = contract.LevelResultRecovery, recoveryPlan.End
+		}
+	}
+	// No data ends a Level written so (status_setter -nodata) on a round
+	// whose own value is a zero that is no observation, once the series'
+	// last real point is (R + T + 1) periods old, as Python's recovery check
+	// times it (recover.py:191-197). Not known, it ends nothing and says so.
+	// Never beside a trigger window that still holds its anomalies: this
+	// round's detection may be NORMAL while an earlier zero was anomalous -
+	// a ring ratio judges a zero against the recent average - and the window
+	// is then still triggering, which is not an alert to end.
+	if result == "" && inferredZero && recoveryPlan.MissingData == contract.RecoveryMissingDataEvaluateAsZero &&
+		observedAnomalies < triggerPlan.RequiredAnomalies {
+		switch last := levelHistory.LastRealPoint; {
+		case last <= 0:
+			if withheld != "" {
+				withheld = contract.RecoveryWithheldNoDataLastPointUnknown
+			}
+		case noDataEndDueV2(request.Record.SourceTime, last, triggerPlan, recoveryPlan):
+			// Before no data ends it, the source itself is asked whether
+			// it is alive: no data from a source that may be down is not
+			// "it stopped happening". Not known, the Level stays as it is,
+			// saying why where the windows were met.
+			// The span's first empty period is the one after last
+			// (noDataEndDueV2 times the end from it), and the probe reads
+			// from there on, never the last period with data.
+			if source := request.NoDataEndSource; source != nil && !source.SourceAlive(definition.LevelID, noDataSpanV2(triggerPlan, recoveryPlan), last) {
+				if withheld != "" {
+					withheld = contract.RecoveryWithheldSourceUnknown
+				}
+				break
+			}
+			result, end, endedBy, withheld = contract.LevelResultRecovery, recoveryPlan.End, contract.RecoveryEndedByNoData, ""
+		default:
+			// Due on the next round if no real point comes: its source is
+			// probed now, so that round has an answer to end on.
+			if source := request.NoDataEndSource; source != nil &&
+				noDataEndDueV2(request.Record.SourceTime+int64(triggerPlan.StepSeconds), last, triggerPlan, recoveryPlan) {
+				source.DueNext(definition.LevelID, last, noDataSpanV2(triggerPlan, recoveryPlan))
+			}
+		}
+	}
+	if result == "" {
 		if summary.Completeness != HistoryFull {
 			outcome.UnavailableReason = historyReasonV2(summary.Completeness)
 			outcome.HistoryCompleteness = summary.Completeness
@@ -460,7 +630,7 @@ func evaluateLevelV2(
 		Recovery: contract.RecoveryWindowEvidenceV1{
 			Enabled: recoveryPlan.Enabled, RequiredConsecutiveWindows: recoveryPlan.ConsecutiveWindows,
 			ObservedConsecutiveMisses: observedMisses, OldestWindowStart: oldestWindowStart,
-			SkippedWindows: skippedWindows,
+			SkippedWindows: skippedWindows, Withheld: withheld, End: end, EndedBy: endedBy,
 		},
 		HistoryCompleteness: summary.Completeness,
 		WindowEvidence: contract.WindowEvidenceV1{
@@ -473,9 +643,29 @@ func evaluateLevelV2(
 	outcome.DetectEvidence = &detectEvidence
 	levelResult := contract.LevelResultV1{
 		LevelID: definition.LevelID, LevelCode: definition.LevelCode, Priority: definition.Priority, Result: result,
-		DecisionWindow: decisionWindow, DetectEvidence: detectEvidence, LevelTriggerFingerprint: level.Fingerprints().Trigger,
+		DecisionWindow: decisionWindow, DetectEvidence: &detectEvidence, LevelTriggerFingerprint: level.Fingerprints().Trigger,
 	}
 	return outcome, levelResult, nil
+}
+
+// noDataEndDueV2 is whether a series whose last real point is last has had
+// no real point through (R + T + 1) periods at source time now: the recovery
+// windows, the trigger window and one period more.
+func noDataEndDueV2(now, last int64, triggerPlan strategy.TriggerPlan, recoveryPlan strategy.RecoveryPlan) bool {
+	return now-last >= noDataSpanV2(triggerPlan, recoveryPlan)
+}
+
+// noDataSpanV2 is how long a Level waits on no data before it ends, in
+// seconds: (R + T + 1) periods.
+func noDataSpanV2(triggerPlan strategy.TriggerPlan, recoveryPlan strategy.RecoveryPlan) int64 {
+	periods := int64(recoveryPlan.ConsecutiveWindows) + int64(triggerPlan.WindowSize) + 1
+	return periods * int64(triggerPlan.StepSeconds)
+}
+
+// zeroCountV2 says a Level's normalized value is a count of zero.
+func zeroCountV2(value json.RawMessage) bool {
+	number, err := strconv.ParseFloat(string(value), 64)
+	return err == nil && number == 0
 }
 
 func buildDetectEvidenceV2(record DetectionRecord, fact DetectionFact, effectiveStatus string) (contract.DetectEvidenceV1, error) {
@@ -589,6 +779,18 @@ func windowStartV2(endTime int64, windowSize, stepSeconds uint32) (int64, bool) 
 	return endTime - span, true
 }
 
+// pythonRecoveryRangeStartV2 is the oldest source time Python reads for a
+// recovery check at end: min_check_timestamp in recover.py, end less R steps
+// less one window less a second. Clamped at zero, the start of time.
+func pythonRecoveryRangeStartV2(end int64, triggerPlan strategy.TriggerPlan, recoveryPlan strategy.RecoveryPlan) int64 {
+	step := int64(triggerPlan.StepSeconds)
+	span := (int64(recoveryPlan.ConsecutiveWindows)+int64(triggerPlan.WindowSize))*step - 1
+	if span >= end {
+		return 0
+	}
+	return end - span
+}
+
 func multiplyUint32ToInt64(left, right uint32) (int64, bool) {
 	value := uint64(left) * uint64(right)
 	if value > math.MaxInt64 {
@@ -697,6 +899,50 @@ func openAlertGateV2(gate RecoveryGateV2, request EvaluationRequestV2, strategyI
 		gate.OpenAlertGate = OpenAlertGatePassed
 	}
 	return gate
+}
+
+// openLevelResultsV2 is a RECOVERY record's Level results as the envelope
+// carries them: only the RECOVERY of the alert's current Level is kept, as
+// Python recovers an alert only at its own Level; a RECOVERY of any other
+// Level is left out. The current Level is the most severe open one by Level
+// id, the lowest, as the link (its severity table) and Python rank Levels,
+// not by the Plan's detect priority, which a strategy may set against the
+// ids. omitted is the Levels whose RECOVERY was left out, for the
+// decomposition to say so (execution.LevelOutcome.EventOmitted); held is no
+// RECOVERY left, and then omitted is nil: the whole record is held. Where the
+// set does not know the series' open Levels, every result stays, as before it
+// could tell.
+func openLevelResultsV2(request EvaluationRequestV2, strategyID, dedupeMD5 string,
+	results []contract.LevelResultV1) ([]contract.LevelResultV1, []uint32, bool) {
+	set, ok := request.OpenAlerts.(contract.OpenLevelSet)
+	if !ok {
+		return results, nil, false
+	}
+	open, known := set.OpenLevels(request.TenantID, strategyID, dedupeMD5)
+	if !known {
+		return results, nil, false
+	}
+	if len(open) == 0 {
+		return nil, nil, true
+	}
+	current := slices.Min(open)
+	kept := make([]contract.LevelResultV1, 0, len(results))
+	var omitted []uint32
+	recovering := false
+	for _, result := range results {
+		if result.Result == contract.LevelResultRecovery {
+			if result.LevelID != current {
+				omitted = append(omitted, result.LevelID)
+				continue
+			}
+			recovering = true
+		}
+		kept = append(kept, result)
+	}
+	if !recovering {
+		return kept, nil, true
+	}
+	return kept, omitted, false
 }
 
 // oneTimeClose is whether the set answers for the one close of a dropped

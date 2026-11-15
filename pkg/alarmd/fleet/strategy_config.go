@@ -42,11 +42,6 @@ import (
 // the handler needs neither Redis nor the repository type.
 type StrategyObjectLoader func(ctx context.Context, objectDigest string) (controlplane.QueryGroupObject, error)
 
-// MaxStrategyConfigReads bounds the object reads one request may cost. A
-// strategy is one Query Group per (tenant, business) in practice; a request
-// that would read more says so and stops.
-const MaxStrategyConfigReads = 8
-
 // StrategyConfigReadTimeout bounds the whole of a request's reads. The
 // object store answers a point read in milliseconds; a request that takes
 // longer is a store that is not answering, and the reader is told that.
@@ -57,8 +52,7 @@ const StrategyConfigReadTimeout = 2 * time.Second
 const (
 	IncludeConfig = "config"
 
-	ConfigLoaderNotWired    = "LOADER_NOT_WIRED"
-	ConfigReadBoundExceeded = "READ_BOUND_EXCEEDED"
+	ConfigLoaderNotWired = "LOADER_NOT_WIRED"
 	// The three ways a read comes back without an object, told apart
 	// because they are three different people's problems: the store did
 	// not answer (a dependency), the digest the catalog names is not in the
@@ -73,7 +67,7 @@ const (
 )
 
 // ConfigRefusals is the closed list, for the page's wording table.
-var ConfigRefusals = []string{ConfigLoaderNotWired, ConfigReadBoundExceeded, ConfigObjectUnreadable, ConfigObjectMissing, ConfigObjectCorrupt, ConfigPlanNotInObject, ConfigNoObjectDigest}
+var ConfigRefusals = []string{ConfigLoaderNotWired, ConfigObjectUnreadable, ConfigObjectMissing, ConfigObjectCorrupt, ConfigPlanNotInObject, ConfigNoObjectDigest}
 
 // StrategyPlanConfigs is what one Plan reference's include=config carries:
 // the Plans of this strategy inside the object (one per item), or the reason
@@ -88,15 +82,25 @@ type StrategyPlanConfigs struct {
 
 // StrategyPlanConfig is one item's frozen configuration, redacted.
 type StrategyPlanConfig struct {
-	PlanID             string                   `json:"plan_id"`
-	StateGeneration    string                   `json:"state_generation,omitempty"`
-	Schedule           StrategyScheduleConfig   `json:"schedule"`
-	Query              StrategyQueryConfig      `json:"query"`
-	Target             StrategyTargetConfig     `json:"target"`
-	NoData             *StrategyNoDataConfig    `json:"no_data,omitempty"`
-	Levels             []StrategyLevelConfig    `json:"levels"`
-	Requirements       []StrategyRequirementRef `json:"requirements,omitempty"`
-	TerminalReasonCode string                   `json:"terminal_reason_code,omitempty"`
+	PlanID          string                 `json:"plan_id"`
+	StateGeneration string                 `json:"state_generation,omitempty"`
+	Schedule        StrategyScheduleConfig `json:"schedule"`
+	Query           StrategyQueryConfig    `json:"query"`
+	// DataUnit is the unit the Plan's values are compared in, "" for none.
+	DataUnit string `json:"data_unit"`
+	// DataUnitBasis is how that unit was chosen
+	// (controlplane.DataUnitBasis*); RawUnitLevels are the Levels compared
+	// raw, or whose written prefix is ignored, and why.
+	DataUnitBasis      string                          `json:"data_unit_basis"`
+	RawUnitLevels      []controlplane.DataUnitRawLevel `json:"raw_unit_levels,omitempty"`
+	Target             StrategyTargetConfig            `json:"target"`
+	NoData             *StrategyNoDataConfig           `json:"no_data,omitempty"`
+	Levels             []StrategyLevelConfig           `json:"levels"`
+	Requirements       []StrategyRequirementRef        `json:"requirements,omitempty"`
+	TerminalReasonCode string                          `json:"terminal_reason_code,omitempty"`
+	// EffectiveTimeConfigured says the plan carries calendar rules for when it
+	// detects; the rules themselves are not projected.
+	EffectiveTimeConfigured bool `json:"effective_time_configured,omitempty"`
 }
 
 // StrategyScheduleConfig is how often and when the Plan is evaluated.
@@ -236,6 +240,9 @@ type StrategyNoDataConfig struct {
 	// TrackingHorizonSeconds is the effective horizon compilation froze into
 	// the Plan, the platform's or the item's own; zero is none.
 	TrackingHorizonSeconds int64 `json:"tracking_horizon_seconds,omitempty"`
+	// MaxGroups is the item's own bound on its no-data groups, frozen into
+	// the Plan; absent when the item states none and the deployment's applies.
+	MaxGroups uint32 `json:"max_groups,omitempty"`
 }
 
 // StrategyLevelConfig is one level: its definition, how its algorithms
@@ -254,6 +261,11 @@ type StrategyLevelConfig struct {
 	Algorithms []StrategyAlgorithmInfo `json:"algorithms"`
 	Trigger    StrategyTypedPlanConfig `json:"trigger"`
 	Recovery   StrategyTypedPlanConfig `json:"recovery"`
+	// ZeroCountIsNoObservation says a count of zero from the query this
+	// Level's primary reads is no observation - an event count, or a log
+	// count grouped by nothing (execution.ZeroCountIsNoObservation, the word
+	// the evaluator reads) - so a quiet group does not recover on it.
+	ZeroCountIsNoObservation bool `json:"zero_count_is_no_observation,omitempty"`
 }
 
 // StrategyAlgorithmInfo is one algorithm by type and version, with the size
@@ -267,9 +279,10 @@ type StrategyAlgorithmInfo struct {
 // StrategyTypedPlanConfig is a trigger or recovery plan by type and version,
 // with the window counts the compiler defines for the two plan types this
 // build has (N_OF_M: window_size, required_anomalies, step_seconds;
-// CONTINUOUS_TRIGGER_MISS: enabled, consecutive_windows). A key outside them
-// is counted under UnknownKeys and its value dropped, so a reader knows the
-// document had more than the projection shows.
+// CONTINUOUS_TRIGGER_MISS: enabled, consecutive_windows, and the end and
+// missing_data words the owner's status_setter compiles to). A key outside
+// them is counted under UnknownKeys and its value dropped, so a reader knows
+// the document had more than the projection shows.
 type StrategyTypedPlanConfig struct {
 	Type               string  `json:"type,omitempty"`
 	Version            uint32  `json:"version,omitempty"`
@@ -278,7 +291,13 @@ type StrategyTypedPlanConfig struct {
 	StepSeconds        *uint32 `json:"step_seconds,omitempty"`
 	Enabled            *bool   `json:"enabled,omitempty"`
 	ConsecutiveWindows *uint32 `json:"consecutive_windows,omitempty"`
-	UnknownKeys        int     `json:"unknown_keys,omitempty"`
+	// End is contract.RecoveryEndClose for a recovery that ends the alert
+	// closed, empty for one that ends it resolved.
+	End string `json:"end,omitempty"`
+	// MissingData is contract.RecoveryMissingDataEvaluateAsZero for a
+	// recovery that also ends the alert when no data arrives.
+	MissingData string `json:"missing_data,omitempty"`
+	UnknownKeys int    `json:"unknown_keys,omitempty"`
 	// Undecodable says the document was not a JSON object at all.
 	Undecodable bool `json:"undecodable,omitempty"`
 }
@@ -321,15 +340,18 @@ func strategyPlanConfigOf(object controlplane.QueryGroupObject, plan controlplan
 			IntervalSeconds: plan.ScheduleSpec.EvaluationIntervalSeconds, AlignmentSeconds: int64(plan.ScheduleSpec.Alignment),
 			Timezone: plan.ScheduleSpec.Timezone, CompletionOffsetSeconds: plan.ScheduleSpec.CompletionDeadlineOffsetSeconds,
 		},
-		Query:              strategyQueryConfigOf(object.QueryPlan, plan.QueryPlans),
-		Target:             strategyTargetConfigOf(plan.TargetScope, plan.TargetPlan),
-		Levels:             []StrategyLevelConfig{},
-		TerminalReasonCode: plan.TerminalReasonCode,
+		Query:                   strategyQueryConfigOf(object.QueryPlan, plan.QueryPlans),
+		DataUnit:                plan.InputProjection.DataUnit,
+		DataUnitBasis:           controlplane.DataUnitBasisQueryUnit,
+		Target:                  strategyTargetConfigOf(plan.TargetScope, plan.TargetPlan),
+		Levels:                  []StrategyLevelConfig{},
+		TerminalReasonCode:      plan.TerminalReasonCode,
+		EffectiveTimeConfigured: len(plan.EffectiveTimeSnapshot) > 0 && string(plan.EffectiveTimeSnapshot) != "null",
 	}
 	if plan.NoData != nil {
 		config.NoData = &StrategyNoDataConfig{Continuous: plan.NoData.Continuous, Level: plan.NoData.Level,
 			AggDimension:           append([]string(nil), plan.NoData.AggDimension...),
-			TrackingHorizonSeconds: plan.NoData.TrackingHorizonSeconds}
+			TrackingHorizonSeconds: plan.NoData.TrackingHorizonSeconds, MaxGroups: plan.NoData.MaxGroups}
 	}
 	for _, level := range plan.StrategyIR.Levels {
 		entry := StrategyLevelConfig{
@@ -337,6 +359,8 @@ func strategyPlanConfigOf(object controlplane.QueryGroupObject, plan controlplan
 			Connector: level.Connector, Algorithms: []StrategyAlgorithmInfo{},
 			Trigger:  typedPlanConfigOf(level.TriggerPlan),
 			Recovery: typedPlanConfigOf(level.RecoveryPlan),
+			ZeroCountIsNoObservation: model.ZeroCountIsNoObservation(
+				primaryFactsOf(object.QueryPlan, plan, level.Definition.LevelID)),
 		}
 		for _, algorithm := range level.DetectPlan.Algorithms {
 			entry.Algorithms = append(entry.Algorithms, StrategyAlgorithmInfo{Type: algorithm.Type, Version: algorithm.Version, ConfigBytes: len(algorithm.Config)})
@@ -352,6 +376,21 @@ func strategyPlanConfigOf(object controlplane.QueryGroupObject, plan controlplan
 		})
 	}
 	return config
+}
+
+// primaryFactsOf is the query a Level's primary reads, as the controlplane
+// binds it: a template-bound primary reads the Plan's own query by its
+// logical reference, every other primary the object's query.
+func primaryFactsOf(shared model.QueryPlanFacts, plan controlplane.QueryGroupPlanObject, levelID uint32) model.QueryPlanFacts {
+	for _, template := range plan.RequirementTemplates {
+		if template.Role != model.InputRolePrimary || template.ConsumerLevelID != levelID {
+			continue
+		}
+		if facts, ok := plan.QueryPlans[template.LogicalQueryRef]; ok {
+			return facts
+		}
+	}
+	return shared
 }
 
 func typedPlanConfigOf(plan contract.TypedPlanV1) StrategyTypedPlanConfig {
@@ -381,11 +420,26 @@ func typedPlanConfigOf(plan contract.TypedPlanV1) StrategyTypedPlanConfig {
 			} else {
 				config.UnknownKeys++
 			}
+		case "end":
+			config.End = typedPlanWord(raw, contract.RecoveryEndClose, &config.UnknownKeys)
+		case "missing_data":
+			config.MissingData = typedPlanWord(raw, contract.RecoveryMissingDataEvaluateAsZero, &config.UnknownKeys)
 		default:
 			config.UnknownKeys++
 		}
 	}
 	return config
+}
+
+// typedPlanWord reads a key whose one value the compiler writes is word; any
+// other value is counted as unknown instead.
+func typedPlanWord(raw json.RawMessage, word string, unknown *int) string {
+	var value string
+	if json.Unmarshal(raw, &value) != nil || value != word {
+		*unknown++
+		return ""
+	}
+	return value
 }
 
 // typedPlanCount reads one window count; a value that is not a whole
@@ -498,7 +552,14 @@ func strategyTargetConfigOf(scope *contract.TargetScopeV2, plan *contract.Target
 func attachStrategyConfigs(ctx context.Context, standing *StrategyStanding, loader StrategyObjectLoader) {
 	ctx, cancel := context.WithTimeout(ctx, StrategyConfigReadTimeout)
 	defer cancel()
-	reads := 0
+	// Every Plan is read: a count would leave a strategy with many Plans
+	// unread for being large, while what bounds a request is its time and
+	// the response it fits in. Plans in one object read it once.
+	type loaded struct {
+		object controlplane.QueryGroupObject
+		err    error
+	}
+	objects := map[string]loaded{}
 	for index := range standing.Plans {
 		plan := &standing.Plans[index]
 		configs := StrategyPlanConfigs{Redacted: true}
@@ -507,24 +568,45 @@ func attachStrategyConfigs(ctx context.Context, standing *StrategyStanding, load
 			configs.Refusal = ConfigLoaderNotWired
 		case plan.ObjectDigest == "":
 			configs.Refusal = ConfigNoObjectDigest
-		case reads >= MaxStrategyConfigReads:
-			configs.Refusal = ConfigReadBoundExceeded
 		default:
-			reads++
-			object, err := loader(ctx, plan.ObjectDigest)
-			if err != nil {
-				configs.Refusal = configReadRefusal(err)
-				if errors.Is(err, context.DeadlineExceeded) {
+			read, seen := objects[plan.ObjectDigest]
+			if !seen {
+				read.object, read.err = loader(ctx, plan.ObjectDigest)
+				objects[plan.ObjectDigest] = read
+				if errors.Is(read.err, context.DeadlineExceeded) {
 					// The deadline is the request's: every Plan after this
 					// one would wait on the same store, so they are told the
 					// same thing without being tried.
 					cancel()
 				}
+			}
+			if read.err != nil {
+				configs.Refusal = configReadRefusal(read.err)
 			} else {
-				configs = StrategyPlanConfigsOf(object, standing.StrategyID, plan.Business)
+				configs = StrategyPlanConfigsOf(read.object, standing.StrategyID, plan.Business)
+				withDataUnitFacts(&configs, plan.DataUnitFacts)
 			}
 		}
 		plan.Config = &configs
+	}
+}
+
+// withDataUnitFacts sets how the Plan's values are compared from the facts
+// its publication froze, which the object a Worker runs does not carry.
+// Without facts the Plan compares in its one query's unit (the default
+// strategyPlanConfigOf sets). One ref's facts are written onto every item
+// the object holds for the strategy and business: those items are the
+// pieces of one compiled item (a strategy with more than one item is
+// refused, UNSUPPORTED_MULTI_ITEM_STRATEGY, and PlanID is the strategy's
+// id), so their facts are equal. Supporting more than one item breaks this:
+// the facts then have to go per Plan.
+func withDataUnitFacts(configs *StrategyPlanConfigs, facts *controlplane.DataUnitFacts) {
+	if facts == nil {
+		return
+	}
+	for index := range configs.Items {
+		configs.Items[index].DataUnitBasis = facts.Basis
+		configs.Items[index].RawUnitLevels = append([]controlplane.DataUnitRawLevel(nil), facts.RawLevels...)
 	}
 }
 

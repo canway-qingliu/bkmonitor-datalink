@@ -74,8 +74,8 @@ func TestProductionPhaseTwoBundleReRunsChunkedSlotIdempotently(t *testing.T) {
 		if index > 0 {
 			body.WriteByte(',')
 		}
-		fmt.Fprintf(&body, `{"name":"_result0","columns":["_time","_result"],"types":["int64","float64"],"group_keys":["host"],"group_values":["10.0.%d.%d"],"values":[[%d,95]]}`,
-			index/256, index%256, (base-1)*1000)
+		fmt.Fprintf(&body, `{"name":"_result0","columns":["_time","_result"],"types":["int64","float64"],"group_keys":["host"],"group_values":["host-%05d"],"values":[[%d,95]]}`,
+			index, (base-1)*1000)
 	}
 	body.WriteString(`],"status":null,"trace_id":"c2-chunked-apply","is_partial":false,"result_table_id":["system.cpu"]}`)
 	response := body.Bytes()
@@ -246,10 +246,7 @@ func TestProductionPhaseTwoBundleReRunsChunkedSlotIdempotently(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stateStore, err := state.NewExecutionStore(state.ExecutionStoreOptions{
-		Prefix: cfg.Redis.StatePrefix, Router: router, MaxValueBytes: cfg.Limits.Codec.MaxEncodedBytes,
-		MaxItemsPerCall: cfg.Limits.Store.MaxKeysPerBatch, MinTTL: cfg.Redis.MinTTL.Duration(), MaxTTL: cfg.Redis.MaxTTL.Duration(), RestartMargin: cfg.Redis.RestartMargin.Duration(),
-	})
+	stateStore, err := state.NewExecutionStore(executionStoreOptions(cfg, router))
 	if err != nil {
 		t.Fatal(err)
 	}

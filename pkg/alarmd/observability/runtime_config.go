@@ -109,12 +109,11 @@ type RuntimeRetentionFacts struct {
 }
 
 // RuntimeLinkdFacts is what the alert link's configuration switches on: the
-// Console configured or not, the event source and hook the link's target is
-// narrowed to. With the Console configured, the closes of alerts of
-// strategies that no longer exist and of targets that left a strategy's
-// scope send. No address, username or password.
+// link's control plane named with its secret or not. With it, the recovery
+// gate's copy is refreshed and every close is sent; without it neither. No
+// address or secret.
 type RuntimeLinkdFacts struct {
-	ConsoleConfigured bool `json:"console_configured"`
+	ControlPlaneConfigured bool `json:"control_plane_configured"`
 }
 
 type RuntimeStorageFacts struct {
@@ -173,13 +172,17 @@ type RuntimeCapacityFacts struct {
 	ReplayAgeNS               int64  `json:"replay_age_ns"`
 	RetryMinNS                int64  `json:"retry_min_ns"`
 	RetryMaxNS                int64  `json:"retry_max_ns"`
-	SequencerReservations     int    `json:"sequencer_reservations"`
-	Series                    uint64 `json:"series"`
-	RetainedBytes             uint64 `json:"retained_bytes"`
-	StateMutations            uint64 `json:"state_mutations"`
-	Events                    uint64 `json:"events"`
-	GapMutations              uint64 `json:"gap_mutations"`
-	GapFacts                  uint64 `json:"gap_facts"`
+	// TakeoverDivertNS is the least budget a round taken over before its
+	// deadline needs to run as normal when its group has no reading of its
+	// own query (scheduler.RecoveryLimits.TakeoverDivertFloor).
+	TakeoverDivertNS      int64  `json:"takeover_divert_ns"`
+	SequencerReservations int    `json:"sequencer_reservations"`
+	Series                uint64 `json:"series"`
+	RetainedBytes         uint64 `json:"retained_bytes"`
+	StateMutations        uint64 `json:"state_mutations"`
+	Events                uint64 `json:"events"`
+	GapMutations          uint64 `json:"gap_mutations"`
+	GapFacts              uint64 `json:"gap_facts"`
 	// SlotStateMutations and SlotGapMutations are the derived per-Slot caps:
 	// the smaller of the process budget and what StateApplyChunks Store calls
 	// of StoreMaxItems can carry. A Slot above its cap completes UNAVAILABLE.
@@ -208,7 +211,6 @@ type RuntimeCapacityFacts struct {
 	EvaluatorMaxLevels uint64 `json:"evaluator_max_levels"`
 	EvidenceBytes      int    `json:"evidence_bytes"`
 	OutputMessageBytes int    `json:"output_message_bytes"`
-	UQBodyBytes        int64  `json:"uq_body_bytes"`
 	UQSeriesBytes      int64  `json:"uq_series_bytes"`
 	UQSeries           uint64 `json:"uq_series"`
 	UQRecords          uint64 `json:"uq_records"`

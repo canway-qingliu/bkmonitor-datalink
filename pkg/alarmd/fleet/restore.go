@@ -129,9 +129,22 @@ type RestoredRound struct {
 // count of groups at rest, or every series outside the monitoring target,
 // and the content the round ran under.
 type RestoredEmptyRound struct {
-	Quiet           bool   `json:"quiet,omitempty"`
-	EmptiedByTarget bool   `json:"emptied_by_target,omitempty"`
-	ContentScope    string `json:"content_scope,omitempty"`
+	Quiet           bool `json:"quiet,omitempty"`
+	EmptiedByTarget bool `json:"emptied_by_target,omitempty"`
+	// Unfilled is the round's word that its empty answer was a grouped log
+	// count, not zero-filled (KindLogCountEmpty).
+	Unfilled     bool   `json:"unfilled,omitempty"`
+	ContentScope string `json:"content_scope,omitempty"`
+	// IdentityRounds is how many rounds in a row ended empty because the
+	// target's identity could read none of the data, this one included.
+	IdentityRounds int `json:"identity_rounds,omitempty"`
+	// Filtered is the round's word that it was filtered empty with its
+	// unfiltered witness answering data (KindFilteredEmpty); the witness
+	// counts are the run's rounds its witness answered with data and
+	// without, this one included.
+	Filtered             bool   `json:"filtered,omitempty"`
+	WitnessDataRounds    uint32 `json:"witness_data_rounds,omitempty"`
+	WitnessMissingRounds uint32 `json:"witness_missing_rounds,omitempty"`
 }
 
 // Restore seeds one object from what survived the restart. It reports whether
@@ -224,6 +237,10 @@ func (tracker *Tracker) Restore(queryGroup string, restored RestoredState, at ti
 		if round := restored.LastRound; round != nil && round.Empty != nil &&
 			round.Empty.ContentScope != "" && round.Empty.ContentScope == restored.ContentScopeNow {
 			state.quiet, state.emptiedByTarget = round.Empty.Quiet, round.Empty.EmptiedByTarget
+			state.unfilled = round.Empty.Unfilled
+			state.identityRounds = round.Empty.IdentityRounds
+			state.filtered = round.Empty.Filtered
+			state.witnessData, state.witnessMissing = round.Empty.WitnessDataRounds, round.Empty.WitnessMissingRounds
 		}
 	}
 	if round := restored.LastRound; round != nil && healthyCompletion(restored.LastCompletion) && !round.CompletedAt.IsZero() {
@@ -251,6 +268,10 @@ func (tracker *Tracker) Restore(queryGroup string, restored RestoredState, at ti
 		// attribute one nobody recorded.
 		if round := restored.LastRound; round != nil {
 			state.causeReason = round.ReasonCode
+			// The summary never recorded whose the reason was.
+			if state.causeReason != "" {
+				state.causeOrigin = heldCauseOrigin(state.causeReason)
+			}
 			if !round.CompletedAt.IsZero() {
 				// The round said its reason when it was committed: that is
 				// both ends of the reason's clock this process can vouch for.

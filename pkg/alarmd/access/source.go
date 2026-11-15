@@ -4,6 +4,7 @@ package access
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -34,13 +35,25 @@ func queryBudgetOf(schedule execution.ScheduleSpec, reserve time.Duration) time.
 	return time.Duration(schedule.CompletionOffsetSeconds())*time.Second - reserve
 }
 
+// DiscardSliceRead takes back what the lookback captured of a slice's read
+// that completed and was not used: a slice the worker read ahead of the one
+// its Slot was on and let go, to read it again later
+// (lookback.Engine.DiscardSlice).
+func (source *Source) DiscardSliceRead(contract execution.FrozenExecutionContractRef, slice execution.InputSlice) {
+	if source == nil || source.config.Lookback == nil {
+		return
+	}
+	source.config.Lookback.DiscardSlice(contract.Slot.QueryGroup, contract.Slot.EvaluationTime, slice)
+}
+
 // lookbackQuery is a physical query as the lookback sees it before it is
 // sent: its Slot, its frozen spec, the attempt, when it was ready, and the
 // Slot the frozen schedule has next, which the Runner put on ctx.
 func lookbackQuery(ctx context.Context, request execution.QueryExecutionRequest, spec execution.PhysicalQuerySpec,
 	attemptNo uint32, readyAtUnixMilli int64, secondary bool) lookback.Query {
 	return lookback.Query{Contract: request.Contract, Spec: spec, Operation: request.Operation, AttemptNo: attemptNo,
-		ReadyAt: time.UnixMilli(readyAtUnixMilli), FollowingSlot: execution.FollowingSlotOf(ctx), Secondary: secondary}
+		ReadyAt: time.UnixMilli(readyAtUnixMilli), FollowingSlot: execution.FollowingSlotOf(ctx), Secondary: secondary,
+		Slice: request.Slice}
 }
 
 // slotFirstRead is the index in queries of the Slot's first read: the query
@@ -69,9 +82,61 @@ func slotFirstRead(queries []PlannedQuery) int {
 	return first
 }
 
-type ReadinessDeferredError struct{ readyAt time.Time }
+// ReadinessDeferredError is a Slot turned away as not ready: when it comes
+// back, and what that time was decided on (ReadinessDeferral).
+type ReadinessDeferredError struct {
+	readyAt time.Time
+	facts   observability.ReadinessDeferralFacts
+}
 
 func (err *ReadinessDeferredError) Error() string { return "alarmd access: execution is not ready" }
+
+// ReadinessDeferral is what the Slot waits for: the query whose readiness set
+// readyAt, the requirement it serves, and the basis of that time.
+func (err *ReadinessDeferredError) ReadinessDeferral() *observability.ReadinessDeferralFacts {
+	if err == nil {
+		return nil
+	}
+	facts := err.facts
+	return &facts
+}
+
+// ReadinessDeferralOf is the readiness detail err carries; nil when it
+// carries none.
+func ReadinessDeferralOf(err error) *observability.ReadinessDeferralFacts {
+	var deferred interface {
+		ReadinessDeferral() *observability.ReadinessDeferralFacts
+	}
+	if !errors.As(err, &deferred) {
+		return nil
+	}
+	return deferred.ReadinessDeferral()
+}
+
+// readinessDeferral names the query at index and its readiness basis for a
+// Slot coming back at readyAt.
+func readinessDeferral(queries []PlannedQuery, index int, readyAt time.Time, readHoldMillis int64) observability.ReadinessDeferralFacts {
+	facts := observability.ReadinessDeferralFacts{ReadyAtUnixMilli: readyAt.UnixMilli(), Basis: observability.ReadinessBasisSettleWait}
+	if readHoldMillis > 0 {
+		facts.Basis, facts.ReadHoldMillis = observability.ReadinessBasisReadHold, readHoldMillis
+	}
+	if index < 0 || index >= len(queries) {
+		return facts
+	}
+	query := queries[index]
+	facts.PhysicalQuery = string(query.Spec.Digest)
+	// The primary requirement when the query serves one, else its first:
+	// the name a strategy's data reads by.
+	for _, requirement := range query.Requirements {
+		if facts.Requirement == "" || requirement.Role == execution.InputRolePrimary {
+			facts.Requirement = string(requirement.RequirementID)
+			if requirement.Role == execution.InputRolePrimary {
+				break
+			}
+		}
+	}
+	return facts
+}
 
 func (err *ReadinessDeferredError) ReadinessReadyAt() time.Time {
 	if err == nil {
@@ -141,9 +206,18 @@ type Config struct {
 	// downstream is overloaded or unreachable (DistressClasses), with whether
 	// the query had queued for its permit. Optional.
 	ObserveDownstreamDistress func(class string, contended bool)
-	// ScopeDrops receives the series the target filters turned away, for
-	// the target-scope close; see ScopeDropSink. Optional.
-	ScopeDrops ScopeDropSink
+	// ObserveQuery hears every physical query this Source runs -- each
+	// attempt, retries included -- with the time its provider took and how
+	// it failed (QueryFailures), "" when it answered. Diagnostic reads do
+	// not go through a Source and are not heard.
+	ObserveQuery func(elapsed time.Duration, failure string)
+	// ObserveQueryAnswer hears the same queries with what came back and how
+	// each ended (queryAnswerOf), for the per-query histograms. Optional.
+	ObserveQueryAnswer func(observability.PhysicalQueryAnswer)
+	// Superseded receives the old fingerprints of admitted series whose
+	// alert identity moved, for the superseded-identity close; see
+	// SupersededSink. Optional.
+	Superseded SupersededSink
 	// ObserveSeriesPulled counts what this process actually read: one call per
 	// series handed into the pipeline, carrying the datapoints it held. It is
 	// the load figure the per-Slot ceilings have to be read against -- a limit
@@ -155,6 +229,10 @@ type Config struct {
 	// compare later reads of the same window with; see package lookback. It
 	// sees the query and hands nothing back into the pipeline. Optional.
 	Lookback *lookback.Engine
+	// LiveReserve is this runtime's measured post-query tail, which sizes the
+	// deadline its queries run under (execution.LiveReserve); nil runs every
+	// query under the plan's frozen reserve.
+	LiveReserve *execution.LiveReserve
 }
 
 type Source struct {
@@ -190,6 +268,9 @@ func (source *Source) Execute(ctx context.Context, request execution.QueryExecut
 		return execution.QueryExecutionCompletion{}, err
 	}
 	if request.Operation == execution.OperationSupplement {
+		if !request.Slice.IsZero() {
+			return execution.QueryExecutionCompletion{}, &execution.InputSliceUnsupportedError{Reason: execution.InputSliceReasonSupplement}
+		}
 		return source.executeSupplement(ctx, request, consumer)
 	}
 	// Read once, before anything this call does can take time. It is what "how
@@ -207,11 +288,22 @@ func (source *Source) Execute(ctx context.Context, request execution.QueryExecut
 	if err != nil {
 		return execution.QueryExecutionCompletion{}, fmt.Errorf("alarmd access: resolve frozen plan: %w", err)
 	}
-	prepared, err := prepare(request.Contract, frozen, source.config.MinReadyDelay, request.Operation != execution.OperationNormal)
+	prepared, err := prepare(request.Contract, frozen, source.config.MinReadyDelay, request.Operation != execution.OperationNormal, source.config.LiveReserve)
 	if err != nil {
 		return execution.QueryExecutionCompletion{}, err
 	}
-	recoveryDeadline, budgetErr := deriveRecoveryQueryDeadline(request, frozen, recoveryStartedAt)
+	// A slice is read of every physical query of the Slot or of none: one
+	// query it cannot go into would deliver the whole Query Group beside the
+	// others' slice, so the Slot is refused before anything is sent.
+	if err := checkInputSlice(request.Slice, prepared.Queries); err != nil {
+		return execution.QueryExecutionCompletion{}, err
+	}
+	// A slice's read takes part in the lookback as itself: its sample, its
+	// directed and early rereads and its kept read are of the slice
+	// (lookback.Query.Slice), and a slice let go past its limit is discarded
+	// from it (lookback.Read.Discard).
+	lookbackEngine := source.config.Lookback
+	recoveryDeadline, budgetErr := deriveRecoveryQueryDeadline(request, frozen, recoveryStartedAt, source.config.LiveReserve)
 	source.observeQueryTiming(ctx, request, frozen, prepared, recoveryStartedAt, recoveryDeadline)
 	// The deadline this recovery runs under, from here on: its channel wait
 	// and its queries are bounded by it, not by the frozen Slot's first
@@ -224,14 +316,19 @@ func (source *Source) Execute(ctx context.Context, request execution.QueryExecut
 		return completeBudgetExhaustedQueries(execution.QueryExecutionCompletion{}, prepared.Queries, request.AttemptNo), nil
 	}
 	firstRead := slotFirstRead(prepared.Queries)
-	if request.Operation == execution.OperationNormal && source.config.Lookback != nil {
+	// While the Query Group's queries are failing the lookback reserves no
+	// earlier-read trial, one more read of the same backend, and counts why.
+	if request.Operation == execution.OperationNormal && lookbackEngine != nil {
+		failing := execution.BackendFailing(ctx)
 		for index, query := range prepared.Queries {
-			source.config.Lookback.Prepare(lookbackQuery(ctx, request, query.Spec, request.AttemptNo, query.ReadyAtUnixMilli,
-				index != firstRead))
+			seen := lookbackQuery(ctx, request, query.Spec, request.AttemptNo, query.ReadyAtUnixMilli, index != firstRead)
+			seen.BackendFailing = failing
+			lookbackEngine.Prepare(seen)
 		}
 	}
-	if readyAt := slotPendingReadiness(prepared.Queries, request.Contract.ReadHoldMillis, source.now()); !readyAt.IsZero() {
-		return execution.QueryExecutionCompletion{}, &ReadinessDeferredError{readyAt: readyAt}
+	if readyAt, pending := slotPendingReadinessOf(prepared.Queries, request.Contract.ReadHoldMillis, source.now()); !readyAt.IsZero() {
+		return execution.QueryExecutionCompletion{}, &ReadinessDeferredError{readyAt: readyAt,
+			facts: readinessDeferral(prepared.Queries, pending, readyAt, request.Contract.ReadHoldMillis)}
 	}
 	// Past the turn-away, so this arrival is one that goes on to do the work.
 	// Deferred arrivals are already counted as deferrals; recording them here
@@ -255,7 +352,7 @@ func (source *Source) Execute(ctx context.Context, request execution.QueryExecut
 				if err != nil {
 					return execution.QueryExecutionCompletion{}, err
 				}
-				prepared, err = prepare(request.Contract, frozen, source.config.MinReadyDelay, true)
+				prepared, err = prepare(request.Contract, frozen, source.config.MinReadyDelay, true, source.config.LiveReserve)
 				if err != nil {
 					return execution.QueryExecutionCompletion{}, err
 				}
@@ -273,7 +370,7 @@ func (source *Source) Execute(ctx context.Context, request execution.QueryExecut
 			if err != nil {
 				return execution.QueryExecutionCompletion{}, err
 			}
-			prepared, err = prepare(request.Contract, frozen, source.config.MinReadyDelay, true)
+			prepared, err = prepare(request.Contract, frozen, source.config.MinReadyDelay, true, source.config.LiveReserve)
 			if err != nil {
 				return execution.QueryExecutionCompletion{}, err
 			}
@@ -294,7 +391,7 @@ func (source *Source) Execute(ctx context.Context, request execution.QueryExecut
 	// one of them would otherwise repeat the same lookup.
 	scopes := buildPlanScopes(prepared.Header.DuePlans, consumer.ResolvedTargets(), consumer.ResolvedScopeGroups())
 	var outputs planOutputs
-	if source.config.ScopeDrops != nil {
+	if source.config.Superseded != nil {
 		outputs = buildPlanOutputs(prepared.Header.DuePlans, prepared.Queries)
 	}
 	// Only one permit acquisition per Source is pending at a time. Queries
@@ -302,11 +399,11 @@ func (source *Source) Execute(ctx context.Context, request execution.QueryExecut
 	queryCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var running sync.WaitGroup
-	// The adapters are kept so that the target rejections of the whole
-	// attempt are handed over once, after every query has ended.
-	adapters := make([]*seriesAdapter, len(prepared.Queries))
 	var queryFailure sync.Once
 	var firstQueryErr error
+	// firstQueryDeadline is the deadline the first failed query ran under,
+	// read with its error once every query has returned.
+	var firstQueryDeadline int64
 	consumer = &serializedQueryConsumer{QueryExecutionConsumer: consumer}
 	results := make([]physicalQueryResult, len(prepared.Queries))
 	pending := make([]int, len(prepared.Queries))
@@ -344,9 +441,23 @@ func (source *Source) Execute(ctx context.Context, request execution.QueryExecut
 			}
 		}
 		queryDeadline := time.UnixMilli(query.DeadlineUnixMilli)
+		fellBack := false
+		if now := source.now(); !queryDeadline.After(now) && query.FrozenDeadlineUnixMilli > now.UnixMilli() {
+			// The live reserve left this query no time; the frozen one still
+			// does. Run it under the frozen reserve rather than fail it now.
+			queryDeadline = time.UnixMilli(query.FrozenDeadlineUnixMilli)
+			source.config.LiveReserve.CountFallback(request.Contract.Slot.QueryGroup, now)
+			fellBack = true
+		}
+		planned := plannedQueryFacts(query, fellBack)
 		// Where the budget ending at that deadline began: a recovery's is
 		// counted from its arrival, a normal query's from its Slot.
 		budgetStart := int64(request.Contract.Slot.EvaluationTime) * 1000
+		if request.Operation == execution.OperationNormal && query.CompletionDeadlineUnixMilli > 0 {
+			// A normal Slot is due by its consumers' completion deadline; a
+			// recovery runs under the budget it derives from its arrival.
+			execution.MarkCompletionDeadline(queryCtx, time.UnixMilli(query.CompletionDeadlineUnixMilli))
+		}
 		if !recoveryDeadline.IsZero() {
 			queryDeadline = recoveryDeadline
 			budgetStart = recoveryStartedAt.UnixMilli()
@@ -373,21 +484,25 @@ func (source *Source) Execute(ctx context.Context, request execution.QueryExecut
 		}
 		attempt := execution.QueryAttempt{Spec: query.Spec, Slot: request.Contract.Slot, Operation: request.Operation,
 			AttemptNo: request.AttemptNo, DeadlineUnixMilli: queryDeadline.UnixMilli(), RecoveryPermit: permit.RecoveryPermit(),
-			BudgetStartUnixMilli: budgetStart, ReadyAtUnixMilli: query.ReadyAtUnixMilli}
+			BudgetStartUnixMilli: budgetStart, ReadyAtUnixMilli: query.ReadyAtUnixMilli,
+			Strategies: queryStrategies(query), Slice: request.Slice}
 		if err := attempt.Validate(); err != nil {
 			permit.Release()
 			dispatchErr = err
 			break
 		}
-		kept := source.config.Lookback.Begin(lookbackQuery(ctx, request, query.Spec, attempt.AttemptNo, query.ReadyAtUnixMilli,
+		kept := lookbackEngine.Begin(lookbackQuery(ctx, request, query.Spec, attempt.AttemptNo, query.ReadyAtUnixMilli,
 			queryIndex != firstRead))
 		// Each query raises the execution's deadline to its own as it
 		// starts, so a later query is judged by its deadline and not by an
 		// earlier one's that has passed.
 		execution.ExtendDeadline(ctx, queryDeadline, source.now())
 		// What the query has from its send to its deadline, read here on the
-		// dispatch loop just before it is sent.
-		budgetMillis := attempt.DeadlineUnixMilli - source.now().UnixMilli()
+		// dispatch loop just before it is sent; and when it was sent, for a
+		// lost round's line.
+		sentAt := source.now()
+		budgetMillis := attempt.DeadlineUnixMilli - sentAt.UnixMilli()
+		observability.BudgetCaptureFromContext(ctx).MarkStarted(sentAt)
 		sent++
 		running.Add(1)
 		go func(index int, query PlannedQuery, attempt execution.QueryAttempt, permit QueryPermit) {
@@ -395,10 +510,18 @@ func (source *Source) Execute(ctx context.Context, request execution.QueryExecut
 			adapter := &seriesAdapter{consumer: consumer, query: query, attemptNo: attempt.AttemptNo,
 				admission: source.config.Admission, observe: source.config.ObserveAdmission,
 				hostPlacement: source.config.ObserveHostPlacement, queryGroup: request.Contract.Slot.QueryGroup, pulled: source.config.ObserveSeriesPulled, scopes: scopes,
-				scopeSink: source.config.ScopeDrops, outputs: outputs, round: int64(request.Contract.Slot.EvaluationTime),
+				supersededSink: source.config.Superseded, outputs: outputs, round: int64(request.Contract.Slot.EvaluationTime),
 				lookback: kept}
-			adapters[index] = adapter
+			primeQueryTenants(queryCtx, source.config.Admission, query)
 			completion, err := source.executeWithPermit(queryCtx, attempt, adapter, permit)
+			// A failed physical query says which input it was and the
+			// deadlines it was planned under, its own rather than the
+			// round's binding consumer's.
+			annotatePlanned(&completion, planned)
+			if err != nil {
+				err = &plannedQueryError{err: err, planned: planned}
+			}
+			recordFailedQuery(ctx, completion, err, planned)
 			// The time it took is the provider's own measure, from its
 			// request to its answer or failure; this goroutine reads no
 			// clock of the Source's, which the dispatch loop owns.
@@ -410,15 +533,21 @@ func (source *Source) Execute(ctx context.Context, request execution.QueryExecut
 				err = errors.New("alarmd access: G1 provider returned an untrusted completion")
 			}
 			// The provider's own completion: a first read is kept as the
-			// provider delivered it, and a recheck is compared with that.
-			kept.Complete(completion, err)
+			// provider delivered it, and a recheck is compared with that. A
+			// slice let go past its limit is no read: its children are read
+			// in its place, and what was captured of it is taken back.
+			if errors.Is(err, execution.ErrSliceOverflow) {
+				kept.Discard()
+			} else {
+				kept.Complete(completion, err)
+			}
 			if err == nil {
 				completion = adapter.reconcileCompletion(completion)
 			}
 			results[index].completion = completion
 			if err != nil {
 				queryFailure.Do(func() {
-					firstQueryErr = err
+					firstQueryErr, firstQueryDeadline = err, attempt.DeadlineUnixMilli
 					cancel()
 				})
 			}
@@ -428,9 +557,8 @@ func (source *Source) Execute(ctx context.Context, request execution.QueryExecut
 		cancel()
 	}
 	running.Wait()
-	flushScopeDrops(source.config.ScopeDrops, adapters, request.Contract.Slot, outputs)
 	if firstQueryErr != nil {
-		return execution.QueryExecutionCompletion{}, firstQueryErr
+		return execution.QueryExecutionCompletion{}, endedByDeadline(firstQueryErr, firstQueryDeadline, source.now())
 	}
 	if dispatchErr != nil {
 		return execution.QueryExecutionCompletion{}, dispatchErr
@@ -468,7 +596,8 @@ func appendQueryCompletion(
 		DataState: providerCompletion.DataState, Delivery: providerCompletion.Delivery,
 		RouteFacts: providerCompletion.RouteFacts, PartialEvidence: providerCompletion.PartialEvidence,
 		Stats: providerCompletion.Stats, Withheld: providerCompletion.Withheld, WithheldOutsideTarget: providerCompletion.WithheldOutsideTarget,
-		Range: queryRange(query),
+		WithheldKeyMissing: providerCompletion.WithheldKeyMissing, IdentitySamples: providerCompletion.IdentitySamples,
+		Range: queryRange(query), NamedOutputs: providerCompletion.NamedOutputs,
 	})
 	// Every valid requirement receives a completion binding, also when the
 	// query delivered series. A Plan whose PRIMARY query returned no series
@@ -517,6 +646,42 @@ func (e *queryPermitDeadlineError) Error() string { return e.err.Error() }
 func (e *queryPermitDeadlineError) Unwrap() error { return e.err }
 func (e *queryPermitDeadlineError) QueryFailure() (string, string) {
 	return observability.QueryFailureCategoryAdmission, "QUERY_PERMIT_DEADLINE"
+}
+
+// queryDeadlineError names a query that ended because its own deadline
+// passed: its request cancelled when the round gave up at that deadline, or
+// its context expired at it. The provider never failed - the query's time
+// ran out - so it is the query's timeout, the word the same deadline met
+// before the request was sent completes with, and not an internal error.
+type queryDeadlineError struct{ err error }
+
+func (e *queryDeadlineError) Error() string { return e.err.Error() }
+func (e *queryDeadlineError) Unwrap() error { return e.err }
+func (e *queryDeadlineError) QueryFailure() (string, string) {
+	return observability.QueryFailureCategoryProviderTransport, contract.ReasonQueryTimeout
+}
+
+// QueryFailureTimeoutSource names this branch on the request facts the
+// wrapped error carries.
+func (e *queryDeadlineError) QueryFailureTimeoutSource() string {
+	return observability.QueryTimeoutSourceRoundDeadline
+}
+
+// endedByDeadline is err named as the query's timeout when it is a bare
+// cancellation or expiry and the query's own deadline had passed by now. A
+// cancellation before that deadline - the process stopping, the Query
+// Group's lease lost, another query of the round failing first - is not a
+// timeout and keeps its error, and an error that already names its cause
+// keeps that name.
+func endedByDeadline(err error, deadlineUnixMilli int64, now time.Time) error {
+	var declared interface{ QueryFailure() (string, string) }
+	if err == nil || errors.As(err, &declared) || (!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)) {
+		return err
+	}
+	if deadlineUnixMilli <= 0 || now.UnixMilli() < deadlineUnixMilli {
+		return err
+	}
+	return &queryDeadlineError{err: err}
 }
 
 // prepared queries already have stable deadline ordering. Select the first
@@ -624,6 +789,7 @@ func deriveRecoveryQueryDeadline(
 	request execution.QueryExecutionRequest,
 	frozen FrozenPlan,
 	startedAt time.Time,
+	live *execution.LiveReserve,
 ) (time.Time, error) {
 	if request.Operation == execution.OperationNormal {
 		return time.Time{}, nil
@@ -644,7 +810,10 @@ func deriveRecoveryQueryDeadline(
 				return time.Time{}, errors.New("alarmd access: frozen consumer schedule unavailable")
 			}
 			intervalMillis := spec.EvaluationIntervalSeconds * 1000
-			candidate := intervalMillis - consumer.DownstreamExecutionReserveMilliSec
+			candidate, fellBack := live.QueryBudgetMilli(consumer, request.Contract.Slot.QueryGroup, intervalMillis)
+			if fellBack {
+				live.CountFallback(request.Contract.Slot.QueryGroup, startedAt)
+			}
 			if intervalMillis <= 0 || consumer.DownstreamExecutionReserveMilliSec <= 0 || candidate <= 0 {
 				return time.Time{}, errors.New("alarmd access: recovery query budget is invalid")
 			}
@@ -667,7 +836,20 @@ func (source *Source) executeWithPermit(
 ) (execution.ProviderCompletion, error) {
 	defer permit.Release()
 	observability.EmitTargetFlow(ctx, "runner_decision", observability.TraceFields{}, observability.TargetFlowFacts{Decision: "query_running"})
+	called := time.Now()
 	completion, err := source.provider.Execute(ctx, attempt, adapter)
+	// A caller that gave up -- a step-down, a shutdown -- is not a failure of
+	// the query, and an attempt cut short that way has no duration of its
+	// own: it is not heard.
+	if !errors.Is(err, context.Canceled) {
+		elapsed, failure := queryElapsed(completion, err, time.Since(called)), queryFailureOf(completion, err)
+		if source.config.ObserveQuery != nil {
+			source.config.ObserveQuery(elapsed, failure)
+		}
+		if source.config.ObserveQueryAnswer != nil {
+			source.config.ObserveQueryAnswer(queryAnswerOf(completion, err, elapsed, failure))
+		}
+	}
 	if err == nil && source.config.ObserveDownstreamDistress != nil {
 		if class := downstreamDistressOf(completion); class != "" {
 			source.config.ObserveDownstreamDistress(class, permitWaited(permit))
@@ -681,6 +863,19 @@ func (source *Source) executeWithPermit(
 		observability.EmitTargetFlow(ctx, "runner_decision", observability.TraceFields{}, observability.TargetFlowFacts{Decision: "identity_field_null"})
 	}
 	return completion, err
+}
+
+// checkInputSlice is execution.CheckInputSlice over the facts of every
+// physical query the Slot plans, primary and dependency alike.
+func checkInputSlice(slice execution.InputSlice, queries []PlannedQuery) error {
+	if slice.IsZero() {
+		return nil
+	}
+	facts := make([]execution.QueryPlanFacts, 0, len(queries))
+	for _, query := range queries {
+		facts = append(facts, query.Spec.PlanFacts)
+	}
+	return execution.CheckInputSlice(slice, facts...)
 }
 
 func trustedProviderCompletion(digest execution.PhysicalQueryDigest, completion execution.ProviderCompletion) bool {
@@ -720,10 +915,18 @@ type PlannedQuery struct {
 	ReadinessInvalidRequirements []execution.DataRequirement
 	ReadyAtUnixMilli             int64
 	DeadlineUnixMilli            int64
+	// FrozenDeadlineUnixMilli is the deadline under the plan's frozen reserve.
+	// DeadlineUnixMilli is under this worker's live reserve when one is
+	// measured; the frozen one is the fallback when the live one has passed
+	// by the time the query starts.
+	FrozenDeadlineUnixMilli int64
+	// CompletionDeadlineUnixMilli is the earliest completion deadline of the
+	// consumers the query serves: a Slot returning after it overran.
+	CompletionDeadlineUnixMilli int64
 }
 
 func Prepare(contractRef execution.FrozenExecutionContractRef, frozen FrozenPlan, minReadyDelay time.Duration) (PreparedExecution, error) {
-	return prepare(contractRef, frozen, minReadyDelay, false)
+	return prepare(contractRef, frozen, minReadyDelay, false, nil)
 }
 
 // prepare plans one Slot's physical queries.
@@ -740,6 +943,7 @@ func prepare(
 	frozen FrozenPlan,
 	minReadyDelay time.Duration,
 	allowExhaustedRecoveryBudget bool,
+	live *execution.LiveReserve,
 ) (PreparedExecution, error) {
 	if err := contractRef.Validate(); err != nil {
 		return PreparedExecution{}, err
@@ -771,9 +975,12 @@ func prepare(
 		}
 		window := requirement.AbsoluteWindow(contractRef.Slot.EvaluationTime)
 		// The provider is asked from earlier for an event count (its
-		// requirement's lead); only the window is accepted.
+		// requirement's lead); only the window is accepted. A query asked a
+		// step apart is asked for, and accepts, only the buckets that lie
+		// inside the window.
 		spec, err := execution.BuildPhysicalQuerySpec(execution.PhysicalQuerySpec{PlanFacts: facts,
-			LogicalWindow: window, ProviderRange: requirement.ProviderWindow(contractRef.Slot.EvaluationTime), AcceptedRange: window,
+			LogicalWindow: window, ProviderRange: facts.RequestRange(requirement.ProviderWindow(contractRef.Slot.EvaluationTime)),
+			AcceptedRange:   facts.RequestRange(window),
 			RequiredColumns: append([]string(nil), requirement.RequiredColumns...)})
 		if err != nil {
 			return PreparedExecution{}, fmt.Errorf("alarmd access: build physical query: %w", err)
@@ -803,10 +1010,17 @@ func prepare(
 			if err != nil {
 				return PreparedExecution{}, err
 			}
-			candidate := consumer.ConsumerDeadlineUnixMilli - consumer.DownstreamExecutionReserveMilliSec
-			if candidate <= readyAt && !allowExhaustedRecoveryBudget {
+			// Whether the consumer can run at all is decided on the frozen
+			// reserve, as the plan was built: a slow post-query tail on this
+			// worker never takes a consumer out of execution.
+			frozenCandidate := consumer.ConsumerDeadlineUnixMilli - consumer.DownstreamExecutionReserveMilliSec
+			if frozenCandidate <= readyAt && !allowExhaustedRecoveryBudget {
 				invalidRequirement.Consumers = append(invalidRequirement.Consumers, consumer)
 				continue
+			}
+			candidate, fellBack := live.QueryDeadlineUnixMilli(consumer, contractRef.Slot.QueryGroup, readyAt)
+			if fellBack {
+				live.CountFallback(contractRef.Slot.QueryGroup, time.UnixMilli(readyAt))
 			}
 			validRequirement.Consumers = append(validRequirement.Consumers, consumer)
 			if planned.ReadyAtUnixMilli == 0 || readyAt < planned.ReadyAtUnixMilli {
@@ -814,6 +1028,12 @@ func prepare(
 			}
 			if planned.DeadlineUnixMilli == 0 || candidate < planned.DeadlineUnixMilli {
 				planned.DeadlineUnixMilli = candidate
+			}
+			if planned.FrozenDeadlineUnixMilli == 0 || frozenCandidate < planned.FrozenDeadlineUnixMilli {
+				planned.FrozenDeadlineUnixMilli = frozenCandidate
+			}
+			if planned.CompletionDeadlineUnixMilli == 0 || consumer.ConsumerDeadlineUnixMilli < planned.CompletionDeadlineUnixMilli {
+				planned.CompletionDeadlineUnixMilli = consumer.ConsumerDeadlineUnixMilli
 			}
 		}
 		if len(validRequirement.Consumers) != 0 {
@@ -853,7 +1073,7 @@ func prepare(
 	header := execution.InternalExecutionHeader{ExecutionID: executionDigest, Contract: contractRef,
 		DuePlans: append([]execution.DuePlan(nil), frozen.DuePlans...), Requirements: append([]execution.DataRequirement(nil), frozen.Requirements...),
 		EffectiveTimeFacts: append([]execution.BoundEffectiveTimeFact(nil), frozen.EffectiveTimeFacts...), RequiredPhysicalQueries: refs,
-		DeadlineUnixMilli: deadline}
+		DeadlineUnixMilli: deadline, QueryFacts: frozen.QueryFacts}
 	if err := header.Validate(contractRef); err != nil {
 		return PreparedExecution{}, err
 	}
@@ -915,7 +1135,7 @@ func frozenSchedules(frozen FrozenPlan) (map[execution.PlanIdentity]execution.Sc
 	return schedules, nil
 }
 
-// slotPendingReadiness is when a Slot that is not ready comes back, instead
+// slotPendingReadinessOf is when a Slot that is not ready comes back, instead
 // of waiting inside its execution. A Slot carrying a read hold comes back
 // when the last of its queries is ready, whenever any is still pending: it
 // waits in the due index, as its held readiness is its due time there, and
@@ -924,41 +1144,47 @@ func frozenSchedules(frozen FrozenPlan) (map[execution.PlanIdentity]execution.Sc
 // same and no less complete. A Slot without a hold keeps the shared rule:
 // deferred only when every query waits for the same moment, otherwise the
 // settling wait for the earliest is spent inside the execution.
-func slotPendingReadiness(queries []PlannedQuery, readHoldMillis int64, now time.Time) time.Time {
+//
+// With the time comes the index of the query whose readiness decided it:
+// the latest pending one under a read hold, the first of the shared moment
+// without; -1 with a zero time.
+func slotPendingReadinessOf(queries []PlannedQuery, readHoldMillis int64, now time.Time) (time.Time, int) {
 	if readHoldMillis <= 0 {
-		return sharedPendingReadiness(queries, now)
+		return sharedPendingReadinessOf(queries, now)
 	}
 	var latest time.Time
-	for _, query := range queries {
+	index := -1
+	for position, query := range queries {
 		if len(query.Requirements) == 0 {
 			continue
 		}
 		if readyAt := time.UnixMilli(query.ReadyAtUnixMilli); readyAt.After(now) && readyAt.After(latest) {
-			latest = readyAt
+			latest, index = readyAt, position
 		}
 	}
-	return latest
+	return latest, index
 }
 
-func sharedPendingReadiness(queries []PlannedQuery, now time.Time) time.Time {
+func sharedPendingReadinessOf(queries []PlannedQuery, now time.Time) (time.Time, int) {
 	var shared time.Time
-	for _, query := range queries {
+	index := -1
+	for position, query := range queries {
 		if len(query.Requirements) == 0 {
 			continue
 		}
 		readyAt := time.UnixMilli(query.ReadyAtUnixMilli)
 		if !readyAt.After(now) {
-			return time.Time{}
+			return time.Time{}, -1
 		}
 		if shared.IsZero() {
-			shared = readyAt
+			shared, index = readyAt, position
 			continue
 		}
 		if !shared.Equal(readyAt) {
-			return time.Time{}
+			return time.Time{}, -1
 		}
 	}
-	return shared
+	return shared, index
 }
 
 func frozenRequirementReadyAt(
@@ -992,15 +1218,13 @@ type seriesAdapter struct {
 	// pulled counts the series this query actually handed on. Optional.
 	pulled func(records uint64)
 	scopes planScopes
-	// scopeSink, outputs and round serve the target-scope close; see
-	// ScopeDropSink. scopeScreens and scopeTallies are this query's own
-	// memory of it: one Screen per Plan, and the bulk counts handed over
-	// when the query ends. Empty when nothing listens.
-	scopeSink    ScopeDropSink
-	outputs      planOutputs
-	round        int64
-	scopeScreens map[execution.PlanIdentity]string
-	scopeTallies map[scopeTallyKey]int
+	// supersededSink, outputs and round serve the superseded-identity
+	// close; see SupersededSink. supersededScreens is this query's own
+	// memory of it: one Screen per Plan. Empty when nothing listens.
+	supersededSink    SupersededSink
+	outputs           planOutputs
+	round             int64
+	supersededScreens map[execution.PlanIdentity]bool
 	// lookback is this query's first read as the lookback sees it: its bytes
 	// counted, and a summary kept when it was taken as its Query Group's
 	// sample; nil for a query that is not a formal first read.
@@ -1020,16 +1244,35 @@ type seriesAdapter struct {
 	// outside its monitoring target on facts that were all there: data that
 	// exists and that the target did not select.
 	withheldOutside uint64
+	// withheldKeyMissing counts the withheld series every Plan refused
+	// because its key could not be built, and identitySamples keeps a few
+	// of them by their identity fields.
+	withheldKeyMissing uint64
+	identitySamples    []execution.IdentitySample
 }
 
 func (adapter *seriesAdapter) ConsumeProviderSeries(ctx context.Context, batch execution.ProviderSeriesBatch) error {
 	if batch.PhysicalQuery != adapter.query.Spec.Digest || batch.CompletionRef == "" || batch.Dataset == nil || batch.Dataset.Len() == 0 {
 		return errors.New("alarmd access: provider delivered an invalid series")
 	}
-	admitted, outside := adapter.admittedPlans(batch)
+	admitted, outside, keyMissing, overlays, unreadable := adapter.admittedPlans(batch)
+	if unreadable {
+		// A host-placed series whose alert identity no CMDB index can give:
+		// emitting it would file its alerts under its raw address. The query
+		// fails instead, and the Slot is retried as for any query that could
+		// not be answered, once the index has been read.
+		return &hostIdentityUnavailableError{}
+	}
 	// Kept before the target filter returns: a recheck reads the whole
 	// dimension set, and a series every Plan turned away is still data.
 	adapter.lookback.Series(batch.Dataset, batch.Delivery.Bytes)
+	// A query that feeds no PRIMARY input hands its series on without their
+	// dimensions, once the target filter and the recheck above have read
+	// them: its readers read the series' digest, times and values, and the
+	// Slot holds it, beside its PRIMARY's, from now until it is evaluated.
+	if !feedsPrimary(adapter.query) {
+		batch.Dataset = batch.Dataset.WithoutDimensions()
+	}
 	bindings, err := dataBindings(adapter.query, batch, adapter.attemptNo, admitted)
 	if err != nil {
 		return err
@@ -1042,11 +1285,17 @@ func (adapter *seriesAdapter) ConsumeProviderSeries(ctx context.Context, batch e
 		if outside {
 			adapter.withheldOutside++
 		}
+		if keyMissing != nil {
+			adapter.withheldKeyMissing++
+			if len(adapter.identitySamples) < execution.IdentitySamplesPerQuery {
+				adapter.identitySamples = append(adapter.identitySamples, *keyMissing)
+			}
+		}
 		return nil
 	}
 	if err := adapter.consumer.ConsumeSeries(ctx, execution.SeriesExecutionBatch{PhysicalQuery: batch.PhysicalQuery,
 		QueryRevision: adapter.query.Spec.PlanFacts.QueryRevision, CompletionRef: batch.CompletionRef,
-		Dataset: batch.Dataset, Inputs: bindings, Delivery: batch.Delivery}); err != nil {
+		Dataset: batch.Dataset, Inputs: bindings, Delivery: batch.Delivery, HostOverlays: overlays}); err != nil {
 		return err
 	}
 	// Counted here rather than at the provider: this is the point a series
@@ -1066,6 +1315,16 @@ func (adapter *seriesAdapter) ConsumeProviderSeries(ctx context.Context, batch e
 	return nil
 }
 
+// feedsPrimary is whether any requirement query answers is a PRIMARY input.
+func feedsPrimary(query PlannedQuery) bool {
+	for _, requirement := range query.Requirements {
+		if requirement.Role == execution.InputRolePrimary {
+			return true
+		}
+	}
+	return false
+}
+
 // reconcileCompletion restates a provider completion in terms of what the
 // access layer forwarded.
 //
@@ -1077,6 +1336,7 @@ func (adapter *seriesAdapter) ConsumeProviderSeries(ctx context.Context, batch e
 // subtract from the completion in the same layer that does the filtering.
 func (adapter *seriesAdapter) reconcileCompletion(completion execution.ProviderCompletion) execution.ProviderCompletion {
 	completion.Withheld, completion.WithheldOutsideTarget = adapter.withheld, adapter.withheldOutside
+	completion.WithheldKeyMissing, completion.IdentitySamples = adapter.withheldKeyMissing, adapter.identitySamples
 	if adapter.withheld == 0 || completion.DataState != execution.DataStateData {
 		return completion
 	}
@@ -1097,11 +1357,17 @@ func (adapter *seriesAdapter) reconcileCompletion(completion execution.ProviderC
 // plan, and says whether every plan refused it as outside its monitoring
 // target, decided on facts that were all there. A nil result means no
 // filtering is installed and every plan is admitted.
-func (adapter *seriesAdapter) admittedPlans(batch execution.ProviderSeriesBatch) (map[execution.PlanIdentity]bool, bool) {
+func (adapter *seriesAdapter) admittedPlans(batch execution.ProviderSeriesBatch) (map[execution.PlanIdentity]bool, bool, *execution.IdentitySample, map[execution.PlanIdentity]map[string]json.RawMessage, bool) {
 	if adapter.admission == nil {
-		return nil, false
+		return nil, false, nil, nil, false
 	}
-	outside := true
+	unreadable := false
+	var overlays map[execution.PlanIdentity]map[string]json.RawMessage
+	// keyMissing holds while every Plan refuses the series because its key
+	// could not be built; sample is the series' identity fields as the first
+	// such Plan's target reads them.
+	outside, keyMissing := true, true
+	var sample *execution.IdentitySample
 	dimensions := seriesDimensions(batch.Dataset)
 	// The plans of one query are one tenant's in practice: the facts are
 	// kept for the last tenant enriched for, and only a plan of another
@@ -1121,14 +1387,36 @@ func (adapter *seriesAdapter) admittedPlans(batch execution.ProviderSeriesBatch)
 			}
 			admit, filter, reason := adapter.admission.Admit(plan, &facts)
 			decisions[identity] = admit
-			if !admit {
-				adapter.reportScopeDrop(identity, plan, &facts, filter, reason)
+			unreadable = unreadable || (admit && facts.HostIdentityUnavailable)
+			if admit && adapter.observe != nil {
+				// Where the alert identity of a host-placed series came from
+				// when not from the index the filters decided on, and the
+				// series held for want of any.
+				switch {
+				case facts.HostIdentityUnavailable:
+					adapter.observe(hostIdentityFilter, "held", admission.HostIdentityHeld)
+				case facts.HostOverlaySource == admission.HostIdentityRawNoIndex,
+					facts.HostOverlaySource == admission.HostIdentityInstanceWithoutAddress,
+					facts.HostOverlay != nil && facts.HostOverlaySource != "":
+					adapter.observe(hostIdentityFilter, "admitted", facts.HostOverlaySource)
+				}
+			}
+			if admit && facts.HostOverlay != nil {
+				if overlays == nil {
+					overlays = make(map[execution.PlanIdentity]map[string]json.RawMessage, 1)
+				}
+				overlays[identity] = facts.HostOverlay
+				adapter.reportSuperseded(identity, &facts)
 			}
 			if admit && facts.PlacedByHostID && adapter.hostPlacement != nil {
 				adapter.hostPlacement(HostPlacement{Plan: identity, QueryGroup: adapter.queryGroup,
 					GroupedByTargetIP: adapter.query.groupsByTargetIP(), Address: facts.ReportedAddress})
 			}
 			outside = outside && !admit && admission.DefinitelyOutside(plan, &facts, filter, reason)
+			keyMissing = keyMissing && !admit && reason == admission.TargetPlanReasonKeyMissing
+			if keyMissing && sample == nil && plan.TargetPlan != nil {
+				sample = identitySampleOf(plan.TargetPlan.Identity, dimensions)
+			}
 			if adapter.observe != nil {
 				switch {
 				case !admit:
@@ -1149,7 +1437,73 @@ func (adapter *seriesAdapter) admittedPlans(batch execution.ProviderSeriesBatch)
 			}
 		}
 	}
-	return decisions, outside && len(decisions) > 0
+	if !keyMissing || len(decisions) == 0 || sample == nil {
+		sample = nil
+	}
+	return decisions, outside && len(decisions) > 0, sample, overlays, unreadable
+}
+
+// hostIdentityFilter is the filter name the admission counter reads a
+// host-placed series' alert identity under: not a filter, a fact about the
+// identity the series' alerts will carry.
+const hostIdentityFilter = "host_identity"
+
+// hostIdentityUnavailableError fails a query that delivered a host-placed
+// series while no CMDB index that ever held hosts can say where its host is
+// (admission.Facts.HostIdentityUnavailable). Retryable: the store reads the
+// cache again on its next refresh.
+type hostIdentityUnavailableError struct{}
+
+func (*hostIdentityUnavailableError) Error() string {
+	return "alarmd access: a host-placed series has no CMDB index to read its alert identity from"
+}
+
+func (*hostIdentityUnavailableError) QueryFailure() (string, string) {
+	// The query could not be answered as a query whose provider failed
+	// could not: the word a Level may be unavailable for, should the
+	// binding carry it there. The series' own count is held_no_index.
+	return observability.QueryFailureCategorySeriesIdentity, contract.ReasonQueryUnavailable
+}
+
+// identitySampleOf is a series' identity fields as a target's identity reads
+// them -- the key dimensions, the model gate with the value it requires -- and
+// the canonical instance fields beside them, names and values only, values
+// cut to execution.IdentityValueBytes.
+func identitySampleOf(identity contract.TargetPlanIdentityV1, dimensions map[string]json.RawMessage) *execution.IdentitySample {
+	sample := &execution.IdentitySample{}
+	seen := map[string]bool{}
+	add := func(name, expected string, canonical bool) {
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		field := execution.IdentityField{Name: name, Expected: expected, Canonical: canonical}
+		if raw, ok := dimensions[name]; ok {
+			field.Present, field.Actual = true, identityValue(raw)
+		}
+		sample.Fields = append(sample.Fields, field)
+	}
+	add(identity.ModelDimension, identity.ModelValue, false)
+	for _, name := range identity.Dimensions {
+		add(name, "", false)
+	}
+	for _, name := range execution.CanonicalIdentityFields {
+		add(name, "", true)
+	}
+	return sample
+}
+
+// identityValue is a dimension's value as text: a JSON string unquoted,
+// anything else as written, cut to execution.IdentityValueBytes.
+func identityValue(raw json.RawMessage) string {
+	var text string
+	if json.Unmarshal(raw, &text) != nil {
+		text = string(raw)
+	}
+	if len(text) > execution.IdentityValueBytes {
+		text = text[:execution.IdentityValueBytes]
+	}
+	return text
 }
 
 func dataBindings(
@@ -1301,4 +1655,72 @@ func (consumer *serializedQueryConsumer) RetainedInputBytesNow() uint64 {
 		return reporter.RetainedInputBytesNow()
 	}
 	return 0
+}
+
+// ReserveRetainedBytes and ReleaseRetainedBytes pass through to the
+// wrapped consumer under the mutex its series are delivered under: a query
+// aligning named outputs reserves beside the other queries of its Slot
+// delivering series, and both move the same retained total
+// (execution.RetainedBytesReserver). The reservation never waits - the
+// consumer's own refuses at once when there is no room - so holding the
+// mutex across it stalls no delivery.
+func (consumer *serializedQueryConsumer) ReserveRetainedBytes(ctx context.Context, bytes uint64) error {
+	reserver, ok := consumer.QueryExecutionConsumer.(execution.RetainedBytesReserver)
+	if !ok {
+		return nil
+	}
+	consumer.mu.Lock()
+	defer consumer.mu.Unlock()
+	return reserver.ReserveRetainedBytes(ctx, bytes)
+}
+
+func (consumer *serializedQueryConsumer) ReleaseRetainedBytes(bytes uint64) {
+	reserver, ok := consumer.QueryExecutionConsumer.(execution.RetainedBytesReserver)
+	if !ok {
+		return
+	}
+	consumer.mu.Lock()
+	defer consumer.mu.Unlock()
+	reserver.ReleaseRetainedBytes(bytes)
+}
+
+// ReserveRetainedBytes and ReleaseRetainedBytes reserve, through the
+// consumer its series are delivered to, what the provider holds beside the
+// series it has handed on - the alignment of a query with named outputs, the
+// series a carried APM read holds until its response is whole - so it is
+// held to the same share and pool as the Slot's series, as it grows
+// (execution.RetainedBytesReserver). A consumer that reserves nothing
+// refuses nothing.
+func (adapter *seriesAdapter) ReserveRetainedBytes(ctx context.Context, bytes uint64) error {
+	if reserver, ok := adapter.consumer.(execution.RetainedBytesReserver); ok {
+		return reserver.ReserveRetainedBytes(ctx, bytes)
+	}
+	return nil
+}
+
+func (adapter *seriesAdapter) ReleaseRetainedBytes(bytes uint64) {
+	if reserver, ok := adapter.consumer.(execution.RetainedBytesReserver); ok {
+		reserver.ReleaseRetainedBytes(bytes)
+	}
+}
+
+// queryStrategies are the strategy ids of the Plans a planned query serves,
+// sorted and unique: the provider's request carries them for correlation.
+func queryStrategies(query PlannedQuery) []string {
+	seen := map[string]struct{}{}
+	for _, requirements := range [][]execution.DataRequirement{query.Requirements, query.ReadinessInvalidRequirements} {
+		for _, requirement := range requirements {
+			for _, consumer := range requirement.Consumers {
+				if id := consumer.Consumer.Plan.StrategyID; id != "" {
+					seen[id] = struct{}{}
+				}
+			}
+		}
+	}
+	strategies := make([]string, 0, len(seen))
+	for id := range seen {
+		strategies = append(strategies, id)
+	}
+	sort.Strings(strategies)
+	return strategies
 }

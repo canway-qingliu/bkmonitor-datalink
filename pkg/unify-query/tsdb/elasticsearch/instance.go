@@ -123,7 +123,7 @@ func NewInstance(ctx context.Context, opt *InstanceOption) (*Instance, error) {
 	return ins, nil
 }
 
-func (i *Instance) getClient(ctx context.Context, connect Connect) (*elastic.Client, error) {
+func (i *Instance) getClient(ctx context.Context, connect Connect, options ...elastic.ClientOptionFunc) (*elastic.Client, error) {
 	cliOpts := []elastic.ClientOptionFunc{
 		elastic.SetURL(connect.Address),
 		elastic.SetSniff(false),
@@ -148,6 +148,7 @@ func (i *Instance) getClient(ctx context.Context, connect Connect) (*elastic.Cli
 		)
 	}
 
+	cliOpts = append(cliOpts, options...)
 	return elastic.DialContext(ctx, cliOpts...)
 }
 
@@ -209,7 +210,9 @@ func resolveIndexMetadataSnapshot(ctx context.Context, span *trace.Span, cli *el
 	mappings := make(map[string]map[string]any)
 
 	span.Set("get-indexes", aliases)
+	indexStartedAt := time.Now()
 	indices, indicesErr := cli.IndexGet(aliases...).Do(ctx)
+	span.Set("index-get-duration-ms", float64(time.Since(indexStartedAt))/float64(time.Millisecond))
 	span.Set("index-get-fallback", indicesErr != nil)
 	if indicesErr != nil {
 		indexGetError := truncateString(indicesErr.Error(), esIndexMetadataErrorMaxLength)
@@ -223,7 +226,9 @@ func resolveIndexMetadataSnapshot(ctx context.Context, span *trace.Span, cli *el
 		).Warn(ctx)
 
 		span.Set("get-mapping", aliases)
+		mappingStartedAt := time.Now()
 		res, err := cli.GetMapping().Index(aliases...).Type("").Do(ctx)
+		span.Set("get-mapping-duration-ms", float64(time.Since(mappingStartedAt))/float64(time.Millisecond))
 		if err != nil {
 			span.Set("get-mapping-error", truncateString(err.Error(), esIndexMetadataErrorMaxLength))
 			return nil, metadata.NewMessage(
@@ -280,7 +285,11 @@ func (i *Instance) fieldMapWithIndexFields(ctx context.Context, fieldAlias metad
 		span.End(&err)
 	}()
 	span.Set("aliases", aliases)
-	cli, err := i.getClient(ctx, i.connect)
+	decoder := &indexMetadataDecoder{}
+	defer decoder.record(span)
+	clientStartedAt := time.Now()
+	cli, err := i.getClient(ctx, i.connect, elastic.SetDecoder(decoder))
+	span.Set("mapping-client-duration-ms", float64(time.Since(clientStartedAt))/float64(time.Millisecond))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("get client error: %w", err)
 	}
@@ -294,6 +303,10 @@ func (i *Instance) fieldMapWithIndexFields(ctx context.Context, fieldAlias metad
 	span.Set("mapping-length", len(mappings))
 	span.Set("physical-index-length", len(physicalIndexes))
 
+	parseStartedAt := time.Now()
+	defer func() {
+		span.Set("mapping-field-parse-duration-ms", float64(time.Since(parseStartedAt))/float64(time.Millisecond))
+	}()
 	iof := NewIndexOptionFormat(fieldAlias)
 	indexFields := &collapseIndexMetadata{fields: make(map[string]map[string]bool, len(mappings)), directQuerySafe: snapshot.directQuerySafe}
 
@@ -352,7 +365,7 @@ func buildESQuerySource(ctx context.Context, qb *metadata.Query, fact *FormatFac
 	}
 
 	// 查询时间生成 elastic.query
-	rangeQuery, err := fact.RangeQuery()
+	rangeQuery, err := fact.rangeQuery(qb.RangeEndExclusive)
 	if err != nil {
 		return nil, nil, "", err
 	}
@@ -477,6 +490,10 @@ func (i *Instance) executeESQuery(
 	}
 	defer client.Stop()
 	opt := qb.ResultTableOption
+	search := client.Search().Index(qo.indexes...).SearchSource(source)
+	if partialShardResults(ctx) != nil {
+		search.AllowPartialSearchResults(true)
+	}
 	var res *elastic.SearchResult
 	func() {
 		defer func() {
@@ -497,7 +514,7 @@ func (i *Instance) executeESQuery(
 			}
 			if len(opt.SearchAfter) > 0 {
 				span.Set("query-search-after", opt.SearchAfter)
-				res, err = client.Search().Index(qo.indexes...).SearchSource(source).Do(ctx)
+				res, err = search.Do(ctx)
 				return
 			}
 		}
@@ -518,7 +535,7 @@ func (i *Instance) executeESQuery(
 			res, err = scroll.Do(ctx)
 		} else {
 			span.Set("query-from", qb.From)
-			res, err = client.Search().Index(qo.indexes...).SearchSource(source).Do(ctx)
+			res, err = search.Do(ctx)
 		}
 	}()
 
@@ -565,6 +582,7 @@ func (i *Instance) queryWithAgg(ctx context.Context, qo *queryOption, fact *Form
 	}
 
 	if sr == nil || sr.Aggregations == nil {
+		recordPartialShardResult(ctx, sr)
 		return storage.EmptySeriesSet()
 	}
 
@@ -575,6 +593,7 @@ func (i *Instance) queryWithAgg(ctx context.Context, qo *queryOption, fact *Form
 	}
 
 	span.Set("time-series-length", len(qr.Timeseries))
+	recordPartialShardResult(ctx, sr)
 
 	return remote.FromQueryResult(true, qr)
 }
@@ -777,10 +796,38 @@ func (i *Instance) QueryPreparedRawData(
 		).Error(ctx, err)
 	}
 
-	size, total, option, err = decodePreparedRawResult(prepared, sr, dataCh)
+	// Match executeESQuery's cursor precedence: ScrollID, SearchAfter, then Scroll.
+	isScroll := rawQuery.Scroll != ""
+	if option != nil {
+		if option.ScrollID != "" {
+			isScroll = true
+		} else if len(option.SearchAfter) > 0 {
+			isScroll = false
+		}
+	}
+
+	// Scroll keeps its existing streaming behavior; other queries publish only a fully decoded route.
+	destination := dataCh
+	var rows chan map[string]any
+	if !isScroll {
+		rowCapacity := 0
+		if sr != nil && sr.Hits != nil {
+			rowCapacity = len(sr.Hits.Hits)
+		}
+		rows = make(chan map[string]any, rowCapacity)
+		destination = rows
+	}
+	size, total, option, err = decodePreparedRawResult(prepared, sr, destination)
 	if err != nil {
 		return size, total, option, err
 	}
+	if rows != nil {
+		close(rows)
+		for row := range rows {
+			dataCh <- row
+		}
+	}
+	recordPartialShardResult(ctx, sr)
 	if sr != nil && sr.Hits != nil {
 		span.Set("instance-out-list-size", len(sr.Hits.Hits))
 	}
@@ -859,6 +906,9 @@ func (i *Instance) QuerySeriesSet(
 			"字段查询异常: %v",
 			err,
 		).Warn(ctx)
+		if metadata.IsStrictQueryFailures(ctx) {
+			return storage.ErrSeriesSet(err)
+		}
 		return storage.EmptySeriesSet()
 	}
 	qo.physicalIndexes = physicalIndexes

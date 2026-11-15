@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/execution"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/alarmd/internal/testwait"
 )
 
 // delivered is a provider answer whose deliveries are whole, as a query's
@@ -231,7 +232,7 @@ func TestADirectedSlotNotReadIsUnobservedByWhy(t *testing.T) {
 // kept, or it failed.
 func TestADirectedSlotWhoseSupplementDidNotRunIsCountedByWhy(t *testing.T) {
 	for refused, want := range map[string]string{DirectedFlightBusy: DirectedFlightBusy,
-		DirectedContractExpired: DirectedContractExpired, "redis": DirectedFailed} {
+		DirectedContractExpired: DirectedContractExpired, DirectedKeptReadAbsent: DirectedKeptReadAbsent, "redis": DirectedFailed} {
 		f, _ := directedFixture(t, SupplementOutcome{Refused: refused})
 		slot := f.clock.now().Unix()
 		f.firstRead(slot, execution.CompletenessFull)
@@ -372,15 +373,11 @@ func TestADirectedGroupsSlotsAreReadOneAtATimeOldestFirst(t *testing.T) {
 	}
 	f.answers <- late(first)
 	f.engine.Step(context.Background())
-	for {
+	testwait.Until(t, "the first Slot's supplement started", func() bool {
 		mu.Lock()
-		started := len(order)
-		mu.Unlock()
-		if started == 1 {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
+		defer mu.Unlock()
+		return len(order) == 1
+	})
 	// Its supplement still running, the second is not read.
 	f.engine.Step(context.Background())
 	if len(f.answers) != 0 {
@@ -388,7 +385,7 @@ func TestADirectedGroupsSlotsAreReadOneAtATimeOldestFirst(t *testing.T) {
 	}
 	f.answers <- late(second)
 	f.engine.Step(context.Background())
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(10 * time.Millisecond) // fixed-wait: a window in which the second Slot's supplement must not start; an absence sends no signal to wait on
 	mu.Lock()
 	if len(order) != 1 {
 		mu.Unlock()
@@ -487,5 +484,116 @@ func TestTheLongestSupplementHoldIsKeptNotTheLast(t *testing.T) {
 	source := f.engine.Stats().Sources[sourceLog]
 	if source.SupplementHoldMaxSeconds != 3 || source.SupplementHold["le_5s"] != 1 || source.SupplementHold["le_1s"] != 1 {
 		t.Fatalf("hold %v max %v, want both counted and the longest, 3 s, kept", source.SupplementHold, source.SupplementHoldMaxSeconds)
+	}
+}
+
+// sliceOf is a slice of qg on host, by the pattern given.
+func sliceOf(pattern string) execution.InputSlice {
+	return execution.InputSlice{Conditions: []execution.InputSliceCondition{{Dimension: "host", Pattern: pattern}}}
+}
+
+// slicedFirstRead is one slice's formal first read of qg, with the series
+// given in it, ending complete.
+func (f *fixture) slicedFirstRead(slot int64, slice execution.InputSlice, series ...*execution.Dataset) *Read {
+	f.t.Helper()
+	seen := query("qg", slot, minute, sourceLog)
+	seen.Slice = slice
+	read := f.engine.Begin(seen)
+	if read == nil || read.directed == nil {
+		f.t.Fatal("a directed Query Group's sliced first read was not kept for its directed read")
+	}
+	for _, one := range series {
+		read.Series(one, 100)
+	}
+	read.Complete(execution.ProviderCompletion{Completeness: execution.CompletenessFull}, nil)
+	return read
+}
+
+// A Slot read in slices is read again slice by slice, each against its own
+// first read, and the late series of the slices are one kept read of the
+// physical query: one supplement of both slices' late series, replaying
+// both. The slices of one query are not two physical queries.
+func TestASlicedSlotIsReadAgainSliceBySliceIntoOneKeptRead(t *testing.T) {
+	f, recorder := directedFixture(t, SupplementOutcome{Ran: true, Facts: execution.SupplementFacts{Candidates: 2, Admitted: 2}})
+	slot := f.clock.now().Unix()
+	f.slicedFirstRead(slot, sliceOf("^a$"), point(slot, "1"))
+	f.slicedFirstRead(slot, sliceOf("^b$"), dataset("h3", map[int64]string{slot: "1"}))
+	f.clock.set(f.clock.now().Add(rungDelay(0, minute)))
+	f.answers <- delivered(point(slot, "1"), dataset("h2", map[int64]string{slot - 60: "5"}))
+	f.answers <- delivered(dataset("h3", map[int64]string{slot: "1"}), dataset("h4", map[int64]string{slot - 60: "5"}))
+	f.engine.Step(context.Background())
+	f.waitFor(func(stats Stats) bool { return stats.Sources[sourceLog].SupplementWindows[DirectedSupplemented] == 1 })
+	jobs := recorder.taken()
+	if len(jobs) != 1 || !reflect.DeepEqual(jobs[0].Series, []execution.SeriesIdentityDigest{"digest-h2", "digest-h4"}) {
+		t.Fatalf("jobs %+v, want one supplement of both slices' late series", jobs)
+	}
+	sink := &replaySink{}
+	if _, err := jobs[0].Read.Replay(context.Background(), query("qg", slot, minute, sourceLog).Spec, sink); err != nil || len(sink.batches) != 2 {
+		t.Fatalf("replayed %d batches (%v), want the two late series", len(sink.batches), err)
+	}
+}
+
+// A slice let go past its limit is no read: discarded, its Slot has no read
+// of it to reread and is not unobserved for it; a slice read ahead and let
+// go after it completed is taken back the same way, and only the slice left
+// is read again.
+func TestADiscardedSliceIsNotReadAgain(t *testing.T) {
+	f, recorder := directedFixture(t, SupplementOutcome{Ran: true})
+	slot := f.clock.now().Unix()
+	seen := query("qg", slot, minute, sourceLog)
+	seen.Slice = sliceOf("^a$")
+	f.engine.Begin(seen).Discard()
+	f.engine.mu.Lock()
+	directed := len(f.engine.groups["qg"].directed)
+	f.engine.mu.Unlock()
+	if directed != 0 {
+		t.Fatalf("a discarded slice left %d directed Slots", directed)
+	}
+	f.slicedFirstRead(slot, sliceOf("^b$"), point(slot, "1"))
+	f.slicedFirstRead(slot, sliceOf("^c$"), dataset("h3", map[int64]string{slot: "1"}))
+	f.engine.DiscardSlice("qg", execution.EvaluationTime(slot), sliceOf("^c$"))
+	f.clock.set(f.clock.now().Add(rungDelay(0, minute)))
+	f.answers <- delivered(point(slot, "1"), dataset("h2", map[int64]string{slot - 60: "5"}))
+	f.engine.Step(context.Background())
+	f.waitFor(func(stats Stats) bool { return stats.Sources[sourceLog].SupplementWindows[DirectedSupplemented] == 1 })
+	if jobs := recorder.taken(); len(jobs) != 1 || !reflect.DeepEqual(jobs[0].Series, []execution.SeriesIdentityDigest{"digest-h2"}) {
+		t.Fatalf("jobs %+v, want the slice left read again alone", jobs)
+	}
+}
+
+// A Slot read in slices some of whose rereads the share refused comes to the
+// outcome of the slices read - supplemented - and is counted partly refused,
+// in no reason of the unobserved: every directed Slot comes to one outcome.
+func TestASlotPartlyRefusedIsCountedApartFromTheUnobserved(t *testing.T) {
+	f, recorder := directedFixture(t, SupplementOutcome{Ran: true, Facts: execution.SupplementFacts{Candidates: 1, Admitted: 1}})
+	slot := f.clock.now().Unix()
+	f.slicedFirstRead(slot, sliceOf("^a$"), point(slot, "1"))
+	f.slicedFirstRead(slot, sliceOf("^b$"), dataset("h3", map[int64]string{slot: "1"}))
+	// The slices are read again one after another: the second's late series
+	// is past the share.
+	var mu sync.Mutex
+	asked := 0
+	f.engine.options.Memory = func(uint64) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		asked++
+		return asked != 2
+	}
+	f.clock.set(f.clock.now().Add(rungDelay(0, minute)))
+	f.answers <- delivered(point(slot, "1"), dataset("h2", map[int64]string{slot - 60: "5"}))
+	f.answers <- delivered(dataset("h3", map[int64]string{slot: "1"}), dataset("h4", map[int64]string{slot - 60: "5"}))
+	f.engine.Step(context.Background())
+	stats := f.waitFor(func(stats Stats) bool { return stats.Sources[sourceLog].SupplementWindows[DirectedSupplemented] == 1 })
+	source := stats.Sources[sourceLog]
+	if source.SupplementPartlyRefused != 1 || source.SupplementWindows[DirectedUnobserved] != 0 {
+		t.Fatalf("partly refused %d, windows %v: want one partly refused, none unobserved", source.SupplementPartlyRefused, source.SupplementWindows)
+	}
+	for reason, count := range source.SupplementUnobserved {
+		if count != 0 {
+			t.Fatalf("unobserved by %s %d, want none", reason, count)
+		}
+	}
+	if jobs := recorder.taken(); len(jobs) != 1 || !reflect.DeepEqual(jobs[0].Series, []execution.SeriesIdentityDigest{"digest-h2"}) {
+		t.Fatalf("jobs %+v, want the slice read supplemented alone", jobs)
 	}
 }

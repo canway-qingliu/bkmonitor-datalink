@@ -85,19 +85,45 @@ func TestActivationChangeIsClassifiedFromTheSameComparisonAsDrift(t *testing.T) 
 			want:        activationChangeNotActive, wantReason: contract.ReasonPlanNotActive, wantCause: execution.CausePlanNotActive},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			change := classifyActivationChange(testCase.duePlans, testCase.activations, testCase.gaps)
+			change := classifyActivationChange(testCase.duePlans, testCase.activations, testCase.gaps, nil)
 			if change != testCase.want {
 				t.Fatalf("change = %d, want %d", change, testCase.want)
 			}
 			primary := execution.PrimaryInputFact{Completeness: execution.CompletenessFull}
-			completion, cause := activationChangeCompletion(execution.FrozenExecutionContractRef{}, &primary, change)
-			if completion.Kind != execution.CompletionPartialGap || string(completion.ReasonCode) != testCase.wantReason || cause != testCase.wantCause {
-				t.Fatalf("completion = (%s, %s, %s), want a partial gap under %s / %s", completion.Kind, completion.ReasonCode, cause, testCase.wantReason, testCase.wantCause)
+			completion, attribution := activationChangeCompletion(execution.FrozenExecutionContractRef{}, &primary, change, nil, nil)
+			if completion.Kind != execution.CompletionPartialGap || string(completion.ReasonCode) != testCase.wantReason || attribution.Cause != testCase.wantCause {
+				t.Fatalf("completion = (%s, %s, %s), want a partial gap under %s / %s", completion.Kind, completion.ReasonCode, attribution.Cause, testCase.wantReason, testCase.wantCause)
 			}
-			// The unavailable-primary rule is the same under every word.
+			// The attribution names the change's word as its reason: the
+			// line's completion_reason, which read reason_not_reported.
+			if string(attribution.Reason) != testCase.wantReason {
+				t.Fatalf("attribution reason = %q, want %s", attribution.Reason, testCase.wantReason)
+			}
+			// The unavailable-primary rule is the same under every word, and
+			// its reason and scope are the primary binding's, as a derived
+			// completion names them; the completion's own reason stays the
+			// change's word.
 			unavailable := execution.PrimaryInputFact{Completeness: execution.CompletenessUnavailable}
-			if completion, cause := activationChangeCompletion(execution.FrozenExecutionContractRef{}, &unavailable, change); completion.Kind != execution.CompletionUnavailable || cause != execution.CausePrimaryInputUnavailable {
-				t.Fatalf("with an unavailable primary the completion is (%s, %s), want unavailable / primary input unavailable", completion.Kind, cause)
+			plan := execution.PlanIdentity{TenantID: "tenant", BusinessID: "2", StrategyID: "101"}
+			bindings := []execution.NamedInputBinding{
+				{Role: execution.InputRoleAlgorithmDependency, Completeness: execution.CompletenessUnavailable, ReasonCode: "QUERY_PARTIAL"},
+				{Role: execution.InputRolePrimary, Completeness: execution.CompletenessUnavailable, ReasonCode: execution.ReasonCode(contract.ReasonQueryTimeout),
+					Consumer: execution.ConsumerRef{Plan: plan, LevelID: 2, HasLevel: true}},
+			}
+			targets := []execution.TargetResolutionSummary{{StrategyID: "101"}}
+			completion, attribution = activationChangeCompletion(execution.FrozenExecutionContractRef{}, &unavailable, change, bindings, targets)
+			// The targets the Slot resolved at Begin stay its completion's.
+			if len(completion.TargetResolutions) != 1 || completion.TargetResolutions[0].StrategyID != "101" {
+				t.Fatalf("target resolutions = %+v, want the Slot's", completion.TargetResolutions)
+			}
+			if completion.Kind != execution.CompletionUnavailable || attribution.Cause != execution.CausePrimaryInputUnavailable {
+				t.Fatalf("with an unavailable primary the completion is (%s, %s), want unavailable / primary input unavailable", completion.Kind, attribution.Cause)
+			}
+			wantScope := execution.CompletionScope{Plan: plan, HasPlan: true, LevelID: 2, HasLevel: true}
+			if attribution.Reason != execution.ReasonCode(contract.ReasonQueryTimeout) || attribution.Scope != wantScope ||
+				string(completion.ReasonCode) != testCase.wantReason {
+				t.Fatalf("with an unavailable primary: reason %q scope %+v, completion reason %q; want the primary binding's %s at %+v and the completion's %s",
+					attribution.Reason, attribution.Scope, completion.ReasonCode, contract.ReasonQueryTimeout, wantScope, testCase.wantReason)
 			}
 		})
 	}
@@ -119,10 +145,10 @@ func TestTheGuardWordIsClassifiedOverThePlansGettingAGuard(t *testing.T) {
 		Plan: back, Selection: execution.ActivationCurrent,
 		Selected: execution.ActivatedPlan{Identity: back, StateGeneration: "gen-1", StateApplyEpoch: 9, ScheduleRevision: "sched-1"},
 	}}}
-	if change := classifyActivationChange(duePlans, returned, execution.GapLoadResult{}); change != activationChangeNotActive {
+	if change := classifyActivationChange(duePlans, returned, execution.GapLoadResult{}, nil); change != activationChangeNotActive {
 		t.Fatalf("the Slot's change = %d, want the gone Plan's PLAN_NOT_ACTIVE to outrank the returned one", change)
 	}
-	if reason := guardReasonFor(duePlans, returned, execution.GapLoadResult{}); string(reason) != contract.ReasonPlanReactivated {
+	if reason := guardReasonFor(duePlans, returned, execution.GapLoadResult{}, nil); string(reason) != contract.ReasonPlanReactivated {
 		t.Fatalf("the Guard's word = %s, want %s: only the Plan that came back gets a Guard", reason, contract.ReasonPlanReactivated)
 	}
 	// And the Guard's word is a word the fold ranks and the scope vocabulary
