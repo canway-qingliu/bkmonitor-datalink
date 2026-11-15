@@ -722,11 +722,11 @@ func (d *DorisSQLExpr) buildCondition(c metadata.ConditionField) (string, error)
 				op = "="
 			}
 
-			for _, v := range values {
+			for i, v := range values {
 				if c.IsWildcard {
 					v = d.likeValue(v)
 				} else if op == "LIKE" {
-					v = substringLikeValue(v)
+					v = substringLikeLiteral(c.Value[i])
 				} else if key == metadata.Null {
 					// key 为 null 时，根据 IsPrefix/IsSuffix 转换值
 					if c.IsPrefix {
@@ -787,11 +787,11 @@ func (d *DorisSQLExpr) buildCondition(c metadata.ConditionField) (string, error)
 				op = "!="
 			}
 
-			for _, v := range values {
+			for i, v := range values {
 				if c.IsWildcard {
 					v = d.likeValue(v)
 				} else if op == "NOT LIKE" {
-					v = substringLikeValue(v)
+					v = substringLikeLiteral(c.Value[i])
 				}
 				filter = append(filter, fmt.Sprintf("%s %s '%s'", key, op, v))
 			}
@@ -875,6 +875,12 @@ var (
 // substringLikeValue 把字面值包成 LIKE 子串模式，值里的 \、% 和 _ 按字面匹配
 func substringLikeValue(s string) string {
 	return "%" + likeMetaEscaper.Replace(s) + "%"
+}
+
+// substringLikeLiteral 从原值生成 LIKE 子串模式的字符串字面量内容：反斜杠只按 LIKE 规则转义一次
+// （substringLikeValue），不再叠加 valueTransform 的字面量转义，单引号照常加倍。
+func substringLikeLiteral(s string) string {
+	return strings.ReplaceAll(substringLikeValue(s), "'", "''")
 }
 
 func (d *DorisSQLExpr) likeValue(s string) string {
