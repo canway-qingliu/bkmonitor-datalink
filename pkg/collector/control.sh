@@ -236,7 +236,12 @@ function package_v3() {
   cp -R ${src}/. ${root}/
   sed -i.bak "/^version:/s/.*/version: ${version}/" ${root}/project.yaml && rm -f ${root}/project.yaml.bak
 
-  # 构建二进制
+  collect_git_ci_metadata
+  calc_release_value "${version}"
+  local build_time
+  build_time="$(date -u '+%Y-%m-%d_%I:%M:%S%p')"
+
+  # 构建二进制，构建元数据与 V2 插件包（package）相同
   mkdir -p ${dir}/bin
   go mod tidy
   JSON_LIB=${JSON_LIB:-jsonsonic}
@@ -244,9 +249,18 @@ function package_v3() {
     go build -tags "${JSON_LIB}" -ldflags " \
     -s -w \
     -X main.version=${version} \
-    -X main.buildTime=$(date -u '+%Y-%m-%d_%I:%M:%S%p') \
-    -X main.gitHash=$(git rev-parse HEAD)" \
+    -X main.buildTime=${build_time} \
+    -X main.gitHash=${GIT_COMMIT_HASH} \
+    -X 'main.tag=${GIT_TAG}' \
+    -X 'main.committer=${GIT_COMMITTER_NAME}' \
+    -X 'main.commitTime=${GIT_COMMIT_TIME}' \
+    -X 'main.buildId=${CI_BUILD_ID_VALUE}' \
+    -X 'main.buildNo=${CI_BUILD_NUM_VALUE}' \
+    -X 'main.release=${RELEASE_VALUE}'" \
     -o ${dir}/bin/${MODULE} ./cmd/collector
+
+  # 生成 ci_git.yaml，与 project.yaml 同级，随插件包一起发布
+  write_ci_git_yaml "${version}" "${root}"
 }
 
 function sidecar() {
