@@ -2,8 +2,15 @@ type: 'subconfig'
 token: '{{ bk_data_token }}'
 bk_biz_id: {{ bk_biz_id }}
 bk_app_name: {{ bk_app_name }}
-traces_dataid: {{ trace_data_id | default(0) }}
-metrics_dataid: {{ metric_data_id | default(0) }}
+app_id: {{ app_id | default(0) }}
+traces_dataid: {{ trace_data_id | default(0) }}{% if traces_shared is defined and traces_shared %}
+traces_shared: true
+{% endif %}
+metrics_dataid: {{ metric_data_id | default(0) }}{% if metrics_shared is defined and metrics_shared %}
+metrics_shared: true
+{% endif %}{% if (traces_shared is defined and traces_shared) or (metrics_shared is defined and metrics_shared) or (bk_tenant_id is defined and bk_tenant_id) %}
+bk_tenant_id: {{ bk_tenant_id | default('') | tojson }}
+{% endif %}
 logs_dataid: {{ log_data_id | default(0) }}
 profiles_dataid: {{ profile_data_id | default(0) }}
 
@@ -432,6 +439,78 @@ default:
               {%- endfor %}
 {%- endif %}
 
+{% if metrics_deriver_config is defined %}
+      - name: '{{ metrics_deriver_config.name }}'
+        config:
+          {%- if metrics_deriver_config.ot_java_agent is defined %}
+          ot_java_agent:
+            enabled: {{ metrics_deriver_config.ot_java_agent.enabled }}
+            keep_origin_metric: {{ metrics_deriver_config.ot_java_agent.keep_origin_metric }}
+          {%- endif %}
+{%- endif %}
+
+{% if skywalking_processor_config is defined %}
+      - name: '{{ skywalking_processor_config.name }}'
+        config:
+          {%- if skywalking_processor_config.meter_data is defined %}
+          meter_data:
+            enabled: {{ skywalking_processor_config.meter_data.get("enabled", false) }}
+            {%- if skywalking_processor_config.meter_data.rules is defined %}
+            rules:
+              {%- for rule in skywalking_processor_config.meter_data.rules %}
+              - types: {{ rule.types | tojson }}
+                metrics: {{ rule.metrics | tojson }}
+              {%- endfor %}
+            {%- endif %}
+          {%- endif %}
+{%- endif %}
+
+{% if span_processor_config is defined %}
+      - name: '{{ span_processor_config.name }}'
+        config:
+          {%- if span_processor_config.drop is defined %}
+          drop:
+            {%- for item in span_processor_config.drop %}
+            - match_rules:
+                {%- for match_rule in item.match_rules %}
+                - key: '{{ match_rule.key }}'
+                  op: '{{ match_rule.op }}'
+                  value:
+                    {%- for v in match_rule.value %}
+                    - '{{ v }}'
+                    {%- endfor %}
+                  link: '{{ match_rule.link }}'
+                {%- endfor %}
+            {%- endfor %}
+          {%- endif %}
+          {%- if span_processor_config.replace_value is defined %}
+          replace_value:
+            {%- for item in span_processor_config.replace_value %}
+            - predicate_key: '{{ item.predicate_key }}'
+              rules:
+                {%- for rule in item.rules %}
+                - filters:
+                    {%- for filter in rule.filters %}
+                    - key: '{{ filter.key }}'
+                      op: '{{ filter.op }}'
+                      value:
+                        {%- for v in filter.value %}
+                        - '{{ v }}'
+                        {%- endfor %}
+                      link: '{{ filter.link }}'
+                    {%- endfor %}
+                  replace_from:
+                    source:
+                      {%- for key in rule.replace_from.source %}
+                      - '{{ key }}'
+                      {%- endfor %}
+                    separator: '{{ rule.replace_from.separator }}'
+                    const_val: '{{ rule.replace_from.const_val }}'
+                {%- endfor %}
+            {%- endfor %}
+          {%- endif %}
+{%- endif %}
+
 {% if service_configs is defined %}
 service:
 {%- for service_config in service_configs %}
@@ -488,4 +567,42 @@ instance:
           sampling_percentage: {{ instance_config.sampler_config.sampling_percentage }}
 {%- endif %}
 {%- endfor %}
+{%- endif %}
+
+{% if profiling_config is defined %}
+profiling:
+  {% if profiling_config.disabled is defined %}
+  # 与 Kingeye 总开关一致：true 不采集，false 允许采集
+  disabled: {{ profiling_config.disabled }}
+  {%- endif %}
+  {% if profiling_config.cpu is defined %}
+  cpu:
+    {% if profiling_config.cpu.enabled is defined %}
+    enabled: {{ profiling_config.cpu.enabled }}
+    {%- endif %}
+    {% if profiling_config.cpu.collection_period is defined %}
+    collection_period: "{{ profiling_config.cpu.collection_period }}"
+    {%- endif %}
+    {% if profiling_config.cpu.collection_window is defined %}
+    collection_window: "{{ profiling_config.cpu.collection_window }}"
+    {%- endif %}
+    {% if profiling_config.cpu.sampling_frequency is defined %}
+    sampling_frequency: "{{ profiling_config.cpu.sampling_frequency }}"
+    {%- endif %}
+  {%- endif %}
+  {% if profiling_config.memory is defined %}
+  memory:
+    {% if profiling_config.memory.enabled is defined %}
+    enabled: {{ profiling_config.memory.enabled }}
+    {%- endif %}
+    {% if profiling_config.memory.collection_period is defined %}
+    collection_period: "{{ profiling_config.memory.collection_period }}"
+    {%- endif %}
+    {% if profiling_config.memory.collection_window is defined %}
+    collection_window: "{{ profiling_config.memory.collection_window }}"
+    {%- endif %}
+    {% if profiling_config.memory.allocation_threshold is defined %}
+    allocation_threshold: "{{ profiling_config.memory.allocation_threshold }}"
+    {%- endif %}
+  {%- endif %}
 {%- endif %}

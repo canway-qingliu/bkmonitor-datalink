@@ -124,6 +124,49 @@ bk-collector:
       - "{{ plugin_path.subconfig_path }}/bkmonitorproxy_*.conf"
 
 
+  # =============================== Profiling ================================
+  # profiling 段定义 CPU / Memory profiling 的全局默认采集参数
+  # 客户端通过 `GET /profiling/config`（携带 X-BK-TOKEN）拉取本应用生效的配置
+  # per-token 覆盖由 type=subconfig 的子配置文件提供（与 apm.patterns 共用同一套机制）
+  # disabled 为 profiling 总开关：true 不采集，false 允许采集，缺省为 true
+  profiling:
+{%- if profiling_config is defined and profiling_config.disabled is defined %}
+    disabled: {{ profiling_config.disabled }}
+{%- else %}
+    disabled: true
+{%- endif %}
+{%- if profiling_config is defined and profiling_config.cpu is defined %}
+    cpu:
+{%- if profiling_config.cpu.enabled is defined %}
+      enabled: {{ profiling_config.cpu.enabled }}
+{%- endif %}
+{%- if profiling_config.cpu.collection_period is defined %}
+      collection_period: "{{ profiling_config.cpu.collection_period }}"
+{%- endif %}
+{%- if profiling_config.cpu.collection_window is defined %}
+      collection_window: "{{ profiling_config.cpu.collection_window }}"
+{%- endif %}
+{%- if profiling_config.cpu.sampling_frequency is defined %}
+      sampling_frequency: "{{ profiling_config.cpu.sampling_frequency }}"
+{%- endif %}
+{%- endif %}
+{%- if profiling_config is defined and profiling_config.memory is defined %}
+    memory:
+{%- if profiling_config.memory.enabled is defined %}
+      enabled: {{ profiling_config.memory.enabled }}
+{%- endif %}
+{%- if profiling_config.memory.collection_period is defined %}
+      collection_period: "{{ profiling_config.memory.collection_period }}"
+{%- endif %}
+{%- if profiling_config.memory.collection_window is defined %}
+      collection_window: "{{ profiling_config.memory.collection_window }}"
+{%- endif %}
+{%- if profiling_config.memory.allocation_threshold is defined %}
+      allocation_threshold: "{{ profiling_config.memory.allocation_threshold }}"
+{%- endif %}
+{%- endif %}
+
+
   # =============================== Receiver =================================
   receiver:
     # Http Server Config
@@ -186,6 +229,12 @@ bk-collector:
       # default: ""
       endpoint: ":4319"
 
+    # NetworkFlow Receiver Config
+    networkflow:
+      # 子配置文件包含 networkflow 全部配置（enabled/dataid/listeners/workers 等）
+      listeners_file:
+        - "{{ plugin_path.subconfig_path }}/bk-collector-networkflow.conf"
+
   processor:
     # ApdexCalculator: 健康度状态计算器
     - name: "apdex_calculator/standard"
@@ -193,31 +242,221 @@ bk-collector:
         calculator:
           type: "standard"
 
-    # AttributeFilter: 属性过滤处理器
-    - name: "attribute_filter/common"
+    # AttributeFilter: 属性过滤处理器（嘉为）
+    - name: "attribute_filter/canway"
       config:
         as_string:
           keys:
             - "attributes.db.name"
+        as_int:
+          keys:
+            - "attributes.http.status_code"
+        assemble:
+          - destination: "db.system"
+            predicate_key: "attributes.db.system"
+            default_from: "attributes.db.system"
+            rules:
+              - kind: ""
+                first_upper:
+                  - "attributes.db.system"
+                keys:
+                  - "attributes.db.system"
+                separator: ""
+                placeholder: "Unknown"
 
     # ResourceFilter: 维度补充
     - name: "resource_filter/fill_dimensions"
 
     # FieldNormalizer: 协议字段替换
     - name: "field_normalizer/otel_mapping"
+      config:
+        fields:
+          - kind: SPAN_KIND_SERVER
+            predicate_key: attributes.http.method,attributes.http.request.method
+            rules:
+              - key: attributes.http.method
+                op: or
+                values:
+                  - attributes.http.request.method
+              - key: attributes.http.status_code
+                op: or
+                values:
+                  - attributes.http.response.status_code
+              - key: attributes.http.scheme
+                op: or
+                values:
+                  - attributes.url.scheme
+              - key: attributes.net.peer.ip
+                op: or
+                values:
+                  - attributes.client.address
+              - key: attributes.net.peer.port
+                op: or
+                values:
+                  - attributes.client.port
+              - key: attributes.net.peer.name
+                op: concat
+                values:
+                  - attributes.net.peer.ip
+                  - attributes.net.peer.port
+              - key: attributes.http.client_ip
+                op: or
+                values:
+                  - attributes.client.address
+              - key: attributes.net.host.name
+                op: concat
+                values:
+                  - attributes.server.address
+                  - attributes.server.port
+              - key: attributes.net.host.ip
+                op: or
+                values:
+                  - attributes.server.address
+              - key: attributes.net.host.port
+                op: or
+                values:
+                  - attributes.server.port
+          - kind: SPAN_KIND_CLIENT
+            predicate_key: attributes.http.method,attributes.http.request.method
+            rules:
+              - key: attributes.net.peer.ip
+                op: or
+                values:
+                  - attributes.server.address
+                  - attributes.network.peer.address
+              - key: attributes.net.peer.port
+                op: or
+                values:
+                  - attributes.server.port
+                  - attributes.network.peer.port
+              - key: attributes.net.peer.name
+                op: concat
+                values:
+                  - attributes.net.peer.ip
+                  - attributes.net.peer.port
+              - key: attributes.net.host.name
+                op: concat
+                values:
+                  - attributes.client.address
+                  - attributes.client.port
+              - key: attributes.net.host.ip
+                op: or
+                values:
+                  - attributes.client.address
+              - key: attributes.net.host.port
+                op: or
+                values:
+                  - attributes.client.port
+              - key: attributes.http.method
+                op: or
+                values:
+                  - attributes.http.request.method
+              - key: attributes.http.status_code
+                op: or
+                values:
+                  - attributes.http.response.status_code
+              - key: attributes.http.url
+                op: or
+                values:
+                  - attributes.url.full
+              - key: attributes.http.scheme
+                op: or
+                values:
+                  - attributes.url.scheme
+          - kind: SPAN_KIND_CLIENT
+            predicate_key: attributes.db.system,attributes.db.system.name
+            rules:
+              - key: "attributes.db.system"
+                op: "or"
+                values:
+                  - "attributes.db.system.name"
+              - key: attributes.net.peer.ip
+                op: or
+                values:
+                  - attributes.server.address
+                  - attributes.network.peer.address
+              - key: attributes.net.peer.port
+                op: or
+                values:
+                  - attributes.server.port
+                  - attributes.network.peer.port
+              - key: attributes.net.peer.name
+                op: concat
+                values:
+                  - attributes.net.peer.ip
+                  - attributes.net.peer.port
+              - key: attributes.db.name
+                op: or
+                values:
+                  - attributes.db.namespace
+              - key: attributes.db.statement
+                op: or
+                values:
+                  - attributes.db.query.text
+          - kind: 'SPAN_KIND_PRODUCER'
+            predicate_key: attributes.messaging.system
+            rules:
+              - key: "attributes.net.peer.ip"
+                op: "or"
+                values:
+                  - "attributes.server.address"
+                  - "attributes.network.peer.address"
+              - key: "attributes.net.peer.port"
+                op: "or"
+                values:
+                  - "attributes.server.port"
+                  - "attributes.network.peer.port"
+              - key: "attributes.net.peer.name"
+                op: "concat"
+                values:
+                  - "attributes.net.peer.ip"
+                  - "attributes.net.peer.port"
+          - kind: "SPAN_KIND_CONSUMER"
+            predicate_key: "attributes.messaging.system"
+            rules:
+              - key: "attributes.net.peer.ip"
+                op: "or"
+                values:
+                  - "attributes.server.address"
+                  - "attributes.network.peer.address"
+              - key: "attributes.net.peer.port"
+                op: "or"
+                values:
+                  - "attributes.server.port"
+                  - "attributes.network.peer.port"
+              - key: "attributes.net.peer.name"
+                op: "concat"
+                values:
+                  - "attributes.net.peer.ip"
+                  - "attributes.net.peer.port"
+          # MESSAGING CLIENT：兼容部分探针将消息 span 标记为 CLIENT。
+          - kind: "SPAN_KIND_CLIENT"
+            predicate_key: "attributes.messaging.system"
+            rules:
+              - key: "attributes.net.peer.ip"
+                op: "or"
+                values:
+                  - "attributes.server.address"
+                  - "attributes.network.peer.address"
+              - key: "attributes.net.peer.port"
+                op: "or"
+                values:
+                  - "attributes.server.port"
+                  - "attributes.network.peer.port"
+              - key: "attributes.net.peer.name"
+                op: "concat"
+                values:
+                  - "attributes.net.peer.ip"
+                  - "attributes.net.peer.port"
 
-    # ResourceFilter: 资源过滤处理器
+    # ResourceFilter: 资源过滤处理器（嘉为）
     - name: "resource_filter/instance_id"
       config:
         assemble:
           - destination: "bk.instance.id"
             separator: ":"
             keys:
-              - "resource.telemetry.sdk.language"
-              - "resource.service.name"
-              - "resource.net.host.name"
-              - "resource.net.host.ip"
-              - "resource.net.host.port"
+              - "resource.service.instance.id"
         drop:
           keys:
             - "resource.bk.data.token"
@@ -238,12 +477,63 @@ bk-collector:
           keys:
             - "resource.bk.data.token"
             - "resource.process.pid"
+            - "resource.container.id"
+            - "resource.deployment.environment"
+            - "resource.host.arch"
+            - "resource.host.name"
+            - "resource.os.description"
+            - "resource.os.type"
+            - "resource.process.command_line"
+            - "resource.process.command_args"
+            - "resource.process.executable.path"
+            - "resource.process.runtime.description"
+            - "resource.process.runtime.name"
+            - "resource.process.runtime.version"
+            - "resource.service.namespace"
+            - "resource.service.version"
+            - "resource.telemetry.distro.name"
+            - "resource.telemetry.distro.version"
+            - "resource.telemetry.sdk.language"
+            - "resource.telemetry.sdk.name"
+            - "resource.telemetry.sdk.version"
         from_token:
           keys:
             - "app_name"
+        replace:
+          - source: "service.instance.id"
+            destination: "bk.instance.id"
+
+    # ResourceFilter: 资源过滤处理器（嘉为）
+    - name: "resource_filter/keep_origin_traceid"
+      config:
+        keep_origin_traceid:
+          enabled: true
 
     # MetricsFilter: 指标过滤处理器
     - name: "metrics_filter/relabel"
+
+    # MetricsFilter: jvm 指标过滤处理器
+    - name: "metrics_filter/jvm"
+
+    # MetricsDeriver: 指标派生处理器
+    - name: "metrics_deriver/ot_java_agent"
+
+    # SkyWalkingProcessor: SkyWalking 数据处理器
+    - name: "skywalking_processor/default"
+      config:
+        meter_data:
+          enabled: true
+          rules:
+            - types: ["*"]
+              metrics:
+                db_pool_max_connections: db_pool_max_connections
+                db_pool_active_connections: db_pool_active_connections
+                db_pool_idle_connections: db_pool_idle_connections
+                db_pool_connection_usage_percent: db_pool_connection_usage_percent
+                db_pool_connection_wait_queue_size: db_pool_connection_wait_queue_size
+                web_thread_pool_usage_percent: web_thread_pool_usage_percent
+                web_thread_pool_busy_threads: web_thread_pool_busy_threads
+                web_thread_pool_max_threads: web_thread_pool_max_threads
 
     # MethodFilter: method 过滤处理器（做 span 丢弃处理）
     - name: "method_filter/drop_span"
@@ -266,6 +556,12 @@ bk-collector:
         type: "drop"
         enabled: false
 
+    # Probe_filter 探针采集过滤器 探针自定义配置下发（嘉为）
+    - name: "probe_filter/common"
+
+    # TokenReplacer: Token 替换器（token 映射）（嘉为）
+    - name: "token_replacer/token_mapping"
+
     # TokenChecker: 权限校验处理器
     - name: "token_checker/aes256"
 
@@ -276,6 +572,91 @@ bk-collector:
 
     # ServiceDiscover: 服务发现处理器
     - name: "service_discover/common"
+      config:
+        rules:
+          # SkyWalking 定时任务框架 component_id 映射
+          - service: "None"
+            type: "sw-schedule-task"
+            kind: "SPAN_KIND_UNSPECIFIED,SPAN_KIND_INTERNAL,SPAN_KIND_SERVER,SPAN_KIND_CLIENT,SPAN_KIND_PRODUCER,SPAN_KIND_CONSUMER"
+            match_type: "regex"
+            predicate_key: "attributes.sw8.component_id"
+            match_key: "attributes.sw8.component_id"
+            replace_type: "missing"
+            match_groups:
+              - destination: "job.system"
+                const_val: "spring_scheduling"
+            rule:
+              regex: "^96$"
+          - service: "None"
+            type: "sw-schedule-task"
+            kind: "SPAN_KIND_UNSPECIFIED,SPAN_KIND_INTERNAL,SPAN_KIND_SERVER,SPAN_KIND_CLIENT,SPAN_KIND_PRODUCER,SPAN_KIND_CONSUMER"
+            match_type: "regex"
+            predicate_key: "attributes.sw8.component_id"
+            match_key: "attributes.sw8.component_id"
+            replace_type: "missing"
+            match_groups:
+              - destination: "job.system"
+                const_val: "quartz"
+            rule:
+              regex: "^97$"
+          - service: "None"
+            type: "sw-schedule-task"
+            kind: "SPAN_KIND_UNSPECIFIED,SPAN_KIND_INTERNAL,SPAN_KIND_SERVER,SPAN_KIND_CLIENT,SPAN_KIND_PRODUCER,SPAN_KIND_CONSUMER"
+            match_type: "regex"
+            predicate_key: "attributes.sw8.component_id"
+            match_key: "attributes.sw8.component_id"
+            replace_type: "missing"
+            match_groups:
+              - destination: "job.system"
+                const_val: "xxl-job"
+            rule:
+              regex: "^98$"
+          - service: "None"
+            type: "sw-schedule-task"
+            kind: "SPAN_KIND_UNSPECIFIED,SPAN_KIND_INTERNAL,SPAN_KIND_SERVER,SPAN_KIND_CLIENT,SPAN_KIND_PRODUCER,SPAN_KIND_CONSUMER"
+            match_type: "regex"
+            predicate_key: "attributes.sw8.component_id"
+            match_key: "attributes.sw8.component_id"
+            replace_type: "missing"
+            match_groups:
+              - destination: "job.system"
+                const_val: "dolphinscheduler"
+            rule:
+              regex: "^106$"
+
+    # SpanProcessor: 应用级 span 处理器
+    - name: "span_processor/common"
+
+    # SpanProcessor: Client HTTP span 名称处理器
+    - name: "span_processor/common_client_http"
+      config:
+        replace_value:
+          - predicate_key: "span_name"
+            rules:
+              - filters:
+                  - key: "kind"
+                    op: "eq"
+                    value:
+                      - "3"
+                  - key: "attributes.http.method"
+                    op: "reg"
+                    value:
+                      - "^.+$"
+                replace_from:
+                  source:
+                    - "attributes.http.method"
+              - filters:
+                  - key: "kind"
+                    op: "eq"
+                    value:
+                      - "3"
+                  - key: "attributes.http.request.method"
+                    op: "reg"
+                    value:
+                      - "^.+$"
+                replace_from:
+                  source:
+                    - "attributes.http.request.method"
 
     # TokenChecker: 权限校验处理器
     # Proxy
@@ -288,6 +669,9 @@ bk-collector:
 
     # DbFilter: db 处理器
     - name: "db_filter/common"
+
+    # AttributeFilter: 属性过滤处理器
+    - name: "attribute_filter/common"
 
     # Attribute_filter 应用层级的配置
     - name: "attribute_filter/app"
@@ -312,8 +696,8 @@ bk-collector:
     - name: "rate_limiter/token_bucket"
       config:
         type: token_bucket
-        qps: 2000
-        burst: 4000
+        qps: 500
+        burst: 1000
 
     # TracesDeriver: 指标派生处理器
     - name: "traces_deriver/delta"
@@ -335,16 +719,23 @@ bk-collector:
     - name: "traces_pipeline/common"
       type: "traces"
       processors:
+        - "token_replacer/token_mapping"
         - "token_checker/aes256"
         - "rate_limiter/token_bucket"
+        - "license_checker/common"
         - "sampler/drop_traces"
         - "method_filter/drop_span"
         - "field_normalizer/otel_mapping"
         - "resource_filter/fill_dimensions"
         - "resource_filter/instance_id"
+        - "resource_filter/keep_origin_traceid"
         - "db_filter/common"
+        - "attribute_filter/canway"
         - "attribute_filter/common"
         - "attribute_filter/app"
+        - "probe_filter/common"
+        - "span_processor/common"
+        - "span_processor/common_client_http"
         - "service_discover/common"
         - "apdex_calculator/standard"
         - "traces_deriver/delta"
@@ -360,18 +751,24 @@ bk-collector:
     - name: "metrics_pipeline/common"
       type: "metrics"
       processors:
+        - "token_replacer/token_mapping"
         - "token_checker/aes256"
         - "rate_limiter/token_bucket"
+        - "skywalking_processor/default"
+        - "metrics_filter/jvm"
+        - "metrics_deriver/ot_java_agent"
         - "resource_filter/metrics"
         - "metrics_filter/relabel"
 
     - name: "metrics_pipeline/derived"
       type: "metrics.derived"
       processors:
+        - "apdex_calculator/standard"
 
     - name: "logs_pipeline/common"
       type: "logs"
       processors:
+        - "token_replacer/token_mapping"
         - "token_checker/aes256"
         - "rate_limiter/token_bucket"
         - "resource_filter/logs"
@@ -380,6 +777,7 @@ bk-collector:
     - name: "pushgateway_pipeline/common"
       type: "pushgateway"
       processors:
+        - "token_replacer/token_mapping"
         - "token_checker/aes256"
         - "rate_limiter/token_bucket"
         - "metrics_filter/relabel"
@@ -387,6 +785,7 @@ bk-collector:
     - name: "remotewrite_pipeline/common"
       type: "remotewrite"
       processors:
+        - "token_replacer/token_mapping"
         - "token_checker/aes256"
         - "rate_limiter/token_bucket"
         - "metrics_filter/relabel"
@@ -402,15 +801,21 @@ bk-collector:
       type: "pingserver"
       processors:
 
+    - name: "networkflow_pipeline/common"
+      type: "networkflow"
+      processors:
+
     - name: "fta_pipeline/common"
       type: "fta"
       processors:
+        - "token_replacer/token_mapping"
         - "token_checker/aes256"
         - "rate_limiter/token_bucket"
 
     - name: "profiles_pipeline/common"
       type: "profiles"
       processors:
+        - "token_replacer/token_mapping"
         - "token_checker/aes256"
         - "pprof_translator/common"
         - "sampler/drop_profiles"
@@ -424,12 +829,14 @@ bk-collector:
     - name: "tars_pipeline/common"
       type: "tars"
       processors:
+        - "token_replacer/token_mapping"
         - "token_checker/aes256"
         - "rate_limiter/token_bucket"
 
     - name: "logpush_pipeline/common"
       type: "logpush"
       processors:
+        - "token_replacer/token_mapping"
         - "token_checker/aes256"
         - "rate_limiter/token_bucket"
         - "text_spliter/common"
