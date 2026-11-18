@@ -54,6 +54,20 @@ func PublishEvents(events ...define.Event) {
 
 var SentFunc = beat.Send
 
+// sendHook is what the GSE output asks before it hands an encoded event of
+// n bytes to the GSE client. An event of maxBytes or more is dropped and
+// counted as oversize; only the events that go on count as sent bytes.
+func sendHook(maxBytes int) func(dataID int32, n float64) bool {
+	return func(dataID int32, n float64) bool {
+		if n >= float64(maxBytes) {
+			DefaultMetricMonitor.IncOversizeCounter()
+			return false
+		}
+		DefaultMetricMonitor.ObserveBeatSentBytes(dataID, n)
+		return true
+	}
+}
+
 func New(conf *confengine.Config) (*Exporter, error) {
 	c := &Config{}
 	if err := conf.UnpackChild(define.ConfigFieldExporter, c); err != nil {
@@ -63,10 +77,7 @@ func New(conf *confengine.Config) (*Exporter, error) {
 	logger.Infof("exporter config: %+v", c)
 
 	// 注册 gse output hook
-	gse.RegisterSendHook(func(dataID int32, n float64) bool {
-		DefaultMetricMonitor.ObserveBeatSentBytes(dataID, n)
-		return n < float64(c.MaxMessageBytes)
-	})
+	gse.RegisterSendHook(sendHook(c.MaxMessageBytes))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	exp := &Exporter{
@@ -144,9 +155,14 @@ func (e *Exporter) sendEvents() {
 		select {
 		case event := <-e.queue.Pop():
 			start := time.Now()
-			SentFunc(event)
+			sent := SentFunc(event)
 			DefaultMetricMonitor.ObserveSentDuration(start)
-			DefaultMetricMonitor.IncSentCounter()
+			// Only an event the beat pipeline took counts as sent.
+			if sent {
+				DefaultMetricMonitor.IncSentCounter()
+			} else {
+				DefaultMetricMonitor.IncSendRejectedCounter()
+			}
 
 		case <-e.ctx.Done():
 			e.queue.Close()
