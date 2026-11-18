@@ -79,7 +79,7 @@ var (
 			Name:      "pipeline_skipped_total",
 			Help:      "Pipeline skipped records total",
 		},
-		[]string{"pipeline", "record_type", "id", "processor", "token"},
+		[]string{"pipeline", "record_type", "id", "processor", define.TokenFingerprintLabel},
 	)
 
 	handledTotal = promauto.NewCounterVec(
@@ -88,7 +88,7 @@ var (
 			Name:      "pipeline_handled_total",
 			Help:      "Pipeline handled records total",
 		},
-		[]string{"pipeline", "record_type", "id", "token"},
+		[]string{"pipeline", "record_type", "id", define.TokenFingerprintLabel},
 	)
 
 	handledDuration = promauto.NewHistogramVec(
@@ -148,12 +148,12 @@ func (m *metricMonitor) IncDroppedCounter(pipeline string, rtype define.RecordTy
 }
 
 func (m *metricMonitor) IncSkippedCounter(pipeline string, rtype define.RecordType, dataId int32, processor string, token string) {
-	lvs := []string{pipeline, rtype.S(), strconv.Itoa(int(dataId)), processor, token}
+	lvs := []string{pipeline, rtype.S(), strconv.Itoa(int(dataId)), processor, define.TokenFingerprint(token)}
 	skippedTotal.WithLabelValues(lvs...).Inc()
 }
 
 func (m *metricMonitor) IncHandledCounter(pipeline string, rtype define.RecordType, dataId int32, token string) {
-	lvs := []string{pipeline, rtype.S(), strconv.Itoa(int(dataId)), token}
+	lvs := []string{pipeline, rtype.S(), strconv.Itoa(int(dataId)), define.TokenFingerprint(token)}
 	handledTotal.WithLabelValues(lvs...).Inc()
 }
 

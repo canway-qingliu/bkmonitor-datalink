@@ -10,8 +10,6 @@
 package appmonitor
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"strconv"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -27,7 +25,7 @@ type Identity struct {
 	TokenFingerprint string
 }
 
-var identityLabels = []string{"bk_tenant_id", "bk_biz_id", "app_id", "token_fingerprint"}
+var identityLabels = []string{"bk_tenant_id", "bk_biz_id", "app_id", define.TokenFingerprintLabel}
 
 var (
 	receiverRecords = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -56,12 +54,11 @@ func IdentityFromToken(token define.Token) (Identity, bool) {
 	if token.AppID <= 0 || token.BizId <= 0 || token.Original == "" {
 		return Identity{}, false
 	}
-	digest := sha256.Sum256([]byte(token.Original))
 	return Identity{
 		TenantID:         token.TenantID,
 		BizID:            strconv.FormatInt(int64(token.BizId), 10),
 		AppID:            strconv.FormatInt(token.AppID, 10),
-		TokenFingerprint: hex.EncodeToString(digest[:8]),
+		TokenFingerprint: define.TokenFingerprint(token.Original),
 	}, true
 }
 
