@@ -33,7 +33,6 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/confengine"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/appmonitor"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/grpcmiddleware"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/httpmiddleware"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/throttle"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/receiver/networkflow"
@@ -249,16 +248,7 @@ func (r *Receiver) startGrpcServer() error {
 	endpoint := r.config.GrpcServer.Endpoint
 	logger.Infof("start to listen grpc server at: %v", endpoint)
 
-	var opts []grpc.ServerOption
-	for _, mid := range r.config.GrpcServer.Middlewares {
-		opt := grpcmiddleware.Get(mid)
-		if opt != nil {
-			logger.Debugf("receiver/grpc use '%s' middleware", mid)
-			opts = append(opts, opt)
-		}
-	}
-
-	r.grpcServer = grpc.NewServer(opts...)
+	r.grpcServer = newGrpcServer(r.config.GrpcServer.Middlewares)
 	for _, svc := range serviceMgr.grpcServices {
 		svc(r.grpcServer)
 	}

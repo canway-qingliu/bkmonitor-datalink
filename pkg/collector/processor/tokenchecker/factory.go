@@ -275,7 +275,16 @@ func (p *tokenChecker) processTraces(decoder TokenDecoder, config Config, record
 		return define.ErrSkipEmptyRecord
 	}
 	record.Token = firstToken
+	countPartial(record, errs)
 	return nil
+}
+
+// countPartial counts a request that is handled with the resources whose
+// token did not decode dropped from it.
+func countPartial(record *define.Record, errs []error) {
+	if len(errs) > 0 {
+		define.IncReceiverRejected(record.RequestType, define.RejectTokenPartial)
+	}
 }
 
 func (p *tokenChecker) processMetrics(decoder TokenDecoder, config Config, record *define.Record) error {
@@ -352,6 +361,7 @@ func (p *tokenChecker) processMetrics(decoder TokenDecoder, config Config, recor
 		}
 		return define.ErrSkipEmptyRecord
 	}
+	countPartial(record, errs)
 	return nil
 }
 
@@ -391,6 +401,7 @@ func (p *tokenChecker) processLogs(decoder TokenDecoder, config Config, record *
 		}
 		return define.ErrSkipEmptyRecord
 	}
+	countPartial(record, errs)
 	return nil
 }
 
