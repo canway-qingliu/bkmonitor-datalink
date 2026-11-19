@@ -228,6 +228,7 @@ func resolveIndexMetadataSnapshot(ctx context.Context, span *trace.Span, cli *el
 		span.Set("get-mapping", aliases)
 		mappingStartedAt := time.Now()
 		res, err := cli.GetMapping().Index(aliases...).Type("").Do(ctx)
+		metric.TsDBRequestInc(ctx, metadata.ElasticsearchStorageType, withBackendStatus(err))
 		span.Set("get-mapping-duration-ms", float64(time.Since(mappingStartedAt))/float64(time.Millisecond))
 		if err != nil {
 			span.Set("get-mapping-error", truncateString(err.Error(), esIndexMetadataErrorMaxLength))
@@ -280,6 +281,7 @@ func (i *Instance) fieldMapWithIndexFields(ctx context.Context, fieldAlias metad
 	ctx, span := trace.NewSpan(ctx, "elasticsearch-get-mapping")
 	defer func() {
 		if r := recover(); r != nil {
+			metric.PanicInc(ctx, metric.PanicSiteStorage)
 			err = fmt.Errorf("get mapping error: %s", r)
 		}
 		span.End(&err)
@@ -442,6 +444,9 @@ func buildESQuerySource(ctx context.Context, qb *metadata.Query, fact *FormatFac
 }
 
 func (i *Instance) esQuery(ctx context.Context, qo *queryOption, fact *FormatFactory) (*elastic.SearchResult, error) {
+	if err := i.configureDateHistogram(ctx, qo.query, fact, qo.indexes); err != nil {
+		return nil, err
+	}
 	source, countQuery, bodyString, err := buildESQuerySource(ctx, qo.query, fact, nil)
 	if err != nil {
 		return nil, err
@@ -498,6 +503,7 @@ func (i *Instance) executeESQuery(
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
+				metric.PanicInc(ctx, metric.PanicSiteStorage)
 				err = metadata.NewMessage(
 					metadata.MsgQueryES,
 					"es 查询发生 panic index: %+v, panic: %v",
@@ -547,7 +553,10 @@ func (i *Instance) executeESQuery(
 		retryQo.indexes = retryIndexes
 		recordESQueryShardsWithPrefix(ctx, span, &retryQo, res, "fallback_retry_")
 	}
-	if err = handleESError(ctx, qo.conn.Address, err, res); err != nil {
+	// 一次查询（含缺 mapping 的回退重试）计一次，按 handleESError 归一后的结果。
+	err = handleESError(ctx, qo.conn.Address, err, res)
+	metric.TsDBRequestInc(ctx, metadata.ElasticsearchStorageType, err)
+	if err != nil {
 		return nil, err
 	}
 	if res.Hits != nil {
@@ -702,6 +711,7 @@ func (i *Instance) QueryFieldMap(ctx context.Context, query *metadata.Query, sta
 	var err error
 	defer func() {
 		if r := recover(); r != nil {
+			metric.PanicInc(ctx, metric.PanicSiteStorage)
 			err = fmt.Errorf("es query error: %s", r)
 		}
 	}()
@@ -734,6 +744,7 @@ func (i *Instance) QueryFieldMap(ctx context.Context, query *metadata.Query, sta
 func (i *Instance) QueryRawData(ctx context.Context, query *metadata.Query, start, end time.Time, dataCh chan<- map[string]any) (size int64, total int64, option *metadata.ResultTableOption, err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			metric.PanicInc(ctx, metric.PanicSiteStorage)
 			err = fmt.Errorf("es query error: %s", r)
 		}
 	}()
@@ -761,6 +772,7 @@ func (i *Instance) QueryPreparedRawData(
 ) (size int64, total int64, option *metadata.ResultTableOption, err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			metric.PanicInc(ctx, metric.PanicSiteStorage)
 			err = fmt.Errorf("es query error: %s", r)
 		}
 	}()
@@ -850,6 +862,7 @@ func (i *Instance) QuerySeriesSet(
 	ctx, span := trace.NewSpan(ctx, "elasticsearch-query-series-set")
 	defer func() {
 		if r := recover(); r != nil {
+			metric.PanicInc(ctx, metric.PanicSiteStorage)
 			err = fmt.Errorf("es query panic error: %s", r)
 		}
 		span.End(&err)
@@ -1188,6 +1201,7 @@ func (i *Instance) QuerySeries(ctx context.Context, query *metadata.Query, start
 	defer cli.Stop()
 
 	searchResult, err := cli.Search().Index(aliases...).SearchSource(source).Do(ctx)
+	metric.TsDBRequestInc(ctx, metadata.ElasticsearchStorageType, withBackendStatus(err))
 	if err != nil {
 		return nil, withBackendStatus(err)
 	}

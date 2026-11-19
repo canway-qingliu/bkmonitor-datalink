@@ -24,6 +24,7 @@ import (
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/function"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metric"
 )
 
 // PreparedFieldMetadata is an immutable, member-scoped snapshot of the index
@@ -79,6 +80,7 @@ func (i *Instance) PrepareRawFieldMetadata(
 ) (prepared *PreparedFieldMetadata, err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			metric.PanicInc(ctx, metric.PanicSiteStorage)
 			prepared = nil
 			err = fmt.Errorf("es query error: %s", r)
 		}
@@ -126,6 +128,7 @@ func (i *Instance) PrepareRawQuery(
 ) (prepared *PreparedRawQuery, err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			metric.PanicInc(ctx, metric.PanicSiteStorage)
 			prepared = nil
 			err = fmt.Errorf("es query error: %s", r)
 		}
@@ -170,6 +173,9 @@ func (i *Instance) PrepareRawQuery(
 		conn:            i.connect,
 	}
 	fact := newRawFormatFactory(ctx, rawQuery, qo, fieldMetadata.fieldMap)
+	if err := i.configureDateHistogram(ctx, rawQuery, fact, qo.indexes); err != nil {
+		return nil, err
+	}
 	source, countQuery, _, err := buildESQuerySource(ctx, rawQuery, fact, nil)
 	if err != nil {
 		return nil, err
