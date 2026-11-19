@@ -287,6 +287,7 @@ func TestASpanBatchOfMaxMessageBytesIsDroppedAsOversize(t *testing.T) {
 func gseOutput(t *testing.T) *gseoutput.Output {
 	t.Helper()
 	require.NoError(t, storage.Init(filepath.Join(t.TempDir(), "gse.db"), nil))
+	t.Cleanup(storage.Close)
 	sock := filepath.Join(t.TempDir(), "ipc.state.report")
 	ln, err := net.Listen("unix", sock)
 	require.NoError(t, err)
