@@ -25,7 +25,7 @@ var (
 			Name:      "receiver_handled_total",
 			Help:      "Receiver handled records total",
 		},
-		[]string{"source", "protocol", "record_type", define.TokenFingerprintLabel},
+		[]string{"source", "protocol", "record_type", "token"},
 	)
 
 	droppedTotal = promauto.NewCounterVec(
@@ -43,7 +43,7 @@ var (
 			Name:      "receiver_skipped_total",
 			Help:      "Receiver skipped records total",
 		},
-		[]string{"source", "protocol", "record_type", define.TokenFingerprintLabel},
+		[]string{"source", "protocol", "record_type", "token"},
 	)
 
 	internalErrorTotal = promauto.NewCounterVec(
@@ -62,7 +62,7 @@ var (
 			Help:      "Receiver handled duration seconds",
 			Buckets:   define.DefObserveDuration,
 		},
-		[]string{"source", "protocol", "record_type", define.TokenFingerprintLabel},
+		[]string{"source", "protocol", "record_type", "token"},
 	)
 
 	receivedBytesTotal = promauto.NewCounterVec(
@@ -71,7 +71,7 @@ var (
 			Name:      "receiver_received_bytes_total",
 			Help:      "Receiver received body bytes total",
 		},
-		[]string{"source", "protocol", "record_type", define.TokenFingerprintLabel},
+		[]string{"source", "protocol", "record_type", "token"},
 	)
 
 	receivedBytesSize = promauto.NewHistogramVec(
@@ -81,7 +81,7 @@ var (
 			Help:      "Receiver received body bytes size",
 			Buckets:   define.DefSizeDistribution,
 		},
-		[]string{"source", "protocol", "record_type", define.TokenFingerprintLabel},
+		[]string{"source", "protocol", "record_type", "token"},
 	)
 
 	preCheckFailedTotal = promauto.NewCounterVec(
@@ -90,7 +90,7 @@ var (
 			Name:      "receiver_precheck_failed_total",
 			Help:      "Receiver records precheck failed total",
 		},
-		[]string{"source", "protocol", "record_type", "processor", define.TokenFingerprintLabel, "code"},
+		[]string{"source", "protocol", "record_type", "processor", "token", "code"},
 	)
 )
 
@@ -109,23 +109,23 @@ func (m *metricMonitor) IncDroppedCounter(protocol define.RequestType, rtype def
 }
 
 func (m *metricMonitor) IncHandledCounter(protocol define.RequestType, rtype define.RecordType, token string) {
-	handledTotal.WithLabelValues(m.source, protocol.S(), rtype.S(), define.TokenFingerprint(token)).Inc()
+	handledTotal.WithLabelValues(m.source, protocol.S(), rtype.S(), token).Inc()
 }
 
 func (m *metricMonitor) IncSkippedCounter(protocol define.RequestType, rtype define.RecordType, token string) {
-	skippedTotal.WithLabelValues(m.source, protocol.S(), rtype.S(), define.TokenFingerprint(token)).Inc()
+	skippedTotal.WithLabelValues(m.source, protocol.S(), rtype.S(), token).Inc()
 }
 
 func (m *metricMonitor) IncPreCheckFailedCounter(protocol define.RequestType, rtype define.RecordType, processor, token string, code define.StatusCode) {
-	preCheckFailedTotal.WithLabelValues(m.source, protocol.S(), rtype.S(), processor, define.TokenFingerprint(token), code.S()).Inc()
+	preCheckFailedTotal.WithLabelValues(m.source, protocol.S(), rtype.S(), processor, token, code.S()).Inc()
 }
 
 func (m *metricMonitor) AddReceivedBytesCounter(v float64, protocol define.RequestType, rtype define.RecordType, token string) {
-	receivedBytesTotal.WithLabelValues(m.source, protocol.S(), rtype.S(), define.TokenFingerprint(token)).Add(v)
+	receivedBytesTotal.WithLabelValues(m.source, protocol.S(), rtype.S(), token).Add(v)
 }
 
 func (m *metricMonitor) ObserveBytesDistribution(v float64, protocol define.RequestType, rtype define.RecordType, token string) {
-	receivedBytesSize.WithLabelValues(m.source, protocol.S(), rtype.S(), define.TokenFingerprint(token)).Observe(v)
+	receivedBytesSize.WithLabelValues(m.source, protocol.S(), rtype.S(), token).Observe(v)
 }
 
 func (m *metricMonitor) IncInternalErrorCounter(protocol define.RequestType, rtype define.RecordType) {
@@ -133,5 +133,5 @@ func (m *metricMonitor) IncInternalErrorCounter(protocol define.RequestType, rty
 }
 
 func (m *metricMonitor) ObserveHandledDuration(t time.Time, protocol define.RequestType, rtype define.RecordType, token string) {
-	handledDuration.WithLabelValues(m.source, protocol.S(), rtype.S(), define.TokenFingerprint(token)).Observe(time.Since(t).Seconds())
+	handledDuration.WithLabelValues(m.source, protocol.S(), rtype.S(), token).Observe(time.Since(t).Seconds())
 }

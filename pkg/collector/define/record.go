@@ -337,12 +337,12 @@ var tokenInfo = promauto.NewGaugeVec(
 		Name:      "receiver_token_info",
 		Help:      "Receiver decoded token info",
 	},
-	[]string{TokenFingerprintLabel, "metrics_id", "traces_id", "logs_id", "profiles_id", "proxy_id", "app_name", "biz_id"},
+	[]string{"token", "metrics_id", "traces_id", "logs_id", "profiles_id", "proxy_id", "app_name", "biz_id"},
 )
 
 func SetTokenInfo(token Token) {
 	tokenInfo.WithLabelValues(
-		TokenFingerprint(token.Original),
+		token.Original,
 		fmt.Sprintf("%d", token.MetricsDataId),
 		fmt.Sprintf("%d", token.TracesDataId),
 		fmt.Sprintf("%d", token.LogsDataId),

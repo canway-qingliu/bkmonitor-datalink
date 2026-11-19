@@ -81,7 +81,7 @@ var (
 			Name:      "proxy_precheck_failed_total",
 			Help:      "proxy records precheck failed total",
 		},
-		[]string{"processor", define.TokenFingerprintLabel, "id", "code"},
+		[]string{"processor", "token", "id", "code"},
 	)
 )
 
@@ -114,5 +114,5 @@ func (m *metricMonitor) ObserveHandledDuration(t time.Time, id int64) {
 }
 
 func (m *metricMonitor) IncPreCheckFailedCounter(processor, token string, id int64, code define.StatusCode) {
-	preCheckFailedTotal.WithLabelValues(processor, define.TokenFingerprint(token), strconv.Itoa(int(id)), code.S()).Inc()
+	preCheckFailedTotal.WithLabelValues(processor, token, strconv.Itoa(int(id)), code.S()).Inc()
 }
