@@ -160,6 +160,36 @@ func TestGrpcServerCountsTheRequestsGrpcRefuses(t *testing.T) {
 	assert.Equal(t, want, grpcRejected(t))
 }
 
+func TestGrpcLegacyDecompressorFailureIsCounted(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := grpc.NewServer(
+		grpc.StatsHandler(rejectedStats{}),
+		grpc.RPCDecompressor(grpc.NewGZIPDecompressor()),
+	)
+	healthpb.RegisterHealthServer(server, health.NewServer())
+	go server.Serve(l)
+	t.Cleanup(server.Stop)
+
+	conn, err := grpc.NewClient(l.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, conn.Close()) })
+
+	gzip := encoding.GetCompressor("gzip")
+	require.NotNil(t, gzip)
+	encoding.RegisterCompressor(notGzip{gzip: gzip})
+	defer encoding.RegisterCompressor(gzip)
+
+	want := grpcRejected(t)
+	want["decompress"]++
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err = healthpb.NewHealthClient(conn).Check(ctx, &healthpb.HealthCheckRequest{Service: "bad gzip"}, grpc.UseCompressor("gzip"))
+	require.Equal(t, codes.Internal, status.Code(err))
+	assert.Eventually(t, func() bool { return assert.ObjectsAreEqual(want, grpcRejected(t)) }, 5*time.Second, 20*time.Millisecond)
+	assert.Equal(t, want, grpcRejected(t))
+}
+
 // unknownEncoding marks its messages compressed with an encoding no
 // compressor is registered for. It is given to the client as a dial option
 // that names the encoding itself, rather than through the registry the

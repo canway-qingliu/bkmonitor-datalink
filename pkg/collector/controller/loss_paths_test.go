@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -288,7 +289,11 @@ func gseOutput(t *testing.T) *gseoutput.Output {
 	t.Helper()
 	require.NoError(t, storage.Init(filepath.Join(t.TempDir(), "gse.db"), nil))
 	t.Cleanup(storage.Close)
-	sock := filepath.Join(t.TempDir(), "ipc.state.report")
+	// t.TempDir 会附加完整测试名，macOS 下可能超过 Unix socket 路径上限。
+	dir, err := os.MkdirTemp("", "gse-")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "ipc.state.report")
 	ln, err := net.Listen("unix", sock)
 	require.NoError(t, err)
 	t.Cleanup(func() { ln.Close() })

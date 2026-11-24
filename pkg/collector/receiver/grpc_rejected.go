@@ -80,7 +80,8 @@ func grpcRejectReason(st *status.Status) (define.RejectReason, bool) {
 			strings.HasPrefix(msg, "grpc: failed to unmarshal the received message") {
 			return define.RejectDecode, true
 		}
-		if strings.HasPrefix(msg, "grpc: failed to decompress the received message") {
+		// grpc-go 不同版本对解压失败使用不同文案，按共同前缀兼容识别。
+		if strings.HasPrefix(msg, "grpc: failed to decompress") {
 			return define.RejectDecompress, true
 		}
 	case codes.Unimplemented:

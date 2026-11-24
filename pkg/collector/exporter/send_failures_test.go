@@ -13,6 +13,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -79,7 +80,11 @@ func TestGseWriteFailuresAreTheGseClientsOwnCounts(t *testing.T) {
 // client's request for agent info and takes whatever is written to it.
 func fakeAgent(t *testing.T) string {
 	t.Helper()
-	sock := filepath.Join(t.TempDir(), "ipc.state.report")
+	// t.TempDir 会附加完整测试名，macOS 下可能超过 Unix socket 路径上限。
+	dir, err := os.MkdirTemp("", "gse-")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "ipc.state.report")
 	ln, err := net.Listen("unix", sock)
 	require.NoError(t, err)
 	t.Cleanup(func() { ln.Close() })
